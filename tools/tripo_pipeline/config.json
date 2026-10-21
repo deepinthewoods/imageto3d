@@ -2,7 +2,7 @@
   "schema_version": 1,
   "generation_service": "Tripo Studio website",
   "source_image_look": "studio plain paper",
-  "active_base_views": "base_views/human_male (native 1254 studio-plain semantic markers); earlier 1024 version archived and frozen in existing staged job",
+  "active_base_views": "base_views/human_male (native 1254 studio-plain semantic markers; 45 deg three-quarter cameras: front-left from above, back-right from below; regions.json landmarks)",
   "marker_palette_srgb": {
     "body_red": "#E61923",
     "head_yellow": "#F5DC14",
@@ -15,7 +15,7 @@
   "user_selected_reference_sha256": "a59a7413ba6f68db6a1fc93bc1c4723c71c851b9069c5138d046d2ac8a17f033",
   "approved_contains": "front concepts only, selected by user",
   "tripo_trigger": "policy: automatically after all four views in every module pass validation; watcher not yet enabled",
-  "tripo_playwright_worker": "manual Firefox submit/collect implemented and dry-run tested; automatic queue watcher not implemented or enabled",
+  "tripo_playwright_worker": "convert_job.py: sequential per-module submit/collect (waits for Studio queue, polls for completion, retries export) then reduce_model.py; automatic queue watcher not implemented",
   "tripo_model_version": "H3.0",
   "tripo_pbr": false,
   "tripo_texture_resolution": "2K",
@@ -28,12 +28,11 @@
   "default_geometry_error_fraction": 0.004,
   "fixed_polygon_target": null,
   "fallback_policy": "retain all three outputs per module; default 0.4%, review and switch to 0.2% or 0.1% when detail needs it",
-  "material_stage": "after whole-geometry reduction, sample source texture over faces, average or cluster colors; preserve uncertain boundaries for review",
+  "material_stage": "after whole-geometry reduction: hue-classified texture samples weighted by pixel quality and concept-view visibility, plus module prior, mirror face and crease-aware neighbours (face_labels.py); per-face provenance recorded",
   "engine_material_roles": [
     "base",
     "primary",
-    "secondary",
-    "uncertain"
+    "secondary"
   ],
   "tripo_topology_default": "Triangle",
   "tripo_triangle_polycount_ceiling": 2000000,

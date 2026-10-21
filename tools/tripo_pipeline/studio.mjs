@@ -80,6 +80,13 @@ async function submit(){
    if(!response.url().includes('/v2/studio/operation/multiview_to_model'))return;
    try{const j=await response.json();const d=j.data??{};responses.push({http_status:response.status(),code:j.code,message:j.message,task_id:d.task_id,project_id:d.project_id,operation_id:d.operation_id});}catch{}
   });
+  // Studio disables Generate while another model of this account is generating; wait it out
+  // rather than failing (a failed click is never charged, but leaves a stale record).
+  const queueDeadline=Date.now()+Number(process.env.TRIPO_QUEUE_WAIT_MIN??30)*60000;
+  while(!(await generate.isEnabled())){
+   if(Date.now()>queueDeadline)throw new Error('Generate stayed disabled; another Studio generation may be stuck');
+   record.status='waiting_for_studio_queue';write(record);await page.waitForTimeout(15000);
+  }
   record.status='submission_attempted';record.submit_clicked_at=new Date().toISOString();write(record);
   await generate.click();await page.waitForTimeout(7000);
   record.response=responses[0]??null;record.project_id=record.response?.project_id??page.url().match(/[a-f0-9-]{36}$/)?.[0]??null;
@@ -89,6 +96,18 @@ async function submit(){
  }finally{await context.close();}
 }
 async function downloadFormat(page,format,record){
+ for(let attempt=1;;attempt++){
+  try{return await downloadOnce(page,format,record);}
+  catch(err){
+   // The first export's toast/dialog sometimes blocks the Export button; clear it and retry.
+   if(attempt>=3)throw err;
+   await page.keyboard.press('Escape').catch(()=>{});
+   await page.reload({waitUntil:'domcontentloaded'});
+   await page.getByRole('button',{name:'Export',exact:true}).first().waitFor({timeout:60000});
+  }
+ }
+}
+async function downloadOnce(page,format,record){
  await page.getByRole('button',{name:'Export',exact:true}).first().click();
  const dialog=page.getByRole('dialog',{name:'Export'});await dialog.waitFor();
  const current=dialog.getByText(/^(FBX|OBJ|GLB)$/).first();await current.click();await page.getByText(format,{exact:true}).last().click();
@@ -97,15 +116,23 @@ async function downloadFormat(page,format,record){
  if(fs.existsSync(destination))throw new Error(`Export destination exists: ${destination}`);
  await download.saveAs(destination);
  record.exports??={};record.exports[format]={path:destination,bytes:fs.statSync(destination).size,downloaded_at:new Date().toISOString()};write(record);
+ await page.keyboard.press('Escape').catch(()=>{});await page.waitForTimeout(1500);
 }
 async function collect(){
  const record=JSON.parse(fs.readFileSync(recordPath));
  if(!record.project_id)throw new Error('Submission has no project ID; review record manually');
  const {context,page}=await openStudio(`https://studio.tripo3d.ai/workspace/generate/${record.project_id}`);
  try{
-  await page.getByRole('button',{name:'Export',exact:true}).first().waitFor({timeout:60000});
-  const body=await page.locator('body').innerText();const top=body.match(/Topology\s+(Quad|Triangle)/)?.[1];const faces=Number(body.match(/Faces\s+(\d+)/)?.[1]);const vertices=Number(body.match(/Vertices\s+(\d+)/)?.[1]);
-  if(!top||!faces)throw new Error('Model is not ready or topology counts unavailable');
+  // Poll until Studio shows the finished model (TRIPO_COLLECT_WAIT_MIN, default 30).
+  const readyDeadline=Date.now()+Number(process.env.TRIPO_COLLECT_WAIT_MIN??30)*60000;
+  let top,faces,vertices;
+  for(;;){
+   await page.getByRole('button',{name:'Export',exact:true}).first().waitFor({timeout:60000}).catch(()=>{});
+   const body=await page.locator('body').innerText();top=body.match(/Topology\s+(Quad|Triangle)/)?.[1];faces=Number(body.match(/Faces\s+(\d+)/)?.[1]);vertices=Number(body.match(/Vertices\s+(\d+)/)?.[1]);
+   if(top&&faces)break;
+   if(Date.now()>readyDeadline)throw new Error('Model is not ready or topology counts unavailable');
+   await page.waitForTimeout(30000);await page.reload({waitUntil:'domcontentloaded'});
+  }
   record.studio_result={topology:top,faces,vertices,inspected_at:new Date().toISOString()};write(record);
   await page.screenshot({path:path.join(output,'studio_result.png')});
   for(const format of ['OBJ','GLB'])if(!record.exports?.[format])await downloadFormat(page,format,record);

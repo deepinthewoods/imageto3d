@@ -12,12 +12,12 @@ concept or view task.
 
 | Step | Owner |
 | --- | --- |
-| Front concepts in `concepts/<set>/...` (+ `prompts.json`, design record) | Codex job |
+| Front concepts in `concepts/<set>/<race_gender>/<module>_front.png` (flat, all modules in one folder) (+ `prompts.json`, design record) | Codex job |
 | Remaining three views in `processing_views/<set>--<job-id>/...` | Codex job |
 | Regenerating a rejected view | Codex job |
 | `workflow.py status/check/claim/ready`, folder moves | Claude |
 | Visual review of every generated image (dimensions, alpha, side, boundaries, colors) | Claude, then Codex for retries |
-| `studio.mjs submit/collect`, `reduce_model.py`, material review, `completed/` | Claude |
+| `convert_job.py` (Tripo submit/collect + `reduce_model.py`), material review, `completed/` | Claude |
 
 Wherever `AGENTS.md`/`PROMPTING_GUIDE.md` say "use the imagegen skill / built-in
 image generation tool", that means: write a Codex job prompt and launch it. Never
@@ -41,13 +41,15 @@ must be new. Set `CODEX_TIMEOUT` (seconds, default 3600) for long batches.
 
 Each prompt must be self-contained and state:
 
-- The task (front concepts for a set, or remaining views for a claimed job) and the
+- The task (front concepts for a set, saved flat as `<module>_front.png` in the one `concepts/<set>/<race_gender>/` folder, or remaining views for a claimed job) and the
   exact output paths. Codex must copy the chosen output from
   `~/.codex/generated_images/...` into those paths and must not overwrite existing
   images (use versioned names for retries; keep rejected attempts).
 - The design brief, module(s), race_gender and the base view used as edit target
   (Image 1), plus the approved front as Image 2 for remaining views, and the
-  established `back.png` as a reference for `back_three_quarter.png`.
+  established `back.png` as a reference for `back_three_quarter.png`. For three-quarter
+  views, describe the camera: front-left from 45° above / back-right from 45° below, 45° around
+  (see `PROMPTING_GUIDE.md`); without this imagegen drifts back to a level view.
 - To follow `AGENTS.md` and `PROMPTING_GUIDE.md`: native base dimensions, RGBA
   alpha, marker colors and swatches, anatomical side, bare anchors, module
   boundaries.
@@ -68,7 +70,7 @@ since `back_three_quarter` depends on `back`.
 1. Check `exit_code` and `result.md`; if the log tail shows a usage/rate limit,
    tell the user rather than retrying in a loop. A killed job can be continued with
    `codex exec resume <session id from log.txt> "continue ..."`.
-2. Inspect every image yourself (Read the PNGs; verify size/mode with
+2. Run `python3 tools/check_framing.py <base.png> <images...>` first; any `FRAMING`/`POSE` flag means regenerate (see `PROMPTING_GUIDE.md`). Then inspect every image yourself (Read the PNGs; verify size/mode with
    `python3 -c "from PIL import Image; ..."` or `identify`) against the review list
    in `AGENTS.md`. Run `workflow.py check` where it applies.
 3. For a failed view, launch a new Codex job naming the specific failure and

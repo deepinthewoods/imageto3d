@@ -71,6 +71,39 @@ def check_image(image: Path, base: Path) -> dict:
     return {'sha256': digest(image), 'dimensions': list(target.size)}
 
 
+def flat_fronts(race: Path) -> dict[str, Path] | None:
+    """Concept/approved layout: `<race>/<module>_front.png` side by side in one folder.
+
+    Returns {module: path}, or None when the race folder uses per-module subfolders.
+    """
+    fronts = {p.name[:-len('_front.png')]: p for p in race.iterdir()
+              if p.is_file() and p.name.endswith('_front.png')}
+    subdirs = [p for p in race.iterdir() if p.is_dir() and not p.name.startswith('.')]
+    if fronts and subdirs:
+        raise ValueError(f'{race}: mix of flat <module>_front.png files and module folders')
+    return fronts or None
+
+
+def unflatten(race: Path) -> None:
+    """Turn the flat concept layout into `<module>/front.png` folders for the view stages.
+
+    Everything else in the folder (prompts, design records, rejected attempts) moves to
+    `.concept_notes/` so it travels with the job but is not mistaken for a view or module.
+    """
+    fronts = flat_fronts(race)
+    if not fronts:
+        return
+    notes = race / '.concept_notes'
+    notes.mkdir(exist_ok=True)
+    keep = set(fronts.values())
+    for path in sorted(race.iterdir()):
+        if path.is_file() and path not in keep:
+            shutil.move(str(path), notes / path.name)
+    for module, path in fronts.items():
+        (race / module).mkdir()
+        shutil.move(str(path), race / module / 'front.png')
+
+
 def validate_set(root: Path, folder: Path, complete: bool) -> dict:
     if not folder.is_dir() or not clean_name(folder.name):
         raise ValueError(f'Expected a named set directory: {folder}')
@@ -97,18 +130,26 @@ def validate_set(root: Path, folder: Path, complete: bool) -> dict:
                 expected = record.get('base_view_hashes', {}).get(f'{race.name}/{view}.png')
                 if not expected or not base_file.is_file() or digest(base_file) != expected:
                     raise ValueError(f'Frozen base view changed or missing: {base_file}')
-        modules = {p.name for p in race.iterdir() if p.is_dir()}
+        flat = flat_fronts(race)
+        if flat is not None and complete:
+            raise ValueError(f'{race}: four-view jobs use <module>/<view>.png folders, found flat fronts')
+        modules = set(flat) if flat is not None else {
+            p.name for p in race.iterdir() if p.is_dir() and not p.name.startswith('.')}
         if modules not in (ARMOR, OUTFIT):
             raise ValueError(f'{race.name} needs both armor modules or one outfit module; found {sorted(modules)}')
         for module in sorted(modules):
             source = race / module
             wanted = VIEWS if complete else VIEWS[:1]
-            actual = {p.name for p in source.iterdir() if p.suffix.lower() == '.png'}
-            if actual != {view + '.png' for view in wanted}:
-                raise ValueError(f'{source}: expected exactly {list(wanted)} PNG views, found {sorted(actual)}')
+            if flat is None:
+                actual = {p.name for p in source.iterdir() if p.suffix.lower() == '.png'}
+                if actual != {view + '.png' for view in wanted}:
+                    raise ValueError(f'{source}: expected exactly {list(wanted)} PNG views, found {sorted(actual)}')
             result['modules'].append({'race_gender': race.name, 'module': module})
             for view in wanted:
                 relative = Path(race.name) / module / (view + '.png')
+                if flat is not None:
+                    result['images'][relative.as_posix()] = check_image(flat[module], base / (view + '.png'))
+                    continue
                 result['images'][relative.as_posix()] = check_image(folder / relative, base / (view + '.png'))
     return result
 
@@ -144,6 +185,13 @@ def claim(root: Path, set_name: str) -> dict:
                 raise ValueError(f'Missing or linked base view: {source_base}')
             shutil.copy2(source_base, frozen / filename)
             base_hashes[f'{race}/{filename}'] = digest(frozen / filename)
+        # Cameras and body landmarks the concept views were made with; reduce_model.py uses them
+        # for visibility weighting and the module prior (--cameras/--regions).
+        for extra in ('transforms.json', 'regions.json'):
+            source_extra = root / 'base_views' / race / extra
+            if source_extra.is_file() and not source_extra.is_symlink():
+                shutil.copy2(source_extra, frozen / extra)
+                base_hashes[f'{race}/{extra}'] = digest(frozen / extra)
     job_id = uuid.uuid4().hex[:12]
     job_name = f'{set_name}--{job_id}'
     destination = root / 'processing_views' / job_name
@@ -157,6 +205,8 @@ def claim(root: Path, set_name: str) -> dict:
               'modules': details['modules'], 'conversion': 'pending',
               'tripo_upload_started': False}
     write_json(source / '.tripo-job.json', record)
+    for race in sorted(p for p in source.iterdir() if p.is_dir() and not p.name.startswith('.')):
+        unflatten(race)
     os.rename(source, destination)
     return {'job': job_name, 'path': str(destination), 'modules': details['modules']}
 

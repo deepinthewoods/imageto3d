@@ -27,7 +27,12 @@ import tripo_reduce as tripo
 from adaptive_cleanup04 import cancel_pairs
 from adaptive_lod04 import compact, measure
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import face_labels  # noqa: E402
+
 LEVELS = [('0p4', .004), ('0p2', .002), ('0p1', .001)]
+# Review when more of the surface than this was decided by prior/neighbours rather than seen texture.
+LOW_EVIDENCE_REVIEW = .2
 ROLES = ('base', 'primary', 'secondary', 'uncertain')
 
 
@@ -99,6 +104,11 @@ def cluster_face_colors(means, area, swatches, reference_palette=None):
                          'note': 'COLOR_00/01/02 are visual groups only; supply concept swatches for semantic roles.'}
 
 
+def classify_samples(colors, swatches):
+    """Role per texture sample (0 base, 1 primary, 2 secondary, 3 unusable); see face_labels."""
+    return face_labels.classify_samples(colors, swatches)[0]
+
+
 def assign_materials(obj, labels, palette, semantic, cache):
     obj.data.materials.clear()
     names = list(ROLES) if semantic else [f'COLOR_{i:02}' for i in range(len(palette))]
@@ -134,14 +144,91 @@ def export_native(obj, info, dest):
     return count
 
 
-def run(source, out, swatch_path=None):
+MODULES = ('body_armor', 'right_gauntlet_boot', 'outfit')
+JOB_STATES = ('processing', 'multiview_ready', 'completed', 'failed', 'processing_views')
+
+
+def default_swatches():
+    palette = json.loads((Path(__file__).resolve().parent / 'config.json').read_text())['marker_palette_srgb']
+    return {'base': palette['body_red'],
+            'base_markers': {'head': palette['head_yellow'], 'left_hand': palette['left_hand_magenta'],
+                             'left_foot': palette['left_foot_cyan']},
+            'primary': palette['primary_green'], 'secondary': palette['secondary_blue']}
+
+
+def resolve_inputs(source, swatch_path, cameras_path, regions_path, module):
+    """Fill unset inputs from the standard layout models/<set>/<job-id>/<race>/<module>/source.glb.
+
+    Cameras come from the job's frozen `.base_views/<race>/transforms.json`; for jobs frozen before
+    that file was copied, from whichever active/archived base set has the same three-quarter view
+    hashes as the job's frozen images (never blindly from the active base). Returns the resolved
+    values and a note of where each came from.
+    """
+    notes = {}
+    folder = source.parent
+    if module is None and folder.name in MODULES:
+        module, notes['module'] = folder.name, 'model folder name'
+    if swatch_path is None:
+        if (folder / 'swatches.json').is_file():
+            swatch_path, notes['swatches'] = folder / 'swatches.json', 'swatches.json beside source'
+        else:
+            notes['swatches'] = 'config.json marker_palette_srgb'
+    race = folder.parent.name
+    parts = source.parts
+    snapshot = None
+    if len(parts) >= 6 and parts[-6] == 'models':
+        set_name, job_id = parts[-5], parts[-4]
+        for state in JOB_STATES:
+            candidate = ROOT / state / f'{set_name}--{job_id}' / '.base_views' / race
+            if candidate.is_dir():
+                snapshot = candidate
+                break
+    if regions_path is None:
+        for candidate in [snapshot, ROOT / 'base_views' / race]:
+            if candidate is not None and (candidate / 'regions.json').is_file():
+                regions_path, notes['regions'] = candidate / 'regions.json', str(candidate)
+                break
+    if cameras_path is None:
+        if snapshot is not None and (snapshot / 'transforms.json').is_file():
+            cameras_path, notes['cameras'] = snapshot / 'transforms.json', 'job snapshot'
+        elif snapshot is not None:
+            wanted = {n: digest(snapshot / n) for n in ('front_three_quarter.png', 'back_three_quarter.png')}
+            sets = [ROOT / 'base_views' / race] + sorted(ROOT.glob(f'archive/*/{race}'))
+            for candidate in sets:
+                if all((candidate / n).is_file() and digest(candidate / n) == h for n, h in wanted.items()) \
+                        and (candidate / 'transforms.json').is_file():
+                    cameras_path = candidate / 'transforms.json'
+                    notes['cameras'] = f'matched frozen view hashes: {candidate.relative_to(ROOT)}'
+                    break
+        if cameras_path is None:
+            notes['cameras'] = 'none found; visibility weighting off'
+    return swatch_path, cameras_path, regions_path, module, notes
+
+
+def canonical_order(v, f):
+    """Sort vertices by position and faces by their (rotated, winding-preserving) vertex triples."""
+    order = np.lexsort((v[:, 2], v[:, 1], v[:, 0]))
+    rank = np.empty(len(v), np.int64)
+    rank[order] = np.arange(len(v))
+    f = rank[f]
+    shift = f.argmin(axis=1)
+    f = np.take_along_axis(f, (shift[:, None] + np.arange(3)[None]) % 3, axis=1)
+    f = f[np.lexsort((f[:, 2], f[:, 1], f[:, 0]))]
+    return v[order], f
+
+
+def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, module=None):
     source = Path(source).resolve(); out = Path(out).resolve()
     if not source.is_file() or source.suffix.lower() != '.glb':
         raise ValueError(f'Expected a source GLB: {source}')
     if out.exists() and any(out.iterdir()):
         raise FileExistsError(f'Output directory is not empty; keep earlier attempts: {out}')
     out.mkdir(parents=True, exist_ok=True)
-    swatches = json.loads(Path(swatch_path).read_text()) if swatch_path else None
+    swatch_path, cameras_path, regions_path, module, input_notes = resolve_inputs(
+        source, swatch_path, cameras_path, regions_path, module)
+    if cameras_path and not regions_path:
+        cameras_path, input_notes['cameras'] = None, 'found but no regions.json; visibility weighting off'
+    swatches = json.loads(Path(swatch_path).read_text()) if swatch_path else default_swatches()
     if swatches is not None:
         if set(swatches) not in [set(ROLES[:3]), set(ROLES[:3]) | {'base_markers'}]:
             raise ValueError('Swatches need base, primary, secondary and optional base_markers')
@@ -150,6 +237,11 @@ def run(source, out, swatch_path=None):
             if not isinstance(swatches['base_markers'], dict) or not swatches['base_markers']:
                 raise ValueError('base_markers must be a nonempty name-to-hex map')
             for value in swatches['base_markers'].values(): swatch_rgb(value)
+    regions = json.loads(Path(regions_path).read_text()) if regions_path else None
+    if cameras_path and regions is None:
+        raise ValueError('--cameras needs --regions (base frame for mapping the camera matrices)')
+    if module is not None and module not in ('body_armor', 'right_gauntlet_boot', 'outfit'):
+        raise ValueError(f'Unknown module: {module}')
     source_hash = digest(source)
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.import_scene.gltf(filepath=str(source), merge_vertices=False)
@@ -183,6 +275,9 @@ def run(source, out, swatch_path=None):
     np.savez_compressed(out / 'source_geometry.npz', v=rv, f=rf)
     source_stats = lab.stats(obj)
     cleaned_v, cleaned_f, cleanup = adaptive.local_repair(rv, rf)
+    # local_repair walks Python sets of BMesh elements, so its output order changes from run to run
+    # and the order-sensitive simplifier then differs; a canonical order makes runs reproducible.
+    cleaned_v, cleaned_f = canonical_order(cleaned_v, cleaned_f)
     tree = BVHTree.FromPolygons(rv.tolist(), rf.tolist(), all_triangles=True)
     refpoints, _ = lab.sample_surface(rv, rf, 10000, seed=940)
     info = {'source': str(source), 'source_sha256': source_hash,
@@ -190,8 +285,26 @@ def run(source, out, swatch_path=None):
             'source_audit': tripo.audit(rv, rf), 'cleanup': cleanup,
             'normalization_origin_rotated': origin.tolist(),
             'normalization_scale': float(scale), 'rotation_to_review': rotation.tolist(),
-            'target_polygon_count': None, 'material_order': 'reduce whole geometry, then sample original texture',
+            'target_polygon_count': None,
+            'material_order': 'reduce whole geometry, then label faces from texture hue weighted by '
+                              'pixel quality and concept-view visibility, with module prior, mirror '
+                              'face and crease-aware neighbours (face_labels.py)',
+            'module': module, 'input_sources': input_notes,
+            'cameras': str(cameras_path) if cameras_path else None,
+            'regions': str(regions_path) if regions_path else None,
             'levels': {}}
+    if swatches is not None:
+        # Which parts of the high-poly surface did any concept view actually see?
+        hv, hf = cleaned_v, cleaned_f
+        hi_normals, _ = face_labels.face_normals(hv, hf)
+        hi_tree = BVHTree.FromPolygons(hv.tolist(), hf.tolist(), all_triangles=True)
+        cameras = face_labels.load_cameras(cameras_path, regions) if cameras_path else []
+        hi_cos = face_labels.visibility(hv[hf].mean(1), hi_normals, hi_tree, cameras) if cameras else \
+            np.ones(len(hf))
+        hi_vis = face_labels.visibility_weight(hi_cos, bool(cameras))
+        hi_area = face_labels.face_normals(hv, hf)[1]
+        info['highpoly_unseen_area_share'] = \
+            float(hi_area[hi_cos <= 0].sum() / hi_area.sum()) if cameras else None
     material_cache = {}
     reference_palette = None
     for label, fraction in LEVELS:
@@ -214,14 +327,46 @@ def run(source, out, swatch_path=None):
         totals = np.bincount(owner, minlength=len(reduced.data.polygons))
         means = np.stack([np.bincount(owner, weights=colors[:, i], minlength=len(totals))
                           for i in range(3)], axis=1) / np.maximum(totals[:, None], 1)
-        labels, palette, color_info = cluster_face_colors(means, area, swatches, reference_palette)
+        role_share = None
+        if swatches is not None:
+            sample_role, sample_weight = face_labels.classify_samples(colors, swatches)
+            nearest = np.array([hi_tree.find_nearest(Vector(p))[2] for p in points], int)
+            sample_weight = sample_weight * hi_vis[nearest]
+            cent = v[f].mean(1)
+            prior = face_labels.wear_prior(cent, module, regions)
+            labels, label_source, evidence_arrays = face_labels.resolve_faces(
+                v, f, owner, sample_role, sample_weight, prior,
+                module in face_labels.SYMMETRIC_MODULES)
+            role_share = evidence_arrays['vote_share']
+            palette = np.vstack([swatch_rgb(swatches[name]) for name in ROLES[:3]] +
+                                [np.array([1., .4, .03])])
+            face_area = face_labels.face_normals(v, f)[1]
+            by_source = {name: float(face_area[label_source == i].sum() / face_area.sum())
+                         for i, name in enumerate(face_labels.SOURCES)}
+            color_info = {'mode': 'hue_visibility_prior', 'swatches': swatches, 'module': module,
+                          'symmetric': module in face_labels.SYMMETRIC_MODULES,
+                          'area_share_by_source': by_source,
+                          'faces_by_source': {name: int((label_source == i).sum())
+                                              for i, name in enumerate(face_labels.SOURCES)},
+                          'low_evidence_area_share': by_source['prior'] + by_source['neighbours'],
+                          'uncertain_faces': 0}
+            attr = reduced.data.attributes.new('label_source', 'INT', 'FACE')
+            attr.data.foreach_set('value', label_source.astype(np.int32))
+        else:
+            labels, palette, color_info = cluster_face_colors(means, area, swatches, reference_palette)
         if reference_palette is None:
             reference_palette = palette.copy()
         assign_materials(reduced, labels, palette, swatches is not None, material_cache)
         evidence = out / (reduced.name + '_colors.npz')
         np.savez_compressed(evidence, face_mean_source_rgb=means, face_area=area,
                             material_id=labels, material_palette_source_rgb=palette,
-                            texture_sample_count=totals)
+                            texture_sample_count=totals,
+                            **({'face_role_vote_share': role_share,
+                                'face_confidence': evidence_arrays['confidence'],
+                                'face_wear_prior': evidence_arrays['wear_prior'],
+                                'face_label_source': label_source,
+                                'label_source_names': np.array(face_labels.SOURCES)}
+                               if role_share is not None else {}))
         native_glb = out / (reduced.name + '.glb')
         count = export_native(reduced, info, native_glb)
         valid &= count == len(f)
@@ -247,7 +392,8 @@ def run(source, out, swatch_path=None):
             lab.drop(wearable)
         uncertain_share = color_info.get('uncertain_faces', 0) / max(len(f), 1)
         confident_wearable_faces = int(np.count_nonzero((labels == 1) | (labels == 2)))
-        material_review = (swatches is None or uncertain_share > .1 or
+        low_evidence = color_info.get('low_evidence_area_share', 0)
+        material_review = (swatches is None or uncertain_share > .1 or low_evidence > LOW_EVIDENCE_REVIEW or
                            float(np.percentile(projection, 95)) > .01 or confident_wearable_faces == 0)
         reduced['source_sha256'] = source_hash
         reduced['error_fraction_of_height'] = fraction
@@ -284,11 +430,28 @@ def run(source, out, swatch_path=None):
     bpy.context.view_layer.objects.active = None
     bpy.ops.wm.save_as_mainfile(filepath=str(out / 'review.blend'), compress=True)
     dump(out / 'manifest.json', info)
+    # Separate file of just the wearable meshes (base markers removed), one per level.
+    # Runs last: it resets the Blender session to import the exported GLBs.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import make_wearable_blend
+    make_wearable_blend.build(out)
+    if swatches is not None:
+        # High-poly evidence file beside the source GLB: detected face materials + original texture.
+        import make_highpoly_blend
+        make_highpoly_blend.build(source, swatches, cameras_path=cameras_path, regions_path=regions_path)
     return info
 
 
 if __name__ == '__main__':
-    args = sys.argv[sys.argv.index('--') + 1:]
-    if len(args) not in (2, 3):
-        raise SystemExit('Usage: blender -b --python reduce_model.py -- source.glb output_dir [swatches.json]')
-    run(*args)
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog='blender -b --python reduce_model.py --',
+        description='Reduce one Tripo GLB to 0.4/0.2/0.1% levels with material roles.')
+    parser.add_argument('source')
+    parser.add_argument('output_dir')
+    parser.add_argument('swatches', nargs='?')
+    parser.add_argument('--cameras', help='transforms.json of the base views the concept used')
+    parser.add_argument('--regions', help='regions.json of that base (base_regions.py)')
+    parser.add_argument('--module', choices=['body_armor', 'right_gauntlet_boot', 'outfit'])
+    a = parser.parse_args(sys.argv[sys.argv.index('--') + 1:])
+    run(a.source, a.output_dir, a.swatches, a.cameras, a.regions, a.module)
