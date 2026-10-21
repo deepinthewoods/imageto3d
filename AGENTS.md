@@ -2,7 +2,7 @@
 
 ## Current pipeline
 
-- Use Tripo Studio with the **studio plain paper** source-image look. The chosen reference export and reduction experiments are recorded in `lowpoly algo/config/pipeline_decisions.json` and `lowpoly algo/results/tripo_method_gallery_01/`.
+- Use Tripo Studio with the **studio plain paper** source-image look. The chosen reference export and reduction experiments are recorded in `tools/tripo_pipeline/pipeline_decisions.json` and `experiments/tripo_method_gallery_01/`.
 - The old `pixal3d-armor-queue` service was disabled on 21 October 2026. Do not restart it or use its old `approved/` contract for new work. Its code and past outputs remain under `tools/pixal3d_queue/` and `models/` for recovery.
 - See `tools/tripo_pipeline/README.md` for the folder contract, processing commands and current Tripo website automation. Firefox Playwright submit/collect works manually; the unattended queue watcher is not yet connected. Never claim a conversion ran or move a job to `completed/` without its Tripo output and low-poly/material artifacts.
 - New front concepts belong under `concepts/<set_id>/<race_gender>/<module>/front.png`. Generate fronts for the entire requested set in one pass. A set is either both `body_armor` and `right_gauntlet_boot`, or one `outfit`, per character.

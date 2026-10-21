@@ -1,0 +1,22 @@
+{
+  "recorded_date": "2026-10-21",
+  "generation_service": "Tripo Studio",
+  "source_render_preset": "studio plain paper",
+  "source_choice_status": "chosen_by_user",
+  "source_choice_reason": "User prefers its appearance and requested using it going forward.",
+  "reference_export": "../tripo/low-poly humanoid 3d model 2k nopbr 25credits studio plain paper.glb",
+  "reference_export_sha256": "a59a7413ba6f68db6a1fc93bc1c4723c71c851b9069c5138d046d2ac8a17f033",
+  "reference_export_settings": {
+    "pbr": false,
+    "texture_resolution": "2k (recorded in filename)",
+    "model_version": "unconfirmed"
+  },
+  "reduction_policy": "Automatic quality/error limits; polygon count is an output, never a fixed target.",
+  "reduction_method": "bounded local cleanup followed by geometry-only meshoptimizer QEM",
+  "reduction_error_fractions_of_height": [0.004, 0.002, 0.001],
+  "reduction_default_error_fraction": 0.004,
+  "reduction_choice_status": "chosen_by_user; preserve 0.2% and 0.1% as reviewable fallbacks",
+  "review_gallery": "results/tripo_method_gallery_01/comparison.blend",
+  "parent_project_update": "Parent instructions and front-view staging updated; Pixal3D watcher retired; Tripo website Playwright worker pending.",
+  "scope": "Records the selected source and reduction recipe. No Tripo website conversion has run."
+}

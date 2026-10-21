@@ -9,7 +9,7 @@ from pathlib import Path
 import hashlib, json, shutil, time
 
 ROOT=Path(__file__).resolve().parents[2]
-SOURCE=ROOT/'lowpoly algo/results/armor_09/studio_plain_input.blend'
+SOURCE=ROOT/'assets/studio_plain_input.blend'
 CAMERAS=ROOT/'base_views/human_male/transforms.json'
 DEST=ROOT/'experiments/base_1254_studio_plain_20261021/human_male'
 SIZE=1254

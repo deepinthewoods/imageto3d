@@ -18,7 +18,7 @@ from mathutils import Matrix, Vector
 from mathutils.bvhtree import BVHTree
 
 ROOT = Path(__file__).resolve().parents[2]
-LAB = ROOT / 'lowpoly algo/scripts'
+LAB = ROOT / 'tools/lowpoly'
 sys.path.insert(0, str(LAB))
 import lowpoly_lab as lab
 import polygon_materials05 as texture_tools

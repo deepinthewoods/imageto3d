@@ -9,6 +9,7 @@
 !/TRIPO_HANDOFF.md
 !/tools/
 
+tools/lowpoly/lib/
 node_modules/
 __pycache__/
 *.pyc
