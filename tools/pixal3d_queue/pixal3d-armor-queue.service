@@ -1,0 +1,17 @@
+[Unit]
+Description=Pixal3D approved armor folder queue
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/media/niz/Samsung SSD/godot/blender/characters/imageto3d
+ExecStart="/media/niz/Samsung SSD/_dev/sd/assetfurnace/.venv/bin/python" -u "/media/niz/Samsung SSD/godot/blender/characters/imageto3d/tools/pixal3d_queue/queue_service.py"
+Restart=always
+RestartSec=15
+KillMode=control-group
+TimeoutStopSec=35
+Nice=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

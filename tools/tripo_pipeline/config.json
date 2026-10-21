@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "generation_service": "Tripo Studio website",
+  "source_image_look": "studio plain paper",
+  "active_base_views": "base_views/human_male (native 1254 studio-plain semantic markers); earlier 1024 version archived and frozen in existing staged job",
+  "marker_palette_srgb": {
+    "body_red": "#E61923",
+    "head_yellow": "#F5DC14",
+    "left_hand_magenta": "#E119DC",
+    "left_foot_cyan": "#14DCEB",
+    "primary_green": "#19D228",
+    "secondary_blue": "#1E41EB"
+  },
+  "user_selected_reference_export": "tripo/low-poly humanoid 3d model 2k nopbr 25credits studio plain paper.glb",
+  "user_selected_reference_sha256": "a59a7413ba6f68db6a1fc93bc1c4723c71c851b9069c5138d046d2ac8a17f033",
+  "approved_contains": "front concepts only, selected by user",
+  "tripo_trigger": "policy: automatically after all four views in every module pass validation; watcher not yet enabled",
+  "tripo_playwright_worker": "manual Firefox submit/collect implemented and dry-run tested; automatic queue watcher not implemented or enabled",
+  "tripo_model_version": "H3.0",
+  "tripo_pbr": false,
+  "tripo_texture_resolution": "2K",
+  "geometry_method": "bounded local cleanup then meshoptimizer geometry QEM",
+  "geometry_error_fractions_of_height": [
+    0.004,
+    0.002,
+    0.001
+  ],
+  "default_geometry_error_fraction": 0.004,
+  "fixed_polygon_target": null,
+  "fallback_policy": "retain all three outputs per module; default 0.4%, review and switch to 0.2% or 0.1% when detail needs it",
+  "material_stage": "after whole-geometry reduction, sample source texture over faces, average or cluster colors; preserve uncertain boundaries for review",
+  "engine_material_roles": [
+    "base",
+    "primary",
+    "secondary",
+    "uncertain"
+  ],
+  "tripo_topology_default": "Triangle",
+  "tripo_triangle_polycount_ceiling": 2000000,
+  "tripo_quad_polycount_ceiling": 50000,
+  "tripo_remove_lighting": true,
+  "tripo_export_formats": [
+    "OBJ",
+    "GLB"
+  ],
+  "active_base_resolution": [
+    1254,
+    1254
+  ],
+  "candidate_base_resolution": [
+    2048,
+    2048
+  ],
+  "candidate_base_views": "experiments/base_2k_studio_plain_20261021/human_male; not active until imagegen canvas is verified",
+  "former_base_views": "archive/base_views_studio_plain_markers_1024_20261021/human_male",
+  "image_size_policy": "Request native base dimensions; reject mismatched imagegen output. Never resize, crop, pad or stretch generated or rendered views to force a match."
+}

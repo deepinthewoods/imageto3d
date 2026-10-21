@@ -1,0 +1,15 @@
+# Share the pipeline (code + docs) only. Everything else here is local working
+# data: outputs, models, base views, concepts, experiments, the lowpoly study.
+/*
+!/.gitignore
+!/README.md
+!/AGENTS.md
+!/CLAUDE.md
+!/PROMPTING_GUIDE.md
+!/TRIPO_HANDOFF.md
+!/tools/
+
+node_modules/
+__pycache__/
+*.pyc
+.codex_jobs/

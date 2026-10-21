@@ -1,0 +1,11 @@
+{
+  "name": "tripo-studio-pipeline",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "auth": "node auth.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.64.1"
+  }
+}

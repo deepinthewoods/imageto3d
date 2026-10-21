@@ -1,0 +1,13 @@
+{
+  "root": "/media/niz/Samsung SSD/godot/blender/characters/imageto3d",
+  "assetfurnace": "/media/niz/Samsung SSD/_dev/sd/assetfurnace",
+  "poll_seconds": 10,
+  "settle_seconds": 20,
+  "hip_visible_devices": "1",
+  "seed": 42,
+  "steps": 12,
+  "gss": 10.0,
+  "timeout_seconds": 14400,
+  "max_attempts": 3,
+  "allow_conditional": true
+}
