@@ -7,12 +7,12 @@ import os from 'node:os';
 import path from 'node:path';
 
 const [command, sourceArg, outputArg, topologyArg] = process.argv.slice(2);
-if (!['submit', 'collect'].includes(command)) throw new Error('Usage: node studio.mjs submit <views_dir> <output_dir> [Triangle|Quad] | collect <output_dir>');
-if (command === 'submit' && (!sourceArg || !outputArg)) throw new Error('Submit needs views_dir and output_dir');
+if (!['submit', 'collect', 'retry'].includes(command)) throw new Error('Usage: node studio.mjs submit <views_dir> <output_dir> [Triangle|Quad] | collect <output_dir> | retry <previous_output_dir> <output_dir>');
+if (['submit','retry'].includes(command) && (!sourceArg || !outputArg)) throw new Error(`${command} needs two directories`);
 if (command === 'collect' && !sourceArg) throw new Error('Collect needs output_dir');
 const DEFAULT_TOPOLOGY = 'Triangle';
 const source = command === 'submit' ? path.resolve(sourceArg) : null;
-const output = path.resolve(command === 'submit' ? outputArg : sourceArg);
+const output = path.resolve(command === 'collect' ? sourceArg : outputArg);
 const topology = topologyArg ?? DEFAULT_TOPOLOGY;
 if (command === 'submit' && !['Triangle','Quad'].includes(topology)) throw new Error('Topology must be Triangle or Quad');
 const views = ['front.png','front_three_quarter.png','back_three_quarter.png','back.png'];
@@ -118,6 +118,35 @@ async function downloadOnce(page,format,record){
  record.exports??={};record.exports[format]={path:destination,bytes:fs.statSync(destination).size,downloaded_at:new Date().toISOString()};write(record);
  await page.keyboard.press('Escape').catch(()=>{});await page.waitForTimeout(1500);
 }
+// Studio's "Free Retry (×N)" regenerates a project from the same inputs and settings without
+// charging credits (verified 2026-10-22: balance unchanged, counter 3 -> 2; the previous version
+// stays in the project's model history). The click starts the retry at once (no confirmation).
+// The new version is collected into a separate output dir with the ordinary collect command.
+async function retry(){
+ const previous=JSON.parse(fs.readFileSync(path.join(path.resolve(sourceArg),'studio_submission.json')));
+ if(!previous.project_id)throw new Error('Previous submission has no project ID');
+ if(fs.existsSync(recordPath))throw new Error(`Record already exists: ${recordPath}`);
+ fs.mkdirSync(output,{recursive:true});
+ const record={...previous,status:'retry_preparing',retry_of:path.resolve(sourceArg),started_at:new Date().toISOString()};
+ for(const key of ['exports','studio_result','response','submit_clicked_at','after_submit_at'])delete record[key];
+ write(record);
+ const {context,page}=await openStudio(`https://studio.tripo3d.ai/workspace/generate/${previous.project_id}`);
+ try{
+  const button=page.locator('[data-trace="studio.workspace_generate.free_retry_button"]').first();
+  await button.waitFor({timeout:90000});
+  const left=Number((await button.innerText()).match(/×\s*(\d+)/)?.[1]??0);
+  const credits=async()=>Number((await page.locator('body').innerText()).match(/(\d{1,7})\s*\n\s*Upgrade/)?.[1]);
+  record.free_retries_left_before=left;record.credits_before=await credits();write(record);
+  if(left<1){record.status='no_free_retries';write(record);throw new Error('No free retries left on this project');}
+  if(process.env.TRIPO_DRY_RUN==='1'){record.status='dry_run';write(record);console.log(JSON.stringify({status:record.status,left}));return;}
+  record.status='retry_attempted';record.submit_clicked_at=new Date().toISOString();write(record);
+  await button.click();
+  await page.getByText(/Generating/).first().waitFor({timeout:60000});
+  await page.screenshot({path:path.join(output,'after_retry.png')});
+  record.status='submitted';record.after_submit_at=new Date().toISOString();write(record);
+  console.log(JSON.stringify({status:record.status,project_id:record.project_id,free_retries_left:left-1}));
+ }finally{await context.close();}
+}
 async function collect(){
  const record=JSON.parse(fs.readFileSync(recordPath));
  if(!record.project_id)throw new Error('Submission has no project ID; review record manually');
@@ -127,6 +156,11 @@ async function collect(){
   const readyDeadline=Date.now()+Number(process.env.TRIPO_COLLECT_WAIT_MIN??30)*60000;
   let top,faces,vertices;
   for(;;){
+   // after a free retry the old version can stay on screen until the new one is generated
+   if(record.retry_of&&await page.getByText(/Generating/).count()){
+    if(Date.now()>readyDeadline)throw new Error('Retry still generating');
+    await page.waitForTimeout(30000);await page.reload({waitUntil:'domcontentloaded'});continue;
+   }
    await page.getByRole('button',{name:'Export',exact:true}).first().waitFor({timeout:60000}).catch(()=>{});
    const body=await page.locator('body').innerText();top=body.match(/Topology\s+(Quad|Triangle)/)?.[1];faces=Number(body.match(/Faces\s+(\d+)/)?.[1]);vertices=Number(body.match(/Vertices\s+(\d+)/)?.[1]);
    if(top&&faces)break;
@@ -139,4 +173,4 @@ async function collect(){
   record.status='exported';write(record);console.log(JSON.stringify({status:record.status,project_id:record.project_id,...record.studio_result,exports:record.exports}));
  }finally{await context.close();}
 }
-if(command==='submit')await submit();else await collect();
+if(command==='submit')await submit();else if(command==='retry')await retry();else await collect();

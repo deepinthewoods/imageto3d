@@ -23,6 +23,9 @@ class WorkflowTest(unittest.TestCase):
                 image.putpixel((x, y), (120, 90, 60, 255))
         for view in workflow.VIEWS:
             image.save(base / (view + '.png'))
+        (base / 'regions.json').write_text('{}')
+        (base / 'parts.npz').write_bytes(b'parts')
+        (base / 'clearance.json').write_text('{}')
 
     def make_set(self, name, modules):
         result = self.root / 'approved' / name / 'human_male'
@@ -48,6 +51,16 @@ class WorkflowTest(unittest.TestCase):
         record = json.loads((Path(ready['path']) / '.tripo-job.json').read_text())
         self.assertEqual(record['state'], 'ready_for_tripo')
         self.assertEqual(len(record['view_hashes']), 8)
+
+    def test_claim_freezes_regions_and_parts(self):
+        self.make_set('armor03', workflow.ARMOR)
+        job = workflow.claim(self.root, 'armor03')
+        frozen = Path(job['path']) / '.base_views/human_male'
+        self.assertEqual((frozen / 'parts.npz').read_bytes(), b'parts')
+        record = json.loads((Path(job['path']) / '.tripo-job.json').read_text())
+        self.assertEqual((frozen / 'clearance.json').read_text(), '{}')
+        self.assertIn('human_male/parts.npz', record['base_view_hashes'])
+        self.assertIn('human_male/regions.json', record['base_view_hashes'])
 
     def test_outfit_and_missing_view(self):
         self.make_set('outfit01', workflow.OUTFIT)

@@ -185,9 +185,10 @@ def claim(root: Path, set_name: str) -> dict:
                 raise ValueError(f'Missing or linked base view: {source_base}')
             shutil.copy2(source_base, frozen / filename)
             base_hashes[f'{race}/{filename}'] = digest(frozen / filename)
-        # Cameras and body landmarks the concept views were made with; reduce_model.py uses them
-        # for visibility weighting and the module prior (--cameras/--regions).
-        for extra in ('transforms.json', 'regions.json'):
+        # Cameras, body landmarks and per-face body parts the concept views were made with;
+        # reduce_model.py uses them for visibility weighting and the module prior
+        # (--cameras/--regions/--parts); clearance.json tells it how far bare skin can stray from the base.
+        for extra in ('transforms.json', 'regions.json', 'parts.npz', 'clearance.json'):
             source_extra = root / 'base_views' / race / extra
             if source_extra.is_file() and not source_extra.is_symlink():
                 shutil.copy2(source_extra, frozen / extra)

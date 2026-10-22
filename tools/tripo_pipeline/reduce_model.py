@@ -3,6 +3,11 @@
 Usage: blender -b -t 6 --python tools/tripo_pipeline/reduce_model.py -- source.glb output_dir [swatches.json]
 Reduces whole geometry at 0.4/0.2/0.1% height, then samples source texture
 and assigns simple colors to whole faces. No fixed polygon targets.
+With a base `parts.npz` (base_parts.py; found next to the resolved regions.json, or --parts) the
+base body parts are fitted to the mesh (trimmed ICP) and transferred onto every level as the FACE
+attribute `body_part`; they also drive the module prior. `--no-parts` turns that off.
+Sources whose area is mostly enclosed (an inner shell welded to the outer skin) are stripped of those
+faces before reduction (`--interior auto|strip|flag`); the manifest records the `interior` audit.
 """
 from pathlib import Path
 import hashlib
@@ -144,6 +149,41 @@ def export_native(obj, info, dest):
     return count
 
 
+def part_colors(count):
+    """Distinct, evenly spread colours for body part ids (golden-ratio hue steps)."""
+    import colorsys
+    return [colorsys.hsv_to_rgb((i * .618034) % 1, .55 + .25 * (i % 2), .95 - .2 * (i % 3) / 2) for i in range(count)]
+
+
+def part_object(source, names, parts, name, location, cache):
+    """Review aid: a copy of `source` with one flat material per body part (material index = part id)."""
+    copy = source.copy()
+    copy.data = source.data.copy()
+    copy.name = name
+    bpy.context.scene.collection.objects.link(copy)
+    copy.data.materials.clear()
+    for part_name, color in zip(names, part_colors(len(names))):
+        if part_name not in cache:
+            mat = bpy.data.materials.new('part_' + part_name)
+            mat.diffuse_color = (*color, 1.)
+            mat.use_nodes = True
+            mat.node_tree.nodes['Principled BSDF'].inputs['Base Color'].default_value = (*color, 1.)
+            mat.node_tree.nodes['Principled BSDF'].inputs['Roughness'].default_value = .9
+            cache[part_name] = mat
+        copy.data.materials.append(cache[part_name])
+    copy.data.polygons.foreach_set('material_index', np.asarray(parts, np.int32))
+    copy.location = location
+    return copy
+
+
+def set_parts(mesh, names, parts):
+    """FACE int attribute `body_part` + JSON mesh property `body_part_names` (build_marker_base.py's form)."""
+    if 'body_part' in mesh.attributes:
+        mesh.attributes.remove(mesh.attributes['body_part'])
+    mesh.attributes.new('body_part', 'INT', 'FACE').data.foreach_set('value', np.asarray(parts, np.int32))
+    mesh['body_part_names'] = json.dumps(list(names))
+
+
 MODULES = ('body_armor', 'right_gauntlet_boot', 'outfit')
 JOB_STATES = ('processing', 'multiview_ready', 'completed', 'failed', 'processing_views')
 
@@ -156,13 +196,14 @@ def default_swatches():
             'primary': palette['primary_green'], 'secondary': palette['secondary_blue']}
 
 
-def resolve_inputs(source, swatch_path, cameras_path, regions_path, module):
+def resolve_inputs(source, swatch_path, cameras_path, regions_path, module, parts_path=None, use_parts=True):
     """Fill unset inputs from the standard layout models/<set>/<job-id>/<race>/<module>/source.glb.
 
     Cameras come from the job's frozen `.base_views/<race>/transforms.json`; for jobs frozen before
     that file was copied, from whichever active/archived base set has the same three-quarter view
-    hashes as the job's frozen images (never blindly from the active base). Returns the resolved
-    values and a note of where each came from.
+    hashes as the job's frozen images (never blindly from the active base). `parts.npz` is taken from
+    the folder of the resolved regions.json. Returns the resolved values and a note of where each
+    came from.
     """
     notes = {}
     folder = source.parent
@@ -188,6 +229,14 @@ def resolve_inputs(source, swatch_path, cameras_path, regions_path, module):
             if candidate is not None and (candidate / 'regions.json').is_file():
                 regions_path, notes['regions'] = candidate / 'regions.json', str(candidate)
                 break
+    if not use_parts:
+        parts_path, notes['parts'] = None, 'disabled (--no-parts)'
+    elif parts_path is not None:
+        notes['parts'] = '--parts'
+    elif regions_path is not None and (Path(regions_path).parent / 'parts.npz').is_file():
+        parts_path, notes['parts'] = Path(regions_path).parent / 'parts.npz', 'beside regions.json'
+    else:
+        notes['parts'] = 'none found; landmark prior'
     if cameras_path is None:
         if snapshot is not None and (snapshot / 'transforms.json').is_file():
             cameras_path, notes['cameras'] = snapshot / 'transforms.json', 'job snapshot'
@@ -202,7 +251,7 @@ def resolve_inputs(source, swatch_path, cameras_path, regions_path, module):
                     break
         if cameras_path is None:
             notes['cameras'] = 'none found; visibility weighting off'
-    return swatch_path, cameras_path, regions_path, module, notes
+    return swatch_path, cameras_path, regions_path, parts_path, module, notes
 
 
 def canonical_order(v, f):
@@ -217,15 +266,16 @@ def canonical_order(v, f):
     return v[order], f
 
 
-def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, module=None):
+def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, module=None,
+        parts_path=None, use_parts=True, interior_mode='auto', use_off_body=True):
     source = Path(source).resolve(); out = Path(out).resolve()
     if not source.is_file() or source.suffix.lower() != '.glb':
         raise ValueError(f'Expected a source GLB: {source}')
     if out.exists() and any(out.iterdir()):
         raise FileExistsError(f'Output directory is not empty; keep earlier attempts: {out}')
     out.mkdir(parents=True, exist_ok=True)
-    swatch_path, cameras_path, regions_path, module, input_notes = resolve_inputs(
-        source, swatch_path, cameras_path, regions_path, module)
+    swatch_path, cameras_path, regions_path, parts_path, module, input_notes = resolve_inputs(
+        source, swatch_path, cameras_path, regions_path, module, parts_path, use_parts)
     if cameras_path and not regions_path:
         cameras_path, input_notes['cameras'] = None, 'found but no regions.json; visibility weighting off'
     swatches = json.loads(Path(swatch_path).read_text()) if swatch_path else default_swatches()
@@ -267,12 +317,47 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
     obj.data.update()
     surface = texture_tools.TextureSurface(obj)
     source_texture = surface.image_name
+    # Interior surface: some Tripo exports contain a second, inward-facing copy of the body welded to the
+    # outer skin. Measure how much of the area looks only at other surface; above the threshold strip it
+    # (the GLB itself is never changed).
+    sv, sf = surface.v.astype(np.float64), surface.f.astype(np.int64)
+    interior = face_labels.interior_metrics(sv, sf, surface.tree)
+    interior.update(mode=interior_mode, threshold=face_labels.INTERIOR_THRESHOLD, stripped=False)
+    flagged = interior['interior_area_share'] >= face_labels.INTERIOR_THRESHOLD
+    removed = None
+    if interior_mode == 'strip' or (interior_mode == 'auto' and flagged):
+        enclosed = face_labels.enclosed_faces(sv, sf, surface.tree)
+        if len(obj.data.polygons) != len(sf):
+            raise ValueError('Cannot strip interior surface: source is not a pure triangle mesh')
+        _, shell_area = face_labels.face_normals(sv, sf)
+        removed = {'v': sv, 'f': sf[enclosed]}
+        interior.update(stripped=True, removed_faces=int(enclosed.sum()),
+                        removed_area_share=float(shell_area[enclosed].sum() / shell_area.sum()),
+                        source_faces=len(sf))
+        surface.f, surface.uv = surface.f[~enclosed], surface.uv[~enclosed]   # texture lookups ignore it too
+        surface.tree = BVHTree.FromPolygons(surface.v.tolist(), surface.f.tolist(), all_triangles=True)
     bm = bmesh.new(); bm.from_mesh(obj.data)
+    if removed is not None:
+        bm.faces.ensure_lookup_table()
+        bmesh.ops.delete(bm, geom=[bm.faces[i] for i in np.flatnonzero(enclosed)], context='FACES')
+        bmesh.ops.delete(bm, geom=[x for x in bm.verts if not x.link_faces], context='VERTS')
     bmesh.ops.remove_doubles(bm, verts=list(bm.verts), dist=2e-7)
     bm.to_mesh(obj.data); bm.free(); obj.data.update()
     obj.name = 'source'
     rv, rf = lab.arrays(obj)
     np.savez_compressed(out / 'source_geometry.npz', v=rv, f=rf)
+    review_reasons = []
+    if removed is not None:
+        np.savez_compressed(out / 'interior_removed.npz', **removed)
+        after = face_labels.interior_metrics(rv, rf)
+        interior['after_strip'] = after
+        review_reasons.append(f"interior surface: {interior['interior_area_share']:.0%} of the source area was enclosed; "
+                              f"stripped {interior['removed_faces']} faces ({interior['removed_area_share']:.0%} of area)")
+        if after['interior_area_share'] >= face_labels.INTERIOR_THRESHOLD:
+            review_reasons.append(f"interior surface still {after['interior_area_share']:.0%} after stripping")
+    elif flagged:
+        review_reasons.append(f"interior surface: {interior['interior_area_share']:.0%} of the source area is enclosed "
+                              "(inner shell / duplicated body); not stripped (--interior flag)")
     source_stats = lab.stats(obj)
     cleaned_v, cleaned_f, cleanup = adaptive.local_repair(rv, rf)
     # local_repair walks Python sets of BMesh elements, so its output order changes from run to run
@@ -280,6 +365,24 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
     cleaned_v, cleaned_f = canonical_order(cleaned_v, cleaned_f)
     tree = BVHTree.FromPolygons(rv.tolist(), rf.tolist(), all_triangles=True)
     refpoints, _ = lab.sample_surface(rv, rf, 10000, seed=940)
+    base_parts = part_fit = parts_info = None
+    if parts_path:
+        # bare-mesh clearance per part (base_clearance.py): beside the parts file, else the active base's
+        # (job snapshots made before it existed lack the file)
+        clearance_path = next((c for c in (Path(parts_path).with_name('clearance.json'),
+                                           ROOT / 'base_views' / source.parent.parent.name / 'clearance.json')
+                               if c.is_file()), None)
+        if not use_off_body:
+            clearance_path = None
+        input_notes['clearance'] = str(clearance_path) if clearance_path else 'none; no off-body rule'
+        base_parts = face_labels.BaseParts.load(parts_path, clearance_path)
+        scale_fit, shift_fit, fit_info = face_labels.fit_base(base_parts, rv, rf, tree=tree)
+        part_fit = base_parts.moved(scale_fit, shift_fit) if fit_info['used'] == 'icp' else base_parts
+        parts_info = {'file': str(Path(parts_path).resolve()), 'sha256': digest(parts_path),
+                      'base_scene': str(np.load(parts_path)['source_scene']), 'names': part_fit.names,
+                      'fit': fit_info, 'prior': 'parts' if swatches is not None else None,
+                      'clearance': str(clearance_path) if clearance_path else None}
+        print('PARTS_FIT', json.dumps(fit_info), flush=True)
     info = {'source': str(source), 'source_sha256': source_hash,
             'source_texture': source_texture, 'source_stats': source_stats,
             'source_audit': tripo.audit(rv, rf), 'cleanup': cleanup,
@@ -292,6 +395,7 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
             'module': module, 'input_sources': input_notes,
             'cameras': str(cameras_path) if cameras_path else None,
             'regions': str(regions_path) if regions_path else None,
+            'parts': parts_info, 'interior': interior, 'source_review_reasons': review_reasons,
             'levels': {}}
     if swatches is not None:
         # Which parts of the high-poly surface did any concept view actually see?
@@ -305,7 +409,8 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
         hi_area = face_labels.face_normals(hv, hf)[1]
         info['highpoly_unseen_area_share'] = \
             float(hi_area[hi_cos <= 0].sum() / hi_area.sum()) if cameras else None
-    material_cache = {}
+    material_cache, part_material_cache = {}, {}
+    reduced_x = {'0p4': 0, '0p2': 2.8, '0p1': 5.6}
     reference_palette = None
     for label, fraction in LEVELS:
         start = time.monotonic()
@@ -328,15 +433,27 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
         means = np.stack([np.bincount(owner, weights=colors[:, i], minlength=len(totals))
                           for i in range(3)], axis=1) / np.maximum(totals[:, None], 1)
         role_share = None
+        level_parts = None if part_fit is None else face_labels.transfer_parts(v, f, part_fit)
         if swatches is not None:
             sample_role, sample_weight = face_labels.classify_samples(colors, swatches)
             nearest = np.array([hi_tree.find_nearest(Vector(p))[2] for p in points], int)
             sample_weight = sample_weight * hi_vis[nearest]
             cent = v[f].mean(1)
-            prior = face_labels.wear_prior(cent, module, regions)
+            zones = None
+            if part_fit is not None:
+                zones = face_labels.part_zones(
+                    part_fit.membership(cent, face_labels.face_normals(v, f)[0]), part_fit.names)
+            prior = face_labels.wear_prior(cent, module, regions, zones)
+            # a face clearly outside the fitted base body cannot be bare base (only where the module
+            # lets the garment be; head/hands/feet etc. are exempt through the prior)
+            off = face_labels.off_body_excess(v, f, level_parts, part_fit, prior) \
+                if part_fit is not None and module is not None else None
             labels, label_source, evidence_arrays = face_labels.resolve_faces(
                 v, f, owner, sample_role, sample_weight, prior,
-                module in face_labels.SYMMETRIC_MODULES)
+                module in face_labels.SYMMETRIC_MODULES, None if off is None else off[0])
+            riser = None
+            if off is not None:
+                labels, label_source, riser = face_labels.hem_risers(v, f, labels, label_source, part_fit, prior)
             role_share = evidence_arrays['vote_share']
             palette = np.vstack([swatch_rgb(swatches[name]) for name in ROLES[:3]] +
                                 [np.array([1., .4, .03])])
@@ -344,11 +461,18 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
             by_source = {name: float(face_area[label_source == i].sum() / face_area.sum())
                          for i, name in enumerate(face_labels.SOURCES)}
             color_info = {'mode': 'hue_visibility_prior', 'swatches': swatches, 'module': module,
+                          'prior_source': 'parts' if zones is not None else
+                                          'landmarks' if regions is not None else 'neutral',
                           'symmetric': module in face_labels.SYMMETRIC_MODULES,
                           'area_share_by_source': by_source,
                           'faces_by_source': {name: int((label_source == i).sum())
                                               for i, name in enumerate(face_labels.SOURCES)},
                           'low_evidence_area_share': by_source['prior'] + by_source['neighbours'],
+                          'off_body': None if off is None else {
+                              'faces_beyond_threshold': int((off[0] > 0).sum()),
+                              'faces_flipped_from_base': int((label_source == face_labels.SOURCES.index('off_body')).sum()),
+                              'area_share_flipped': by_source['off_body'],
+                              'riser_faces': int(riser.sum()), 'riser_area_share': by_source['riser']},
                           'uncertain_faces': 0}
             attr = reduced.data.attributes.new('label_source', 'INT', 'FACE')
             attr.data.foreach_set('value', label_source.astype(np.int32))
@@ -357,6 +481,24 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
         if reference_palette is None:
             reference_palette = palette.copy()
         assign_materials(reduced, labels, palette, swatches is not None, material_cache)
+        parts_extra = parts_summary = None
+        if part_fit is not None:
+            face_area = face_labels.face_normals(v, f)[1]
+            set_parts(reduced.data, part_fit.names, level_parts)
+            part_object(reduced, part_fit.names, level_parts, reduced.name + '_parts',
+                        (reduced_x[label], 0, -2.4), part_material_cache)
+            # glTF has no face attributes and the exporter groups faces by material slot (stable), so
+            # the sidecar also carries the parts in each GLB's face order.
+            glb_order = np.argsort(labels, kind='stable')
+            keep = np.flatnonzero(labels != 0)
+            wearable_order = keep[np.argsort(labels[keep], kind='stable')]
+            parts_extra = {'body_part': level_parts, 'body_part_names': np.array(part_fit.names),
+                           'glb_face_order': glb_order, 'body_part_glb_order': level_parts[glb_order],
+                           'wearable_face_order': wearable_order,
+                           'wearable_body_part_glb_order': level_parts[wearable_order]}
+            parts_summary = {'area_share': face_labels.part_area_shares(level_parts, face_area, part_fit.names),
+                             'wearable_area_share': face_labels.part_area_shares(
+                                 level_parts[keep], face_area[keep], part_fit.names)}
         evidence = out / (reduced.name + '_colors.npz')
         np.savez_compressed(evidence, face_mean_source_rgb=means, face_area=area,
                             material_id=labels, material_palette_source_rgb=palette,
@@ -365,8 +507,11 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
                                 'face_confidence': evidence_arrays['confidence'],
                                 'face_wear_prior': evidence_arrays['wear_prior'],
                                 'face_label_source': label_source,
-                                'label_source_names': np.array(face_labels.SOURCES)}
-                               if role_share is not None else {}))
+                                'label_source_names': np.array(face_labels.SOURCES),
+                                **({'face_off_body_distance': off[1], 'face_off_body_threshold': off[2]}
+                                   if off is not None else {})}
+                               if role_share is not None else {}),
+                            **(parts_extra or {}))
         native_glb = out / (reduced.name + '.glb')
         count = export_native(reduced, info, native_glb)
         valid &= count == len(f)
@@ -393,13 +538,13 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
         uncertain_share = color_info.get('uncertain_faces', 0) / max(len(f), 1)
         confident_wearable_faces = int(np.count_nonzero((labels == 1) | (labels == 2)))
         low_evidence = color_info.get('low_evidence_area_share', 0)
-        material_review = (swatches is None or uncertain_share > .1 or low_evidence > LOW_EVIDENCE_REVIEW or
+        material_review = (bool(review_reasons) or swatches is None or uncertain_share > .1 or low_evidence > LOW_EVIDENCE_REVIEW or
                            float(np.percentile(projection, 95)) > .01 or confident_wearable_faces == 0)
         reduced['source_sha256'] = source_hash
         reduced['error_fraction_of_height'] = fraction
         reduced['mesh_checks_pass'] = bool(valid)
         reduced['material_mode'] = color_info['mode']
-        reduced.location.x = {'0p4': 0, '0p2': 2.8, '0p1': 5.6}[label]
+        reduced.location.x = reduced_x[label]
         info['levels'][label] = {'error_fraction_of_height': fraction, 'triangles': len(f),
                                  'generator_seconds': generator_seconds, 'total_level_seconds': time.monotonic()-start,
                                  'internal_quadric_error': internal, 'mesh_checks_pass': bool(valid),
@@ -408,6 +553,7 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
                                  'texture_samples': len(points), 'material': color_info,
                                  'material_review_required': bool(material_review),
                                  'color_evidence': str(evidence),
+                                 'body_parts': parts_summary,
                                  'material_colors_source_rgb': palette.tolist(),
                                  'material_face_counts': np.bincount(labels, minlength=len(palette)).tolist(),
                                  'native_glb': str(native_glb), 'serialized_triangles': count,
@@ -438,7 +584,8 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
     if swatches is not None:
         # High-poly evidence file beside the source GLB: detected face materials + original texture.
         import make_highpoly_blend
-        make_highpoly_blend.build(source, swatches, cameras_path=cameras_path, regions_path=regions_path)
+        make_highpoly_blend.build(source, swatches, cameras_path=cameras_path, regions_path=regions_path,
+                                  base_parts=base_parts, part_fit=part_fit, module=module)
     return info
 
 
@@ -452,6 +599,12 @@ if __name__ == '__main__':
     parser.add_argument('swatches', nargs='?')
     parser.add_argument('--cameras', help='transforms.json of the base views the concept used')
     parser.add_argument('--regions', help='regions.json of that base (base_regions.py)')
+    parser.add_argument('--parts', help='parts.npz of that base (base_parts.py); default: beside regions.json')
+    parser.add_argument('--no-parts', action='store_true', help='ignore parts.npz; landmark prior, no body_part')
+    parser.add_argument('--no-off-body', action='store_true', help='skip the off-body rule (faces outside the base body cannot be base)')
+    parser.add_argument('--interior', choices=['auto', 'strip', 'flag'], default='auto',
+                        help='enclosed (inner shell) faces: auto = strip above the calibrated threshold, '
+                             'strip = always, flag = measure and flag only')
     parser.add_argument('--module', choices=['body_armor', 'right_gauntlet_boot', 'outfit'])
     a = parser.parse_args(sys.argv[sys.argv.index('--') + 1:])
-    run(a.source, a.output_dir, a.swatches, a.cameras, a.regions, a.module)
+    run(a.source, a.output_dir, a.swatches, a.cameras, a.regions, a.module, a.parts, not a.no_parts, a.interior, not a.no_off_body)
