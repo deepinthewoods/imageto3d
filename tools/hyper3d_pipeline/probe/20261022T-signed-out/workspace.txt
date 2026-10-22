@@ -1,0 +1,206 @@
+7-Day Trial
+Subscribe
+7
+FREE
+-DAY
+Creator
+24
+/ month
+30 credits renew per month
+Business
+96
+/ month
+208 credits renew per month
+Education
+12
+24
+/ month
+30 credits renew per month
+Enterprise
+Let's Talk
+Add On
+API
+MCP&CLI
+Login
+Gen-1.5 V1.2
+Gen-2.5 Agent-Ready
+More details on low-poly? Click Bake Normal at confirm!
+Add-On lets you use almost all Rodin features in DCC software.
+Change style, detail, or speed? Switch Mode.
+Many OmniCraft features run locally—no uploads required.
+Use OmniCraft HDRI Generation for 8K panoramas and HDRI.
+Regret confirming? Fork and redo!
+Rodin helps you separate multiview design images.
+Convert model format with OmniCraft Model Format Convertor.
+Preview various model formats using OmniCraft Model Viewer.
+Drink water to speed up generation!
+Redos are free, but confirmation costs credits.
+Try latest image generation models at OmniCraft Remix Image.
+Specify image directions via the direction bar.
+Upload your model → Get textures in OmniCraft.
+Generate and redo for free—no credits if unsatisfied.
+Click T/A pose button for direct T/A pose assets.
+Remix or enhance input images before generation.
+Search 3D assets cross-platform with OmniCraft Rodin Search.
+Business subscriptions include API access.
+OmniCraft has many handy little features.
+The best way to understand is to create.
+What I cannot create, I do not understand.
+Controllable Large-scale Generative Model
+for Creating High-quality 3D Assets
+Slow down, zoom in.
+The details are everything.
+Clean and sharp surfaces. No distractions.
+Less is more.
+Distilled to pure speed – 8X faster.
+Who has time to wait?
+Select the direction of this image
+Front Left
+Front
+Front Right
+Left
+UP
+Right
+Back Left
+Back
+Back Right
+Down
+Unknown
+Images that have been set with Direction will help improve the accuracy of generation.
+Image to 3D
+3D Editing
+WorldGen
+Image to 3D
+Text to Image/3D
+Remix Gen
+Turbo Gen
+A Robot
+
+Remix Images with your idea
+
+The @Man is wearing this @Shirt.
+
+Transform it into a 3D Cartoon figurine style.
+
+Single image
+Multi-view
+Upload photos from any angle
+
+Sample images
+
+3D editing
+WorldGen
+Bounding Box ControlNet
+Voxel ControlNet
+PointCloud ControlNet
+Private
+times
+GENERATE
+Free Preview
+Unlock
+5x and 10x tiers
+with
+Business Plan
+1 results at a time
+1
+Presets
+Gen-2.5
+Build Myself
+Creation Mode
+Build Myself
+Manual
+Create Manually
+Generate Objects
+AI Assist
+3D Objects
+Complete Scene
+Full AI
+3D Objects
+3D Gaussian Environment
+Default
+Speedy
+Select Effort
+Medium
+Thinking Effort
+Extreme-Low
+~ 4s
+Low
+~ 9s
+Medium
+~ 20s
+High
+~ 40s
+Extreme-High
+~ 80s
+OFF
+Agentic Mode
+5 min
+Vibe Modeling. Let AI plan and build.
+1 Credit
+ASSET
+EXPLORE
+Featured
+Filter
+hello@deemos.com
+PRODUCT
+Rodin
+ChatAvatar
+FEATURES
+Text to 3D
+Image to 3D
+AI Video Generator
+AI Image Generator
+OmniCraft
+PLUG-INS
+Blender
+Unreal
+Unity
+Godot
+C4D
+Maya
+OV/Isaac
+LEGAL
+Privacy
+Terms
+© 2026 Deemos Corporation. All rights reserved
+Privacy
+Terms
+Avatar
+Image
+Text/Image to 3D Avatar
+3D
+Image
+3D Large Model
+Video
+Image
+Video Generators
+Texture Generator
+Image Enhancer
+Image Remix
+HDRI Generation
+Rodin Search
+Vector to 3D
+Mesh Editor
+Model Viewer
+Format Convertor
+An error has occurred: NO_CURRENT_USER. (Trace ID: b3953875fae2436ca318b3d8af743813)
+Oops, something went wrong. Please try again later.
+Discord
+Twitter
+Youtube
+Linkedin
+Feedback
+Chat with us
+Notifications
+Back
+Name
+Email
+Type
+Malfunction
+Can we contact you about this issue?
+Yes
+Comments
+
+By filling out this form and clicking submit, you acknowledge our privacy policy.
+
+Submit

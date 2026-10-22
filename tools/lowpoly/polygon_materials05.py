@@ -9,6 +9,9 @@ import numpy as np
 from mathutils import Vector
 from mathutils.bvhtree import BVHTree
 
+# NOTE: stale 6-colour tricolor palette of the 2026-10 lab. NOT the pipeline palette: the Tripo pipeline only uses
+# TextureSurface / polygon_samples from this module; its colours come from tools/tripo_pipeline/palette.py
+# (palette.json beside the base views).
 PALETTE = np.array([
     [230, 25, 35], [245, 220, 20], [225, 25, 220],
     [20, 220, 235], [25, 210, 40], [30, 65, 235],

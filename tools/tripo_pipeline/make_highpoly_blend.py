@@ -1,12 +1,13 @@
 """Build `highpoly.blend` beside a Tripo source GLB: the full-resolution mesh twice, side by side.
 
-Usage: blender -b --python tools/tripo_pipeline/make_highpoly_blend.py -- <source.glb> <swatches.json>
+Usage: blender -b --python tools/tripo_pipeline/make_highpoly_blend.py -- <source.glb> <swatches.json|palette.json>
            [<cameras transforms.json> <regions.json> [<parts.npz> [<module>]]]
 
 - `highpoly_detected`: every triangle gets the material detected from the texture at its UV centre
-  (base / primary / secondary by hue, or orange `uncertain` when the pixel is too grey/dark or between
-  hues; face_labels.classify_samples).
-- `off_body` (magenta, with parts + module + clearance record): a face the texture calls base that lies
+  (base / one material per palette garment role - primary, secondary, and with white_anchor_v2 also
+  tertiary, accent - or orange `uncertain` when the pixel is too grey/dark or between hues;
+  palette.Palette.classify).
+- `off_body` (magenta; cyan when the palette has a magenta accent; with parts + module + clearance record): a face the texture calls base that lies
   clearly outside the fitted base body where the module allows garment (face_labels.off_body_excess).
 - `highpoly_seen` (only with cameras): white where a concept view saw the surface, dark grey where
   none did. Texture there is Tripo's invention and the pipeline barely trusts it.
@@ -30,8 +31,21 @@ import face_labels  # noqa: E402
 from mathutils.bvhtree import BVHTree  # noqa: E402
 
 ROLE_COLORS = {'base': (0.9, 0.1, 0.14), 'primary': (0.1, 0.82, 0.16),
-               'secondary': (0.12, 0.25, 0.92), 'uncertain': (1.0, 0.4, 0.03),
+               'secondary': (0.12, 0.25, 0.92), 'tertiary': (0.96, 0.86, 0.08),
+               'accent': (0.88, 0.1, 0.86), 'uncertain': (1.0, 0.4, 0.03),
                'off_body': (0.95, 0.3, 0.75)}
+OFF_BODY_ALT = (0.1, 0.85, 0.95)     # when the palette's accent is magenta, off_body would be indistinguishable
+
+
+def role_colors(pal):
+    """Ordered {material name: display colour}: base, garment roles, uncertain, off_body (class index = position)."""
+    from palette import swatch_rgb
+    out = {'base': ROLE_COLORS['base']}
+    for role, hex_ in pal.garments:
+        out[role] = ROLE_COLORS.get(role) or tuple(swatch_rgb(hex_).tolist())
+    out['uncertain'] = ROLE_COLORS['uncertain']
+    out['off_body'] = OFF_BODY_ALT if 'accent' in pal.roles else ROLE_COLORS['off_body']
+    return out
 
 
 def uv_centre_colors(obj):
@@ -73,9 +87,12 @@ def normalized_triangles(obj):
     return (v - origin) * (2 / (high[2] - low[2])), f.reshape(-1, 3), poly
 
 
-def build(source, swatches, dest=None, cameras_path=None, regions_path=None, parts_path=None,
+def build(source, palette, dest=None, cameras_path=None, regions_path=None, parts_path=None,
           base_parts=None, part_fit=None, module=None):
     source = Path(source).resolve()
+    pal = face_labels.Palette.coerce(palette)
+    colors_by_role = role_colors(pal)
+    off_body_index = len(colors_by_role) - 1
     dest = Path(dest) if dest else source.parent / 'highpoly.blend'
     if dest.exists():
         print('HIGHPOLY_BLEND exists, kept:', dest)
@@ -100,8 +117,8 @@ def build(source, swatches, dest=None, cameras_path=None, regions_path=None, par
         parts[tri_poly] = tri_parts
         rm.set_parts(textured.data, part_fit.names, parts)
     rgb, poly = uv_centre_colors(textured)
-    role = np.full(len(textured.data.polygons), 3, np.int32)
-    role[poly] = face_labels.classify_samples(rgb, swatches)[0]  # Tripo meshes: one loop-tri per polygon
+    role = np.full(len(textured.data.polygons), pal.unusable, np.int32)
+    role[poly] = pal.classify(rgb)[0]  # Tripo meshes: one loop-tri per polygon
     if parts is not None and module is not None and part_fit.clearance is not None:
         regions = json.loads(Path(regions_path).read_text()) if regions_path else None
         tri_base = np.flatnonzero(role[tri_poly] == 0)
@@ -113,14 +130,14 @@ def build(source, swatches, dest=None, cameras_path=None, regions_path=None, par
             c_cand = v[f[cand]].mean(1)
             zones = face_labels.part_zones(part_fit.membership(c_cand, n_cand), part_fit.names)
             allowed = face_labels.wear_prior(c_cand, module, regions, zones) >= face_labels.OFF_BODY_MIN_PRIOR
-            role[tri_poly[cand[allowed]]] = 4
+            role[tri_poly[cand[allowed]]] = off_body_index
     detected = textured.copy()
     detected.data = textured.data.copy()
     detected.name = 'highpoly_detected'
     for c in textured.users_collection:
         c.objects.link(detected)
     detected.data.materials.clear()
-    for name, color in ROLE_COLORS.items():
+    for name, color in colors_by_role.items():
         mat = bpy.data.materials.new(name)
         mat.diffuse_color = (*color, 1)
         mat.use_nodes = True
@@ -154,8 +171,9 @@ def build(source, swatches, dest=None, cameras_path=None, regions_path=None, par
         shown_parts.location.x += 3 * width * 1.3
         shown_parts['part_face_counts'] = {n: int(c) for n, c in zip(part_fit.names, np.bincount(
             parts, minlength=len(part_fit.names)))}
-    counts = np.bincount(role, minlength=len(ROLE_COLORS))
-    detected['detected_face_counts'] = {k: int(n) for k, n in zip(ROLE_COLORS, counts)}
+    counts = np.bincount(role, minlength=len(colors_by_role))
+    detected['detected_face_counts'] = {k: int(n) for k, n in zip(colors_by_role, counts)}
+    detected['palette_scheme'] = pal.scheme
     detected['source_sha256'] = rm.digest(source)
     bpy.ops.file.pack_all()
     bpy.ops.wm.save_as_mainfile(filepath=str(dest), compress=True)
@@ -168,6 +186,6 @@ if __name__ == '__main__':
     if len(args) not in (2, 4, 5, 6):
         raise SystemExit(__doc__)
     module = args[5] if len(args) == 6 else None
-    build(args[0], json.loads(Path(args[1]).read_text()), cameras_path=args[2] if len(args) >= 4 else None,
+    build(args[0], Path(args[1]), cameras_path=args[2] if len(args) >= 4 else None,
           regions_path=args[3] if len(args) >= 4 else None, parts_path=args[4] if len(args) >= 5 else None,
           module=module)

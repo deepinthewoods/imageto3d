@@ -14,3 +14,9 @@ node_modules/
 __pycache__/
 *.pyc
 .codex_jobs/
+# Hyper3D runner working data (jobs, native-monitor runs, per-module downloads)
+tools/hyper3d_pipeline/jobs/
+tools/hyper3d_pipeline/runs/
+tools/hyper3d_pipeline/**/downloads/
+tools/hyper3d_pipeline/probe/**/*.png
+tools/hyper3d_pipeline/probe/**/x*/

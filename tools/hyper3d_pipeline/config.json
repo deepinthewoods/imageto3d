@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "_comment": "Settings for rodin_backend.py. Items marked (live) were seen in the signed-in UI on 2026-10-22, (code) were read from the Rodin web client's JavaScript bundle (string literals/logic), (unverified) were neither; see probe/20261022T-signed-in/FINDINGS.md.",
+  "venv_python": "/home/niz/.cache/codex-firefox-playwright/venv/bin/python",
+  "jobs_root": "tools/hyper3d_pipeline/jobs",
+  "runs_root": "tools/hyper3d_pipeline/runs",
+  "workspace_url": "https://hyper3d.ai/workspace/rodin",
+  "model": "Gen-2.5",
+  "effort": "Medium",
+  "effort_levels": [
+    "Extreme-Low",
+    "Low",
+    "Medium",
+    "High",
+    "Extreme-High"
+  ],
+  "multi_view": true,
+  "max_images": null,
+  "view_order": [
+    "front.png",
+    "front_three_quarter.png",
+    "back_three_quarter.png",
+    "back.png"
+  ],
+  "directions": {
+    "front.png": "Front",
+    "front_three_quarter.png": "Front Left",
+    "back_three_quarter.png": "Back Right",
+    "back.png": "Back"
+  },
+  "directions_required": false,
+  "directions_status": "best effort: the #oripopup picker (live labels) did not open on hover/click of a thumbnail on 2026-10-22; Rodin multi-view is pose-free so unset directions are recorded (upload_info.directions_assigned) and the run continues",
+  "mesh_mode_option": "Triangle",
+  "mesh_simplify": false,
+  "triangle_polycount_label": "1M",
+  "material_effort": "High",
+  "mesh_mode_status": "(code) UI mode Triangle = API mesh_export_type Raw, unreduced 'detailed sharp triangular mesh'; the polygon-count override only applies when Simplify is on. Smart Low-poly (2 credits) is never used. The confirm popover itself is unverified (no model at that stage existed)",
+  "de_light": true,
+  "export_format_label": ".glb",
+  "texture_resolution": "2K",
+  "export_checkboxes": {
+    "Base Model": true,
+    "LOD": false,
+    "Shaded": false,
+    "PBR": true
+  },
+  "export_status": "(live) Pack panel: format radios .obj .fbx .glb .usdz .stl; Geometry checkboxes Base Model / LOD / High-poly; Material checkboxes Shaded + PBR (both ticked by default, a past manual export had a _shaded and a _pbr GLB) and 2K / 4K radios",
+  "expected_costs": {
+    "geometry": 0.5,
+    "material_generate": 0,
+    "material_confirm": 0
+  },
+  "budget_credits": 0.5,
+  "expected_costs_status": "(live+code) a paid step stops unless the displayed cost equals the value here (or --expect-cost kind=N) and the running total stays within budget_credits. The Free Preview click additionally requires the Generate hover to read 'Free Preview', which holds for Extreme-Low, Low, Medium only",
+  "cost_table": {
+    "gen2.5_generate_extreme_low_low_medium": "Free Preview (live)",
+    "gen2.5_generate_high": 0.5,
+    "gen2.5_generate_extreme_high": 1,
+    "gen1.5_generate": "Free Preview (live), no effort control",
+    "geometry_confirm_triangle_or_quad": 0.5,
+    "geometry_confirm_smart_low_poly": 2,
+    "material_generate_confirm_effort_high_or_lower": 0,
+    "material_generate_redo_extreme_high": 2,
+    "export_download_business_plan": 0,
+    "fork_revert_to_branch": 0.5,
+    "agentic_mode": 1
+  },
+  "free_retries": false,
+  "stage_timeout_s": 1800,
+  "download_timeout_s": 900,
+  "cost_table_status": "generate hover prices (live 2026-10-22, empty workspace); the rest from the web client's code literals. Cheapest downloadable path = Medium or lower (free preview) + 0.5 geometry confirm = 0.5 total; High adds 0.5 at generate."
+}

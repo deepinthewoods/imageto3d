@@ -1,6 +1,8 @@
 """Material-role labelling shared by reduce_model.py and make_highpoly_blend.py.
 
-Roles: 0 base (body + all base markers), 1 primary, 2 secondary, 3 no usable colour.
+Roles (palette.py): 0 base (body + all anchors), 1..K the garment colours of the palette (legacy
+tricolor_v1: 1 primary, 2 secondary; white_anchor_v2: primary, secondary, tertiary, accent), K+1 no
+usable colour.
 
 Evidence per texture sample
   * hue: nearest swatch hue within HUE_TOLERANCE degrees. Saturation is NOT compared: Tripo's body
@@ -18,20 +20,23 @@ without a parts file they fall back to the T-pose landmarks of base_views/<race>
 """
 import json
 import math
+import sys
 from pathlib import Path
 
 import numpy as np
 
-HUE_TOLERANCE = 20.0      # degrees; closest swatch hues (cyan/blue) are ~45 deg apart
-SAT_RAMP = (.2, .45)      # sample weight 0 at/below first value, 1 at/above second
-VAL_RAMP = (.08, .25)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from palette import HUE_TOLERANCE, SAT_RAMP, VAL_RAMP, Palette, hsv, ramp, swatch_rgb  # noqa: E402,F401
+
 UNSEEN_WEIGHT = .05       # texture on surfaces no concept view saw
 GRAZING_COS = .25         # view cosine at which a surface counts as fully seen
 PRIOR_WEIGHT = .6         # strength of the module prior (score units; full clear evidence = 1)
 NEIGHBOUR_WEIGHT = .25    # per smooth edge
 MIRROR_WEIGHT = .5
+TIE_BONUS = 1e-6          # score bonus of the default garment: breaks exact ties between garment classes only
 SYMMETRIC_MODULES = {'body_armor'}
-SOURCES = ('texture', 'symmetry', 'prior', 'neighbours', 'off_body', 'riser')
+SOURCES = ('texture', 'symmetry', 'prior', 'neighbours', 'off_body', 'riser', 'mirrored')
+# 'mirrored' never appears on the labelled LOD faces: only the copies added to the wearable carry it
 OFF_BODY_PENALTY = 3.      # base score taken away from a face fully outside the base body (clear texture = 1)
 OFF_BODY_MARGIN = .02      # added to the bare-mesh p99.9 clearance of a part (normalized units, height 2)
 OFF_BODY_FLOOR = .03       # threshold never below this
@@ -41,44 +46,10 @@ RISER_RINGS = 2            # a riser may only flip next to wear faces, at most t
 OFF_BODY_MIN_PRIOR = .4    # only where the module prior allows wear (body parts that must stay bare are exempt)
 
 
-def swatch_rgb(value):
-    if not isinstance(value, str) or len(value) != 7 or not value.startswith('#'):
-        raise ValueError('Swatches must be #RRGGBB strings')
-    return np.array([int(value[i:i+2], 16) for i in (1, 3, 5)], float) / 255
-
-
-def hsv(rgb):
-    rgb = np.asarray(rgb, float)
-    mx, mn = rgb.max(1), rgb.min(1)
-    d = mx - mn
-    r, g, b = rgb.T
-    h = np.zeros(len(rgb))
-    nz = d > 1e-9
-    i = nz & (mx == r)
-    h[i] = ((g - b)[i] / d[i]) % 6
-    j = nz & (mx == g) & ~i
-    h[j] = (b - r)[j] / d[j] + 2
-    k = nz & ~i & ~j
-    h[k] = (r - g)[k] / d[k] + 4
-    return h * 60, np.where(mx > 0, d / np.maximum(mx, 1e-9), 0), mx
-
-
-def ramp(x, lo, hi):
-    return np.clip((x - lo) / (hi - lo), 0, 1)
-
-
-def classify_samples(colors, swatches):
-    """Return (role 0..3, weight 0..1) per colour sample."""
-    names = [swatches['base'], *swatches.get('base_markers', {}).values(),
-             swatches['primary'], swatches['secondary']]
-    centre_h, _, _ = hsv(np.array([swatch_rgb(s) for s in names]))
-    h, s, v = hsv(colors)
-    dist = np.abs((h[:, None] - centre_h[None] + 180) % 360 - 180)
-    nearest = dist.argmin(1)
-    markers = len(names) - 2
-    role = np.where(nearest < markers, 0, nearest - markers + 1)
-    weight = ramp(s, *SAT_RAMP) * ramp(v, *VAL_RAMP) * (dist.min(1) <= HUE_TOLERANCE)
-    return np.where(weight > 0, role, 3), weight
+def classify_samples(colors, palette):
+    """Return (class 0..K+1, weight 0..1) per colour sample. `palette` is a palette.Palette or anything
+    Palette.coerce takes (a legacy swatches dict, a palette dict, a JSON path)."""
+    return Palette.coerce(palette).classify(colors)
 
 
 # ---------------------------------------------------------------- cameras and visibility
@@ -500,14 +471,14 @@ def off_body_excess(v, f, parts, base, prior):
     return excess, dist, threshold
 
 
-def hem_risers(v, f, labels, source, base, prior, min_angle=RISER_MIN_ANGLE, rings=RISER_RINGS):
+def hem_risers(v, f, labels, source, base, prior, min_angle=RISER_MIN_ANGLE, rings=RISER_RINGS, classes=3):
     """Flip base-labelled hem slivers to the garment next to them.
 
     Tripo bakes the body's red onto the thin faces where an armour edge meets the limb: they lie flush
     with the skin (so off_body_excess cannot see them) but face along the limb (the edge's underside or
     riser), not out of it. A base face is flipped when it shares an edge with a wear face, the module prior
     allows wear (OFF_BODY_MIN_PRIOR), and its normal differs from the nearest fitted-base normal by more
-    than `min_angle`. It takes the wear role most of its wear neighbours have. At most `rings` rounds, each
+    than `min_angle`. It takes the wear role most of its wear neighbours have (`classes` = base + garments). At most `rings` rounds, each
     only next to wear faces, so it cannot creep up a limb. Returns (labels, source, flipped mask).
     """
     labels, source = labels.copy(), source.copy()
@@ -517,7 +488,7 @@ def hem_risers(v, f, labels, source, base, prior, min_angle=RISER_MIN_ANGLE, rin
     a, b = face_adjacency(f)
     flipped = np.zeros(len(f), bool)
     for _ in range(rings):
-        wear = np.zeros((len(f), 3))
+        wear = np.zeros((len(f), classes))
         for x, y in ((a, b), (b, a)):
             ok = labels[y] != 0
             np.add.at(wear, (x[ok], labels[y][ok]), 1)
@@ -610,24 +581,40 @@ def face_normals(v, f):
     return n / np.maximum(2 * area[:, None], 1e-20), area
 
 
-def resolve_faces(v, f, sample_owner, sample_role, sample_weight, prior, symmetric, off_body=None):
+def resolve_faces(v, f, sample_owner, sample_role, sample_weight, prior, symmetric, off_body=None,
+                  garments=2, default_garment=None):
     """Combine weighted texture votes, module prior, mirror face and crease-aware neighbours.
 
-    `off_body` (0..1 per face, off_body_excess) takes score away from the base role: a face clearly outside
-    the base body cannot be bare skin, whatever baked texture says. Returns labels (0..2), source index
-    into SOURCES, and per-face evidence arrays.
+    Classes: 0 base, 1..`garments` the palette's garment colours; `sample_role` == garments + 1 means no
+    usable colour. `off_body` (0..1 per face, off_body_excess) takes score away from the base role: a face
+    clearly outside the base body cannot be bare skin, whatever baked texture says.
+
+    The module prior says only "garment" for a face with no evidence, not which one; the garment classes
+    then tie and `default_garment` decides (a tiny score bonus, so it only matters for exact ties - faces
+    with texture, symmetric or neighbour evidence follow that). None = the garment with the most seen
+    area on this mesh (votes weighted by sample quality and concept-view visibility); the legacy
+    tricolor_v1 palette passes 1 (primary), which is also what argmax's first-index tie-break gave
+    before there were more than two. Returns labels (0..garments), source index into SOURCES, and
+    per-face evidence arrays (including `default_garment`).
     """
     n_faces = len(f)
-    votes = np.zeros((n_faces, 3))
-    ok = sample_role < 3
+    classes = garments + 1
+    votes = np.zeros((n_faces, classes))
+    ok = sample_role < classes
     np.add.at(votes, (sample_owner[ok], sample_role[ok]), sample_weight[ok])
     n_samples = np.bincount(sample_owner, minlength=n_faces)
     total = votes.sum(1)
     conf = np.clip(total / np.maximum(.5 * n_samples, 1e-9), 0, 1)
     share = votes / np.maximum(total[:, None], 1e-12)
     data = conf[:, None] * share
-    prior_score = PRIOR_WEIGHT * np.stack([.5 - prior, prior - .5, prior - .5], axis=1)
-    normals, _ = face_normals(v, f)
+    prior_score = PRIOR_WEIGHT * np.stack([.5 - prior] + [prior - .5] * garments, axis=1)
+    normals, face_area = face_normals(v, f)
+    if default_garment is None:
+        seen = (conf[:, None] * share * face_area[:, None]).sum(0)[1:]
+        default_garment = 1 + int(seen.argmax()) if seen.max() > 0 else 1
+    if default_garment != 1:     # argmax already prefers the first garment on a tie
+        prior_score[:, default_garment] += TIE_BONUS
+
     a, b = face_adjacency(f)
     w = np.maximum(np.clip((normals[a] * normals[b]).sum(1), 0, 1), .02) ** 8
     mirror, mirror_ok = None, np.zeros(n_faces, bool)
@@ -645,7 +632,7 @@ def resolve_faces(v, f, sample_owner, sample_role, sample_weight, prior, symmetr
         labels = (data + prior_score + ban).argmax(1)
         for _ in range(10):
             score = data + prior_score + ban
-            nb = np.zeros((n_faces, 3))
+            nb = np.zeros((n_faces, classes))
             np.add.at(nb, (a, labels[b]), w)
             np.add.at(nb, (b, labels[a]), w)
             score += NEIGHBOUR_WEIGHT * nb
@@ -657,7 +644,7 @@ def resolve_faces(v, f, sample_owner, sample_role, sample_weight, prior, symmetr
                 break
             labels = new
         return labels
-    ban = np.zeros((n_faces, 3))
+    ban = np.zeros((n_faces, classes))
     labels = free = solve(ban)
     if off_body is not None and off_body.any():
         ban[:, 0] = -OFF_BODY_PENALTY * off_body
@@ -673,4 +660,125 @@ def resolve_faces(v, f, sample_owner, sample_role, sample_weight, prior, symmetr
         source[is_mirror] = 1
     source[(conf >= .5) & (labels == texture_choice)] = 0
     source[(free == 0) & (labels != 0)] = SOURCES.index('off_body')
-    return labels, source, {'confidence': conf, 'vote_share': share, 'wear_prior': prior}
+    return labels, source, {'confidence': conf, 'vote_share': share, 'wear_prior': prior,
+                            'default_garment': default_garment}
+
+
+# ---------------------------------------------------------------- mirroring one-sided wear to the bare anchor side
+#
+# Concepts keep the anatomical-LEFT hand and foot bare as alignment anchors, so a wearable made from them has the
+# gauntlet / shoe on the right only. The wearable (never the labelled LOD) gets mirrored copies of the right-side wear
+# faces whose mirror position on the left is bare base. The base is left/right symmetric about a plane x = const
+# (anatomical right is -X); the plane comes from the base's '.l' / '.r' parts and is mapped into mesh space by the
+# ICP fit (scale + translation, so the normal stays X).
+
+MIRROR_GROUPS = {'foot': ('foot.', 'leg_stretch.'), 'hand': ('hand.', 'forearm_stretch.')}   # part name prefixes
+MIRROR_NEAR = .05          # a mirrored face counts as "already worn" when a wear face lies within this (height 2)
+MIRROR_MIN_FACES = 3       # connected patches smaller than this are dropped (no stray faces)
+MIRROR_GROW_RINGS = 2      # the patch grows over at most this many rings of neighbouring right-side wear faces (a boot cuff past the lower-leg part)
+MIRROR_MIN_MATCH = .8      # base symmetry: share of reflected right samples landing on the matching left part
+MIRROR_MAX_P95 = .04       # ... and 95th-percentile distance of the reflected samples to the base surface
+
+
+def symmetry_plane(base, samples=6000, seed=5):
+    """Sagittal plane x = `x` of a BaseParts (its own frame) from the mean of its '.r' and '.l' surface samples
+    (anatomical right is -X), and how well the base mirrors across it: reflected '.r' samples vs the base surface
+    (`p50`/`p95` distance, normalized units, height 2) and the share that land on the matching '.l' part."""
+    pts, part, _ = base.samples
+    side = {n: ('r' if n.endswith('.r') else 'l' if n.endswith('.l') else None) for n in base.names}
+    sides = np.array([side[n] or '' for n in base.names])[part]
+    xr, xl = pts[sides == 'r', 0], pts[sides == 'l', 0]
+    if not len(xr) or not len(xl):
+        return {'x': None, 'ok': False, 'reason': 'no .l/.r parts'}
+    x = float((xr.mean() + xl.mean()) / 2)
+    rng = np.random.default_rng(seed)
+    idx = np.flatnonzero(sides == 'r')
+    idx = rng.choice(idx, min(samples, len(idx)), replace=False)
+    from mathutils import Vector
+    dist, match = [], 0
+    name_id = {n: i for i, n in enumerate(base.names)}
+    for i in idx:
+        p = pts[i].copy()
+        p[0] = 2 * x - p[0]
+        hit = base.tree.find_nearest(Vector(p))
+        dist.append(hit[3])
+        want = name_id.get(base.names[part[i]][:-1] + 'l')
+        match += int(base.part[hit[2]] == want)
+    dist = np.array(dist)
+    out = {'x': x, 'right_mean_x': float(xr.mean()), 'left_mean_x': float(xl.mean()),
+           'p50': float(np.median(dist)), 'p95': float(np.quantile(dist, .95)),
+           'p50_pct_height': float(np.median(dist) / 2 * 100), 'p95_pct_height': float(np.quantile(dist, .95) / 2 * 100),
+           'counterpart_part_share': match / len(idx)}
+    out['ok'] = bool(xr.mean() < xl.mean() and out['counterpart_part_share'] >= MIRROR_MIN_MATCH
+                     and out['p95'] <= MIRROR_MAX_P95)
+    if not out['ok']:
+        out['reason'] = 'base not left/right symmetric enough' if xr.mean() < xl.mean() else 'right is not -X'
+    return out
+
+
+def mirror_wear(v, f, labels, parts, names, prior, plane_x, groups, near=MIRROR_NEAR, min_faces=MIRROR_MIN_FACES):
+    """Right-side wear faces to copy onto the left. Returns a dict (`faces` = selected face ids, `left_part` = body
+    part id of each copy, `stats`).
+
+    Eligible: a wear face (label >= 1) whose body part is a right part of one of `groups` (MIRROR_GROUPS keys:
+    'foot' = foot + lower leg, 'hand' = hand + forearm), right of the plane, and where the module prior allows wear
+    (>= OFF_BODY_MIN_PRIOR). Its centroid is mirrored across x = plane_x and looked up on the labelled mesh: when a
+    wear face lies within `near` there (a robe hem on both shins) the left already has that garment and the face is
+    NOT copied. What remains is cleaned to connected patches of at least `min_faces` faces (no stray faces), then grown
+    over MIRROR_GROW_RINGS rings into neighbouring right-side wear faces of any right part (a boot cuff, a gauntlet
+    edge past the forearm part) that are not already worn on the left."""
+    from mathutils import Vector
+    from mathutils.bvhtree import BVHTree
+    name_id = {n: i for i, n in enumerate(names)}
+    prefixes = tuple(p for g in groups for p in MIRROR_GROUPS[g])
+    right = np.array([n.endswith('.r') and n.startswith(prefixes) for n in names])
+    normals, area = face_normals(v, f)
+    cent = v[f].mean(1)
+    right_any = np.array([n.endswith('.r') for n in names])
+    allowed = (labels >= 1) & (prior >= OFF_BODY_MIN_PRIOR) & (cent[:, 0] < plane_x)
+    eligible = allowed & right[parts]
+    tree = BVHTree.FromPolygons(v.tolist(), f.tolist(), all_triangles=True)
+    already = np.zeros(len(f), bool)
+    for i in np.flatnonzero(allowed & right_any[parts]):
+        p = cent[i].copy()
+        p[0] = 2 * plane_x - p[0]
+        hit = tree.find_nearest(Vector(p))
+        already[i] = hit[2] is not None and labels[hit[2]] >= 1 and hit[3] < near
+    ok = eligible & ~already
+    a, b = face_adjacency(f)
+    pruned = np.zeros(len(f), bool)
+    if ok.any():
+        both = ok[a] & ok[b]
+        comp = _components(len(f), a[both], b[both])
+        size = np.bincount(comp[ok], minlength=len(f))
+        small = ok & (size[comp] < min_faces)
+        pruned, ok = small, ok & ~small
+    grown = np.zeros(len(f), bool)
+    can_grow = allowed & right_any[parts] & ~already
+    for _ in range(MIRROR_GROW_RINGS if ok.any() else 0):
+        near_patch = np.zeros(len(f), bool)
+        near_patch[a[ok[b]]] = True
+        near_patch[b[ok[a]]] = True
+        add = near_patch & can_grow & ~ok
+        if not add.any():
+            break
+        ok, grown = ok | add, grown | add
+    faces = np.flatnonzero(ok)
+    left_id = np.array([name_id.get(n[:-1] + 'l', -1) if n.endswith('.r') else -1 for n in names])
+    total = area.sum()
+    stats = {'groups': list(groups), 'eligible_faces': int(eligible.sum()),
+             'skipped_counterpart_wear': int((already & eligible).sum()), 'grown_faces': int(grown.sum()), 'pruned_small_patches': int(pruned.sum()),
+             'copied_faces': int(len(faces)), 'copied_area_share_of_mesh': float(area[faces].sum() / total),
+             'copied_area_share_of_wear': float(area[faces].sum() / max(area[labels >= 1].sum(), 1e-20)),
+             'copied_by_role': {int(r): int((labels[faces] == r).sum()) for r in np.unique(labels[faces])},
+             'copied_by_part': {names[p]: int(c) for p, c in zip(*np.unique(parts[faces], return_counts=True))}}
+    return {'faces': faces, 'left_part': left_id[parts[faces]], 'stats': stats, 'plane_x': plane_x}
+
+
+def mirrored_geometry(v, f, faces, plane_x):
+    """Vertices (m, 3) and triangles (k, 3, indices into them) of the mirrored copies of `faces`: reflected across
+    x = plane_x with the winding reversed so the normals still face outward."""
+    used, local = np.unique(f[faces], return_inverse=True)
+    verts = v[used].copy()
+    verts[:, 0] = 2 * plane_x - verts[:, 0]
+    return verts, local.reshape(-1, 3)[:, [0, 2, 1]]

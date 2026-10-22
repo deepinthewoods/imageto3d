@@ -2,7 +2,80 @@
   "schema_version": 1,
   "generation_service": "Tripo Studio website",
   "source_image_look": "studio plain paper",
-  "active_base_views": "base_views/human_male (native 1254 studio-plain semantic markers; 45 deg three-quarter cameras: front-left from above, back-right from below; regions.json landmarks)",
+  "active_base_views": "base_views/<race> (native 1254 studio-plain semantic markers; active scheme white_anchor_v2 since 2026-10-22: red body + one shared white anchor on head/left hand/left foot; 45 deg three-quarter cameras: front-left from above, back-right from below; regions.json landmarks; palette.json per race)",
+  "palette_active_scheme": "white_anchor_v2",
+  "palette_schemes": {
+    "white_anchor_v2": {
+      "scheme": "white_anchor_v2",
+      "base": {
+        "name": "body_red",
+        "hex": "#E61923"
+      },
+      "anchors": {
+        "kind": "achromatic",
+        "hex": "#EDEDED",
+        "parts": [
+          "head",
+          "left_hand",
+          "left_foot"
+        ]
+      },
+      "garments": [
+        {
+          "role": "primary",
+          "hex": "#19D228"
+        },
+        {
+          "role": "secondary",
+          "hex": "#1E41EB"
+        },
+        {
+          "role": "tertiary",
+          "hex": "#F5DC14"
+        },
+        {
+          "role": "accent",
+          "hex": "#E119DC"
+        }
+      ]
+    },
+    "tricolor_v1": {
+      "scheme": "tricolor_v1",
+      "base": {
+        "name": "body_red",
+        "hex": "#E61923"
+      },
+      "anchors": {
+        "kind": "hue",
+        "markers": [
+          {
+            "part": "head",
+            "hex": "#F5DC14"
+          },
+          {
+            "part": "left_hand",
+            "hex": "#E119DC"
+          },
+          {
+            "part": "left_foot",
+            "hex": "#14DCEB"
+          }
+        ]
+      },
+      "garments": [
+        {
+          "role": "primary",
+          "hex": "#19D228"
+        },
+        {
+          "role": "secondary",
+          "hex": "#1E41EB"
+        }
+      ]
+    }
+  },
+  "palette_unlabelled_base_policy": "a base folder / job snapshot / swatches file without palette.json is legacy tricolor_v1 (built from marker_palette_srgb below by palette.Palette.legacy_default)",
+  "marker_palette_srgb_legacy_note": "LEGACY tricolor_v1 colours; kept because palette.py builds the default palette of bases without palette.json from them. New work: palette_schemes.white_anchor_v2 / base_views/<race>/palette.json",
   "marker_palette_srgb": {
     "body_red": "#E61923",
     "head_yellow": "#F5DC14",
@@ -32,7 +105,9 @@
   "engine_material_roles": [
     "base",
     "primary",
-    "secondary"
+    "secondary",
+    "tertiary",
+    "accent"
   ],
   "tripo_topology_default": "Triangle",
   "tripo_triangle_polycount_ceiling": 2000000,
@@ -52,5 +127,178 @@
   ],
   "candidate_base_views": "experiments/base_2k_studio_plain_20261021/human_male; not active until imagegen canvas is verified",
   "former_base_views": "archive/base_views_studio_plain_markers_1024_20261021/human_male",
-  "image_size_policy": "Request native base dimensions; reject mismatched imagegen output. Never resize, crop, pad or stretch generated or rendered views to force a match."
+  "image_size_policy": "Request native base dimensions; reject mismatched imagegen output. Never resize, crop, pad or stretch generated or rendered views to force a match.",
+  "engine_material_roles_note": "primary/secondary for tricolor_v1 bases; all four for white_anchor_v2. 'uncertain' and 'off_body' are review-only.",
+  "mirror_to_anchor_side": {
+    "outfit": [
+      "foot"
+    ],
+    "right_gauntlet_boot": [
+      "hand",
+      "foot"
+    ],
+    "body_armor": []
+  },
+  "mirror_to_anchor_side_note": "wearable only: right-side wear on these parts (foot = foot + lower leg, hand = hand + forearm) is copied, mirrored across the base's sagittal plane, onto the bare anatomical-left anchor side when the left counterpart is bare base (reduce_model.py / face_labels.mirror_wear); the labelled LOD is never changed",
+  "piece_split": {
+    "note": "split_pieces.py: per module, which rigid pieces are cut from the reduced wearable by garment role (roles style) or by accent rim plus the wear faces it encloses (rim style). Pieces are named <piece>_l / <piece>_r (+ rest). region_parts = body part names without the .l/.r suffix; min_island_faces = smaller islands are absorbed by the neighbouring piece; extra_component_share = a detached second patch of a piece smaller than this share of its main patch goes to rest.",
+    "body_armor": {
+      "style": "roles",
+      "pieces": {
+        "pauldron": {
+          "sided": true,
+          "region_parts": [
+            "shoulder",
+            "arm_stretch"
+          ],
+          "min_region_share": 0.5,
+          "min_island_faces": 6,
+          "extra_component_share": 0.25,
+          "styles": {
+            "roles": {
+              "roles": [
+                "tertiary",
+                "accent"
+              ]
+            },
+            "rim": {
+              "roles": [
+                "accent"
+              ],
+              "close_rings": 1,
+              "max_field_share": 0.2,
+              "min_enclosure": 0.6
+            }
+          }
+        }
+      },
+      "rigid": {
+        "note": "split_pieces.py --rigid zones|snap: cut the non-pauldron armour into torso + arm_l/arm_r. zones = body_part zones (arm_parts); snap = zone boundary as a guess, then a min-cut within +-band (fraction of body height) that prefers label/colour boundaries and creases (role_factor, crease_deg), prior = pull towards the zone guess. overlap: --overlap adds an underlap strip of `length` (fraction of height) tucked under the other piece of a cut, sunk `offset` inwards; mode parent = the static piece (torso, or pauldron when it follows the torso) owns the strip, mode cover = the inner piece by cover_order (outermost first) owns it. pose.convention = which body the pauldron follows (arm | torso) for the exported strips. pose: --pose-test arm angles in degrees. seam (M3): soft_roles = soft under-layer garment role(s), rigid plates by body-part majority, mixed_share = minority share above which a plate is split by zone; --soft piece|nearest. colour (M4): arm = faces of `colour.roles` (+ enclosed decoration). overlap.mode parent|child|cover, pose.convention arm|torso|half (pauldron follows the arm / torso / half the arm angle). bands: joint-role (cyan) faces are bands; rigid plates = connected non-band faces by body-part zone majority (part_groups; chest = everything else); a joint without a usable band (min_contact edges to both pieces, no plate spanning it) falls back to snap. Defaults: pauldron convention half; overlap strips are OFF unless --overlap (or overlap.enabled true); when on: mode both, length 6% (the cheaper alternative is --overlap-mode parent --pauldron-convention arm --overlap-length 0.03). cross_joint: see its own note.",
+        "arm_parts": [
+          "arm_stretch",
+          "forearm_stretch",
+          "hand"
+        ],
+        "snap": {
+          "band": 0.08,
+          "role_factor": 0.15,
+          "crease_deg": 30,
+          "prior": 1.0,
+          "min_factor": 0.03
+        },
+        "overlap": {
+          "enabled": false,
+          "length": 0.06,
+          "offset": 0.004,
+          "cover_order": [
+            "pauldron",
+            "torso",
+            "arm"
+          ],
+          "mode": "both"
+        },
+        "cross_joint": {
+          "note": "Fringe / joint-crossing reassignment, on by default for rigid splits with a pelvis (--no-cross-joint switches it off; segment_first.py --no-cross-joint). mode shelf (default): ledges and caps. For a joint between two sections A|B (waist chest|pelvis, hip_l/hip_r pelvis|thigh, armpit_l/armpit_r chest|arm; both directions; only the joints listed in shelf.joints, default the waist) the faces of A whose outward normal points along the joint axis into A's side (within shelf.axis_deg; the up-facing ledge at the bottom of the chest) and that lie within shelf.band (fraction of height) of the A|B boundary are grown into connected groups that stop at edges sharper than shelf.crease_deg; a group touching B moves to B when it is at most shelf.max_share of A (and shelf.min_faces), borders B along at least shelf.min_contact of its outline and is separated from the rest of A by a fold (neck mean dihedral >= shelf.min_fold_deg). No distance-past-the-plane test, so vertical bands (abdomen, baldric) never move. mode plane = the previous signed-distance rule (joints, margin, beyond_share, patch_deg, min_share, min_faces, max_share, min_contact, complete_to_cut below: a planar patch beyond the joint plane moves); mode both = shelf, then plane. Every move and near miss is reported in pieces.json rigid.cross_joint (field rule = shelf | plane).",
+          "enabled": true,
+          "mode": "shelf",
+          "joints": ["waist", "hip_l", "hip_r", "armpit_l", "armpit_r"],
+          "directions": "both",
+          "margin": {"waist": 0.025, "hip": 0.04, "armpit": 0.04, "shoulder": 0.05},
+          "beyond_share": 0.85,
+          "patch_deg": 30,
+          "min_share": 0.005,
+          "min_faces": 4,
+          "max_share": 0.3,
+          "min_contact": 0.1,
+          "complete_to_cut": true,
+          "shelf": {"joints": ["waist"], "band": 0.03, "axis_deg": 35, "crease_deg": 45, "max_share": 0.10, "min_contact": 0.25, "min_faces": 1, "min_fold_deg": 30, "max_listed": 12}
+        },
+        "flaps": {
+          "note": "Flap / spike pruning (split_pieces.prune_flaps; --keep-flaps switches it off): a triangle that hangs off the rest of the wearable by one edge (or by none) and whose free tip stands more than min_height (fraction of body height) off that edge is dropped from the exported pieces (chains are peeled leaf by leaf, up to max_passes). Removing a leaf face opens no hole. Reported in pieces.json rigid.flaps and as a warning.",
+          "enabled": true,
+          "min_height": 0.06,
+          "max_passes": 4
+        },
+        "pose": {
+          "down_deg": 45,
+          "up_deg": 30,
+          "convention": "half",
+          "thigh_flex_deg": 45,
+          "thigh_abd_deg": 20,
+          "spine_deg": 20
+        },
+        "seam": {
+          "soft_roles": [
+            "secondary"
+          ],
+          "mixed_share": 0.25,
+          "soft_min_arm_share": 0.25
+        },
+        "colour": {
+          "roles": [
+            "quinary"
+          ],
+          "close_rings": 1,
+          "max_field_share": 0.2,
+          "min_enclosure": 0.6,
+          "fill_enclosed": true
+        },
+        "part_groups": {
+          "arm": [
+            "arm_stretch",
+            "forearm_stretch",
+            "hand"
+          ],
+          "thigh": [
+            "thigh_stretch",
+            "leg_stretch",
+            "foot"
+          ],
+          "pelvis": [
+            "root"
+          ]
+        },
+        "bands": {
+          "min_band_faces": 6,
+          "min_contact": 3,
+          "mixed_share": 0.03,
+          "auto_min_faces": 10,
+          "mixed_min_faces": 8
+        },
+        "default_for_separable": "auto",
+        "regions": {
+          "note": "--rigid regions (per-piece base colours): expected = main colour of each section (chest, arm, pauldron, pelvis, thigh); min_region_share = a same-colour connected region of the non-pauldron wear faces this large (area share) is a section candidate; min_minor_share = smaller same-role component assigned like a region when not enclosed; min_enclosure = share of a component's perimeter on one section to count as decoration enclosed by it; min_span_share/span_depth = a region with this area share in a second body-part zone, reaching farther than span_depth x height from the main zone, spans a joint (split by zone, snap re-cut); role_resolve_share = a section with at least this share of a region wins over the zone majority when only its expected colour matches the region; min_boundary_share = a joint is a 'region' joint when this share of its cut length lies on a colour boundary, else snap fallback; auto_min_regions/auto_min_share = what --rigid auto needs to choose regions.",
+          "expected": {
+            "chest": "primary",
+            "arm": "secondary",
+            "pauldron": "accent",
+            "pelvis": "secondary",
+            "thigh": "primary"
+          },
+          "min_region_share": 0.025,
+          "min_minor_share": 0.004,
+          "min_enclosure": 0.6,
+          "role_resolve_share": 0.25,
+          "min_boundary_share": 0.6,
+          "auto_min_regions": 3,
+          "auto_min_share": 0.5,
+          "min_span_share": 0.04,
+          "span_depth": 0.05
+        }
+      }
+    }
+  },
+  "segment_first": {
+    "default_method": "segment-first",
+    "venv_python": "/media/niz/Samsung SSD/godot/blender/characters/.venv/bin/python",
+    "levels": "0p4,0p2,0p1",
+    "note": "convert_job.py split step for piece_colours body_armor jobs (2026-10-22): default_method segment-first (segment_first_prep.py in Blender, then segment_first.py with venv_python, which needs numpy + scipy + Pillow; $SEGMENT_FIRST_PYTHON overrides, else <imageto3d>/../.venv/bin/python is tried) or per-face (split_pieces.py --rigid auto) or none. A failed segment-first falls back to per-face. --split-method overrides per run."
+  },
+  "separable_garments": [
+    {
+      "role": "joint",
+      "hex": "#14DCEB"
+    }
+  ],
+  "separable_garments_note": "Optional 5th garment colour (role 'joint', cyan #14DCEB) reserved for joint bands; appended to the palette only with reduce_model.py --separable (or convert_job.py --separable / a separable job). Fallback for palettes (old job snapshots) without their own separable_garments block."
 }

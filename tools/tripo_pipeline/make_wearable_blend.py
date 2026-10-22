@@ -3,10 +3,10 @@
 Usage: blender -b --python tools/tripo_pipeline/make_wearable_blend.py -- <reduced_dir>
 
 One collection per reduction level (0p4, 0p2, 0p1), laid out side by side along X, with the
-flat base/primary/secondary/uncertain face materials from the GLBs. reduce_model.py calls
+flat base / garment-role (primary, secondary, ...) / uncertain face materials from the GLBs. reduce_model.py calls
 build() itself at the end of a run; use this script to backfill older outputs. When the level's
 `lod_error_<level>_colors.npz` has body parts, each wearable mesh gets the FACE attribute `body_part`
-and the property `body_part_names` (the GLB carries neither; the npz holds them in GLB face order).
+and the property `body_part_names` (the GLB carries neither; the npz holds them in GLB face order). Wearables with mirrored copies (face_labels.mirror_wear) also get the FACE attributes `mirrored` (1 = copy) and `label_source` ('mirrored' = index 6 of `label_source_names`).
 """
 from pathlib import Path
 import json
@@ -58,6 +58,13 @@ def build(out):
                 mesh.attributes.new('body_part', 'INT', 'FACE').data.foreach_set(
                     'value', z['wearable_body_part_glb_order'].astype(np.int32))
                 mesh['body_part_names'] = json.dumps([str(n) for n in z['body_part_names']])
+            if 'wearable_mirrored_glb_order' in z and len(z['wearable_mirrored_glb_order']) == len(mesh.polygons):
+                # copies mirrored onto the bare anchor side (face_labels.mirror_wear): marked per face
+                mesh.attributes.new('mirrored', 'INT', 'FACE').data.foreach_set(
+                    'value', z['wearable_mirrored_glb_order'].astype(np.int32))
+                mesh.attributes.new('label_source', 'INT', 'FACE').data.foreach_set(
+                    'value', z['wearable_label_source_glb_order'].astype(np.int32))
+                mesh['label_source_names'] = json.dumps([str(n) for n in z['label_source_names']])
     for area in bpy.context.screen.areas if bpy.context.screen else []:
         if area.type == 'VIEW_3D':
             area.spaces.active.shading.type = 'SOLID'

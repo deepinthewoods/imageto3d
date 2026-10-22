@@ -1,0 +1,254 @@
+7-Day Trial
+Subscribe
+7
+FREE
+-DAY
+Creator
+24
+/ month
+30 credits renew per month
+Business
+96
+/ month
+208 credits renew per month
+Education
+12
+24
+/ month
+30 credits renew per month
+Enterprise
+Let's Talk
+Add On
+API
+MCP&CLI
+Login
+Gen-1.5 V1.2
+Gen-2.5 Agent-Ready
+Drink water to speed up generation!
+Share your Story with Rodin to get free credits.
+Best balance of quality and speed? Default Mode.
+Pay by Results.
+Many OmniCraft features run locally—no uploads required.
+Click Redo for better results.
+Use non-input images for texture generation. Outfit swap time!
+Rodin helps you separate multiview design images.
+Change style, detail, or speed? Switch Mode.
+Convert SVG to 3D models via OmniCraft Vecto3D.
+Use Voxel/Point ControlNet for variant models.
+Business subscriptions have cheaper Credits per unit.
+Drink water for better results!
+Rodin's Multiview Image to 3D is pose-free!
+We support 5 languages now!
+Direct Credits cost more than subscriptions, yet last forever.
+Hide or private your secret assets.
+Supports multiple reference images for geometry and textures.
+Subscribers can use Advanced Options during generation!
+More details on low-poly? Click Bake Normal at confirm!
+The best way to understand is to create.
+What I cannot create, I do not understand.
+Controllable Large-scale Generative Model
+for Creating High-quality 3D Assets
+Slow down, zoom in.
+The details are everything.
+Clean and sharp surfaces. No distractions.
+Less is more.
+Distilled to pure speed – 8X faster.
+Who has time to wait?
+Select the direction of this image
+Front Left
+Front
+Front Right
+Left
+UP
+Right
+Back Left
+Back
+Back Right
+Down
+Unknown
+Images that have been set with Direction will help improve the accuracy of generation.
+Image to 3D
+3D Editing
+WorldGen
+Image to 3D
+Text to Image/3D
+Remix Gen
+Turbo Gen
+A Robot
+
+Remix Images with your idea
+
+The @Man is wearing this @Shirt.
+
+Transform it into a 3D Cartoon figurine style.
+
+Single image
+Multi-view
+Upload photos from any angle
+
+Sample images
+
+3D editing
+WorldGen
+Bounding Box ControlNet
+Voxel ControlNet
+PointCloud ControlNet
+Private
+10 times
+GENERATE
+Free Preview
+Unlock
+5x and 10x tiers
+with
+Business Plan
+1 results at a time
+1
+Presets
+Gen-2.5
+Build Myself
+Creation Mode
+Build Myself
+Manual
+Create Manually
+Generate Objects
+AI Assist
+3D Objects
+Complete Scene
+Full AI
+3D Objects
+3D Gaussian Environment
+Default
+Speedy
+Select Effort
+Medium
+Thinking Effort
+Extreme-Low
+~ 4s
+Low
+~ 9s
+Medium
+~ 20s
+High
+~ 40s
+Extreme-High
+~ 80s
+OFF
+Agentic Mode
+5 min
+Vibe Modeling. Let AI plan and build.
+1 Credit
+ASSET
+EXPLORE
+Featured
+Filter
+Gopal Kumar
+30 likes
+Carlo Calvano
+25 likes
+Keshia
+27 likes
+Danillo Teodoro
+30 likes
+OmniCraft｜
+Toolbag for 3D
+Texture Generator
+Free Trial
+Free to Subscriber
+Image Enhancer
+Free to all
+Image Remix
+Free to Subscriber
+HDRI Generation
+Free Trial
+Free to Subscriber
+Texture Generator
+Free Trial
+Free to Subscriber
+Share a Post & Earn 1 Credit!
+Share
+STORY
+Share @
+Rodin Tips
+Tutorial
+Official
+English
+中文
+Other Languages
+Hyper3D by Deemos
+🚀 Introducing #HYPER3D Agentic Mode.
+AGI optimizes your input and chooses how to model it.
+Generate editable N-GONS #3D model for #CAD, building & industrial product.
+📏Adjust dimensions. 🏃‍♀️Add animation.
+Towards Production-Ready, to Agent-Ready.
+This is Vibe Modeling👇
+31
+Copy link
+Hyper3D by Deemos
+One image. A world to train in, shoot in & explore. 🌍
+👀Meet HYPER3D #WorldGen: independent foreground meshes + #3DGS background, built for interaction.
+For robotics🦾, film🎬, games🎮, DCC💎 & XR.
+🔥Powered by our Best Paper Award Project 「CAST」.
+Let's Connect the Dots⬇️
+11
+Copy link
+hello@deemos.com
+PRODUCT
+Rodin
+ChatAvatar
+FEATURES
+Text to 3D
+Image to 3D
+AI Video Generator
+AI Image Generator
+OmniCraft
+PLUG-INS
+Blender
+Unreal
+Unity
+Godot
+C4D
+Maya
+OV/Isaac
+LEGAL
+Privacy
+Terms
+© 2026 Deemos Corporation. All rights reserved
+Privacy
+Terms
+Avatar
+Image
+Text/Image to 3D Avatar
+3D
+Image
+3D Large Model
+Video
+Image
+Video Generators
+Texture Generator
+Image Enhancer
+Image Remix
+HDRI Generation
+Rodin Search
+Vector to 3D
+Mesh Editor
+Model Viewer
+Format Convertor
+Discord
+Twitter
+Youtube
+Linkedin
+Feedback
+Chat with us
+Notifications
+Back
+Name
+Email
+Type
+Malfunction
+Can we contact you about this issue?
+Yes
+Comments
+
+By filling out this form and clicking submit, you acknowledge our privacy policy.
+
+Submit

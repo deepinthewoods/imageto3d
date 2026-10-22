@@ -12,12 +12,13 @@ concept or view task.
 
 | Step | Owner |
 | --- | --- |
-| Front concepts in `concepts/<set>/<race_gender>/<module>_front.png` (flat, all modules in one folder) (+ `prompts.json`, design record) | Codex job |
+| Front concepts of a batch, FLAT in `concepts/<batch_id>/<NN>_<slug>__<module>.png` + `<NN>_<slug>.json` (no rejected attempts kept; see `PROMPTING_GUIDE.md`) | Codex job |
+| `workflow.py promote concepts/<batch_id> <NN> [--set ..] [--approve]` (chosen concept into the per-set layout / `approved/`) | Claude |
 | Remaining three views in `processing_views/<set>--<job-id>/...` | Codex job |
 | Regenerating a rejected view | Codex job |
 | `workflow.py status/check/claim/ready`, folder moves | Claude |
 | Visual review of every generated image (dimensions, alpha, side, boundaries, colors) | Claude, then Codex for retries |
-| `convert_job.py` (Tripo submit/collect + `reduce_model.py`), material review, `completed/` | Claude |
+| `convert_job.py` (Tripo submit/collect + `reduce_model.py`, then for `piece_colours` body armour the segment-first rigid-piece split with `split_pieces.py --rigid auto` as automatic fallback), material review, `completed/` | Claude |
 
 Wherever `AGENTS.md`/`PROMPTING_GUIDE.md` say "use the imagegen skill / built-in
 image generation tool", that means: write a Codex job prompt and launch it. Never
@@ -41,25 +42,26 @@ must be new. Set `CODEX_TIMEOUT` (seconds, default 3600) for long batches.
 
 Each prompt must be self-contained and state:
 
-- The task (front concepts for a set, saved flat as `<module>_front.png` in the one `concepts/<set>/<race_gender>/` folder, or remaining views for a claimed job) and the
+- The task (front concepts of a batch, saved flat as `<NN>_<slug>__<module>.png` + `<NN>_<slug>.json` in `concepts/<batch_id>/`, or remaining views for a claimed job) and the
   exact output paths. Codex must copy the chosen output from
   `~/.codex/generated_images/...` into those paths and must not overwrite existing
-  images (use versioned names for retries; keep rejected attempts).
+  images (concept batches: do not keep rejected attempts, record only the attempt count; view retries use versioned names).
 - The design brief, module(s), race_gender and the base view used as edit target
   (Image 1), plus the approved front as Image 2 for remaining views, and the
   established `back.png` as a reference for `back_three_quarter.png`. For three-quarter
   views, describe the camera: front-left from 45° above / back-right from 45° below, 45° around
   (see `PROMPTING_GUIDE.md`); without this imagegen drifts back to a level view.
+- To open with the framing-lock sentence from `python3 tools/framing_lock.py <base view>` (before the design brief).
 - To follow `AGENTS.md` and `PROMPTING_GUIDE.md`: native base dimensions, RGBA
   alpha, marker colors and swatches, anatomical side, bare anchors, module
   boundaries.
 - To verify the saved PNG's real pixel size and alpha itself and regenerate on
   mismatch, then record exact prompts, references, dimensions/hashes and swatches
-  in `prompts.json` and the design record.
+  in the concept json (or `prompts.json` and the design record for views).
 - Scope limits: no `workflow.py` state changes, no folder moves between pipeline
   stages, no Tripo calls, no git commits, no edits outside the named output paths.
 - To end with a short report: files written, dimensions, any rejected attempts and
-  known issues.
+  known issues. For concepts also the per-concept `check_framing.py` result.
 
 Independent modules (e.g. `body_armor` and `right_gauntlet_boot`, or separate sets)
 can run as parallel jobs. Keep the three remaining views of one module in one job,

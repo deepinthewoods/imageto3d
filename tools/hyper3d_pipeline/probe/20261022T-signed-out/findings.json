@@ -1,0 +1,738 @@
+{
+  "at": "2026-10-22T08:14:11.208635+00:00",
+  "pages": {
+    "workspace": {
+      "url": "https://hyper3d.ai/workspace/rodin",
+      "title": "Rodin AI - Free AI 3D Model Generator For Everyone | Instantly Create Stunning 3D Assets, 3D Models, and 3D Objects - Create 3D Designs Powered by AI | Hyper3D",
+      "file_inputs": [
+        {
+          "accept": ".jpg, .jpeg, .png, .webp",
+          "multiple": true,
+          "name": "",
+          "id": "",
+          "visible": false,
+          "parent_text": "Select the direction of this image\nFront Left\nFront\nFront Right\nLeft\nUP\nRight\nBack Left\nBack\nBack Right\nDown\nUnknown\nIma"
+        },
+        {
+          "accept": ".obj,.fbx,.glb,.stl",
+          "multiple": false,
+          "name": "",
+          "id": "file-input",
+          "visible": false,
+          "parent_text": ""
+        },
+        {
+          "accept": ".jpg, .jpeg, .png, .webp",
+          "multiple": false,
+          "name": "",
+          "id": "uerupload",
+          "visible": false,
+          "parent_text": ""
+        },
+        {
+          "accept": "image/*",
+          "multiple": false,
+          "name": "",
+          "id": "",
+          "visible": false,
+          "parent_text": ""
+        },
+        {
+          "accept": ".obj,.fbx,.glb,.gltf,.dae,.stl,.ply,.drc",
+          "multiple": false,
+          "name": "",
+          "id": "file-input",
+          "visible": false,
+          "parent_text": ""
+        },
+        {
+          "accept": ".jpg, .jpeg, .png, .webp",
+          "multiple": true,
+          "name": "",
+          "id": "",
+          "visible": false,
+          "parent_text": ""
+        }
+      ],
+      "buttons": [
+        {
+          "tag": "DIV",
+          "role": "button",
+          "text": "7-Day Trial\nSubscribe",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "7-Day Trial Subscribe",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "MCP&CLI",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Connect Hyper3D MCP",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Image to 3D",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "3D Editing",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "WorldGen",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "DIV",
+          "role": "button",
+          "text": "Private\ntimes",
+          "aria_pressed": "false",
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Private",
+          "disabled": "false"
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Unlock\n5x and 10x tiers\nwith\nBusiness Plan\n1 results at a time\n1",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Batch size 1",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Presets",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Presets",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Open model selection",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "5 min",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Agentic settings",
+          "disabled": true
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "1 Credit",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "GENERATE",
+          "disabled": true
+        },
+        {
+          "tag": "BUTTON",
+          "role": "switch",
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": "false",
+          "aria_selected": null,
+          "aria_label": "Agentic Mode",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Search",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Filter",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Filter",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "menuitemcheckbox",
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": "true",
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "menuitemcheckbox",
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": "true",
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "menuitemcheckbox",
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": "true",
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Close",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Close",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Share",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Feedback",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Feedback",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Feedback",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "tab",
+          "text": "Chat with us",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": "true",
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "tab",
+          "text": "Notifications",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": "false",
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Submit",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        }
+      ],
+      "credit_texts": [
+        "30\u00a0credits renew per month",
+        "208\u00a0credits renew per month",
+        "30\u00a0credits renew per month",
+        "Redos are free, but confirmation costs credits.",
+        "Generate and redo for free\u2014no credits if unsatisfied.",
+        "1 Credit"
+      ],
+      "password_inputs": 0
+    },
+    "mine": {
+      "url": "https://hyper3d.ai/workspace/rodin",
+      "title": "Rodin AI - Free AI 3D Model Generator For Everyone | Instantly Create Stunning 3D Assets, 3D Models, and 3D Objects - Create 3D Designs Powered by AI | Hyper3D",
+      "file_inputs": [
+        {
+          "accept": ".jpg, .jpeg, .png, .webp",
+          "multiple": true,
+          "name": "",
+          "id": "",
+          "visible": false,
+          "parent_text": "Select the direction of this image\nFront Left\nFront\nFront Right\nLeft\nUP\nRight\nBack Left\nBack\nBack Right\nDown\nUnknown\nIma"
+        },
+        {
+          "accept": ".obj,.fbx,.glb,.stl",
+          "multiple": false,
+          "name": "",
+          "id": "file-input",
+          "visible": false,
+          "parent_text": ""
+        },
+        {
+          "accept": ".jpg, .jpeg, .png, .webp",
+          "multiple": false,
+          "name": "",
+          "id": "uerupload",
+          "visible": false,
+          "parent_text": ""
+        },
+        {
+          "accept": "image/*",
+          "multiple": false,
+          "name": "",
+          "id": "",
+          "visible": false,
+          "parent_text": ""
+        },
+        {
+          "accept": ".obj,.fbx,.glb,.gltf,.dae,.stl,.ply,.drc",
+          "multiple": false,
+          "name": "",
+          "id": "file-input",
+          "visible": false,
+          "parent_text": ""
+        },
+        {
+          "accept": ".jpg, .jpeg, .png, .webp",
+          "multiple": true,
+          "name": "",
+          "id": "",
+          "visible": false,
+          "parent_text": ""
+        }
+      ],
+      "buttons": [
+        {
+          "tag": "DIV",
+          "role": "button",
+          "text": "7-Day Trial\nSubscribe",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "7-Day Trial Subscribe",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "MCP&CLI",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Connect Hyper3D MCP",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Image to 3D",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "3D Editing",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "WorldGen",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "DIV",
+          "role": "button",
+          "text": "Private\n10 times",
+          "aria_pressed": "false",
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Private",
+          "disabled": "false"
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Unlock\n5x and 10x tiers\nwith\nBusiness Plan\n1 results at a time\n1",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Batch size 1",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Presets",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Presets",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Open model selection",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "5 min",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Agentic settings",
+          "disabled": true
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "1 Credit",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "GENERATE",
+          "disabled": true
+        },
+        {
+          "tag": "BUTTON",
+          "role": "switch",
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": "false",
+          "aria_selected": null,
+          "aria_label": "Agentic Mode",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Search",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Filter",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Filter",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "menuitemcheckbox",
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": "true",
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "menuitemcheckbox",
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": "true",
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "menuitemcheckbox",
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": "true",
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Share",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Share",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Feedback",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Feedback",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": "Feedback",
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "tab",
+          "text": "Chat with us",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": "true",
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": "tab",
+          "text": "Notifications",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": "false",
+          "aria_label": null,
+          "disabled": null
+        },
+        {
+          "tag": "BUTTON",
+          "role": null,
+          "text": "Submit",
+          "aria_pressed": null,
+          "aria_checked": null,
+          "aria_selected": null,
+          "aria_label": null,
+          "disabled": null
+        }
+      ],
+      "credit_texts": [
+        "30\u00a0credits renew per month",
+        "208\u00a0credits renew per month",
+        "30\u00a0credits renew per month",
+        "Share your Story with Rodin to get free credits.",
+        "Business subscriptions have cheaper Credits per unit.",
+        "Direct Credits cost more than subscriptions, yet last",
+        "1 Credit",
+        "Share a Post & Earn 1 Credit!"
+      ],
+      "password_inputs": 0
+    }
+  },
+  "signed_in": true
+}
