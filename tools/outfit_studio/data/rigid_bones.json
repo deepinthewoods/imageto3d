@@ -1,0 +1,70 @@
+{
+ "note": "Rigid piece -> {ARP deform bone: weight}. Pieces not listed here (soft_<joint>, rest, outfit) are skinned smoothly from the base. Every bone is checked against the rig deform bones on use. pauldron_* follows the \"half\" convention.",
+ "pieces": {
+  "arm_l": {
+   "c_arm_stretch.l": 1.0
+  },
+  "arm_r": {
+   "c_arm_stretch.r": 1.0
+  },
+  "chest": {
+   "c_spine_02_bend.x": 1.0
+  },
+  "cuff_l": {
+   "c_forearm_stretch.l": 1.0
+  },
+  "cuff_r": {
+   "c_forearm_stretch.r": 1.0
+  },
+  "foot_l": {
+   "foot.l": 1.0
+  },
+  "foot_r": {
+   "foot.r": 1.0
+  },
+  "hand_l": {
+   "hand.l": 1.0
+  },
+  "hand_r": {
+   "hand.r": 1.0
+  },
+  "pauldron_l": {
+   "shoulder.l": 0.5,
+   "c_arm_stretch.l": 0.5
+  },
+  "pauldron_r": {
+   "shoulder.r": 0.5,
+   "c_arm_stretch.r": 0.5
+  },
+  "pelvis": {
+   "c_root_bend.x": 1.0
+  },
+  "shin_l": {
+   "c_leg_stretch.l": 1.0
+  },
+  "shin_r": {
+   "c_leg_stretch.r": 1.0
+  },
+  "thigh_l": {
+   "c_thigh_stretch.l": 1.0
+  },
+  "thigh_r": {
+   "c_thigh_stretch.r": 1.0
+  }
+ },
+ "smooth": {
+  "influences": 4,
+  "smooth_passes": 2,
+  "smooth_factor": 0.5,
+  "hips": {
+   "root": "c_root_bend.x",
+   "thighs": [
+    "c_thigh_stretch.l",
+    "c_thigh_stretch.r"
+   ],
+   "root_weight": 0.6,
+   "thigh_weight": 0.4,
+   "between_thighs": 0.3
+  }
+ }
+}
