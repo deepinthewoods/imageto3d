@@ -7,12 +7,9 @@ The selected reference and decision record are at `pipeline_decisions.json`; the
 ## Folder states
 
 ```text
-concepts/<batch_id>/<NN>_<slug>__<module>.png + <NN>_<slug>.json   (flat batch for browsing; no rejected attempts kept)
-              │ workflow.py promote concepts/<batch_id> <NN> [--set <set>] [--race <r>] [--approve]
-              ▼   (copies the chosen concept; never overwrites; --approve = straight to approved/ when the user said so)
-concepts/<set>/<race_gender>/{body_armor,right_gauntlet_boot}_front.png   (per-set layout, side by side)
-concepts/<set>/<race_gender>/outfit_front.png
-              │ user moves a complete chosen set
+concepts/<set>/<race_gender>/{body_armor,right_gauntlet_boot}_front.png   (new armor concept, one folder per set)
+concepts/<set>/<race_gender>/outfit_front.png                            (new outfit concept)
+              │ user approves in the local preview site; rejection goes to restorable trash/concepts/
               ▼
 approved/<set>/... same flat <module>_front.png layout
               │ chat request: process approved outfits
@@ -32,7 +29,7 @@ processing/<set>--<job-id>/... website conversion in progress
 
 An armor set has **both** `body_armor` and `right_gauntlet_boot` fronts for each character. A regular outfit has one `outfit` front. They are separate jobs/set types; do not combine them into a single image. The outfit leaves head, both hands and anatomical left foot bare. Headwear and hoods await a later decision. Use large, matte garment color regions (up to four: primary green, secondary blue, tertiary yellow, accent magenta; never white) plus the unchanged exposed base so the generated texture can later be assigned to engine materials.
 
-Concept generation produces fronts in `concepts/`; it does not move anything to `approved/`. The user approves by moving the whole set. The assistant processes approved sets when asked in chat. It preserves each selected front, generates the three other views from corresponding base views, checks all images, and stages the completed set with `workflow.py ready`. The active base views (all races) are native 1254 × 1254 studio-plain semantic-marker renders with the `white_anchor_v2` palette: red body and ONE shared white anchor on the head, anatomical-left hand and anatomical-left foot (the former yellow/magenta/cyan anchors, scheme `tricolor_v1`, are archived at `archive/base_views_markers_tricolor_20261022/`). The prior 1024 set is archived at `archive/base_views_studio_plain_markers_1024_20261021/human_male/`. The old brown views and other races are archived at `archive/base_views_kraft_20261021/`; since 2026-10-22 all eleven races have matching active marker views (`build_marker_base.py` + `render_marker_base.py`). The user chose conversion to run automatically after the four views exist, without a second review stop. `studio.mjs` now provides reusable Firefox Playwright submission and collection for a four-view module. It is not yet connected to a background queue watcher; `multiview_ready/` jobs remain staged until that connection and its recovery rules are tested. The approved arcane plate mail job has not yet been uploaded.
+Concept generation produces fronts in `concepts/`; it does not move anything to `approved/`. The user approves or rejects in the local preview site (`python3 tools/preview/serve.py --open`), which moves the whole set or sends it to restorable `trash/concepts/`. The two existing flat batches stay where they are and remain visible in that site; `workflow.py promote` is retained only to approve their legacy entries. The assistant processes approved sets when asked in chat. It preserves each selected front, generates the three other views from corresponding base views, checks all images, and stages the completed set with `workflow.py ready`. The active base views (all races) are native 1254 × 1254 studio-plain semantic-marker renders with the `white_anchor_v2` palette: red body and ONE shared white anchor on the head, anatomical-left hand and anatomical-left foot (the former yellow/magenta/cyan anchors, scheme `tricolor_v1`, are archived at `archive/base_views_markers_tricolor_20261022/`). The prior 1024 set is archived at `archive/base_views_studio_plain_markers_1024_20261021/human_male/`. The old brown views and other races are archived at `archive/base_views_kraft_20261021/`; since 2026-10-22 all eleven races have matching active marker views (`build_marker_base.py` + `render_marker_base.py`). The user chose conversion to run automatically after the four views exist, without a second review stop. `studio.mjs` now provides reusable Firefox Playwright submission and collection for a four-view module. It is not yet connected to a background queue watcher; `multiview_ready/` jobs remain staged until that connection and its recovery rules are tested. The approved arcane plate mail job has not yet been uploaded.
 
 Past Pixal3D results remain in `models/` and `completed/`. The Pixal3D user service was disabled and stopped before this contract was installed. Do not reactivate it while `approved/` has front-only Tripo selections.
 
@@ -43,7 +40,7 @@ From the parent project directory:
 ```bash
 python3 tools/tripo_pipeline/workflow.py status
 python3 tools/tripo_pipeline/workflow.py check approved/<set>
-python3 tools/tripo_pipeline/workflow.py promote concepts/<batch_id> <NN> [--set <set>] [--approve]   # batch concept -> per-set layout
+python3 tools/tripo_pipeline/workflow.py promote concepts/<batch_id> <NN> [--set <set>] [--approve]   # existing legacy flat batches only
 python3 tools/tripo_pipeline/workflow.py claim <set>
 # Generate the three other views for each module in processing_views/<set>--<job-id>/.
 python3 tools/tripo_pipeline/workflow.py ready <set>--<job-id>

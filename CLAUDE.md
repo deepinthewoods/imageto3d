@@ -12,8 +12,8 @@ concept or view task.
 
 | Step | Owner |
 | --- | --- |
-| Front concepts of a batch, FLAT in `concepts/<batch_id>/<NN>_<slug>__<module>.png` + `<NN>_<slug>.json` (no rejected attempts kept; see `PROMPTING_GUIDE.md`) | Codex job |
-| `workflow.py promote concepts/<batch_id> <NN> [--set ..] [--approve]` (chosen concept into the per-set layout / `approved/`) | Claude |
+| Front concepts of a batch, one `concepts/<set_id>/<race_gender>/` folder per concept with `<module>_front.png` + `<module>_prompts.json` (no rejected attempts kept) | Codex job |
+| `workflow.py promote concepts/<batch_id> <NN> [--set ..] [--approve]` (only for the two existing flat legacy batches) | Claude |
 | Remaining three views in `processing_views/<set>--<job-id>/...` | Codex job |
 | Regenerating a rejected view | Codex job |
 | `workflow.py status/check/claim/ready`, folder moves | Claude |
@@ -42,10 +42,10 @@ must be new. Set `CODEX_TIMEOUT` (seconds, default 3600) for long batches.
 
 Each prompt must be self-contained and state:
 
-- The task (front concepts of a batch, saved flat as `<NN>_<slug>__<module>.png` + `<NN>_<slug>.json` in `concepts/<batch_id>/`, or remaining views for a claimed job) and the
+- The task (front concepts of a batch, saved per concept as `<module>_front.png` + `<module>_prompts.json` in `concepts/<set_id>/<race_gender>/`, or remaining views for a claimed job) and the
   exact output paths. Codex must copy the chosen output from
   `~/.codex/generated_images/...` into those paths and must not overwrite existing
-  images (concept batches: do not keep rejected attempts, record only the attempt count; view retries use versioned names).
+  images (concepts: do not keep rejected attempts, record only the attempt count in the prompts JSON; view retries use versioned names).
 - The design brief, module(s), race_gender and the base view used as edit target
   (Image 1), plus the approved front as Image 2 for remaining views, and the
   established `back.png` as a reference for `back_three_quarter.png`. For three-quarter
@@ -81,5 +81,4 @@ since `back_three_quarter` depends on `back`.
 4. Only then run `workflow.py ready` and continue with the Tripo/reduction steps,
    which Claude runs directly.
 
-The approval gates are unchanged: never move a set into `approved/` yourself, and
-process `approved/` only when the user asks.
+The user approves or rejects concepts in the local preview site (`python3 tools/preview/serve.py --open`), which moves sets into `approved/` or restorable `trash/concepts/`. Never approve a set on the user's behalf; process `approved/` only when the user asks.
