@@ -2,6 +2,7 @@
   "schema_version": 1,
   "_comment": "Settings for rodin_backend.py. Items marked (live) were seen in the signed-in UI on 2026-10-22, (code) were read from the Rodin web client's JavaScript bundle (string literals/logic), (unverified) were neither; see probe/20261022T-signed-in/FINDINGS.md.",
   "venv_python": "/home/niz/.cache/codex-firefox-playwright/venv/bin/python",
+  "venv_python_windows": "C:/Users/niall/.cache/hyper3d-venv/Scripts/python.exe",
   "jobs_root": "tools/hyper3d_pipeline/jobs",
   "runs_root": "tools/hyper3d_pipeline/runs",
   "workspace_url": "https://hyper3d.ai/workspace/rodin",

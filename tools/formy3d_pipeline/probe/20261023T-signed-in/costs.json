@@ -1,0 +1,179 @@
+{
+ "balance": "16688",
+ "empty_label": "Generate 3D Model",
+ "single_default": "Generate 3D Model - 100",
+ "n_comboboxes_single": 2,
+ "n_switches_multi": 2,
+ "n_comboboxes_multi": 2,
+ "combos": [
+  {
+   "texture": "No textures",
+   "geometry": "Standard",
+   "pbr": true,
+   "quad": false,
+   "label": "Generate 3D Model - 67"
+  },
+  {
+   "texture": "No textures",
+   "geometry": "Standard",
+   "pbr": true,
+   "quad": true,
+   "label": "Generate 3D Model - 84"
+  },
+  {
+   "texture": "No textures",
+   "geometry": "Standard",
+   "pbr": false,
+   "quad": false,
+   "label": "Generate 3D Model - 33"
+  },
+  {
+   "texture": "No textures",
+   "geometry": "Standard",
+   "pbr": false,
+   "quad": true,
+   "label": "Generate 3D Model - 50"
+  },
+  {
+   "texture": "No textures",
+   "geometry": "Detailed",
+   "pbr": true,
+   "quad": false,
+   "label": "Generate 3D Model - 134"
+  },
+  {
+   "texture": "No textures",
+   "geometry": "Detailed",
+   "pbr": true,
+   "quad": true,
+   "label": "Generate 3D Model - 151"
+  },
+  {
+   "texture": "No textures",
+   "geometry": "Detailed",
+   "pbr": false,
+   "quad": false,
+   "label": "Generate 3D Model - 100"
+  },
+  {
+   "texture": "No textures",
+   "geometry": "Detailed",
+   "pbr": false,
+   "quad": true,
+   "label": "Generate 3D Model - 117"
+  },
+  {
+   "texture": "Standard",
+   "geometry": "Standard",
+   "pbr": true,
+   "quad": false,
+   "label": "Generate 3D Model - 67"
+  },
+  {
+   "texture": "Standard",
+   "geometry": "Standard",
+   "pbr": true,
+   "quad": true,
+   "label": "Generate 3D Model - 84"
+  },
+  {
+   "texture": "Standard",
+   "geometry": "Standard",
+   "pbr": false,
+   "quad": false,
+   "label": "Generate 3D Model - 67"
+  },
+  {
+   "texture": "Standard",
+   "geometry": "Standard",
+   "pbr": false,
+   "quad": true,
+   "label": "Generate 3D Model - 84"
+  },
+  {
+   "texture": "Standard",
+   "geometry": "Detailed",
+   "pbr": true,
+   "quad": false,
+   "label": "Generate 3D Model - 134"
+  },
+  {
+   "texture": "Standard",
+   "geometry": "Detailed",
+   "pbr": true,
+   "quad": true,
+   "label": "Generate 3D Model - 151"
+  },
+  {
+   "texture": "Standard",
+   "geometry": "Detailed",
+   "pbr": false,
+   "quad": false,
+   "label": "Generate 3D Model - 134"
+  },
+  {
+   "texture": "Standard",
+   "geometry": "Detailed",
+   "pbr": false,
+   "quad": true,
+   "label": "Generate 3D Model - 151"
+  },
+  {
+   "texture": "HD",
+   "geometry": "Standard",
+   "pbr": true,
+   "quad": false,
+   "label": "Generate 3D Model - 67"
+  },
+  {
+   "texture": "HD",
+   "geometry": "Standard",
+   "pbr": true,
+   "quad": true,
+   "label": "Generate 3D Model - 117"
+  },
+  {
+   "texture": "HD",
+   "geometry": "Standard",
+   "pbr": false,
+   "quad": false,
+   "label": "Generate 3D Model - 100"
+  },
+  {
+   "texture": "HD",
+   "geometry": "Standard",
+   "pbr": false,
+   "quad": true,
+   "label": "Generate 3D Model - 117"
+  },
+  {
+   "texture": "HD",
+   "geometry": "Detailed",
+   "pbr": true,
+   "quad": false,
+   "label": "Generate 3D Model - 134"
+  },
+  {
+   "texture": "HD",
+   "geometry": "Detailed",
+   "pbr": true,
+   "quad": true,
+   "label": "Generate 3D Model - 184"
+  },
+  {
+   "texture": "HD",
+   "geometry": "Detailed",
+   "pbr": false,
+   "quad": false,
+   "label": "Generate 3D Model - 167"
+  },
+  {
+   "texture": "HD",
+   "geometry": "Detailed",
+   "pbr": false,
+   "quad": true,
+   "label": "Generate 3D Model - 184"
+  }
+ ],
+ "after_reset_label": "Generate 3D Model - 67"
+}

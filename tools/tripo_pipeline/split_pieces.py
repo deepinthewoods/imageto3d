@@ -61,7 +61,8 @@ class _Colors(dict):
 
 PIECE_COLORS = _Colors({'pauldron_l': (235, 105, 40), 'pauldron_r': (40, 150, 235), 'rest': (170, 172, 176), 'torso': (170, 172, 176),
                         'arm_l': (150, 90, 200), 'arm_r': (60, 170, 110), 'soft': (225, 190, 120), 'chest': (170, 172, 176),
-                        'pelvis': (115, 135, 165), 'thigh_l': (205, 80, 150), 'thigh_r': (60, 150, 140)})
+                        'pelvis': (115, 135, 165), 'thigh_l': (205, 80, 150), 'thigh_r': (60, 150, 140),
+                        'knee_l': (235, 195, 60), 'knee_r': (70, 200, 225)})
 LABEL_NAMES = ['rest', 'L', 'R']          # label 0 = rest, 1 = left (+X), 2 = right (-X)
 WEAK_SOURCES = ('prior', 'neighbours')
 MATCH_TOL = 1e-4                           # centroid match tolerance, fraction of body height
@@ -294,7 +295,7 @@ def triangle_geometry(v, f):
 
 def load_spec(module, style=None, config=CONFIG, overrides=None):
     """Resolved piece settings: {'module', 'style', 'piece', ...} from config.json `piece_split[module]`."""
-    cfg = json.loads(Path(config).read_text()).get('piece_split', {})
+    cfg = json.loads(Path(config).read_text(encoding='utf-8-sig')).get('piece_split', {})
     if module not in cfg:
         raise SystemExit(f'config has no piece_split for module {module!r} (have {[k for k in cfg if k != "note"]})')
     mod = cfg[module]
@@ -431,6 +432,17 @@ def attach_parts(level, full_glb, npz):
     names = [str(n) for n in z['body_part_names']]
     info = {'method': 'none', 'wearable_faces': level.n}
     wear_arr = z['wearable_body_part_glb_order'] if 'wearable_body_part_glb_order' in z.files else None
+    if (wear_arr is not None and len(wear_arr) == level.n and 'wearable_method' in z.files and str(z['wearable_method']) == 'cut'):
+        # a wearable cut from the high-poly mesh (wearcut.py): its faces are not faces of the labelled level, so a centroid match against
+        # the full GLB is only approximate; the sidecar arrays are exact per face (GLB order) there
+        level.part = wear_arr.astype(np.int64)
+        if 'wearable_label_source_glb_order' in z.files and 'label_source_names' in z.files:
+            level.source = z['wearable_label_source_glb_order'].astype(np.int64)
+            level.source_names = [str(n) for n in z['label_source_names']]
+        info.update(method='wearable_array_cut', matched=int(level.n), unmatched=0)
+        level.part_names = names
+        level.parts_info = info
+        return
     if full_glb is not None and Path(full_glb).is_file() and 'body_part_glb_order' in z.files:
         full = read_glb(full_glb)
         fcent = triangle_geometry(full['v'], full['f'])[0]
@@ -513,7 +525,7 @@ def find_plane(manifest, reduced_dir, level, cli_x=None):
     if x_safe:
         pf = (manifest or {}).get('parts') or {}
         race = Path(reduced_dir).resolve().parent.parent.name
-        for path in (pf.get('file'), HERE.parents[1] / 'base_views' / race / 'parts.npz'):
+        for path in (portable_local(pf.get('file')), HERE.parents[1] / 'base_views' / race / 'parts.npz'):
             if path and Path(path).is_file():
                 px = parts_plane_x(path)
                 if px is not None:
@@ -747,13 +759,15 @@ def classify(level, spec):
         m = comp == k
         area = float(level.area[m].sum())
         region = float(level.area[m & in_region].sum() / area) if area else 0.
-        if has_parts and spec['region_parts'] and region < spec['min_region_share']:
+        # a pauldron must also reach the upper arm (spine_01 alone, e.g. a chest emblem, is not one)
+        limb = float(level.area[m & np.isin(base, spec['limb_parts'])].sum() / area) if (area and spec.get('limb_parts')) else 1.
+        if has_parts and spec['region_parts'] and (region < spec['min_region_share'] or limb < spec.get('min_limb_share', 0.)):
             seeds[m] = False
             hist = {}
             for p in level.part[m]:
                 name = level.part_names[p] if p >= 0 else 'unknown'
                 hist[name] = hist.get(name, 0) + 1
-            strays.append({'faces': int(m.sum()), 'area': area, 'region_share': region, 'parts': hist,
+            strays.append({'faces': int(m.sum()), 'area': area, 'region_share': region, 'limb_share': limb, 'parts': hist,
                            'centroid': _centroid_of(level, m).tolist()})
     report['stray_seed_components'] = strays
 
@@ -876,13 +890,15 @@ EDGE_CREASE_DEG = 35.
 JOINT_ROLES = ('joint', 'quinary')       # the cyan joint-band role; 'quinary' is the old name used by the M4 data
 JOINTS_ARMS = {'arm_l': (0, 3), 'arm_r': (0, 4)}                  # joint -> (label a, label b) of the two pieces it joins
 JOINTS_ALL = {'arm_l': (0, 3), 'arm_r': (0, 4), 'waist': (0, 5), 'hip_l': (5, 6), 'hip_r': (5, 7)}
+KNEE_ID = {'knee_l': 13, 'knee_r': 14}                            # knee cops (spec['knee_cops']): own rigid sections under the thighs
+JOINTS_KNEE = {'knee_l': (6, 13), 'knee_r': (7, 14)}             # thigh | knee cop
 SOFT_ID = {'arm_l': 8, 'arm_r': 9, 'waist': 10, 'hip_l': 11, 'hip_r': 12}   # label of the soft band piece of a joint
 
 
 def cover_rank(spec, names):
     """label -> rank (0 = outermost) from rigid.overlap.cover_order matched to the piece name prefix (torso/arm/...)."""
     order = list(spec['rigid']['overlap']['cover_order'])
-    alias = {'rest': 'torso', 'chest': 'torso', 'pelvis': 'torso', 'thigh': 'arm'}
+    alias = {'rest': 'torso', 'chest': 'torso', 'pelvis': 'torso', 'thigh': 'arm', 'knee': 'arm'}
     return {lab: (order.index(alias.get(n.split('_')[0], n.split('_')[0]))
                   if alias.get(n.split('_')[0], n.split('_')[0]) in order else len(order)) for lab, n in names.items()}
 
@@ -895,6 +911,8 @@ def piece_names(spec, rigid, soft=False, joints='arms'):
         return {0: 'rest', 1: f'{p}_l', 2: f'{p}_r'}
     if joints == 'all':
         out = {0: 'chest', 1: f'{p}_l', 2: f'{p}_r', 3: 'arm_l', 4: 'arm_r', 5: 'pelvis', 6: 'thigh_l', 7: 'thigh_r'}
+        if spec.get('knee_cops'):
+            out.update({i: n for n, i in KNEE_ID.items()})
         if soft:
             out.update({i: f'soft_{j}' for j, i in SOFT_ID.items()})
         return out
@@ -917,6 +935,8 @@ def piece_body(name, convention, all_mode):
         return 'C'
     if base == 'thigh':
         return f'T_{side}'
+    if base == 'knee':
+        return f'K_{side}'
     if base == 'arm':
         return f'A_{side}'
     if base == 'pauldron':
@@ -933,6 +953,8 @@ def piece_depth(name, convention, all_mode):
         return 0
     if base in ('chest', 'thigh'):
         return 1
+    if base == 'knee':
+        return 2
     if base == 'arm':
         return cb + 2
     if base == 'pauldron':
@@ -1034,7 +1056,7 @@ def find_joints(manifest, reduced_dir):
         return None
     pf = manifest.get('parts') or {}
     race = Path(reduced_dir).resolve().parent.parent.name
-    for path in (pf.get('file'), HERE.parents[1] / 'base_views' / race / 'parts.npz'):
+    for path in (portable_local(pf.get('file')), HERE.parents[1] / 'base_views' / race / 'parts.npz'):
         if path and Path(path).is_file():
             j = base_joints(path)
             if j:
@@ -1231,6 +1253,8 @@ def zone_group(level, spec):
     out = np.full(level.n, 'chest', object)
     for grp in ('pelvis', 'thigh', 'arm'):
         out[np.isin(base, groups.get(grp, []))] = grp
+    if spec.get('knee_cops'):                                      # the base's knee_cop parts (face_labels.knee_cop_parts)
+        out[np.isin(base, (r.get('knee') or {}).get('parts', ['knee_cop']))] = 'knee'
     return out
 
 
@@ -1262,6 +1286,9 @@ def sections_zones(level, label, side, spec, report, joints='arms'):
         out[cand & (grp == 'pelvis')] = 5
         out[cand & (grp == 'thigh') & (side > 0)] = 6
         out[cand & (grp == 'thigh') & (side < 0)] = 7
+        if spec.get('knee_cops'):
+            out[cand & (grp == 'knee') & (side > 0)] = KNEE_ID['knee_l']
+            out[cand & (grp == 'knee') & (side < 0)] = KNEE_ID['knee_r']
     return out
 
 
@@ -1599,13 +1626,17 @@ def pauldron_spec(spec, cfg):
         return spec
     rim = spec['all_styles']['rim']
     role = cfg['expected'].get('pauldron')
-    allowed = sorted({cfg['expected'][k] for k in ('chest', 'arm', 'pelvis', 'thigh') if k in cfg['expected']})
-    return dict(spec, style='rim', roles=[role] if role else list(rim['roles']), close_rings=rim.get('close_rings', 0),
+    allowed = sorted({cfg['expected'][k] for k in SECTION_KEYS if k in cfg['expected']})
+    # broad plate pauldrons cover the top of the back (base part spine_01) as much as the upper arm: on some races less
+    # than half of a pauldron lies on arm_stretch, so spine_01 counts as pauldron region too, with a 5% upper-arm minimum
+    return dict(spec, style='rim', region_parts=list(spec['region_parts']) + ['spine_01'], limb_parts=['shoulder', 'arm_stretch'],
+                min_limb_share=.05, roles=[role] if role else list(rim['roles']), close_rings=rim.get('close_rings', 0),
                 max_field_share=rim.get('max_field_share', .2), min_enclosure=rim.get('min_enclosure', .6),
                 field_exclude_roles=allowed, field_exclude_share=cfg['min_region_share'])
 
 
-SECTION_KEY = {0: 'chest', 3: 'arm', 4: 'arm', 5: 'pelvis', 6: 'thigh', 7: 'thigh'}   # label -> key of regions.expected
+SECTION_KEY = {0: 'chest', 3: 'arm', 4: 'arm', 5: 'pelvis', 6: 'thigh', 7: 'thigh', 13: 'knee', 14: 'knee'}   # label -> key of regions.expected
+SECTION_KEYS = ('chest', 'arm', 'pelvis', 'thigh', 'knee')           # keys of regions.expected that name a section ('knee' only with knee cops)
 
 
 def region_settings(spec):
@@ -1614,6 +1645,8 @@ def region_settings(spec):
                 'min_region_share': .025, 'min_minor_share': .004, 'min_enclosure': .6, 'min_span_share': .04, 'span_depth': .05, 'role_resolve_share': .25,
                 'min_boundary_share': .6, 'auto_min_regions': 3, 'auto_min_share': .5},
                **(spec['rigid'].get('regions') or {}))
+    if spec.get('knee_cops'):          # the knee cops' own section colour (rigid.knee.expected, default secondary = blue)
+        cfg['expected'] = {**cfg['expected'], 'knee': (spec['rigid'].get('knee') or {}).get('expected', 'secondary')}
     cfg['expected'] = {**cfg['expected'], **(spec.get('expect') or {})}
     return cfg
 
@@ -1622,7 +1655,7 @@ def region_components(level, cand, cfg):
     """Large same-colour connected regions of the candidate faces whose role is one of the expected section roles:
     (comp ids over all faces (-1 outside cand), list of region comp ids, roles allowed)."""
     exp = cfg['expected']
-    allowed = {exp[k] for k in ('chest', 'arm', 'pelvis', 'thigh') if k in exp}
+    allowed = {exp[k] for k in SECTION_KEYS if k in exp}
     ids = [i for i, n in enumerate(level.role_names) if n in allowed]
     comp = level.graph.components(cand, same=np.where(cand, level.face_role, -1))
     cand_area = float(level.area[cand].sum()) or 1.
@@ -1663,6 +1696,29 @@ def sections_regions(level, label, side, spec, report):
     cand_area = float(level.area[cand].sum()) or 1.
     labs = [0, 3, 4, 5, 6, 7]
     lname = {0: 'chest', 3: 'arm_l', 4: 'arm_r', 5: 'pelvis', 6: 'thigh_l', 7: 'thigh_r'}
+    knee = bool(spec.get('knee_cops'))
+    if knee:
+        labs += [KNEE_ID['knee_l'], KNEE_ID['knee_r']]
+        lname.update({i: n for n, i in KNEE_ID.items()})
+    joint_table = {**JOINTS_ALL, **(JOINTS_KNEE if knee else {})}
+
+    def resolve_main(shares, role):
+        """(section label, how) a region of colour `role` with these zone shares belongs to: the section holding most of it, or, when
+        that section's expected colour is another one, a section with >= role_resolve_share of it whose expected colour is the region's.
+        With knee cops the thigh and knee zones of one side are told apart by colour alone: a region of the knee colour on the thigh
+        zone is the knee cop, one of the thigh colour on the knee zone is the thigh (a cop is never merged into the pelvis or an arm,
+        whose zones it does not touch and which hold none of it)."""
+        main = max(shares, key=shares.get)
+        how = 'whole'
+        if knee and main in (6, 7) and exp.get('knee') == role and exp.get('thigh') != role:
+            return main + 7, 'whole (knee colour on the thigh zone)'
+        if knee and main in (13, 14) and exp.get('thigh') == role and exp.get('knee') != role:
+            return main - 7, 'whole (thigh colour on the knee zone)'
+        if exp.get(SECTION_KEY[main]) != role:                   # the colour says it belongs to another section it overlaps
+            alts = [l for l in labs if shares[l] >= cfg['role_resolve_share'] and exp.get(SECTION_KEY[l]) == role]
+            if alts:
+                main, how = max(alts, key=shares.get), 'whole (role decides)'
+        return main, how
     inside_pairs = set()
     recs = []
 
@@ -1671,12 +1727,7 @@ def sections_regions(level, label, side, spec, report):
         area = float(level.area[m].sum())
         role = level.role_names[level.face_role[m][0]] if (level.face_role[m] == level.face_role[m][0]).all() else 'mixed'
         shares = {l: float(level.area[m & (guess == l)].sum() / area) for l in labs}
-        main = max(shares, key=shares.get)
-        how = 'whole'
-        if exp.get(SECTION_KEY[main]) != role:                   # the colour says it belongs to another section it overlaps
-            alts = [l for l in labs if shares[l] >= cfg['role_resolve_share'] and exp.get(SECTION_KEY[l]) == role]
-            if alts:
-                main, how = max(alts, key=shares.get), 'whole (role decides)'
+        main, how = resolve_main(shares, role)
         # sections that hold a real part of the region far from the main zone: it spans joints; spill near the zone
         # boundary (the zone guess is only approximate) is not
         spans = []
@@ -1726,13 +1777,8 @@ def sections_regions(level, label, side, spec, report):
     def main_of(m):
         area_ = float(level.area[m].sum())
         sh = {l: float(level.area[m & (guess == l)].sum() / area_) for l in labs}
-        mn = max(sh, key=sh.get)
         role_ = level.role_names[level.face_role[m][0]]
-        if exp.get(SECTION_KEY[mn]) != role_:
-            alts = [l for l in labs if sh[l] >= cfg['role_resolve_share'] and exp.get(SECTION_KEY[l]) == role_]
-            if alts:
-                mn = max(alts, key=sh.get)
-        return mn, role_
+        return resolve_main(sh, role_)[0], role_
     own = {}
     for k in regions:
         mn, role_ = main_of(comp == k)
@@ -1801,7 +1847,7 @@ def sections_regions(level, label, side, spec, report):
         return (float(ln_[e['role_diff'][sel]].sum() / ln_.sum()) if ln_.sum() else 0.), int(sel.sum())
 
     joints = {}
-    for jn, (a_, b_) in JOINTS_ALL.items():
+    for jn, (a_, b_) in joint_table.items():
         la_, lb_ = out[p[:, 0]], out[p[:, 1]]
         cutm = cand[p[:, 0]] & cand[p[:, 1]] & (((la_ == a_) & (lb_ == b_)) | ((la_ == b_) & (lb_ == a_)))
         ln = e['length'][cutm]
@@ -1830,7 +1876,7 @@ def sections_regions(level, label, side, spec, report):
                          'settings': {k: v for k, v in cfg.items() if k != 'expected'}}
     report['snap'] = {}
     for jn in report['regions']['fell_back']:
-        a_, b_ = JOINTS_ALL[jn]
+        a_, b_ = joint_table[jn]
         out = snap_cut(level, out, spec, a_, b_, report['snap'].setdefault(jn, {}))
     return out
 
@@ -2369,6 +2415,8 @@ def build_sections(level, spec, method='snap', overlap=False):
         final, report['cross_joint'] = reassign_cross_joint(level, final, spec, nm, resolve_joints(level, spec))
     absorb_islands(level, final, mi, f'island < {mi} faces (rigid sections)', absorbed, nm, True)
     limbs = (3, 4, 6, 7) if is_all(names) else (3, 4)
+    if spec.get('knee_cops') and is_all(names):
+        limbs += tuple(KNEE_ID.values())
     minor_components(level, final, limbs, spec['extra_component_share'], absorbed, nm, None, (1, 2), True)
     minor_components(level, final, (0, 5) if is_all(names) else (0,), np.inf, absorbed, nm, None, (1, 2), True)   # one torso/chest/pelvis
     absorb_islands(level, final, mi, f'island < {mi} faces (rigid sections, after detached patches)', absorbed, nm, True)
@@ -2585,9 +2633,9 @@ def pose_transforms(sec, angle, convention, scenario='arms'):
             frac = 1. if base == 'arm' else {'arm': 1., 'torso': 0., 'half': .5}[convention]
             if frac > 0:
                 T[lab] = (_rot('z', np.radians(-sgn * angle * frac)), np.asarray(J[side]['shoulder'], float))
-        elif scenario == 'thigh_flex' and base == 'thigh':
+        elif scenario == 'thigh_flex' and base in ('thigh', 'knee'):          # a knee cop rides the thigh
             T[lab] = (_rot('x', np.radians(-angle)), np.asarray(J[side]['hip'], float))
-        elif scenario == 'thigh_abd' and base == 'thigh':
+        elif scenario == 'thigh_abd' and base in ('thigh', 'knee'):
             T[lab] = (_rot('z', np.radians(sgn * angle)), np.asarray(J[side]['hip'], float))
         elif scenario == 'spine' and base in ('chest', 'arm', 'pauldron'):
             T[lab] = (_rot('x', np.radians(angle)), np.asarray(J['waist'], float))
@@ -2780,6 +2828,8 @@ def explode_shift(name, H, rigid):
         return (sgn * .24 * H, 0.)
     if base == 'thigh':
         return (sgn * .10 * H, -.06 * H)
+    if base == 'knee':
+        return (sgn * .12 * H, -.12 * H)
     if base == 'chest':
         return (0., .04 * H)
     if base == 'pelvis':
@@ -2897,8 +2947,19 @@ def render_pose(sec, path, pw=420):
 
 # ----------------------------------------------------------------------------------------------- blend
 
+def portable_local(path):
+    """A manifest-recorded path from another machine/OS mapped onto this checkout (portable.local_path)."""
+    import portable
+    return portable.local_path(path)
+
+
 def find_blender():
-    return os.environ.get('BLENDER') or shutil.which('blender') or '/usr/local/bin/blender'
+    if os.environ.get('BLENDER'):
+        return os.environ['BLENDER']
+    if os.name == 'nt':
+        import portable
+        return portable.default_blender()
+    return shutil.which('blender') or '/usr/local/bin/blender'
 
 
 def blend_worker(lod_dir, level_name, names):
@@ -2947,7 +3008,7 @@ def build_blend(lod_dir, level_name, names):
         pass
     cmd = [find_blender(), '-b', '--python', str(Path(__file__).resolve()), '--', '--blend-worker', str(lod_dir),
            level_name, ','.join(names)]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    res = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace')
     dest = Path(lod_dir) / f'pieces_{level_name}.blend'
     if res.returncode != 0 or not dest.is_file():
         print('BLEND_FAILED', res.stdout[-600:], res.stderr[-600:], file=sys.stderr)
@@ -3023,6 +3084,8 @@ def split_level(level, spec, lod_dir, render=True, blend=True):
         sym_arm = mirror_stats(level, label, 3, 4, pieces['arm_l'], pieces['arm_r'], plane_x)
         if 'thigh_l' in pieces and 'thigh_r' in pieces:
             sym_arm['thigh'] = mirror_stats(level, label, 6, 7, pieces['thigh_l'], pieces['thigh_r'], plane_x)
+        if 'knee_l' in pieces and 'knee_r' in pieces:
+            sym_arm['knee'] = mirror_stats(level, label, KNEE_ID['knee_l'], KNEE_ID['knee_r'], pieces['knee_l'], pieces['knee_r'], plane_x)
     for key in [names[l] for l in sorted(names) if l > 0 and not names[l].startswith('soft')]:  # soft may have several patches
         if pieces[key]['components'] > 1:
             report['warnings'].append(f'{key} has more than one connected patch (see components)')
@@ -3074,9 +3137,11 @@ def split_level(level, spec, lod_dir, render=True, blend=True):
 def run(reduced, style=None, module=None, levels=None, output_dir=None, overrides=None, plane_x=None, render=True,
         blend=True, config=CONFIG):
     reduced = Path(reduced)
-    manifest = json.loads((reduced / 'manifest.json').read_text()) if (reduced / 'manifest.json').is_file() else {}
+    manifest = json.loads((reduced / 'manifest.json').read_text(encoding='utf-8-sig')) if (reduced / 'manifest.json').is_file() else {}
     module = module or manifest.get('module') or reduced.resolve().parent.name
     spec = load_spec(module, style, config, overrides)
+    if module == 'body_armor' and spec.get('knee_cops') is None and (manifest.get('knee_cops') or {}).get('enabled'):
+        spec['knee_cops'] = True        # the reduction relabelled the knee band as knee_cop parts: cut the knee cops as their own sections
     roles = [g['role'] for g in ((manifest.get('palette') or {}).get('garments') or [])]
     joint_palette = bool(set(roles) & set(JOINT_ROLES))
     adaptive = bool((manifest.get('hue_fit') or {}).get('active'))
@@ -3148,6 +3213,8 @@ def main(argv=None):
     p.add_argument('--pose-test', action='store_true', help='rigid: rotate arms about the shoulder joints, report gaps, render pose_render.png')
     p.add_argument('--joint-l', help='shoulder pivot x,y,z (GLB frame) instead of the base parts file')
     p.add_argument('--joint-r', help='same, anatomical right')
+    p.add_argument('--knee-cops', action='store_true', help='body_armor with knee cops: cut knee_l / knee_r as their own rigid sections (default: on when the manifest says knee_cops)')
+    p.add_argument('--no-knee-cops', action='store_true', help='do not cut knee cops even when the manifest says knee_cops')
     p.add_argument('--no-blend', action='store_true')
     p.add_argument('--no-render', action='store_true')
     a = p.parse_args(argv)
@@ -3157,6 +3224,7 @@ def main(argv=None):
           'close_rings': a.close_rings, 'max_field_share': a.max_field_share, 'rigid_method': a.rigid,
           'overlap': True if a.overlap else None, 'overlap_length': a.overlap_length, 'overlap_offset': a.overlap_offset,
           'snap_band': a.snap_band, 'soft_mode': a.soft, 'joints': a.joints, 'no_overlap': True if a.no_overlap else None, 'cross_joint': False if a.no_cross_joint else None, 'flaps': False if a.keep_flaps else None, 'pose_convention': a.pauldron_convention, 'overlap_mode': a.overlap_mode, 'pose_test': True if a.pose_test else None,
+          'knee_cops': True if a.knee_cops else False if a.no_knee_cops else None,
           'expect': dict(x.split(':') for x in a.expect.split(',')) if a.expect else None,
           'joint_l': [float(x) for x in a.joint_l.split(',')] if a.joint_l else None,
           'joint_r': [float(x) for x in a.joint_r.split(',')] if a.joint_r else None}

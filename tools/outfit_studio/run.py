@@ -3,9 +3,10 @@
 
     python3 tools/outfit_studio/run.py <command> [--base b|all] [--set s|all] [--lod 0p4] [--batch name|dir]
         [--resume] [--all-status] [--project-dir dir] [--items a,b] [--only clip,..] [--limit N]
+        [--approved-only] [--rigid-output] [--mirror-left] [--no-bake] [--allow-no-sections]
 
-Commands: import, validate, export-base, export-anims, export-items, all (= import, validate, export-base,
-export-items, export-anims per base; a base whose validation has errors is not exported).
+Commands: import, validate, export-base, export-heads, export-anims, export-items, all (= import, validate, export-base,
+export-heads, export-items, export-anims per base; a base whose validation has errors is not exported).
 Logs and per-step result JSON go to `<batch>/logs/`. Exit codes: 0 ok, 1 failures (listed), 2 usage."""
 import argparse
 import json
@@ -17,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))        # .../tools,
 
 from outfit_studio import batch, paths  # noqa: E402
 
-STEPS = {'all': ('import', 'validate', 'export-base', 'export-items', 'export-anims')}
+STEPS = {'all': ('import', 'validate', 'export-base', 'export-heads', 'export-items', 'export-anims')}
 
 
 def pipeline_bases(set_id):
@@ -51,6 +52,10 @@ def child_args(step, base, a, batch_dir, result):
         argv += ['--items', a.items]
     if a.reimport:
         argv.append('--reimport')
+    argv += [f for f, on in (('--approved-only', a.approved_only), ('--rigid-output', a.rigid_output), ('--no-bake', a.no_bake), ('--mirror-left', a.mirror_left),
+                             ('--allow-no-sections', a.allow_no_sections)) if on]
+    if step == 'export-heads':
+        argv += ['--shift', a.shift] + (['--no-dragons'] if a.no_dragons else []) + (['--no-sheet'] if a.no_sheet else []) + (['--limit', a.limit] if a.limit else [])
     if step == 'export-anims':
         argv += (['--only', a.only] if a.only else []) + (['--limit', a.limit] if a.limit else [])
     return argv
@@ -74,10 +79,13 @@ def run_step(step, base, a, batch_dir):
 def describe(r):
     bits = [f"{r['step']:13} {r['base']:16} {'ok' if r['ok'] else 'FAILED':6} {r['wall']}s"]
     if r['step'] == 'import':
-        bits.append(f"imported {len(r.get('imported', []))}, skipped {len(r.get('skipped', []))}" + (' (project created)' if r.get('created') else '')
+        bits.append(f"imported {len(r.get('imported', []))}, skipped {len(r.get('skipped', []))}" + (f", suspect {len(r['skipped_suspect'])}" if r.get('skipped_suspect') else '')
+                    + (' (project created)' if r.get('created') else '')
                     + (f" - {r['note']}" if r.get('note') else ''))
     elif r['step'] == 'validate':
         bits.append(f"{r.get('errors', '?')} errors, {r.get('warnings', '?')} warnings")
+    elif r['step'] == 'export-heads':
+        bits.append(r.get('status', '') + (f" {r.get('heads', 0)} heads, shift {r.get('retarget', {}).get('shift_gltf_mm')} mm" if r.get('status') == 'exported' else ''))
     elif r['step'] == 'export-items':
         res = r.get('results', [])
         bits.append(f"{sum(x['status'] == 'exported' for x in res)} exported, {sum(x['status'] == 'skipped' for x in res)} skipped")
@@ -93,15 +101,23 @@ def main(argv=None):
     p.add_argument('command', choices=batch.COMMANDS + ('all',))
     p.add_argument('--base', default='all', help='base name(s, comma separated) or all')
     p.add_argument('--set', default='all')
-    p.add_argument('--lod', default='0p4')
+    p.add_argument('--lod', default='auto', help="0p4 | 0p2 | 0p1 | auto (default: the preview's chosen_lod.json, else 0p4)")
     p.add_argument('--batch', default=None, help='batch name under export/outfit_studio or an absolute folder (default YYYYMMDD-vN)')
     p.add_argument('--resume', action='store_true', help='skip / complete what exists in the batch instead of refusing to overwrite')
     p.add_argument('--all-status', action='store_true', help='export-items: every item, not only approved ones')
     p.add_argument('--reimport', action='store_true')
+    p.add_argument('--approved-only', action='store_true', help='import: only sets approved in the preview Models tab')
+    p.add_argument('--rigid-output', action='store_true', help='import: old segment-first rigid pieces for body armour')
+    p.add_argument('--mirror-left', action='store_true', help='import: mirror the right gauntlet / boot pieces onto the left')
+    p.add_argument('--no-bake', action='store_true', help='import: do not run fit_symmap.py --bake')
+    p.add_argument('--allow-no-sections', action='store_true', help='export-items: allow items without body sections')
     p.add_argument('--project-dir', default=None, help=f'outfit projects folder (default {paths.OUTFIT_PROJECTS})')
     p.add_argument('--items', default='')
     p.add_argument('--only', default='')
     p.add_argument('--limit', type=int, default=None)
+    p.add_argument('--shift', default='auto', choices=('auto', 'fit', 'mesh', 'bone', 'none'), help='export-heads: seat shift mode (see blender/heads.py)')
+    p.add_argument('--no-dragons', action='store_true', help='export-heads (human_male): skip the dragon heads + dragon_seats.json')
+    p.add_argument('--no-sheet', action='store_true', help='export-heads: skip the check sheet renders')
     a = p.parse_args(argv)
     cmds = STEPS.get(a.command, (a.command,))
     bases = select_bases(a.command, a)

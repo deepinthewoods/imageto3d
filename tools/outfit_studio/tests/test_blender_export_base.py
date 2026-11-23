@@ -227,10 +227,10 @@ def test_base():
         names = {n for m in doc['meshes'] for n in m.get('extras', {}).get('targetNames', [])}
         check(set(rec['morphs']) <= names, f'{base}: morphs present as glTF targets')
         check(rec['legless'] == want['legless'], f"{base}: legless {rec['legless']}")
-        check(rec['base_body'] == 'body' and rec['default_head'] == 'head' and {'arm_deg', 'leg_cm'} <= set(rec['spacing']), f'{base}: body/head/spacing fields')
+        check(rec['body_mode'] == 'sections' and rec['default_head'] == 'head' and rec['skin_material'] == 'skin' and {'arm_deg', 'leg_cm'} <= set(rec['spacing']), f'{base}: sections/head/spacing fields')
         check(rec['source']['sha256'] == hashlib.sha256((PROJECTS / (base + '.blend')).read_bytes()).hexdigest() and rec['source']['rig_fingerprint'] == want['fingerprint'], f'{base}: source sha + rig fingerprint')
         meshes = {n['name'] for n in doc['nodes'] if 'mesh' in n}
-        check({'body', 'head'} <= meshes, f'{base}: body + head meshes')
+        check('head' in meshes and meshes - {'head'} == {r['node'] for r in rec['sections']} and all(n.startswith('sec_') for n in meshes - {'head'}), f'{base}: head + sec_* section meshes')
         print(f"       {base}: sha {rec['skeleton_sha256'][:12]} bones {rec['bones']} aps {len(aps)} morphs {len(rec['morphs'])} repaired {rec['weights_repaired']} refit {rec['attachments_refit']}")
     check(hashes.get(('human_male', 'a')) == hashes.get(('human_male', 'b')) is not None, 'human_male skeleton hash identical across two runs')
     check(len({hashes.get(('human_male', 'a')), hashes.get(('dwarf_male', 'a')), hashes.get(('gnome_female', 'a'))}) == 3, 'bases have distinct skeleton hashes')

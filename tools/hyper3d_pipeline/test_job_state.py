@@ -6,7 +6,8 @@ from unittest.mock import patch
 import zipfile
 
 from job_state import Job, BASE, model_id, verify_zip
-from workflow import observe
+from workflow import observe, navigate
+from selenium.common.exceptions import WebDriverException
 
 ID = 'e1690fdd-98aa-4581-a015-2a2a58a787e4'
 
@@ -85,6 +86,32 @@ class RecoveryTests(unittest.TestCase):
         for g,m,p,want in cases:
             with self.subTest(want=want), patch('workflow.scope', side_effect=[Node(g),Node(m),Node(p)]), patch('workflow.visible', return_value=[]), patch('workflow.exact', side_effect=lambda node,label: label if label in node.text.splitlines() else None):
                 self.assertEqual(observe(Driver())['stage'], want)
+
+
+class NavigateTests(unittest.TestCase):
+    class Driver:
+        def __init__(self, errors):
+            self.errors, self.gets = list(errors), 0
+
+        def get(self, url):
+            self.gets += 1
+            if self.errors:
+                raise WebDriverException(self.errors.pop(0))
+
+    def test_a_network_error_page_is_reloaded(self):
+        driver = self.Driver(['Reached error page: about:neterror?e=dnsNotFound'] * 2)
+        with patch('workflow.time.sleep'):
+            navigate(driver, 'https://hyper3d.ai/workspace/rodin')
+        self.assertEqual(driver.gets, 3)
+
+    def test_other_errors_and_a_lasting_outage_still_raise(self):
+        with patch('workflow.time.sleep'):
+            with self.assertRaises(WebDriverException):
+                navigate(self.Driver(['invalid session id']), 'u')
+            driver = self.Driver(['about:neterror?e=dnsNotFound'] * 9)
+            with self.assertRaises(WebDriverException):
+                navigate(driver, 'u', tries=3)
+        self.assertEqual(driver.gets, 3)
 
 
 if __name__ == '__main__':

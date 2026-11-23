@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "_comment": "Settings for formy3d_backend.py. (live) = seen in the signed-in UI / API on 2026-10-23 (read-only probe, probe/20261023T-signed-in/), (code) = read from the site's client bundle, (unverified) = needs a supervised paid run.",
+  "venv_python": "/home/niz/.cache/codex-firefox-playwright/venv/bin/python",
+  "profile_dir": "~/.local/share/formy3d-playwright-firefox",
+  "site": "https://formy3d.com",
+  "generator_url": "https://formy3d.com/tripo?generationMode=image&modelFamily=tripo",
+  "my_models_url": "https://formy3d.com/my-models",
+  "model_family": "tripo",
+  "model_version_label": "H3.1",
+  "model_status": "(live) chip `Tripo3D H3.1` (default) with a select offering `Tripo3D H3.1` and `Tripo3D v2.5`; the backend refuses to run when the chip does not read H3.1",
+  "multi_view": true,
+  "view_order": [
+    "front.png",
+    "front_three_quarter.png",
+    "back_three_quarter.png",
+    "back.png"
+  ],
+  "view_slots": {
+    "front.png": "Front View",
+    "front_three_quarter.png": "Left View",
+    "back_three_quarter.png": "Right View",
+    "back.png": "Back View"
+  },
+  "view_slots_status": "(live) slot labels Front View (required), Back View, Left View, Right View; same Front/Left/Right/Back mapping as studio.mjs",
+  "max_images": 4,
+  "texture": "HD",
+  "geometry_quality": "Detailed",
+  "pbr": false,
+  "quad": false,
+  "settings_status": "(live) Texture No textures/Standard/HD, Geometry Quality Standard/Detailed, PBR switch (default on), Quad Mesh switch (default off, FBX only). No polycount, topology selector, symmetry or remove-lighting control exists: Quad off = triangle mesh, Detailed = highest detail offered",
+  "request_guard": true,
+  "request_guard_status": "(code) the Generate click POSTs /api/demo/gen-3d with pbr / quad / geometry_quality / model; the request is aborted (nothing charged) when those disagree with this config. Field names are from the client bundle and not yet seen on a real request (unverified)",
+  "expected_costs": {
+    "generate": 167
+  },
+  "budget_credits": 200,
+  "cost_table": {
+    "multiview_standard_standard_pbr_any": 67,
+    "multiview_standard_detailed_pbr_any": 134,
+    "multiview_hd_standard_pbr_on": 67,
+    "multiview_hd_standard_pbr_off": 100,
+    "multiview_hd_detailed_pbr_on": 134,
+    "multiview_hd_detailed_pbr_off": 167,
+    "multiview_no_texture_standard_pbr_off": 33,
+    "quad_surcharge": 17,
+    "single_image_default": 100,
+    "download": 0
+  },
+  "cost_table_status": "(live) generate button label 'Generate 3D Model - N' with four views uploaded; download is free (no ledger row); expected_costs.generate must equal the displayed label or --expect-cost N, and budget_credits caps one submit",
+  "free_retries": false,
+  "stage_timeout_s": 1800,
+  "poll_interval_s": 15,
+  "download_timeout_s": 600,
+  "glb_pick": "model"
+}

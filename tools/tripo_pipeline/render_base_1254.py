@@ -30,7 +30,7 @@ scene.render.resolution_percentage=100
 scene.render.image_settings.file_format='PNG'
 scene.render.image_settings.color_mode='RGBA'
 scene.render.film_transparent=True
-frames=json.loads(CAMERAS.read_text())['frames']
+frames=json.loads(CAMERAS.read_text(encoding='utf-8-sig'))['frames']
 assert tuple(f['file_path'] for f in frames)==VIEWS
 began=time.time()
 for frame in frames:

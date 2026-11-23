@@ -7,6 +7,10 @@ and assigns simple colors to whole faces. No fixed polygon targets.
 With a base `parts.npz` (base_parts.py; found next to the resolved regions.json, or --parts) the
 base body parts are fitted to the mesh (trimmed ICP) and transferred onto every level as the FACE
 attribute `body_part`; they also drive the module prior. `--no-parts` turns that off.
+`--wearable-method cut|faces` (default cut): the wearable (garment alone, base removed) is either cut out of the HIGH-POLY mesh along a clean
+iso-line with symmetry-pooled evidence and exact left/right pairs (wearcut.py, wearcut_blender.py; the previous wearable stays as
+`<level>__wearable_faces.glb`) or, with `faces` (and as the automatic fallback, recorded in the manifest `wearable`), made from the faces of the reduced
+level by deleting the base faces and mirroring one-sided wear (face_labels.mirror_wear). The full labelled levels are the same either way.
 Sources whose area is mostly enclosed (an inner shell welded to the outer skin) are stripped of those
 faces before reduction (`--interior auto|strip|flag`); the manifest records the `interior` audit.
 The colour palette (palette.py: base, anchors, K garment colours) comes from `--palette`, else a
@@ -39,6 +43,7 @@ from adaptive_lod04 import compact, measure
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import face_labels  # noqa: E402
+import wearcut_rules  # noqa: E402  (numpy only)
 from palette import Palette  # noqa: E402
 
 CONFIG = Path(__file__).resolve().parent / 'config.json'
@@ -48,7 +53,7 @@ def mirror_groups_for(module, override=None):
     """Which one-sided wear is mirrored onto the bare anchor side in the wearable: `override` (None = config.json
     `mirror_to_anchor_side[module]`; 'off' = none; 'foot,hand' = those groups), checked against MIRROR_GROUPS."""
     if override is None:
-        groups = json.loads(CONFIG.read_text()).get('mirror_to_anchor_side', {}).get(module, []) if module else []
+        groups = json.loads(CONFIG.read_text(encoding='utf-8-sig')).get('mirror_to_anchor_side', {}).get(module, []) if module else []
     elif isinstance(override, str):
         groups = [] if override in ('', 'off', 'none') else [g for g in override.split(',') if g]
     else:
@@ -59,6 +64,7 @@ def mirror_groups_for(module, override=None):
     return groups
 
 LEVELS = [('0p4', .004), ('0p2', .002), ('0p1', .001)]
+WEARABLE_METHODS = ('cut', 'faces')
 # Review when more of the surface than this was decided by prior/neighbours rather than seen texture.
 LOW_EVIDENCE_REVIEW = .2
 
@@ -310,7 +316,18 @@ def canonical_order(v, f):
 
 
 def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, module=None,
-        parts_path=None, use_parts=True, interior_mode='auto', use_off_body=True, palette_path=None, mirror=None, separable=False, adaptive_hue='auto'):
+        parts_path=None, use_parts=True, interior_mode='auto', use_off_body=True, palette_path=None, mirror=None, separable=False, adaptive_hue='auto',
+        omit_views=(), wearable_method='cut', knee_cops=None, feature_labels=None, highpoly_blend=False):
+    omit_views = list(omit_views or ())
+    if feature_labels:
+        import feature_hooks
+        feature_labels = feature_hooks.normalise_spec(feature_labels)        # ValueError for a bad spec, None for 'none'
+        if feature_labels and wearable_method != 'cut':
+            raise ValueError('--feature-labels works on the cut wearable (--wearable-method cut)')
+    if knee_cops in (False, 0, 0.0) or knee_cops == {}:
+        knee_cops = None
+    if wearable_method not in WEARABLE_METHODS:
+        raise ValueError(f'wearable_method must be one of {WEARABLE_METHODS}, not {wearable_method!r}')
     source = Path(source).resolve(); out = Path(out).resolve()
     if not source.is_file() or source.suffix.lower() != '.glb':
         raise ValueError(f'Expected a source GLB: {source}')
@@ -323,11 +340,13 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
         cameras_path, input_notes['cameras'] = None, 'found but no regions.json; visibility weighting off'
     # the same name `swatches` is kept as the "semantic roles available" flag of the code below
     swatches = pal
-    regions = json.loads(Path(regions_path).read_text()) if regions_path else None
+    regions = json.loads(Path(regions_path).read_text(encoding='utf-8-sig')) if regions_path else None
     if cameras_path and regions is None:
         raise ValueError('--cameras needs --regions (base frame for mapping the camera matrices)')
     if module is not None and module not in ('body_armor', 'right_gauntlet_boot', 'outfit'):
         raise ValueError(f'Unknown module: {module}')
+    if knee_cops is not None and module != 'body_armor':
+        raise ValueError(f'knee_cops applies to the body_armor module only (module is {module!r})')
     source_hash = digest(source)
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.import_scene.gltf(filepath=str(source), merge_vertices=False)
@@ -399,9 +418,16 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
     # local_repair walks Python sets of BMesh elements, so its output order changes from run to run
     # and the order-sensitive simplifier then differs; a canonical order makes runs reproducible.
     cleaned_v, cleaned_f = canonical_order(cleaned_v, cleaned_f)
+    # ... and it leaves patches (sometimes a whole shell) with inconsistent / inward winding, again differently from run to run: the
+    # visibility test (unseen faces), meshopt (locks the vertices of an inconsistent edge, so the level stays dense) and the normals
+    # all depend on a consistent outward winding. Orient it once here (deterministic given the canonical order, then canonical again
+    # for the rotation of flipped triangles); wearcut_blender.build_prep finds nothing left to do.
+    cleaned_f, orient = wearcut_rules.orient_consistent(cleaned_v, cleaned_f)
+    cleaned_v, cleaned_f = canonical_order(cleaned_v, cleaned_f)
+    cleanup = dict(cleanup, orient=orient)
     tree = BVHTree.FromPolygons(rv.tolist(), rf.tolist(), all_triangles=True)
     refpoints, _ = lab.sample_surface(rv, rf, 10000, seed=940)
-    base_parts = part_fit = parts_info = None
+    base_parts = part_fit = parts_info = fit_info = None
     if parts_path:
         # bare-mesh clearance per part (base_clearance.py): beside the parts file, else the active base's
         # (job snapshots made before it existed lack the file)
@@ -411,13 +437,15 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
         if not use_off_body:
             clearance_path = None
         input_notes['clearance'] = str(clearance_path) if clearance_path else 'none; no off-body rule'
-        base_parts = face_labels.BaseParts.load(parts_path, clearance_path)
+        base_parts = face_labels.BaseParts.load(parts_path, clearance_path, knee_cops)
         scale_fit, shift_fit, fit_info = face_labels.fit_base(base_parts, rv, rf, tree=tree)
         part_fit = base_parts.moved(scale_fit, shift_fit) if fit_info['used'] == 'icp' else base_parts
         parts_info = {'file': str(Path(parts_path).resolve()), 'sha256': digest(parts_path),
                       'base_scene': str(np.load(parts_path)['source_scene']), 'names': part_fit.names,
                       'fit': fit_info, 'prior': 'parts' if swatches is not None else None,
                       'clearance': str(clearance_path) if clearance_path else None}
+        if base_parts.knee_cops is not None:
+            parts_info['knee_cops'] = base_parts.knee_cops
         print('PARTS_FIT', json.dumps(fit_info), flush=True)
     # One-sided wear (right shoe / gauntlet; the anatomical-left anchors stay bare in the concepts) is mirrored onto
     # the left in the WEARABLE only; the plane is the base's sagittal plane mapped through the ICP fit.
@@ -448,15 +476,24 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
                               'face and crease-aware neighbours (face_labels.py)',
             'module': module, 'input_sources': input_notes,
             'cameras': str(cameras_path) if cameras_path else None,
+            'omit_views': omit_views,
             'regions': str(regions_path) if regions_path else None,
             'parts': parts_info, 'mirror': mirror_info, 'palette': pal.describe(), 'interior': interior, 'source_review_reasons': review_reasons,
+            'wearable': {'requested': wearable_method, 'method': 'faces', 'status': 'done'},
             'levels': {}}
+    if knee_cops is not None:
+        # plate armour with knee cops: a knee cop (its own rigid section) covers the knee; the knee band of the base becomes the body
+        # part knee_cop (face_labels.knee_cop_parts), where garment is allowed; the rest of the shin stays bare
+        info['knee_cops'] = {'enabled': True, 'band_fraction': face_labels.knee_cop_band(knee_cops),
+                             'above_fraction': face_labels.knee_cop_above(knee_cops),
+                             'prior': 'parts' if base_parts is not None else 'landmarks',
+                             **({'sides': base_parts.knee_cops['sides']} if base_parts is not None else {})}
     if swatches is not None:
         # Which parts of the high-poly surface did any concept view actually see?
         hv, hf = cleaned_v, cleaned_f
         hi_normals, _ = face_labels.face_normals(hv, hf)
         hi_tree = BVHTree.FromPolygons(hv.tolist(), hf.tolist(), all_triangles=True)
-        cameras = face_labels.load_cameras(cameras_path, regions) if cameras_path else []
+        cameras = face_labels.load_cameras(cameras_path, regions, omit_views) if cameras_path else []
         hi_cos = face_labels.visibility(hv[hf].mean(1), hi_normals, hi_tree, cameras) if cameras else \
             np.ones(len(hf))
         hi_vis = face_labels.visibility_weight(hi_cos, bool(cameras))
@@ -509,7 +546,7 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
             if part_fit is not None:
                 zones = face_labels.part_zones(
                     part_fit.membership(cent, face_labels.face_normals(v, f)[0]), part_fit.names)
-            prior = face_labels.wear_prior(cent, module, regions, zones)
+            prior = face_labels.wear_prior(cent, module, regions, zones, knee_cops)
             # a face clearly outside the fitted base body cannot be bare base (only where the module
             # lets the garment be; head/hands/feet etc. are exempt through the prior)
             off = face_labels.off_body_excess(v, f, level_parts, part_fit, prior) \
@@ -665,6 +702,18 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
                                  'wearable_is_open_surface': wearable_glb is not None}
         dump(out / 'manifest.json', info)
         print('TRIPO_LOD', label, len(f), 'pass' if valid else 'REVIEW_REQUIRED', flush=True)
+    if wearable_method == 'cut' and swatches is not None:
+        # The wearable of every level is cut out of the high-poly mesh (wearcut_blender.py). It never raises: a failure keeps the faces
+        # wearable made above and records why in info['wearable'] / info['levels'][lv]['wearable'].
+        import wearcut_blender
+        meta = {k: info[k] for k in ('normalization_scale', 'normalization_origin_rotated', 'rotation_to_review')}
+        meta.update(source=str(source), cameras=info['cameras'], regions=info['regions'], omit_views=omit_views, palette=info['palette'])
+        wearcut_blender.cut_wearables(
+            sys.modules[__name__], out, info, module, pal,
+            lambda dest: wearcut_blender.build_prep(dest, surface, cleaned_v, cleaned_f, part_fit, cameras, pal, module, meta),
+            lambda: (v, f), base_parts, fit_info, material_cache=material_cache, feature_labels=feature_labels, live_objects=True)
+    elif swatches is not None:
+        info['wearable'].update(reason='--wearable-method faces' if wearable_method == 'faces' else 'no swatches')
     assert digest(source) == source_hash
     obj.location.x = -2.8
     for area in bpy.context.screen.areas:
@@ -684,11 +733,16 @@ def run(source, out, swatch_path=None, cameras_path=None, regions_path=None, mod
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import make_wearable_blend
     make_wearable_blend.build(out)
-    if swatches is not None:
-        # High-poly evidence file beside the source GLB: detected face materials + original texture.
+    if swatches is not None and highpoly_blend:
+        # High-poly evidence file beside the source GLB: detected face materials + original texture. Off by default since
+        # 2026-10-26 (user: ~150 MB per module filled the disk); build one on demand with make_highpoly_blend.py.
         import make_highpoly_blend
         make_highpoly_blend.build(source, pal, cameras_path=cameras_path, regions_path=regions_path,
-                                  base_parts=base_parts, part_fit=part_fit, module=module)
+                                  base_parts=base_parts, part_fit=part_fit, module=module, omit_views=omit_views, knee_cops=knee_cops)
+    else:
+        # source_import.blend is a second copy of the high-poly source.glb that nothing reads (~40 MB per module, 39 GB
+        # over 924 modules filled the disk; user, 2026-11-14: keep one high-poly model per module). --highpoly-blend keeps it.
+        (out / 'source_import.blend').unlink(missing_ok=True)
     return info
 
 
@@ -701,6 +755,9 @@ if __name__ == '__main__':
     parser.add_argument('output_dir')
     parser.add_argument('swatches', nargs='?')
     parser.add_argument('--cameras', help='transforms.json of the base views the concept used')
+    parser.add_argument('--omit-views', default='', help='three-view module: comma list of concept views that do not exist '
+                        '(e.g. back); those cameras are skipped in the visibility weighting, so surfaces only they would '
+                        'have seen count as unseen. Default none = all four cameras')
     parser.add_argument('--regions', help='regions.json of that base (base_regions.py)')
     parser.add_argument('--palette', help='palette.json (palette.py) or a base folder holding one; default: swatches '
                         'file, else the job snapshot / regions folder palette.json, else legacy tricolor_v1')
@@ -715,7 +772,24 @@ if __name__ == '__main__':
     parser.add_argument('--adaptive-hue', choices=['auto', 'on', 'off'], default='auto',
                         help='fit each palette colour\'s hue centre to the model\'s texture (max 30 deg, ambiguity flagged, '
                              'recorded as hue_fit in the manifest); auto = on for --separable palettes (or any palette with a joint/quinary role)')
+    parser.add_argument('--wearable-method', choices=list(WEARABLE_METHODS), default='cut',
+                        help='cut (default) = the wearable is cut out of the high-poly mesh with clean openings and exact left/right pairs '
+                             '(wearcut.py; falls back to faces per level on any failure, recorded in the manifest); '
+                             'faces = delete the base faces of the reduced level and mirror one-sided wear (the previous behaviour)')
+    parser.add_argument('--feature-labels', metavar='SPEC', help='opt-in label pass on the high-poly labels (feature_hooks.py): studs | rings:secondary | '
+                        'rings:void[:auto|all|<z>]. The cut wearable is built with it and the labelled levels get the corrected roles. Recorded in manifest wearable.feature_labels')
     parser.add_argument('--module', choices=['body_armor', 'right_gauntlet_boot', 'outfit'])
+    parser.add_argument('--knee-cops', action='store_true', help='body_armor with knee cops (plate cuisses that continue over the knee and end '
+                        'just below it): the knee band (config.json knee_cops: band_fraction of the knee-ankle length below the knee ring, above_fraction above it) '
+                        'becomes the body part knee_cop, garment-allowed instead of bare; the rest of the shin stays bare. Recorded as knee_cops in the manifest')
+    parser.add_argument('--knee-cop-band', type=float, help='band fraction override for --knee-cops (default config.json knee_cops.band_fraction)')
+    parser.add_argument('--knee-cop-above', type=float, help='share of the knee-ankle length above the knee ring that counts as knee cop '
+                        '(default config.json knee_cops.above_fraction)')
+    parser.add_argument('--highpoly-blend', action='store_true', help='also write highpoly.blend beside the source GLB (off by default '
+                        'since 2026-10-26: ~150 MB per module; make_highpoly_blend.py builds one on demand)')
     parser.add_argument('--separable', action='store_true', help='append the palette\'s separable garments (role joint, cyan #14DCEB) as a fifth garment colour (joint bands for split_pieces.py --rigid bands)')
     a = parser.parse_args(sys.argv[sys.argv.index('--') + 1:])
-    run(a.source, a.output_dir, a.swatches, a.cameras, a.regions, a.module, a.parts, not a.no_parts, a.interior, not a.no_off_body, a.palette, a.mirror, a.separable, a.adaptive_hue)
+    run(a.source, a.output_dir, a.swatches, a.cameras, a.regions, a.module, a.parts, not a.no_parts, a.interior, not a.no_off_body, a.palette, a.mirror, a.separable, a.adaptive_hue,
+        [v for v in a.omit_views.split(',') if v], a.wearable_method,
+        ({k: v for k, v in (('band_fraction', a.knee_cop_band), ('above_fraction', a.knee_cop_above)) if v is not None} or True)
+        if a.knee_cops else None, a.feature_labels, a.highpoly_blend)

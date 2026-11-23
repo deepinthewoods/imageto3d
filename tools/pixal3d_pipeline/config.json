@@ -1,0 +1,16 @@
+{
+  "note": "Local Pixal3D (pixal3d.cpp trellis-cli, camera-aware multi-view TRELLIS.2) on the RX 9070 through WSL2 + ROCm 7.2. Free, ~4-5 min per module. The CLI is the locally patched build (GPU-resident NAF conditioning, 667 s -> ~250 s); see README.md.",
+  "wsl_distro": "Ubuntu-24.04",
+  "cli": "/home/niall/pixal3d/src/build/trellis-cli",
+  "lib_dir": "/home/niall/pixal3d/src/build",
+  "models": "/home/niall/pixal3d/models/pixal3d-q8_0-v1",
+  "work_dir": "/home/niall/pixal3d/jobs",
+  "env": {"HSA_ENABLE_DXG_DETECTION": "1", "EGL_PLATFORM": "surfaceless"},
+  "args": ["--pixal3d-weights", "mv", "--res", "1024", "--gss", "10.0", "--atlas", "2048", "--webp", "off", "--require-gpu"],
+  "seed": 42,
+  "retries": 2,
+  "timeout_s": 3600,
+  "min_faces": 20000,
+  "rotate_y_deg": 180,
+  "lock_file": ".codex_jobs/_batch/pixal3d_gpu.lock"
+}

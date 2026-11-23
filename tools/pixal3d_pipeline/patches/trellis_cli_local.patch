@@ -1,0 +1,101 @@
+--- a/src/trellis_cli.cpp
++++ b/src/trellis_cli.cpp
+@@ -299,6 +299,33 @@
+                         "single-view weights on 85 subjects).\n", V);
+ }
+ 
++
++// Local patch (2026-11-18): the host conditioning path (pixal3d_cond_slat) reads each view's NAF map back
++// (1-4 GiB, channel-major) and samples it with 4 MB strides on the CPU -- 30-80 s per view under WSL. The
++// device-resident pixal3d_cond_slat_gpu (the WebGPU path) keeps it on the GPU and gathers only the active
++// voxels. PIXAL3D_COND_HOST=1 restores the host path for A/B.
++static std::vector<float> mv_slat_cond(const trellis::Model& dino, const trellis::Model& naf,
++                                       const std::vector<trellis::Pixal3dView>& views,
++                                       const trellis::Pixal3dSlatCondParams& prm,
++                                       const std::vector<std::array<int,3>>& coords, trellis::Pixal3dCond& c) {
++    const char* host = std::getenv("PIXAL3D_COND_HOST");
++    const double t0 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    std::vector<float> proj_sp;
++    if (host && *host && *host != '0') {
++        c = trellis::pixal3d_cond_slat(dino, naf, views, prm);
++        proj_sp = trellis::pixal3d_gather_proj(c.proj, prm.R, c.d_proj, coords);
++    } else {
++        c = trellis::pixal3d_cond_slat_gpu(dino, naf, views, prm, nullptr, &coords);
++        proj_sp.swap(c.proj);
++    }
++    c.proj.clear(); c.proj.shrink_to_fit();
++    const double t1 = std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
++    printf("      [cond] %s S=%d R=%d naf_T=%d tokens=%zu (%.1fs)\n", (host && *host && *host != '0') ? "host" : "gpu",
++           prm.S, prm.R, prm.naf_T, coords.size(), t1 - t0);
++    fflush(stdout);
++    return proj_sp;
++}
++
+ int trellis_run_mv(const trellis::TrellisParams& cfg) {
+     setvbuf(stdout, nullptr, _IONBF, 0);
+     uint32_t run_seed = cfg.seed;
+@@ -374,14 +401,12 @@
+     printf("[3/6] shape SLAT flow (LR 512 -> upsample -> HR %d cascade, max_tok=%d)\n", cfg.hr_res, cfg.max_tokens);
+     vector<float> lr_norm, lr_dn;
+     {
+-        trellis::Pixal3dCond c;
++        trellis::Pixal3dCond c; vector<float> proj_sp;
+         { trellis::Model dino = trellis::Model::load(M + "/dinov3.gguf", gpu);
+           trellis::Model naf  = trellis::Model::load(M + "/pixal3d_naf.gguf", gpu);
+           trellis::Pixal3dSlatCondParams prm{512, 32, 512, mesh_scale};
+-          c = trellis::pixal3d_cond_slat(dino, naf, views512, prm);
++          proj_sp = mv_slat_cond(dino, naf, views512, prm, coords, c);
+           dino.free(); naf.free(); }
+-        vector<float> proj_sp = trellis::pixal3d_gather_proj(c.proj, 32, c.d_proj, coords);
+-        c.proj.clear(); c.proj.shrink_to_fit();
+         vector<float> neg_g(c.global.size(), 0.0f), neg_p(proj_sp.size(), 0.0f);
+         vector<float> nz = noise((size_t)32 * coords.size());
+         lr_norm = mv_shape_flow(W.shape512, cfg, F32, gpu, coords,
+@@ -430,14 +455,12 @@
+ 
+     vector<float> slat_norm;
+     {
+-        trellis::Pixal3dCond c;
++        trellis::Pixal3dCond c; vector<float> proj_sp;
+         { trellis::Model dino = trellis::Model::load(M + "/dinov3.gguf", gpu);
+           trellis::Model naf  = trellis::Model::load(M + "/pixal3d_naf.gguf", gpu);
+           trellis::Pixal3dSlatCondParams prm{1024, grid, 512, mesh_scale};
+-          c = trellis::pixal3d_cond_slat(dino, naf, views1024, prm);
++          proj_sp = mv_slat_cond(dino, naf, views1024, prm, shc, c);
+           dino.free(); naf.free(); }
+-        vector<float> proj_sp = trellis::pixal3d_gather_proj(c.proj, grid, c.d_proj, shc);
+-        c.proj.clear(); c.proj.shrink_to_fit();
+         vector<float> neg_g(c.global.size(), 0.0f), neg_p(proj_sp.size(), 0.0f);
+         vector<float> nz = noise((size_t)32 * shc.size());
+         slat_norm = mv_shape_flow(W.shape1024, cfg, F32, gpu, shc,
+@@ -479,14 +502,12 @@
+         printf("[5/6] texture SLAT flow (HR %d, NAF@1024) + PBR decode\n", RES);
+         vector<float> texlat;
+         {
+-            trellis::Pixal3dCond c;
++            trellis::Pixal3dCond c; vector<float> proj_sp;
+             { trellis::Model dino = trellis::Model::load(M + "/dinov3.gguf", gpu);
+               trellis::Model naf  = trellis::Model::load(M + "/pixal3d_naf.gguf", gpu);
+               trellis::Pixal3dSlatCondParams prm{1024, grid, 1024, mesh_scale};
+-              c = trellis::pixal3d_cond_slat(dino, naf, views1024, prm);
++              proj_sp = mv_slat_cond(dino, naf, views1024, prm, shc, c);
+               dino.free(); naf.free(); }
+-            vector<float> proj_sp = trellis::pixal3d_gather_proj(c.proj, grid, c.d_proj, shc);
+-            c.proj.clear(); c.proj.shrink_to_fit();
+             vector<float> neg_g(c.global.size(), 0.0f), neg_p(proj_sp.size(), 0.0f);
+ 
+             trellis::Model m = trellis::Model::load(W.tex, gpu);
+@@ -569,7 +590,12 @@
+         trellis::fill_small_holes(mesh.faces);
+         trellis::TriBvh bvh = trellis::TriBvh::build(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F());
+         int remesh_band = cfg.band > 0 ? cfg.band : 1;   // MV default: 1 (see dump_post branch above)
+-        trellis::Mesh rm = trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), bvh, so.res, remesh_band);
++        // Local patch (2026-11-18): PIXAL3D_NO_REMESH=1 skips the narrow-band UDF remesh, which wraps every thin sheet
++        // (armour plates, scales) as a closed two-sided skin; the raw dual-grid mesh keeps them single-sided like Tripo's.
++        const char* no_remesh = std::getenv("PIXAL3D_NO_REMESH");
++        const bool skip_remesh = no_remesh && no_remesh[0] == '1';
++        if (skip_remesh) printf("  remesh skipped (PIXAL3D_NO_REMESH=1): raw dual-grid mesh V=%d F=%d\n", mesh.V(), mesh.F());
++        trellis::Mesh rm = skip_remesh ? trellis::Mesh{} : trellis::remesh_narrow_band_dc(mesh.verts.data(), mesh.V(), mesh.faces.data(), mesh.F(), bvh, so.res, remesh_band);
+         if (rm.F() > 0) {
+             trellis::clean_mesh(rm.V(), rm.faces);
+             int ndrop = trellis::drop_small_components(rm.verts, rm.faces, 0.02f);

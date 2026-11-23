@@ -20,3 +20,7 @@ tools/hyper3d_pipeline/runs/
 tools/hyper3d_pipeline/**/downloads/
 tools/hyper3d_pipeline/probe/**/*.png
 tools/hyper3d_pipeline/probe/**/x*/
+# formy3d runner working data (probe screenshots/sample GLBs, per-module downloads)
+tools/formy3d_pipeline/probe/**/*.png
+tools/formy3d_pipeline/probe/**/*.glb
+tools/formy3d_pipeline/**/downloads/

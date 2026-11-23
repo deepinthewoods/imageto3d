@@ -65,7 +65,7 @@ def load_pieces(lod_dir):
 
 def piece_info(lod_dir):
     """(waist pivot in the GLB frame, body height) from the level's pieces.json entry."""
-    d = json.loads((Path(lod_dir).parent / 'pieces.json').read_text())
+    d = json.loads((Path(lod_dir).parent / 'pieces.json').read_text(encoding='utf-8-sig'))
     lv = Path(lod_dir).name[len('lod_'):]
     rg = d['levels'][lv]['rigid']
     return np.asarray(rg['joints']['waist'], float), float(d['levels'][lv]['body_height'])
@@ -186,7 +186,7 @@ def build(out_blend, png, level='0p4'):
         pivot_s, _ = piece_info(shelf_dir)
         pivot_b, _ = piece_info(before_dir)
         pivot_a, _ = piece_info(after_dir)
-        cj = json.loads((after_dir.parent / 'pieces.json').read_text()).get('cross_joint') or {}
+        cj = json.loads((after_dir.parent / 'pieces.json').read_text(encoding='utf-8-sig')).get('cross_joint') or {}
         agg = {}
         for r in cj.get('reassigned', []):
             agg[(r['from'], r['to'])] = agg.get((r['from'], r['to']), 0) + r['faces']

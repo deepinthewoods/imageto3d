@@ -27,7 +27,7 @@ BLOCK_ROWS = list(range(10, 16))
 MATERIALS = [('base', (.9, .1, .1, 1)), ('primary', (.1, .82, .16, 1)), ('secondary', (.12, .25, .92, 1)),
              ('tertiary', (.96, .86, .08, 1)), ('accent', (.88, .1, .86, 1)), ('quinary', (.08, .86, .92, 1)), ('joint', (.08, .86, .92, 1))]
 ROLE = {name: i for i, (name, _) in enumerate(MATERIALS)}
-PART_NAMES = ['spine_01.x', 'shoulder.l', 'shoulder.r', 'arm_stretch.l', 'arm_stretch.r', 'thigh_stretch.l', 'root.x', 'thigh_stretch.r']
+PART_NAMES = ['spine_01.x', 'shoulder.l', 'shoulder.r', 'arm_stretch.l', 'arm_stretch.r', 'thigh_stretch.l', 'root.x', 'thigh_stretch.r', 'knee_cop.l']
 
 
 def cell_parts(i, j):
@@ -93,7 +93,7 @@ def build_cells_b(style='rim', no_hip_band=False, no_right_arm_band=False, no_cy
     return role, truth
 
 
-def build_cells_r(style='rim', no_pelvis_colour=False, arm_role='secondary', deco=True, straddle=False, **_):
+def build_cells_r(style='rim', no_pelvis_colour=False, arm_role='secondary', deco=True, straddle=False, knee=False, **_):
     """Per-piece base colours on the band layout (cell_parts_b): thighs rows 0-1 and chest green, pelvis rows 2-4 and the
     arm cells blue; pauldron blocks as in build_cells_b. deco: a 3x3 yellow patch inside the chest and a 2x2 inside the
     left arm; straddle: a yellow strip across the left arm / chest boundary."""
@@ -115,6 +115,10 @@ def build_cells_r(style='rim', no_pelvis_colour=False, arm_role='secondary', dec
                 role[(i, j)] = 'tertiary'
         for c in ((0, 8), (1, 8), (0, 9), (1, 9)):
             role[c] = 'tertiary'
+    if knee:                                               # knee cops: the lowest thigh row (the left leg only) is blue, the row above stays green
+        for i in range(NU):
+            if bands_left(i):
+                role[(i, 0)] = 'secondary'
     if straddle:                                           # arm cells (5..) are blue; cells (2,6),(2,7) straddle the lower arm edge
         for c in ((2, 6), (2, 7)):
             role[c] = 'tertiary'
@@ -204,6 +208,8 @@ def make_reduced(root, style='rim', parts=True, mismatch=False, wear_only_levels
     bands = bands or regions
     role, truth = (build_cells_r(style, **kw) if regions else build_cells_b(style, **kw) if bands else build_cells(style, **kw))
     parts_of = cell_parts_b if bands else cell_parts
+    if kw.get('knee') == 'parts':                          # the base's knee_cop part under the blue row
+        parts_of = lambda i, j: 'knee_cop.l' if j == 0 and bands_left(i) else cell_parts_b(i, j)
     v = build_vertices()
     cells = [(i, j) for j in range(-NBASE, NV) for i in range(NU)]
     if bands:                                             # only a left leg: no thigh_r faces (hip_r is absent)
@@ -471,6 +477,33 @@ def rigid_run(testcase, method, style='roles', overlap=False, pose=False, render
     ov = {'rigid_method': method, 'overlap': True if overlap else None, 'pose_test': True if pose else None, **JOINTS, **(extra or {})}
     res, out = run(root, reduced, style=style, overrides=ov, render=render)
     return res, out, info, truth
+
+
+class KneeCopZoneTest(unittest.TestCase):
+    """Knee cops: faces the base relabelled thigh_stretch (the knee band of the lower leg, face_labels.knee_cop_parts) are in the thigh
+    zone of the rigid split, so they become part of thigh_l / thigh_r (the cut below them is just the garment boundary)."""
+
+    class Stub:
+        def __init__(self, base):
+            self.base = np.array(base, object)
+            self.n = len(base)
+
+        def part_base(self):
+            return self.base
+
+    def test_thigh_stretch_and_the_unrelabelled_lower_leg_are_one_zone_group(self):
+        cfg = json.loads((Path(__file__).resolve().parent / 'config.json').read_text())
+        spec = {'rigid': cfg['piece_split']['body_armor']['rigid']}
+        stub = self.Stub(['spine_01', 'thigh_stretch', 'thigh_stretch', 'leg_stretch', 'foot', 'root'])
+        self.assertEqual(sp.zone_group(stub, spec).tolist(), ['chest', 'thigh', 'thigh', 'thigh', 'thigh', 'pelvis'])
+
+    def test_knee_cop_part_is_its_own_zone_only_with_the_flag(self):
+        cfg = json.loads((Path(__file__).resolve().parent / 'config.json').read_text())
+        stub = self.Stub(['thigh_stretch', 'knee_cop', 'knee_cop', 'leg_stretch', 'root'])
+        off = sp.zone_group(stub, {'rigid': cfg['piece_split']['body_armor']['rigid']})
+        on = sp.zone_group(stub, {'rigid': cfg['piece_split']['body_armor']['rigid'], 'knee_cops': True})
+        self.assertEqual(off.tolist(), ['thigh', 'chest', 'chest', 'thigh', 'pelvis'])       # untouched flag-off behaviour
+        self.assertEqual(on.tolist(), ['thigh', 'knee', 'knee', 'thigh', 'pelvis'])
 
 
 class RigidSyntheticTest(unittest.TestCase):
@@ -786,6 +819,83 @@ class BandsTest(unittest.TestCase):
         top = np.array([[0., 1., 0.]])
         self.assertGreater(sp.apply_T(top, T3[0])[0][2], .1)                 # chest pitches forward
         self.assertNotIn([l for l, n in sec.names.items() if n == 'pelvis'][0], T3)
+
+
+class KneeCopSectionsTest(unittest.TestCase):
+    """Knee cops: knee_l / knee_r are their own sections under the thighs, cut at the green|blue colour boundary; flag off nothing changes."""
+
+    def run_knee(self, knee='parts', flag=True, **kw):
+        root = _setup(self)
+        reduced, truth, info = make_reduced(root, 'rim', regions=True, knee=knee, **kw)
+        res, out = run(root, reduced, style=None, overrides={'rigid_method': 'regions', 'overlap': True, 'knee_cops': True if flag else None, **JOINTS})
+        return res, out, info
+
+    def test_the_knee_cop_is_its_own_section_cut_at_the_colour_boundary(self):
+        res, out, info = self.run_knee()
+        lv = res['levels']['0p4']
+        cells, _ = piece_cells3(out, info)
+        g = lv['rigid']['regions']
+        self.assertEqual(cells['knee_l'], {(i, 0) for i in range(NU) if bands_left(i)})
+        self.assertEqual(cells['thigh_l'], {(i, 1) for i in range(NU) if bands_left(i)})
+        self.assertEqual(cells['pelvis'], {(i, j) for j in (2, 3, 4) for i in range(NU)})      # the blue pelvis never takes the blue cop
+        self.assertNotIn('knee_r', cells)                                                      # no right leg in the synthetic
+        self.assertEqual(g['joints']['knee_l']['status'], 'region')
+        self.assertEqual(g['joints']['knee_l']['colour_boundary_share'], 1.0)
+        self.assertEqual(g['joints']['knee_r']['status'], 'absent')
+        self.assertEqual(g['fell_back'], [])
+        self.assertEqual(g['expected']['knee'], 'secondary')
+        self.assertEqual(sum(p['faces'] for p in lv['pieces'].values()), lv['wearable_faces'])
+        self.assertEqual(lv['pieces']['knee_l']['components'], 1)
+        self.assertTrue(any(sorted(c['pair']) == ['knee_l', 'thigh_l'] for c in lv['rigid']['cuts']))
+        self.assertTrue(all(arm in cells for arm in ('arm_l', 'arm_r')))
+        arm_l = {(i, j) for j in (7, 8, 9) for i in range(NU) if cell_parts_b(i, j) == 'arm_stretch.l'}
+        self.assertEqual(cells['arm_l'], arm_l)                                                # the blue arms are not touched either
+
+    def test_knee_colour_on_the_thigh_zone_is_still_the_cop(self):
+        res, out, info = self.run_knee(knee='thigh_zone')                                       # cop faces transferred to thigh_stretch.l
+        cells, _ = piece_cells3(out, info)
+        rec = [r for r in res['levels']['0p4']['rigid']['regions']['regions'] if r['assigned'] == ['knee_l']]
+        self.assertEqual(len(rec), 1)
+        self.assertEqual(rec[0]['how'], 'whole (knee colour on the thigh zone)')
+        self.assertEqual(cells['knee_l'], {(i, 0) for i in range(NU) if bands_left(i)})
+        self.assertEqual(cells['thigh_l'], {(i, 1) for i in range(NU) if bands_left(i)})
+
+    def test_the_cop_follows_the_thigh_in_the_leg_pose_scenarios(self):
+        root = _setup(self)
+        reduced, truth, info = make_reduced(root, 'rim', regions=True, knee='parts')
+        level = sp.load_level(reduced, '0p4', json.loads((reduced / 'manifest.json').read_text()), None)
+        spec = sp.load_spec('body_armor', None, overrides={'rigid_method': 'regions', 'knee_cops': True, **JOINTS})
+        sec = sp.build_sections(level, spec, 'regions', False)
+        ids = {n: l for l, n in sec.names.items()}
+        for scenario in ('thigh_flex', 'thigh_abd'):
+            T = sp.pose_transforms(sec, 30, 'half', scenario)
+            self.assertIn(ids['knee_l'], T)
+            self.assertTrue(np.allclose(T[ids['knee_l']][0], T[ids['thigh_l']][0]))            # same rotation about the same hip
+            self.assertTrue(np.allclose(T[ids['knee_l']][1], T[ids['thigh_l']][1]))
+        self.assertNotIn(ids['knee_l'], sp.pose_transforms(sec, 30, 'half', 'arms'))
+        self.assertEqual(sp.piece_body('knee_l', 'half', True), 'K_l')                         # its own rigid body: separable and animatable
+        self.assertEqual(sp.piece_depth('knee_l', 'half', True), 2)
+
+    def test_flag_off_the_sections_are_unchanged(self):
+        res, out, info = self.run_knee(knee=False, flag=False)
+        cells, _ = piece_cells3(out, info)
+        g = res['levels']['0p4']['rigid']['regions']
+        self.assertFalse(any(k.startswith('knee') for k in cells))
+        self.assertNotIn('knee', g['expected'])
+        self.assertFalse(any(k.startswith('knee') for k in g['joints']))
+        res2, out2, info2 = self.run_knee(knee=False, flag=True)                                # flag on without knee parts: the cop piece is empty and dropped
+        self.assertFalse(any(k.startswith('knee') for k in piece_cells3(out2, info2)[0]))
+
+    def test_manifest_knee_cops_turns_the_sections_on(self):
+        root = _setup(self)
+        reduced, truth, info = make_reduced(root, 'rim', regions=True, knee='parts')
+        m = json.loads((reduced / 'manifest.json').read_text())
+        m['knee_cops'] = {'enabled': True, 'band_fraction': .33}
+        (reduced / 'manifest.json').write_text(json.dumps(m))
+        res, out = run(root, reduced, style=None, overrides={'rigid_method': 'regions', **JOINTS})
+        self.assertIn('knee_l', piece_cells3(out, info)[0])
+        res2, out2 = run(_setup(self), reduced, style=None, overrides={'rigid_method': 'regions', 'knee_cops': False, **JOINTS})
+        self.assertNotIn('knee_l', piece_cells3(out2, info)[0])
 
 
 class RegionsTest(unittest.TestCase):

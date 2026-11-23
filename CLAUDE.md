@@ -14,10 +14,10 @@ concept or view task.
 | --- | --- |
 | Front concepts of a batch, one `concepts/<set_id>/<race_gender>/` folder per concept with `<module>_front.png` + `<module>_prompts.json` (no rejected attempts kept) | Codex job |
 | `workflow.py promote concepts/<batch_id> <NN> [--set ..] [--approve]` (only for the two existing flat legacy batches) | Claude |
-| Remaining three views in `processing_views/<set>--<job-id>/...` | Codex job |
+| All four views in `processing_views/<set>--<job-id>/...` — the front is regenerated from the base too; the approved concept art is reference only (user rule 2026-10-28) | Codex job |
 | Regenerating a rejected view | Codex job |
 | `workflow.py status/check/claim/ready`, folder moves | Claude |
-| Visual review of every generated image (dimensions, alpha, side, boundaries, colors) | Claude, then Codex for retries |
+| Visual review of generated views (dimensions, alpha, side, boundaries, colors). Concept art is one-shot and NOT reviewed or checked (user rule 2026-10-28) | Codex job (view self-checks only; no concept review) |
 | `convert_job.py` (Tripo submit/collect + `reduce_model.py`, then for `piece_colours` body armour the segment-first rigid-piece split with `split_pieces.py --rigid auto` as automatic fallback), material review, `completed/` | Claude |
 
 Wherever `AGENTS.md`/`PROMPTING_GUIDE.md` say "use the imagegen skill / built-in
@@ -61,7 +61,8 @@ Each prompt must be self-contained and state:
 - Scope limits: no `workflow.py` state changes, no folder moves between pipeline
   stages, no Tripo calls, no git commits, no edits outside the named output paths.
 - To end with a short report: files written, dimensions, any rejected attempts and
-  known issues. For concepts also the per-concept `check_framing.py` result.
+  known issues. Concepts are one-shot (user rule 2026-10-28): no `check_framing.py` /
+  `check_concept_colours.py` on concept art; the report says the checks were skipped.
 
 Independent modules (e.g. `body_armor` and `right_gauntlet_boot`, or separate sets)
 can run as parallel jobs. Keep the three remaining views of one module in one job,
@@ -72,7 +73,7 @@ since `back_three_quarter` depends on `back`.
 1. Check `exit_code` and `result.md`; if the log tail shows a usage/rate limit,
    tell the user rather than retrying in a loop. A killed job can be continued with
    `codex exec resume <session id from log.txt> "continue ..."`.
-2. Run `python3 tools/check_framing.py <base.png> <images...>` first; any `FRAMING`/`POSE` flag means regenerate (see `PROMPTING_GUIDE.md`). Then inspect every image yourself (Read the PNGs; verify size/mode with
+2. For views (never concept art, which is one-shot and unchecked): run `python3 tools/check_framing.py <base.png> <images...>` first; any `FRAMING`/`POSE` flag means regenerate (see `PROMPTING_GUIDE.md`). Then inspect every image yourself (Read the PNGs; verify size/mode with
    `python3 -c "from PIL import Image; ..."` or `identify`) against the review list
    in `AGENTS.md`. Run `workflow.py check` where it applies.
 3. For a failed view, launch a new Codex job naming the specific failure and
@@ -81,4 +82,4 @@ since `back_three_quarter` depends on `back`.
 4. Only then run `workflow.py ready` and continue with the Tripo/reduction steps,
    which Claude runs directly.
 
-The user approves or rejects concepts in the local preview site (`python3 tools/preview/serve.py --open`), which moves sets into `approved/` or restorable `trash/concepts/`. Never approve a set on the user's behalf; process `approved/` only when the user asks.
+The user approves or rejects concepts in the local preview site (`python3 tools/preview/serve.py --open`). Approval has two stages (user rule 2026-10-28): the first moves a set into `provisional/`, approving it again from the Provisional tab moves it into `approved/`; rejection moves it to restorable `trash/concepts/`. Never approve a set on the user's behalf. Promotion into `approved/` is itself the processing request: the supervisor claims and processes `approved/` automatically (see `AGENTS.md`).

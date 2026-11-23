@@ -64,9 +64,15 @@ def main(argv):
     ap.add_argument('out')
     ap.add_argument('--palette')
     ap.add_argument('--cameras')
+    ap.add_argument('--omit-views', default='', help='three-view module: comma list of concept views whose camera is skipped')
     ap.add_argument('--regions')
     ap.add_argument('--module')
+    ap.add_argument('--knee-cops', action='store_true', help='body_armor with knee cops: the knee band becomes knee_cop parts (like reduce_model.py --knee-cops)')
+    ap.add_argument('--knee-cop-band', type=float, help='band fraction override (default config.json knee_cops.band_fraction)')
+    ap.add_argument('--knee-cop-above', type=float, help='above-the-knee share override (default config.json knee_cops.above_fraction)')
     a = ap.parse_args(argv)
+    knee_cops = ({k: v for k, v in (('band_fraction', a.knee_cop_band), ('above_fraction', a.knee_cop_above)) if v is not None} or True) \
+        if a.knee_cops else None
     t0 = time.monotonic()
     timing = {}
     source, out = Path(a.source).resolve(), Path(a.out).resolve()
@@ -75,7 +81,7 @@ def main(argv):
         source, None, a.cameras, a.regions, a.module, None, True, a.palette, False)
     if cameras_path and not regions_path:
         cameras_path = None
-    regions = json.loads(Path(regions_path).read_text()) if regions_path else None
+    regions = json.loads(Path(regions_path).read_text(encoding='utf-8-sig')) if regions_path else None
     bpy.ops.wm.read_factory_settings(use_empty=True)
     bpy.ops.import_scene.gltf(filepath=str(source), merge_vertices=False)
     obj = [o for o in bpy.context.scene.objects if o.type == 'MESH'][0]
@@ -113,6 +119,11 @@ def main(argv):
     rv, rf = lab.arrays(obj)
     cleaned_v, cleaned_f, cleanup = adaptive.local_repair(rv, rf)
     cleaned_v, cleaned_f = rm.canonical_order(cleaned_v, cleaned_f)
+    # same orientation step as reduce_model.run: local_repair leaves flipped patches / a whole inside-out shell, which makes the
+    # concept-camera visibility below treat those faces as unseen
+    cleaned_f, orient = rm.wearcut_rules.orient_consistent(cleaned_v, cleaned_f)
+    cleaned_v, cleaned_f = rm.canonical_order(cleaned_v, cleaned_f)
+    cleanup = dict(cleanup, orient=orient)
     timing['front_matter_s'] = time.monotonic() - t0
     print('PREP front matter', len(cleaned_f), 'faces', f'{timing["front_matter_s"]:.0f}s', flush=True)
 
@@ -120,7 +131,9 @@ def main(argv):
     t1 = time.monotonic()
     tree = BVHTree.FromPolygons(rv.tolist(), rf.tolist(), all_triangles=True)
     clearance_path = None
-    base_parts = face_labels.BaseParts.load(parts_path, clearance_path)
+    if knee_cops is not None and (a.module or module) != 'body_armor':
+        raise SystemExit('--knee-cops applies to the body_armor module only')
+    base_parts = face_labels.BaseParts.load(parts_path, clearance_path, knee_cops)
     scale_fit, shift_fit, fit_info = face_labels.fit_base(base_parts, rv, rf, tree=tree)
     part_fit = base_parts.moved(scale_fit, shift_fit) if fit_info['used'] == 'icp' else base_parts
     part = face_labels.transfer_parts(cleaned_v, cleaned_f, part_fit)
@@ -130,7 +143,7 @@ def main(argv):
     # visibility of the high-poly faces from the concept cameras
     t1 = time.monotonic()
     hi_normals, hi_area = face_labels.face_normals(cleaned_v, cleaned_f)
-    cams = face_labels.load_cameras(cameras_path, regions) if cameras_path else []
+    cams = face_labels.load_cameras(cameras_path, regions, [v for v in a.omit_views.split(',') if v]) if cameras_path else []
     cent = cleaned_v[cleaned_f].mean(1)
     if cams:
         hi_tree = BVHTree.FromPolygons(cleaned_v.tolist(), cleaned_f.tolist(), all_triangles=True)
@@ -161,9 +174,10 @@ def main(argv):
                         source_tri=ids.astype(np.int32))
     meta = {'source': str(source), 'module': module, 'normalization_scale': float(scale),
             'normalization_origin_rotated': origin.tolist(), 'rotation_to_review': rotation.tolist(),
-            'cameras': str(cameras_path) if cameras_path else None, 'regions': str(regions_path) if regions_path else None,
+            'cameras': str(cameras_path) if cameras_path else None, 'omit_views': [v for v in a.omit_views.split(',') if v], 'regions': str(regions_path) if regions_path else None,
             'palette_source': str(a.palette) if a.palette else notes.get('palette'), 'palette': pal.describe(),
-            'parts': {'file': str(Path(parts_path).resolve()), 'fit': fit_info, 'names': part_fit.names},
+            'parts': {'file': str(Path(parts_path).resolve()), 'fit': fit_info, 'names': part_fit.names,
+                      **({'knee_cops': base_parts.knee_cops} if base_parts.knee_cops is not None else {})},
             'cleanup': cleanup, 'interior': interior, 'input_sources': notes, 'timing': timing,
             'faces': int(len(cleaned_f)), 'source_triangles': int(len(sf)),
             'unseen_area_share': float(hi_area[hi_cos <= 0].sum() / hi_area.sum()) if cams else None,

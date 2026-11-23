@@ -54,9 +54,13 @@ def classify_samples(colors, palette):
 
 # ---------------------------------------------------------------- cameras and visibility
 
-def load_cameras(transforms_path, regions):
-    """Concept cameras mapped into the normalized frame (base bbox centre XY, feet Z=0, height 2)."""
-    t = json.loads(Path(transforms_path).read_text())
+def load_cameras(transforms_path, regions, omit=()):
+    """Concept cameras mapped into the normalized frame (base bbox centre XY, feet Z=0, height 2).
+
+    `omit`: view names (`back`, `front_three_quarter`, ...) of a three-view module whose image does not exist; those
+    cameras are left out, so surfaces only they would have seen count as unseen."""
+    omit = {str(o)[:-4] if str(o).endswith('.png') else str(o) for o in omit or ()}
+    t = json.loads(Path(transforms_path).read_text(encoding='utf-8-sig'))
     low = np.array(regions['base_scene_bbox']['min'])
     high = np.array(regions['base_scene_bbox']['max'])
     origin = (low + high) / 2
@@ -64,6 +68,8 @@ def load_cameras(transforms_path, regions):
     scale = 2 / (high[2] - low[2])
     cams = []
     for frame in t['frames']:
+        if frame['name'] in omit:
+            continue
         m = np.array(frame['transform_matrix'])
         cams.append({'name': frame['name'], 'position': (m[:3, 3] - origin) * scale,
                      'rotation': m[:3, :3], 'tan_half': math.tan(t['camera_angle_x'] / 2)})
@@ -201,14 +207,104 @@ def _sample_surface(v, f, count, seed):
     return np.einsum('ij,ijk->ik', w, v[f[ids]]), ids, normals[ids]
 
 
+# Knee cops (plate body armour whose thigh section continues over the knee; user request 2026-10-25, the cop is its OWN rigid section):
+# with `knee_cops` on, the knee band of the BASE gets its own body parts `knee_cop.l/.r` before anything uses it: the top of each lower-leg
+# part (`leg_stretch.*`, from the knee ring down `band_fraction` of the knee->ankle distance) and the bottom of the thigh part
+# (`thigh_stretch.*`, `above_fraction` of that distance above the knee ring). The garment may be there (the module prior and the
+# wearable cut only keep leg_stretch / foot / forearm / hand / head bare, `knee_cop` is none of them), and split_pieces / segment-first
+# use the part as the zone of the knee_l / knee_r sections. The rest of the shin stays leg_stretch (bare).
+KNEE_COP_BAND = .33        # default: share of the knee->ankle distance below the knee ring (config.json knee_cops.band_fraction)
+KNEE_COP_ABOVE = .15       # default: share of that distance above the knee ring (config.json knee_cops.above_fraction)
+KNEE_COP_PARTS = ('knee_cop.l', 'knee_cop.r')
+CONFIG = Path(__file__).resolve().parent / 'config.json'
+
+
+def _knee_cfg(key, default):
+    try:
+        return float((json.loads(CONFIG.read_text(encoding='utf-8-sig')).get('knee_cops') or {}).get(key, default))
+    except (OSError, ValueError):
+        return default
+
+
+def knee_cop_band(fraction=None):
+    """The knee band below the knee ring as a share of the knee->ankle length: `fraction` if given (a number), else config.json
+    knee_cops.band_fraction, else KNEE_COP_BAND. A dict (manifest knee_cops record or CLI options) gives its `band_fraction`."""
+    if isinstance(fraction, dict):
+        fraction = fraction.get('band_fraction')
+    if fraction is not None and fraction is not True:
+        return float(fraction)
+    return _knee_cfg('band_fraction', KNEE_COP_BAND)
+
+
+def knee_cop_above(fraction=None):
+    """The share of the knee->ankle length above the knee ring that counts as knee cop (config.json knee_cops.above_fraction); a dict gives its `above_fraction`."""
+    if isinstance(fraction, dict):
+        fraction = fraction.get('above_fraction')
+    if fraction is not None and fraction is not True:
+        return float(fraction)
+    return _knee_cfg('above_fraction', KNEE_COP_ABOVE)
+
+
+def knee_cop_parts(v, f, part, names, fraction=None, above=None):
+    """Relabel the knee band of each leg of a base as the parts `knee_cop.l` / `knee_cop.r` (appended to `names`).
+
+    Per side the knee point is the mean of the vertices the thigh_stretch and leg_stretch triangles share (the knee ring), the ankle
+    point the mean of those shared with the foot. A triangle whose centroid projects onto the knee->ankle axis within the first `fraction`
+    (config.json knee_cops.band_fraction, default KNEE_COP_BAND) of it, if it is a leg_stretch triangle, or within `above` (default
+    KNEE_COP_ABOVE) of it above the knee, if it is a thigh_stretch triangle, becomes the side's knee_cop. The axis is the part's own
+    (a splayed A-pose leg is measured along its own direction). A side without both rings (a legless base: gnome_female's leg part is a
+    0.02-tall hem) is left unchanged and reported. Returns (new part array, new names, info)."""
+    if isinstance(fraction, dict) and above is None:     # a manifest `knee_cops` record: replay exactly the band the reduction used
+        above = fraction
+    fraction, above = knee_cop_band(fraction), knee_cop_above(above)
+    part = np.asarray(part).copy()
+    f = np.asarray(f)
+    names = list(names)
+    info = {'band_fraction': fraction, 'above_fraction': above, 'sides': {}}
+    for side in ('l', 'r'):
+        leg_name, thigh_name, foot_name = f'leg_stretch.{side}', f'thigh_stretch.{side}', f'foot.{side}'
+        if not all(n in names for n in (leg_name, thigh_name, foot_name)):
+            info['sides'][side] = {'status': 'unchanged', 'reason': 'part missing'}
+            continue
+        leg, thigh, foot = names.index(leg_name), names.index(thigh_name), names.index(foot_name)
+        verts = lambda i: set(f[part == i].ravel().tolist())
+        v_leg = verts(leg)
+        knee_ring, ankle_ring = sorted(v_leg & verts(thigh)), sorted(v_leg & verts(foot))
+        if not knee_ring or not ankle_ring:
+            info['sides'][side] = {'status': 'unchanged', 'reason': 'no knee ring' if not knee_ring else 'no ankle ring'}
+            continue
+        knee, ankle = v[knee_ring].mean(0), v[ankle_ring].mean(0)
+        axis = ankle - knee
+        length2 = float(axis @ axis)
+        if length2 < 1e-8:
+            info['sides'][side] = {'status': 'unchanged', 'reason': 'degenerate knee-ankle axis'}
+            continue
+        cop_name = f'knee_cop.{side}'
+        if cop_name not in names:
+            names.append(cop_name)
+        cop = names.index(cop_name)
+        t_of = lambda ids: ((v[f[ids]].mean(1) - knee) @ axis) / length2    # 0 at the knee ring, 1 at the ankle ring, < 0 above the knee
+        leg_faces, thigh_faces = np.flatnonzero(part == leg), np.flatnonzero(part == thigh)
+        below = leg_faces[t_of(leg_faces) < fraction]
+        over = thigh_faces[t_of(thigh_faces) > -above]
+        part[below] = cop
+        part[over] = cop
+        info['sides'][side] = {'status': 'applied', 'faces_moved': int(len(below) + len(over)), 'faces_below_knee': int(len(below)),
+                               'faces_above_knee': int(len(over)), 'leg_faces': int(len(leg_faces)),
+                               'knee': [round(float(x), 4) for x in knee], 'ankle': [round(float(x), 4) for x in ankle],
+                               'length': round(float(np.sqrt(length2)), 4)}
+    return part, names, info
+
+
 class BaseParts:
     """Per-triangle body parts of a marker base (base_parts.py npz): nearest-surface lookup and
     soft membership. `names[part]` are Armourforge bone names (head.x, hand.l, forearm_stretch.r...).
     """
 
-    def __init__(self, v, f, part, names, path=None, sha256=None, samples=None, clearance=None):
+    def __init__(self, v, f, part, names, path=None, sha256=None, samples=None, clearance=None, knee_cops=None):
         self.v, self.f, self.part, self.names = v, f, part, list(names)
         self.path, self.sha256, self._tree = path, sha256, None
+        self.knee_cops = knee_cops   # knee_cop_parts info when the knee band was relabelled thigh, else None
         self.clearance = clearance   # base_clearance.py record: p99.9 outside distance per part
         if samples is None:
             pts, ids, normals = _sample_surface(v, f, BASE_SAMPLES, 7)
@@ -216,13 +312,18 @@ class BaseParts:
         self.samples = samples     # points, part, normal
 
     @classmethod
-    def load(cls, path, clearance_path=None):
-        """`clearance_path` defaults to clearance.json beside the parts file (absent = no off-body rule)."""
+    def load(cls, path, clearance_path=None, knee_cops=None):
+        """`clearance_path` defaults to clearance.json beside the parts file (absent = no off-body rule). `knee_cops`: None/False =
+        the file's parts as they are; True or a band fraction = the knee band of each leg becomes the part knee_cop.l/.r (knee_cop_parts; True, a band fraction or a manifest `knee_cops` dict)."""
         z = np.load(path, allow_pickle=False)
         beside = Path(clearance_path) if clearance_path else Path(path).with_name('clearance.json')
-        return cls(z['v'].astype(float), z['f'].astype(np.int64), z['part'].astype(np.int64),
-                   [str(n) for n in z['part_names']], str(path), str(z['source_sha256']),
-                   clearance=json.loads(beside.read_text()) if beside.is_file() else None)
+        v, f, part = z['v'].astype(float), z['f'].astype(np.int64), z['part'].astype(np.int64)
+        names = [str(n) for n in z['part_names']]
+        cops = None
+        if knee_cops is not None and knee_cops is not False:
+            part, names, cops = knee_cop_parts(v, f, part, names, knee_cops)
+        return cls(v, f, part, names, str(path), str(z['source_sha256']),
+                   clearance=json.loads(beside.read_text(encoding='utf-8-sig')) if beside.is_file() else None, knee_cops=cops)
 
     @property
     def tree(self):
@@ -235,7 +336,7 @@ class BaseParts:
         """The base after `x -> scale * x + translation` (fit_base result)."""
         pts, part, normals = self.samples
         return BaseParts(self.v * scale + translation, self.f, self.part, self.names, self.path,
-                         self.sha256, (pts * scale + translation, part, normals), self.clearance)
+                         self.sha256, (pts * scale + translation, part, normals), self.clearance, self.knee_cops)
 
     def nearest_part(self, points, normals=None):
         """Part of the nearest base surface point. With face `normals`, a base triangle whose normal
@@ -507,17 +608,19 @@ def _sig(x, width=.05):
     return 1 / (1 + np.exp(-np.clip(x / width, -60, 60)))
 
 
-def landmark_zones(points, regions):
-    """Body zones (0..1 per point) from T-pose landmarks; wrong for A-posed or legless bases."""
+def landmark_zones(points, regions, knee_cops=None):
+    """Body zones (0..1 per point) from T-pose landmarks; wrong for A-posed or legless bases. `knee_cops` (a band fraction or True):
+    the lower leg starts that share of the knee->ankle height below the knee."""
     L = regions['landmarks']
+    knee_low = L['knee_z'] if knee_cops in (None, False) else L['knee_z'] - knee_cop_band(knee_cops) * (L['knee_z'] - L['ankle_z'])
     x, z = points[:, 0], points[:, 2]
     arm = _sig(np.abs(x) - L['shoulder_x']) * _sig(z - (L['arm_band_z'][0] - .15))
     right = _sig(-x, .03)   # anatomical right is -X
     return {'forearm': arm * _sig(np.abs(x) - L['elbow_x']),
             'hand': arm * _sig(np.abs(x) - L['wrist_x']),
             'head': _sig(z - L['neck_z']) * (1 - arm),
-            'lower_leg': _sig(L['knee_z'] - z) * (1 - arm),
-            'thigh': _sig(z - L['knee_z']) * _sig(L['crotch_z'] + .1 - z) * (1 - arm),
+            'lower_leg': _sig(knee_low - z) * (1 - arm),
+            'thigh': _sig(z - knee_low) * _sig(L['crotch_z'] + .1 - z) * (1 - arm),
             'right': right,
             'left_foot': (1 - right) * _sig(L['ankle_z'] + .06 - z)}
 
@@ -536,16 +639,17 @@ def part_zones(member, names):
             'left_foot': total('foot.l')}
 
 
-def wear_prior(points, module, regions, zones=None):
+def wear_prior(points, module, regions, zones=None, knee_cops=None):
     """Probability that a surface point belongs to the garment/armour, from body zones.
 
     0.5 is neutral (evidence decides). Low values only where the module definition (AGENTS.md)
     says the base must be bare; generous elsewhere so visible armour can extend past the nominal
-    boundary (e.g. a tall boot). `zones` (part_zones) wins over the landmark fallback `regions`.
+    boundary (e.g. a tall boot). `zones` (part_zones) wins over the landmark fallback `regions`. `knee_cops` only matters for the
+    landmark fallback (with parts the knee band is already thigh_stretch, see BaseParts.load).
     """
     if module is None or (zones is None and regions is None):
         return np.full(len(points), .5)
-    z = zones if zones is not None else landmark_zones(points, regions)
+    z = zones if zones is not None else landmark_zones(points, regions, knee_cops)
     if module == 'body_armor':
         bare = np.maximum.reduce([z['forearm'], z['lower_leg'], z['head']])
         return .5 - .45 * bare

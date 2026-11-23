@@ -3,7 +3,6 @@
 No API keys. Uses the dedicated signed-in native Firefox profile.
 """
 import argparse
-import fcntl
 import json
 import os
 from pathlib import Path
@@ -12,14 +11,15 @@ import time
 import zipfile
 
 from selenium import webdriver
-from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import TimeoutException, WebDriverException
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
 
 from job_state import Job, BASE, model_id, verify_zip, atomic_json, now
-from native_browser import PROFILE, BINARY, GECKODRIVER, check_profile
+from native_browser import PROFILE, BINARY, check_profile, firefox_service, firefox_extra_args
+from platform_compat import lock_nonblocking
 
 ROOT = Path(__file__).resolve().parent
 GEOMETRY = '[class*="rodin-card-geometry-"][class*="-layout"]'
@@ -27,12 +27,23 @@ MATERIAL = '.rodin-card-material-layout'
 PACK = '.rodin-pack-panel'
 
 
-def navigate(driver, url):
-    try:
-        driver.get(url)
-    except TimeoutException:
-        # Late third-party resources can keep load pending after the app is usable.
-        driver.execute_script('window.stop()')
+NETERROR_TRIES, NETERROR_WAIT_S = 6, 30   # 2026-10-27: the VPN resolver loses hyper3d.ai for a minute at a time
+
+
+def navigate(driver, url, tries=NETERROR_TRIES, wait=NETERROR_WAIT_S):
+    for attempt in range(1, tries + 1):
+        try:
+            driver.get(url)
+        except TimeoutException:
+            # Late third-party resources can keep load pending after the app is usable.
+            driver.execute_script('window.stop()')
+        except WebDriverException as exc:  # Firefox's error page (dnsNotFound, netTimeout, ...): wait and reload
+            if 'about:neterror' not in str(exc) or attempt == tries:
+                raise
+            print(f'network error loading {url} ({attempt}/{tries}); retrying in {wait} s', flush=True)
+            time.sleep(wait)
+            continue
+        break
     time.sleep(3)
 
 
@@ -89,7 +100,7 @@ def wait_for(driver, job, stages, timeout=1800):
             print(json.dumps(state), flush=True)
             previous = state
         if state['stage'] == 'signed_out':
-            raise RuntimeError('Sign in using native.sh login, then resume this job')
+            raise RuntimeError('Sign in using native.sh login (Windows: native.cmd login), then resume this job')
         if state['stage'] in stages:
             job.observed(state['stage'])
             screenshot(driver, job, state['stage'])
@@ -285,7 +296,7 @@ def main():
         atomic_json(job.path.with_name('review.json'), {'model_id':job.data['model_id'], 'accepted':True, 'note':args.note, 'at':now()})
         return
     with job.path.with_name('job.lock').open('w') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_nonblocking(lock)
         if args.command == 'bind':
             job.bind(args.url)
             return
@@ -301,11 +312,13 @@ def main():
         options.binary_location = BINARY
         options.add_argument('-profile')
         options.add_argument(str(PROFILE))
+        for extra in firefox_extra_args():
+            options.add_argument(extra)
         options.set_preference('browser.download.folderList', 2)
         options.set_preference('browser.download.dir', str(Path.home()/'Downloads'))
         options.set_preference('browser.download.useDownloadDir', True)
         options.set_preference('browser.helperApps.neverAsk.saveToDisk', 'application/zip,application/octet-stream,application/x-zip-compressed')
-        driver = webdriver.Firefox(service=Service(GECKODRIVER), options=options)
+        driver = webdriver.Firefox(service=firefox_service(), options=options)
         driver.set_window_size(1500, 1000)
         driver.set_page_load_timeout(45)
         try:

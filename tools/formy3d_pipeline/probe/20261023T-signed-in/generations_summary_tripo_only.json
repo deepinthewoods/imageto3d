@@ -1,0 +1,26 @@
+[
+ {
+  "model": "tripo3d/h3.1/image-to-3d",
+  "status": "completed",
+  "credits": 67,
+  "created": "2026-06-16T20:07:24.629Z",
+  "completed": "2026-06-16T20:11:05.146Z",
+  "urls": [
+   "WBl1DOQneR2X77WtrSTT__model.glb",
+   "shlN_S-uh-I7TYKwmQI3V_preview.png"
+  ],
+  "manifest": "[]"
+ },
+ {
+  "model": "tripo3d/h3.1/image-to-3d",
+  "status": "completed",
+  "credits": 100,
+  "created": "2026-06-16T18:08:32.649Z",
+  "completed": "2026-06-16T18:10:33.535Z",
+  "urls": [
+   "NGbd1LtQTQiRaqUAxL8Le_model.glb",
+   "xOgqZqs2ajEHBTljkm048_preview.png"
+  ],
+  "manifest": "[]"
+ }
+]

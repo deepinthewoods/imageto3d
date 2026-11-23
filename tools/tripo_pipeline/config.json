@@ -243,6 +243,11 @@
           "min_enclosure": 0.6,
           "fill_enclosed": true
         },
+        "knee": {
+          "note": "Knee cops (spec knee_cops: `knee_cops` in the body_armor prompts json, manifest knee_cops.enabled, split_pieces --knee-cops): the cop is its own rigid section knee_l / knee_r under thigh_l / thigh_r, cut from the thigh at the thigh|cop colour boundary like the other joints (JOINTS_KNEE, snap fallback). `expected` = its main colour (secondary = blue, over its whole field and edge); `parts` = the base parts that are its zone guess (face_labels.knee_cop_parts: the knee band below the knee ring plus the bottom of the thigh part). A region of this colour on the thigh zone is the cop, one of the thigh colour on the cop zone is the thigh; the pelvis and arm zones never touch it.",
+          "expected": "secondary",
+          "parts": ["knee_cop"]
+        },
         "part_groups": {
           "arm": [
             "arm_stretch",
@@ -288,11 +293,20 @@
       }
     }
   },
+  "align": {
+    "enabled": true,
+    "note": "convert_job.py align step (2026-10-26): after the reduction and split it runs align_body.py then body_fit.py --source aligned on the module (about 2 min); set enabled to false to skip it for new conversions (--no-align skips it per run). Never fails the conversion."
+  },
   "segment_first": {
     "default_method": "segment-first",
     "venv_python": "/media/niz/Samsung SSD/godot/blender/characters/.venv/bin/python",
     "levels": "0p4,0p2,0p1",
     "note": "convert_job.py split step for piece_colours body_armor jobs (2026-10-22): default_method segment-first (segment_first_prep.py in Blender, then segment_first.py with venv_python, which needs numpy + scipy + Pillow; $SEGMENT_FIRST_PYTHON overrides, else <imageto3d>/../.venv/bin/python is tried) or per-face (split_pieces.py --rigid auto) or none. A failed segment-first falls back to per-face. --split-method overrides per run."
+  },
+  "knee_cops": {
+    "band_fraction": 0.33,
+    "above_fraction": 0.15,
+    "note": "Plate body armour with knee cops (user request 2026-10-25; `\"knee_cops\": true` in the body_armor prompts json, or convert_job.py/reduce_model.py --knee-cops): a green thigh (cuisse) ends just above the knee, a blue knee cop (its own rigid section knee_l / knee_r, see piece_split.body_armor.rigid.knee) covers the knee and ends just below it, the rest of the shin is bare. The base's knee band becomes the body part knee_cop.l/.r (face_labels.knee_cop_parts): band_fraction = the top of each lower-leg part (leg_stretch.l/.r) from the knee ring down, as a share of the knee-ankle distance measured along that leg's own axis (knee ring shared with thigh_stretch to ankle ring shared with foot; face_labels.knee_cop_parts). above_fraction = the bottom of the thigh part (thigh_stretch.l/.r), the same share of the knee-ankle distance above the knee ring (the cop starts just above the knee, so the zone guess of the cop reaches 5 cm up a 1.75 m body). 0.33 is the upper end of a real cop plus its lower lames (about 10-13 cm on a 1.75 m body, the base's knee joint being the middle of the kneecap); it only makes garment ALLOWED there (neutral prior, no bare cost), the texture still decides what is armour, so a bigger band is safe where a smaller one would cut a real cop, while a much bigger one would let ambiguous or unseen shin faces default to armour. knee_cop is none of the bare parts (forearm, hand, lower leg, foot, head), so the prior, the wearable cut and the off-body rule treat it as garment-allowed, segment-first does not mark it bare, and the rigid split uses it as the zone of knee_l / knee_r."
   },
   "separable_garments": [
     {
@@ -300,5 +314,21 @@
       "hex": "#14DCEB"
     }
   ],
-  "separable_garments_note": "Optional 5th garment colour (role 'joint', cyan #14DCEB) reserved for joint bands; appended to the palette only with reduce_model.py --separable (or convert_job.py --separable / a separable job). Fallback for palettes (old job snapshots) without their own separable_garments block."
+  "separable_garments_note": "Optional 5th garment colour (role 'joint', cyan #14DCEB) reserved for joint bands; appended to the palette only with reduce_model.py --separable (or convert_job.py --separable / a separable job). Fallback for palettes (old job snapshots) without their own separable_garments block.",
+  "feature_labels": {
+    "sets": {
+      "breastplate_07_hand_me_down_cuirass": "studs",
+      "splint_14_garrison_issue": "studs",
+      "studded_leather_09_guardsman_studded_cuirass": "studs",
+      "chain_mail_05_stable_mail_tunic": "rings:secondary",
+      "chain_shirt_02_second_hand_ringshirt": "rings:void:auto"
+    },
+    "modules": ["body_armor", "right_gauntlet_boot"],
+    "note": "Opt-in label passes over the high-poly garment labels (feature_hooks.py, 2026-10-25), chosen per set id: 'studs' keeps round studs/rivets in the tertiary colour (feature_labels.py), 'rings:secondary' paints chain-mail ring tubes primary and their centres secondary from the geometric relief (ring_labels.py), 'rings:void:auto' removes the centres above the waist so the wearable gets real gaps. convert_job.py / relabel_module.py read the set's entry (a job record's own feature_labels and --feature-labels override it) and pass --feature-labels to reduce_model.py (cut wearable + labelled levels) and segment_first.py (rigid pieces); rewear.py / apply_feature_labels.py apply it to modules that were already converted. Only the listed modules take it. Remove a set's line to switch the pass off for new conversions."
+  },
+  "offload": {
+    "enabled": true,
+    "dest": "D:/godot_characters_3d/imageto3d/models",
+    "note": "user 2026-11-18: when a set is complete (finish_sets moved it to completed/) the conversion worker moves its high-poly GLBs and heavy working files here (tools/tripo_pipeline/offload_models.py); a missing drive only skips the move"
+  }
 }

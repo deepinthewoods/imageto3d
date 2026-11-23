@@ -1,6 +1,5 @@
 """Cooperative ten-tab scheduler; preview decisions supplied by supervising reviewer."""
 import argparse
-import fcntl
 import json
 from pathlib import Path
 import shutil
@@ -9,6 +8,7 @@ import zipfile
 
 import workflow as w
 from job_state import Job, verify_zip
+from platform_compat import lock_nonblocking
 
 
 class Batch:
@@ -38,7 +38,7 @@ class Batch:
                 self.finished.append(job)
                 continue
             lock = job.path.with_name('job.lock').open('w')
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_nonblocking(lock)
             self.locks[str(job.path)] = lock
             if self.active or len(self.driver.window_handles) != 1:
                 self.driver.switch_to.new_window('tab')

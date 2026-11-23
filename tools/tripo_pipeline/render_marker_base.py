@@ -39,7 +39,7 @@ def main(source, dest, cameras=ROOT / 'base_views/human_male/transforms.json'):
     scene.render.image_settings.file_format = 'PNG'
     scene.render.image_settings.color_mode = 'RGBA'
     scene.render.film_transparent = True
-    frames = json.loads(cameras.read_text())['frames']
+    frames = json.loads(cameras.read_text(encoding='utf-8-sig'))['frames']
     assert tuple(f['file_path'] for f in frames) == VIEWS
     began = time.time()
     for frame in frames:

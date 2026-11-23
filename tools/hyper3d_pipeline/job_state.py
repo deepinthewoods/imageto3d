@@ -9,6 +9,8 @@ from urllib.parse import urlparse
 import uuid
 import zipfile
 
+from platform_compat import fsync_dir
+
 BASE = 'https://hyper3d.ai/workspace/rodin'
 MINE = BASE + '/tab/mine'
 
@@ -48,11 +50,7 @@ def atomic_json(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temp, path)
-    fd = os.open(path.parent, os.O_DIRECTORY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    fsync_dir(path.parent)
 
 
 class Job:

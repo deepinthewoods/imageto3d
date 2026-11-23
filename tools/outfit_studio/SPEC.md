@@ -57,7 +57,7 @@ BASES = the 11 names in `projects/manifest.json`.
     (outfit|body_armor|gauntlets|boots), label, status
     (imported|edited|needs_review|approved|exported), notes, channels[{id, label,
     role, material}], source{job_id, module, race, lod, manifest, wearable_glb,
-    wearable_sha256, pieces_source}, import{hashes{piece: hash}, rig_fingerprint,
+    wearable_sha256, wearable_fitted, pieces_source, pieces_fitted}, import{hashes{piece: hash}, rig_fingerprint,
     base_fingerprint, date}, stats{tris}`.
   - one mesh object per piece, `OS_<item_id>__<piece>`, parented to the override rig
     with an Armature modifier. The face attribute `os_channel` (INT) is an index into
@@ -80,7 +80,13 @@ with `module` in `body_armor`, `right_gauntlet_boot` and `outfit`. It skips
 (set, race, module), the newest manifest wins, and the import dialog lists the others.
 
 ### Transform (verified 2026-10-23: plate armour lands at a median of about 2 cm, p90 under 5 cm, off the body)
-1. Import `reduced/lod_error_<lv>__wearable.glb`. Its Blender coordinates are `P`.
+1. Import `reduced/lod_error_<lv>__wearable.glb`, or its body-fitted twin `lod_error_<lv>__wearable_fitted.glb`
+   (made by `tools/tripo_pipeline/body_fit.py`: same native space and face order, only vertex positions differ)
+   when that file exists and its mtime is not older than the unfitted wearable's. `pipeline_source.wearable_path(entry, lod, fitted=True)`
+   makes the choice (`fitted=False` or `pipeline_source.USE_FITTED = False` opts out); the item's `source` records
+   `wearable_glb` (the path used) and `wearable_fitted`. The same rule applies to rigid pieces: a sibling folder
+   `lod_<lv>_fitted/` replaces `lod_<lv>/` when every piece has a fitted twin at least as new (`source.pieces_fitted`).
+   Its Blender coordinates are `P`.
 2. `rev = s_n * (P @ inv(R) - o_n)`, where `s_n = normalization_scale`,
    `R = rotation_to_review` and `o_n = normalization_origin_rotated`.
 3. `bp = (rev - fit.translation) / fit.scale`, using `manifest.parts.fit`.
@@ -501,3 +507,58 @@ Shared APIs:
     - `mix_outfit`, `mix_body_armor`, `mix_gauntlets`, `mix_boots` (item ids)
     - `thickness`
     - `pose_action`
+
+## 11. Item export, material schema 2 (2026-11-20; supersedes the channel based parts of sections 3 and 7)
+
+The image to 3D outfits are the only outfits of the game. Decisions of the user: colour roles are the pipeline's palette roles,
+the body is hidden by **body sections** (not per-polygon coverage), and the input mesh is the fit lab's choice.
+
+### Input mesh (`core/pipeline_source.py` `source_choice` / `resolve_source`)
+In this order (the first that applies; all share the topology, face order and native frame of
+`reduced/lod_error_<lv>__wearable_aligned.glb`, so `transform.native_to_world` and the per-face `colors.npz` data apply unchanged):
+1. `<module>/fit_choice.json` (written by the preview viewer, level 0p4 only): `fit_symmap.py <module> --bake` (run with the
+   numpy + scipy interpreter, `tools_python()`) makes `reduced/lod_error_0p4__wearable_fitlab.glb`; it is reused while newer than
+   the choice, the aligned wearable, the combo it blends and, for a symmetry choice, `symmap.json`. `--no-bake` refuses a stale bake.
+2. the lab default `fitlab/lod_0p4/sections_fill__off__none.glb` when fresh (index input stamp = the aligned wearable, not older
+   than the aligned wearable or the body sections record).
+3. `lod_error_<lv>__wearable_aligned_fitted.glb` (any LOD), then `..._aligned.glb`, then the old unaligned / body fitted wearable.
+`--lod auto` (the CLI default) takes `<module>/chosen_lod.json`, else 0p4; other levels never use the lab. A module the lab flagged
+`suspect: true` (fitlab `index.json`) is skipped with a warning (`skipped_suspect` in the import result). `--approved-only` imports only
+sets with `models/<set>/model_approval.json` `{"approved": true}`. The choice is recorded in the item (`source.input`) and in `item.json`.
+
+Body armour is split by body part (the zone fallback) on that single mesh (`--rigid-output` selects the old segment-first rigid pieces,
+which are not fit-lab aligned). Gauntlets and boots take **both sides of the wearable as they are** (the lab fitted each side); a right
+piece without a left twin is mirrored, `--mirror-left` always mirrors (old behaviour). Asymmetry is then a validation warning.
+
+### Body sections
+`experiments/body_mask_20261104/out/<set>__<job>__<race>__<module>/{body_sections.json, connectors.glb}` (the old job-less folder is read
+when its record is this job's). Per section of the exported base (`bases/<base>/base.json` `sections[].node` = `sec_<bone>_<i>`) the item
+lists a state `show`, `hide` or `connector`. The states come from the record (with a symmetry choice: `symmap.json`
+`sections.<sym>.<scope>`); gauntlets only affect arm / forearm / hand sections, boots thigh / leg / foot sections (the rest is `show`).
+Sections that the base export does not have (the head, which is its own mesh) are dropped; an item that hides one of them is refused.
+`connectors.glb` meshes (rest pose, tuck applied, game world = Blender world) are exported **in the item GLB** as skinned nodes
+`conn_<bone>_<i>` with material `skin`: weights are transferred from the base body deform groups (top 4, no smoothing),
+the `bulk_*` / `head_*` morphs are transferred like for the pieces. Mirrored connectors (symmetry choice) are reflected about the
+symmap plane. An item without a sections record is not exported (`--allow-no-sections`).
+
+### Roles
+Garment faces carry `primary`, `secondary`, `tertiary`, `accent` or `joint` (the base body is not part of a wearable). The export has
+**one material per role, named exactly the role**, and a per-vertex role index `COLOR_0.r = role_index / 8` (g = b = 0, a = 1;
+`role_index` = position in `primary, secondary, tertiary, accent, joint`; decode `round(r * 8)`). Authoring channels stay in the
+Blender project (a channel's role alias decides the role of its faces) but are not exported. `skin` is the material of connectors
+(no `COLOR_0`). The per-face body part is not exported.
+
+### Files
+```
+items/<item_id>/item.json     {version 2, material_schema 2, id, label, type, roles[], role_encoding{}, skin_material "skin",
+                               races[], sections{<base>: {sec_node: show|hide|connector}}, connectors{<base>: [conn nodes]},
+                               input{<base>: {kind, choice, lod, file, sha256, job_id, module, sections_record, model_approved}}}
+items/<item_id>/<base>.glb    pieces `piece_<name>` (rigid: weight 1 on the table bone; outfit: transferred weights), connectors
+                              `conn_<bone>_<i>`; one skin (all joints of the base), `bulk_*` / `head_*` morph targets at weight 0
+items/<item_id>/<base>.json   {version 2, nodes{node: {kind piece|connector, piece, section?, primitives[materials], rigid_bone,
+                              rigid_bones}}, pieces[], connectors[], roles[], sections{}, morphs[], tris, weights{max_influences,
+                              max_sum_error}, skeleton_sha256, export_key, input{}, warnings[]}
+catalog.json                  {version 2, format outfit_studio_v2, material_schema 2, bases{base: skeleton_sha256}, items[]}
+```
+Piece nodes are renamed `piece_<piece>` in the export session (ARP refuses object names over 56 characters). Batch:
+`run.py import|validate|export-items [--approved-only] [--rigid-output] [--mirror-left] [--no-bake] [--allow-no-sections] [--lod auto]`.

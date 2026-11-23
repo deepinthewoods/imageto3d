@@ -46,6 +46,7 @@ HUE_FIT_MAX_SHIFT = 30.   # degrees a colour's fitted hue may differ from the pa
 HUE_FIT_DEAD = 8.         # shifts below this are ignored: a calibrated model is classified by the nominal palette
 HUE_FIT_MARGIN = 6.       # a peak must be this much closer to a colour than to any other palette hue
 HUE_FIT_MIN_SHARE = .003  # a peak needs this share of the total sample weight (within +-8 degrees)
+HUE_FIT_SWAP_RATIO = 10.  # a colour gives up its (closest) peak only for a stranded one this many times bigger
 
 SCHEME_LEGACY = 'tricolor_v1'
 SCHEME_WHITE = 'white_anchor_v2'
@@ -88,7 +89,7 @@ class Palette:
         self.separable = False
         sep = data.get('separable_garments')
         if sep is None:
-            sep = json.loads(CONFIG.read_text()).get('separable_garments') if separable else None
+            sep = json.loads(CONFIG.read_text(encoding='utf-8-sig')).get('separable_garments') if separable else None
         for g in sep or []:
             swatch_rgb(g['hex'])
         if separable:
@@ -142,7 +143,7 @@ class Palette:
     @classmethod
     def load(cls, path, separable=False):
         path = Path(path)
-        return cls(json.loads(path.read_text()), path, separable)
+        return cls(json.loads(path.read_text(encoding='utf-8-sig')), path, separable)
 
     @classmethod
     def for_dir(cls, base_dir, separable=False):
@@ -174,7 +175,9 @@ class Palette:
         samples, smoothed, with one peak per palette colour. A colour takes the strongest peak within +-`max_shift` of its
         nominal hue when that peak is clearly closer to it than to any other palette hue (by `margin` degrees), no two
         colours share a peak, and shifts under `dead` degrees are ignored (so a well-calibrated model is classified exactly
-        as by the nominal palette). Returns (shifts {name: degrees}, report dict with per-colour peaks and review flags)."""
+        as by the nominal palette). Peaks are paired with colours closest first; a colour then gives up its peak for a
+        bigger one in its window that would otherwise be left outside every colour's classification tolerance (2026-11-21,
+        below). Returns (shifts {name: degrees}, report dict with per-colour peaks and review flags)."""
         colors = np.asarray(colors, float)
         h, sat, val = hsv(colors)
         w = ramp(sat, *SAT_RAMP) * ramp(val, *VAL_RAMP)
@@ -197,6 +200,26 @@ class Palette:
             if ci not in taken and i not in claimed:
                 taken[ci] = (i, d_)
                 claimed.add(i)
+        # Closest first can hand a colour a sliver and strand its real peak (2026-11-21, monster Goblin Shaman codex4: the green
+        # came back at 102 deg, 23 from the palette's 125, as a third of the texture; a 0.4 % sliver at 138 was 13 away and was
+        # taken as "the green", so every green face fell outside the +-20 deg tolerance and was labelled by its neighbours).
+        # So: an unclaimed peak that no colour's centre would classify goes to the nearest colour in whose window it lies and
+        # whose own peak is at least HUE_FIT_SWAP_RATIO times smaller (the two real cases were 80x and 90x). Peaks that a fitted
+        # centre already covers (a shading lobe beside a big colour), and in-between lobes only a few times bigger than a small
+        # colour's true peak (blends along a boundary), are left alone.
+        swapped = {}
+        for i in sorted((p for p in strong if p not in claimed), key=lambda p: (-mass[p], p)):
+            centre = [hn if ci not in taken or taken[ci][1] < dead else taken[ci][0] for ci, hn in enumerate(nominal)]
+            if min(dist(i, c) for c in centre) <= HUE_TOLERANCE:
+                continue
+            holders = sorted((dist(i, hn), ci) for ci, hn in enumerate(nominal)
+                             if ci in taken and dist(i, hn) <= max_shift and mass[taken[ci][0]] * HUE_FIT_SWAP_RATIO <= mass[i])
+            if holders:
+                d_, ci = holders[0]
+                swapped[ci] = {'gave_up_peak': float(taken[ci][0]), 'gave_up_share': mass[taken[ci][0]] / total}
+                claimed.discard(taken[ci][0])
+                taken[ci] = (i, d_)
+                claimed.add(i)
         shifts = {}
         for ci, (n, hn) in enumerate(zip(names, nominal)):
             rec = {'nominal': float(hn), 'shift': 0., 'applied': False}
@@ -206,6 +229,8 @@ class Palette:
                 continue
             pk, d_self = taken[ci]
             rec.update(peak=float(pk), peak_share=mass[pk] / total, distance=float(d_self))
+            if ci in swapped:
+                rec.update(swapped[ci], swap_note='took the bigger peak in its window: the closer one left it unclassified')
             # a colour without a peak of its own that sits (nearly) as close to this peak makes the assignment ambiguous
             rivals = [no for cj, (no, ho) in enumerate(zip(names, nominal))
                       if cj != ci and cj not in taken and dist(pk, ho) < d_self + margin]
@@ -233,7 +258,7 @@ class Palette:
 
     @classmethod
     def legacy_default(cls, note='legacy default (config.json marker_palette_srgb)', separable=False):
-        colours = json.loads(CONFIG.read_text())['marker_palette_srgb']
+        colours = json.loads(CONFIG.read_text(encoding='utf-8-sig'))['marker_palette_srgb']
         return cls.from_swatches({
             'base': colours['body_red'],
             'base_markers': {'head': colours['head_yellow'], 'left_hand': colours['left_hand_magenta'],
@@ -265,7 +290,7 @@ class Palette:
             return value.with_separable() if separable else value
         if isinstance(value, (str, Path)):
             value = Path(value)
-            return cls.for_dir(value, separable) if value.is_dir() else cls.coerce(json.loads(value.read_text()), value, separable)
+            return cls.for_dir(value, separable) if value.is_dir() else cls.coerce(json.loads(value.read_text(encoding='utf-8-sig')), value, separable)
         if 'scheme' in value or 'garments' in value:
             return cls(value, source, separable)
         return cls.from_swatches(value, source, separable)

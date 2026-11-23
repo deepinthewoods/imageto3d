@@ -1,3 +1,4 @@
 playwright==1.63.0
 selenium==4.50.0
 pillow==12.3.0
+psutil==7.2.2; sys_platform == "win32"

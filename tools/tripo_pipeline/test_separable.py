@@ -105,6 +105,34 @@ class HueFitTest(unittest.TestCase):
         self.assertNotIn('joint', shifts)
         self.assertNotIn('secondary', shifts)
 
+    def test_a_sliver_nearer_the_palette_hue_does_not_strand_the_real_colour(self):
+        # 2026-11-21 (monster Goblin Shaman): green drifted to 102 (23 deg off), a 0.4 % sliver sits at 138 (13 deg off)
+        sample = self.colours(self.rng, [(357, 3000), (102, 2000), (138, 30), (229, 1000), (51, 800), (303, 700)])
+        shifts, report = self.pal.fit_hues(sample)
+        self.assertEqual(list(shifts), ['primary'])
+        self.assertTrue(-25 < shifts['primary'] < -20)
+        self.assertIn('gave_up_peak', report['colours']['primary'])
+        green = self.colours(self.rng, [(102, 5)])
+        self.assertNotEqual(int(self.pal.classify(green)[0][0]), 1)           # nominal: outside the 20 deg window
+        self.assertTrue((self.pal.with_hue_shifts(shifts).classify(green)[0] == 1).all())
+
+    def test_a_shading_lobe_beside_a_big_colour_does_not_take_a_small_colours_peak(self):
+        # red fitted at 8; its lobe at 25 is bigger than the yellow at 48 and inside yellow's window, but red already covers it
+        sample = self.colours(self.rng, [(8, 3000), (25, 300), (123, 2000), (229, 1000), (48, 60), (303, 700)])
+        shifts, report = self.pal.fit_hues(sample)
+        self.assertEqual(list(shifts), ['body'])
+        self.assertTrue(9 < shifts['body'] < 13)
+        self.assertNotIn('gave_up_peak', report['colours']['tertiary'])
+        self.assertTrue(abs(report['colours']['tertiary']['peak'] - 48) <= 2)
+
+    def test_a_boundary_blend_a_few_times_bigger_does_not_take_a_small_colours_peak(self):
+        # green drifted to 105; the yellow-green blend at 78 is 5x the true yellow at 55 and nothing classifies it: still no swap
+        sample = self.colours(self.rng, [(357, 3000), (105, 2000), (78, 300), (229, 1000), (55, 60), (303, 700)])
+        shifts, report = self.pal.fit_hues(sample)
+        self.assertEqual(list(shifts), ['primary'])
+        self.assertNotIn('gave_up_peak', report['colours']['tertiary'])
+        self.assertTrue(abs(report['colours']['tertiary']['peak'] - 55) <= 2)
+
     def test_two_colours_never_share_one_cluster(self):
         # one cluster at 150 deg is within 30 deg of green (125) only; a cluster at 205 is equally near blue/cyan
         sample = self.colours(self.rng, [(357, 3000), (150, 2000), (51, 800)])

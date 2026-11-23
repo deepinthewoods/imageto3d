@@ -205,9 +205,10 @@ def default_label(set_id, item_type):
     return f"{set_id.replace('_', ' ')} {item_type.replace('_', ' ')}"
 
 
-def load_world(entry, lod, manifest, fit, rest):
-    """Wearable of one module as welded world-space arrays plus per-face role / body part / label source."""
-    path = ps.wearable_path(entry, lod)
+def load_world(entry, lod, manifest, fit, rest, path=None):
+    """Wearable of one module as welded world-space arrays plus per-face role / body part / label source.
+    `path`: the GLB to read (ps.resolve_source: fit lab choice / aligned wearable; all share the aligned face order)."""
+    path = path or ps.wearable_path(entry, lod)
     glb = ps.read_glb(path)
     P, F = ps.weld(glb['v'], glb['f'])
     W = tf.native_to_world(P, manifest, fit, rest['H'], rest['o'])
@@ -237,8 +238,35 @@ def load_pieces_output(entry, lod, manifest, fit, rest):
     return given, str(next(iter(glbs.values())).parent)
 
 
-def import_module(context, entry, lod='0p4', only=None, rig=None, base=None):
+def item_sections(entry, lod, src, item_type):
+    """Section record of one item (see ps.item_sections): {'states', 'connectors', 'record', 'connectors_glb', ...} or
+    {'states': None, 'warnings': [reason]} when the module has no usable body sections record."""
+    aligned = Path(entry['reduced']) / f'lod_error_{lod}__wearable_aligned.glb'
+    rec, warnings = ps.sections_record(entry, aligned if aligned.is_file() else None)
+    if rec is None:
+        return {'states': None, 'connectors': {}, 'warnings': warnings}
+    choice = src.get('choice') or {}
+    sym, scope = choice.get('sym', 'off'), choice.get('scope', 'none')
+    symmap = ps.read_json(Path(entry['dir']) / ps.FITLAB_DIR / 'symmap.json') if sym != 'off' else None
+    if sym != 'off' and not symmap:
+        warnings.append(f'the fit choice uses symmetry {sym}/{scope} but there is no symmap.json: unmirrored section states used')
+        sym = 'off'
+    states, conns = ps.item_sections(rec, item_type, symmap, sym, scope)
+    return {'states': states, 'connectors': conns, 'record': rec['json'], 'connectors_glb': rec['connectors_glb'],
+            'connectors_sha256': hashing.file_sha256(rec['connectors_glb']) if rec['connectors_glb'] else None,
+            'record_sha256': hashing.file_sha256(rec['json']), 'layout': rec['layout'], 'sym': [sym, scope],
+            'plane_x': ((symmap or {}).get('plane') or {}).get('x0_m'), 'warnings': warnings}
+
+
+def import_module(context, entry, lod='0p4', only=None, rig=None, base=None, rigid_output=False, bake=True, allow_suspect=False,
+                  mirror_left=False):
     """Import one pipeline module on the base of the open project. -> list of report dicts, one per item.
+
+    The mesh is the fit lab's choice for the module (ps.resolve_source); `lod='auto'` takes the preview's chosen LOD.
+    Body armour is split into pieces by body part (the zone fallback) on that mesh; `rigid_output=True` uses the old
+    segment-first / split_pieces rigid output instead (it is not fit-lab aligned). A module the fit lab flagged suspect
+    raises ps.SuspectModule unless `allow_suspect`. Gauntlets / boots take both sides of the wearable as they are (the fit lab
+    fitted each side); `mirror_left=True` re-mirrors the right pieces onto the left instead.
 
     New items are created; unedited ones are replaced in place (label, notes, status and channel settings kept);
     edited ones receive the new import in a hidden `__reimport` collection and go to `needs_review`."""
@@ -248,18 +276,21 @@ def import_module(context, entry, lod='0p4', only=None, rig=None, base=None):
     race = base_name(context)
     if entry['race'] != race:
         raise ValueError(f"{entry['module']} was converted for {entry['race']}, this project is {race}")
-    if lod not in entry['levels']:
-        raise ValueError(f"LOD {lod} is not available for {entry['set_id']}/{entry['race']}/{entry['module']} ({entry['levels']})")
+    lod = ps.resolve_lod(entry, lod)
+    reasons = ps.suspect_reasons(entry)
+    if reasons and not allow_suspect:
+        raise ps.SuspectModule(f"{entry['set_id']}/{entry['race']}/{entry['module']} is flagged suspect by the fit lab: {reasons}")
+    src = ps.resolve_source(entry, lod, bake=bake)
     rest = rest_context(rig, base)
     manifest = ps.load_manifest(entry)
     fit, fit_info = resolve_fit(entry, manifest, lod)
-    W, F, role, fd = load_world(entry, lod, manifest, fit, rest)
-    given, pieces_dir = (load_pieces_output(entry, lod, manifest, fit, rest) if entry['module'] == 'body_armor'
+    W, F, role, fd = load_world(entry, lod, manifest, fit, rest, src['path'])
+    given, pieces_dir = (load_pieces_output(entry, lod, manifest, fit, rest) if entry['module'] == 'body_armor' and rigid_output
                          else (None, None))
-    specs = ps.make_items(entry['module'], W, F, role, fd['part'], fd['src'], rest['plane_x'], given)
+    specs = ps.make_items(entry['module'], W, F, role, fd['part'], fd['src'], rest['plane_x'], given, mirror=mirror_left)
     deltas = morphs.base_deltas(base)
     rig_fp, base_fp = items.rig_fingerprint(rig), items.base_fingerprint(base, rig, rest)
-    wearable = ps.wearable_path(entry, lod)
+    wearable = Path(src['path'])
     reports = []
     for item_type, spec in specs.items():
         if only and item_type not in only:
@@ -297,6 +328,12 @@ def import_module(context, entry, lod='0p4', only=None, rig=None, base=None):
         if mode != 'created':
             spec['channels'] = _merge(spec['channels'], old.get('channels', []))
         parts = build_item(scene, coll, item_id, item_type, spec, rig, base, rest, deltas, suffix)
+        sections = item_sections(entry, lod, src, item_type)
+        spec['warnings'] += [f'body sections: {w}' for w in sections['warnings']]
+        if sections['states'] is None:
+            spec['warnings'].append('no body sections: the export is refused until the fit lab has made them')
+        if src['note']:
+            spec['warnings'].append(f"input: {src['note']}")
         q = spec['quality']
         data = {
             'item_id': item_id, 'set_id': entry['set_id'], 'type': item_type,
@@ -305,11 +342,15 @@ def import_module(context, entry, lod='0p4', only=None, rig=None, base=None):
             'channels': spec['channels'],
             'source': {'job_id': entry['job_id'], 'source_set': entry.get('source_set', entry['set_id']), 'module': entry['module'], 'race': entry['race'], 'lod': lod,
                        'manifest': entry['manifest'], 'wearable_glb': str(wearable),
-                       'wearable_sha256': hashing.file_sha256(wearable), 'pieces_source': pieces_dir,
+                       'wearable_sha256': hashing.file_sha256(wearable), 'wearable_fitted': ps.is_fitted(wearable),
+                       'input': {'kind': src['kind'], 'path': str(wearable), 'choice': src['choice'], 'note': src['note'],
+                                 'model_approved': ps.model_approved(entry)},
+                       'pieces_source': pieces_dir, 'pieces_fitted': bool(pieces_dir) and ps.is_fitted(pieces_dir),
                        'fit': fit_info, 'fit_values': {'scale': fit['scale'], 'translation': list(fit['translation'])},
                        'face_data': fd.get('from', 'colors.npz'), 'label_source_names': list(ps.SOURCES)},
-            'import': {'hashes': {}, 'rig_fingerprint': rig_fp, 'base_fingerprint': base_fp, 'date': items.now()},
-            'stats': {'tris': tri_count(coll), 'pieces': list(spec['pieces']), **q},
+            'sections': sections,
+            'import':{'hashes': {}, 'rig_fingerprint': rig_fp, 'base_fingerprint': base_fp, 'date': items.now()},
+            'stats': {'tris': tri_count(coll), 'pieces': list(spec['pieces']), 'mirrored': spec.get('mirrored', []), **q},
             'body_part_names': parts, 'stale': [], 'warnings': spec['warnings'], 'version': items.VERSION,
         }
         if mode == 'reimport':
@@ -328,7 +369,9 @@ def import_module(context, entry, lod='0p4', only=None, rig=None, base=None):
             target = coll
         reports.append({'item_id': item_id, 'item_type': item_type, 'mode': mode, 'collection': target.name,
                         'pieces': {n: len(p['F']) for n, p in spec['pieces'].items()}, 'tris': data['stats']['tris'],
-                        'fit_median_pct': q['fit_median_pct'], 'fit_p90_pct': q['fit_p90_pct'], 'warnings': spec['warnings']})
+                        'fit_median_pct': q['fit_median_pct'], 'fit_p90_pct': q['fit_p90_pct'], 'warnings': spec['warnings'],
+                        'input': src['kind'], 'sections': None if sections['states'] is None else {
+                            'hide': sum(v == 'hide' for v in sections['states'].values()), 'connector': len(sections['connectors'])}})
     return reports
 
 

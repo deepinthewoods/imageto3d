@@ -35,6 +35,15 @@ Flow (resumable by the server's stage, intents flushed before every click, never
    material 0) or `--expect-cost kind=N`, and the running total must stay within `budget_credits` (0.5). The wallet
    balance is recorded at every stage (`balances`). Exit code 3 = intentional stop (convert_job prints it and exits 1;
    re-run resumes).
+   **Late-loading wallet (2026-10-27).** The header shows 0 credits until the account loads. Free Preview clicked in that window gets "Insufficient Balance" and creates no model; one gnome submit sat 10 minutes and was left as `submission_needs_review`.
+   - `submit` now waits up to `BALANCE_WAIT_S` (60 s) for a balance above 0 before the intent and click.
+   - `wait_model_url` stops at once on that popup.
+   - Any error before the click (e.g. a DNS failure opening the workspace, 2026-10-27) also sets the record aside, so it is not left at status `preparing`, which `collect` refuses.
+   - `workflow.navigate` reloads Firefox's network error page (`about:neterror`, e.g. dnsNotFound) up to `NETERROR_TRIES` (6) times, 30 s apart, before failing; the VPN resolver loses hyper3d.ai for a minute at a time.
+   - A page whose sign-in state never settles (the app stayed a blank dark page after such a hiccup) is reloaded twice before the run stops with "Could not confirm a signed-in Hyper3D session".
+   - The export download wait ignores `.part` files that were already in `downloads/` before the click; one left by an interrupted collect never completes and used to hold a finished re-download until the 900 s timeout.
+   - In both cases the record is renamed to `studio_submission.not_submitted_<time>.json` (status `not_submitted`), so a re-run submits again.
+   - `export_glb` also tolerates Firefox renaming a download while it is being listed; that crashed a collect on 2026-10-27.
 
 ### Credit costs and the 0.5-credit configuration (2026-10-22)
 
@@ -110,6 +119,28 @@ possible cleaner route but were not evaluated or called.
 
 ## Items-project runner (original documentation)
 
+
+## Windows 11 (2026-11-09)
+
+Same code, same record formats; Linux behaviour is unchanged (branches on `sys.platform`, see `platform_compat.py`).
+
+- Interpreter: `%USERPROFILE%\.cache\hyper3d-venv\Scripts\python.exe` (Python 3.10; `requirements.txt` incl. psutil).
+  `config.json` `venv_python_windows` names it; `$HYPER3D_VENV` (the venv folder) overrides.
+  Recreate: `python -m venv %USERPROFILE%\.cache\hyper3d-venv` then `...\Scripts\python.exe -m pip install -r requirements.txt`.
+- Wrappers: `native.cmd login|inspect|prepare ...` and `rodin.cmd submit|collect|inspect|preview|bind ...` replace `native.sh` / `rodin.sh`
+  (or call `<venv python> -X utf8 native_browser.py ...` / `rodin_backend.py ...`). The other `.sh` files are Linux only.
+- Firefox is the Microsoft Store (MSIX) build. `native_browser.py` finds it: `$HYPER3D_FIREFOX`, `C:\Program Files\Mozilla Firefox`, the Store
+  package (`Get-AppxPackage Mozilla.Firefox`; `WindowsApps` cannot be listed), then the `firefox` alias. Selenium drives the
+  package binary directly (verified, Firefox 159.0.1). geckodriver comes from Selenium Manager (cached in `~/.cache/selenium`);
+  `$HYPER3D_GECKODRIVER` or a `geckodriver` on PATH pins one.
+- Profile: `C:\Users\<user>\.local\share\hyper3d-workflow-profile` (`$HYPER3D_PROFILE` overrides). It is deliberately outside
+  `AppData` so MSIX file virtualisation cannot redirect it. "Profile in use" = Firefox holds `parent.lock` in it.
+- `login` runs `firefox.exe -no-remote -profile <profile> https://hyper3d.ai/workspace/login` (no automation) and returns at once:
+  the Store launcher exits after starting the browser, so close the window yourself before `inspect` / the backend.
+  Automated launches add `-no-remote` so they never attach to another running Firefox.
+- There is no hidden display on Windows (`tools/hidden_display.py` returns nothing): the backend's Firefox window is visible.
+- Unit tests: need selenium and numpy (convert_job imports it) on one interpreter, and no active supervisor PAUSE file
+  (`.codex_jobs/_batch/PAUSE` stalls the convert_job dispatch tests).
 
 ## Google sign-in: use normal Firefox
 

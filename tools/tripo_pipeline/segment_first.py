@@ -51,7 +51,8 @@ import split_pieces as sp  # noqa: E402
 from palette import Palette, hsv, ramp  # noqa: E402
 
 ROOT = HERE.parents[1]
-LIB = C.CDLL(str(ROOT / 'tools/lowpoly/lib/libmeshoptimizer.so'))
+import portable  # noqa: E402
+LIB = C.CDLL(str(portable.meshopt_library(ROOT)))   # libmeshoptimizer.so / .dll (tools/lowpoly/build_meshoptimizer.sh)
 _SIMPLIFY = LIB.meshopt_simplifyWithAttributes
 _P, _S = C.c_void_p, C.c_size_t
 _SIMPLIFY.argtypes = [_P, _P, _S, _P, _S, _S, _P, _S, _P, _S, _P, _S, C.c_float, C.c_uint, _P]
@@ -308,6 +309,14 @@ def fill_slivers(lab, area, pairs, edge_len, bare=None, max_width_pct=1.0, max_s
     return flood_labels(lab, free, pairs), info
 
 
+def bare_part_mask(part, part_names):
+    """Faces on the body parts a body_armor module keeps bare (forearms, hands, lower legs, feet, head). With knee cops the knee band
+    is already the part `knee_cop` in the prep's part array (face_labels.knee_cop_parts), so it is not bare here."""
+    names = [str(x) for x in part_names]
+    bare_ids = [i for i, n_ in enumerate(names) if n_.startswith(('forearm_stretch.', 'hand.', 'leg_stretch.', 'foot.', 'head.'))]
+    return np.isin(part, bare_ids)
+
+
 # ----------------------------------------------------------------------------------------------- 3. wearable + sections
 
 def manifest_for(meta, current_manifest):
@@ -332,11 +341,12 @@ def highpoly_level(v_glb, f, lab, part, part_names, pal, mf, reduced_dir, height
     return level, wear
 
 
-def segment_highpoly(level, min_island_faces, cross_joint=None):
+def segment_highpoly(level, min_island_faces, cross_joint=None, knee_cops=False):
     """Regions segmentation on the high-poly wearable graph: the same sections_regions as the low-poly pipeline, then (build_sections)
-    the cross-joint reassignment of fringe patches (cross_joint False = off, None = config default)."""
+    the cross-joint reassignment of fringe patches (cross_joint False = off, None = config default). `knee_cops`: the prep's part array has
+    knee_cop parts (face_labels.knee_cop_parts) and the knee cops are cut as their own sections knee_l / knee_r."""
     spec = sp.load_spec('body_armor', None, overrides={'rigid_method': 'regions', 'joints': 'all', 'min_island_faces': int(min_island_faces),
-                                                       'cross_joint': cross_joint})
+                                                       'cross_joint': cross_joint, **({'knee_cops': True} if knee_cops else {})})
     spec['rigid'].setdefault('snap', {})
     sec = sp.build_sections(level, spec, 'regions', False)
     return sec
@@ -733,12 +743,16 @@ def hp_inert_snap(level, label, spec, a, b, info):
 
 def process(concept_dir, out_dir, levels=('0p4', '0p2', '0p1'), render=False, blend=True, palette_dir=None, overlap=False,
             cross_joint=None, prep_dir=None, fill=True, smooth_cuts=True, smooth_border=True, cut_band_pct=1.5, sliver_width_pct=1.0,
-            reduced_dir=None, source=None):
+            reduced_dir=None, source=None, label_hook=None):
     """Whole split for one module. concept_dir: the folder with reduced/manifest.json of the reduction (reduced_dir overrides the
     reduced/ folder; source = the source GLB, recorded only); out_dir/prep/ (or prep_dir) from segment_first_prep.py. palette_dir:
     palette folder/JSON, default the palette prep.json recorded (what the reduction used). Overlap strips are off unless `overlap`; cross_joint False switches the
     fringe reassignment off; fill / smooth_cuts / smooth_border switch the seam clean-up steps (base slivers between garment faces,
-    cut straightening on the high-poly graph, smoothing of the kept border polylines) off. Writes out_dir/pieces/ (lod_<lv>/..., pieces.json) and out_dir/segment_first.json."""
+    cut straightening on the high-poly graph, smoothing of the kept border polylines) off. `label_hook`: opt-in feature label pass
+    (feature_hooks.make_hook: studs / rings) on the cleaned high-poly labels, before the sections are cut; it gets ctx (v, f, lab, area, part,
+    part_names, ev, pal, colors, cos, module, out_dir, log) and returns {lab, info, summary, arrays, params}; its arrays go to
+    out_dir/feature_labels.npz (in this prep's face order, not wearcut's) and its summary into segment_first.json `feature_labels`.
+    Writes out_dir/pieces/ (lod_<lv>/..., pieces.json) and out_dir/segment_first.json."""
     concept_dir, out_dir = Path(concept_dir), Path(out_dir)
     reduced_dir = Path(reduced_dir) if reduced_dir else concept_dir / 'reduced'
     if (out_dir / 'pieces' / 'pieces.json').exists():
@@ -756,8 +770,8 @@ def process(concept_dir, out_dir, levels=('0p4', '0p2', '0p1'), render=False, bl
     t = time.monotonic()
     prep_dir = Path(prep_dir) if prep_dir else out_dir / 'prep'
     z = np.load(prep_dir / 'prep.npz')
-    meta = json.loads((prep_dir / 'prep.json').read_text())
-    cur = json.loads((reduced_dir / 'manifest.json').read_text())
+    meta = json.loads((prep_dir / 'prep.json').read_text(encoding='utf-8-sig'))
+    cur = json.loads((reduced_dir / 'manifest.json').read_text(encoding='utf-8-sig'))
     v, f = z['v'].astype(np.float64), z['f'].astype(np.int64)
     if palette_dir:
         pal = Palette.coerce(Path(palette_dir))
@@ -773,9 +787,7 @@ def process(concept_dir, out_dir, levels=('0p4', '0p2', '0p1'), render=False, bl
     t = time.monotonic()
     pairs, pair_edges = edge_pairs(f, True)
     _, area, _ = sp.triangle_geometry(v, f)
-    pn = [str(x) for x in z['part_names']]
-    bare_ids = [i for i, n_ in enumerate(pn) if n_.startswith(('forearm_stretch.', 'hand.', 'leg_stretch.', 'foot.', 'head.'))]
-    bare = np.isin(z['part'], bare_ids)
+    bare = bare_part_mask(z['part'], z['part_names'])
     lab, potts_info = potts(ev, vis, pairs, bare=bare)
     lab, reflood_info = reflood_unseen(lab, z['cos'], area, pairs)
     lab, absorb_info = absorb_small(lab, area, pairs)
@@ -783,6 +795,17 @@ def process(concept_dir, out_dir, levels=('0p4', '0p2', '0p1'), render=False, bl
     if fill:
         edge_len = np.linalg.norm(v[pair_edges[:, 0]] - v[pair_edges[:, 1]], axis=1)
         lab, sliver_info = fill_slivers(lab, area, pairs, edge_len, bare, max_width_pct=sliver_width_pct)
+    hook_res = None
+    if label_hook is not None:
+        lab_pre = lab.copy()
+        hook_res = label_hook(dict(v=v, f=f, lab=lab_pre, area=area, part=z['part'], part_names=[str(x) for x in z['part_names']], ev=ev, pal=pal2,
+                                   colors=z['colors'], cos=z['cos'], module=meta.get('module'), out_dir=out_dir, log=print))
+        lab = np.asarray(hook_res['lab'], lab.dtype)
+        if lab.shape != lab_pre.shape or ((lab_pre == 0) & (lab != 0)).any():
+            raise ValueError('label hook must return one label per face and never turn base faces into garment')
+        out_dir.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(out_dir / 'feature_labels.npz', label_old=lab_pre.astype(np.int8), label_new=lab.astype(np.int8),
+                            **{k: np.asarray(a_) for k, a_ in (hook_res.get('arrays') or {}).items()})
     lap('clean_labels_on_high_poly', t)
     t = time.monotonic()
     mf = {k: meta[k] for k in ('normalization_scale', 'normalization_origin_rotated', 'rotation_to_review', 'parts', 'module')}
@@ -791,11 +814,14 @@ def process(concept_dir, out_dir, levels=('0p4', '0p2', '0p1'), render=False, bl
     level_hp, wear = highpoly_level(vg, f, lab, z['part'], z['part_names'], pal2, mf, reduced_dir, height)
     lp_wear = None
     try:                      # the per-face split's wearable faces at 0p4 (pieces_auto), else the reduction's own count (the same number)
-        lp_wear = json.loads((concept_dir / 'pieces_auto' / 'pieces.json').read_text())['levels']['0p4']['wearable_faces']
+        lp_wear = json.loads((concept_dir / 'pieces_auto' / 'pieces.json').read_text(encoding='utf-8-sig'))['levels']['0p4']['wearable_faces']
     except (OSError, KeyError, ValueError):
-        lp_wear = (cur.get('levels', {}).get('0p4') or {}).get('wearable_triangles')
+        lp_level = cur.get('levels', {}).get('0p4') or {}
+        # the wearable of a cut reduction has other triangle counts: the faces wearable's number is the one this size was tuned on
+        lp_wear = (lp_level.get('wearable') or {}).get('previous_triangles') or lp_level.get('wearable_triangles')
     min_island = round(6 * level_hp.n / lp_wear) if lp_wear else 2500
-    sec_hp = segment_highpoly(level_hp, min_island, cross_joint)
+    knee_cops = bool((meta.get('parts') or {}).get('knee_cops'))       # the prep relabelled the knee band as knee_cop parts
+    sec_hp = segment_highpoly(level_hp, min_island, cross_joint, knee_cops)
     cj_info = sec_hp.report.get('cross_joint')
     lap('segment_high_poly', t)
     piece = sec_hp.label.copy()
@@ -817,18 +843,21 @@ def process(concept_dir, out_dir, levels=('0p4', '0p2', '0p1'), render=False, bl
     np.savez_compressed(out_dir / 'highpoly_labels.npz', label=lab.astype(np.int8), wear=wear, piece=piece.astype(np.int8),
                         piece_names=np.array([names[i] for i in sorted(names)]), piece_ids=np.array(sorted(names)))
     mats = level_hp.materials
-    spec_base = {'rigid_method': 'given', 'overlap': bool(overlap), 'pose_test': True, 'joints': 'all'}
+    spec_base = {'rigid_method': 'given', 'overlap': bool(overlap), 'pose_test': True, 'joints': 'all', **({'knee_cops': True} if knee_cops else {})}
     out = out_dir / 'pieces'
     out.mkdir(parents=True, exist_ok=True)
     result = {'source': str(concept_dir), 'source_glb': str(source) if source else None, 'reduced': str(reduced_dir), 'module': 'body_armor', 'method': 'segment_first', 'style': 'roles', 'piece': 'pauldron',
               'rigid_method': 'given', 'overlap': bool(overlap), 'cross_joint': cj_info, 'levels': {}}
-    seg = {'timing_s': timing, 'palette_hue_fit': hue_rep, 'potts': potts_info, 'reflood_unseen': reflood_info,
+    seg = {'timing_s': timing, 'palette_hue_fit': hue_rep,
+           **({'feature_labels': {'spec': getattr(label_hook, 'spec', None), **hook_res.get('summary', {})}} if hook_res is not None else {}), 'potts': potts_info, 'reflood_unseen': reflood_info,
            'absorb_small': absorb_info, 'fill_slivers': sliver_info, 'smooth_cuts': smooth_info, 'highpoly_seams': hp_seams, 'high_poly': {'faces': int(len(f)), 'wear_faces': int(wear.sum()),
                                                       'wear_area_share': float(area[wear].sum() / area.sum()),
                                                       'pieces': {names[l]: int((piece == l).sum()) for l in names},
                                                       'regions_report': sec_hp.report.get('regions'), 'cross_joint': cj_info,
                                                       'min_island_faces': int(min_island)},
            'levels': {}}
+    if (meta.get('parts') or {}).get('knee_cops'):       # knee-cop job: the prep relabelled the knee band as knee_cop parts
+        seg['knee_cops'] = meta['parts']['knee_cops']
     (out_dir / 'levels').mkdir(exist_ok=True)
     for lv in levels:
         fraction = dict(LEVELS)[lv]
@@ -903,11 +932,16 @@ def main(argv=None):
     ap.add_argument('--sliver-width', type=float, default=1.0, help='base strips between garment faces narrower than this %% of the height are filled (default 1.0)')
     ap.add_argument('--cut-band', type=float, default=1.5, help="cut straightening: faces within this %% of the height of a cut may move (default 1.5)")
     ap.add_argument('--no-smooth-border', action='store_true', help='keep the kept border polylines where the Douglas-Peucker pass left them')
+    ap.add_argument('--feature-labels', metavar='SPEC', help='opt-in label pass on the cleaned high-poly labels: studs | rings:secondary | rings:void (feature_hooks.py)')
     a = ap.parse_args(argv)
+    label_hook = None
+    if a.feature_labels:
+        import feature_hooks
+        label_hook = feature_hooks.make_hook(a.feature_labels)
     process(a.concept_dir, a.out_dir, a.levels.split(','), a.render and not a.no_render, not a.no_blend, palette_dir=a.palette, overlap=a.overlap,
             cross_joint=False if a.no_cross_joint else None, prep_dir=a.prep_dir, fill=not a.no_fill_slivers,
             smooth_cuts=not a.no_smooth_cuts, smooth_border=not a.no_smooth_border, cut_band_pct=a.cut_band,
-            sliver_width_pct=a.sliver_width, reduced_dir=a.reduced, source=a.source)
+            sliver_width_pct=a.sliver_width, reduced_dir=a.reduced, source=a.source, label_hook=label_hook)
 
 
 if __name__ == '__main__':

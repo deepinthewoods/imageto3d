@@ -390,7 +390,7 @@ def scenario_outfit_and_pieces():
         return
     ent = entries('dwarf_male')['body_armor']
     man = ps.load_manifest(ent)
-    glb = ps.read_glb(ps.wearable_path(ent, '0p4'))
+    glb = ps.read_glb(ps.wearable_path(ent, '0p4', fitted=False))
     cz = glb['v'][glb['f']].mean(1)
     zq = np.quantile(cz[:, 2], [.35, .6])
     label = np.where(cz[:, 2] > zq[1], 0, np.where(cz[:, 2] > zq[0], 1, np.where(cz[:, 0] > 0, 2, 3)))

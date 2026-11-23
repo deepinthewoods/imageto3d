@@ -83,7 +83,7 @@ def perturb_experiment(level, spec, sec_zones):
 
 def build_pair(reduced, style, level_name, methods=('zones', 'snap'), overrides=None):
     reduced = Path(reduced)
-    manifest = json.loads((reduced / 'manifest.json').read_text())
+    manifest = json.loads((reduced / 'manifest.json').read_text(encoding='utf-8-sig'))
     level = sp.load_level(reduced, level_name, manifest)
     spec = sp.load_spec('body_armor', style, overrides={'rigid_method': methods[-1], 'overlap': True, 'pose_test': True,
                                                          **(overrides or {})})
@@ -213,7 +213,7 @@ def continuity_main(argv):
     result = {}
     for entry in entries:
         name, reduced = entry.split('=', 1)
-        manifest = json.loads((Path(reduced) / 'manifest.json').read_text())
+        manifest = json.loads((Path(reduced) / 'manifest.json').read_text(encoding='utf-8-sig'))
         result[name] = {}
         for lv in sp.levels_in(reduced)[::-1]:
             level = sp.load_level(Path(reduced), lv, manifest)
@@ -242,7 +242,7 @@ def bands_main(argv):
             ('spine', 'spine', 20)]
     for entry in entries:
         name, reduced = entry.split('=', 1)
-        manifest = json.loads((Path(reduced) / 'manifest.json').read_text())
+        manifest = json.loads((Path(reduced) / 'manifest.json').read_text(encoding='utf-8-sig'))
         level = sp.load_level(Path(reduced), '0p4', manifest)
         base = {'overlap': True, 'pose_test': True}
         secs = {}
@@ -362,7 +362,7 @@ def regions_main(argv):
     for entry in entries:
         entry, _, concept = entry.partition('@')
         name, reduced = entry.split('=', 1)
-        manifest = json.loads((Path(reduced) / 'manifest.json').read_text())
+        manifest = json.loads((Path(reduced) / 'manifest.json').read_text(encoding='utf-8-sig'))
         level = sp.load_level(Path(reduced), lvl, manifest)
         base = {'overlap': True, 'pose_test': True}
         secs = {}

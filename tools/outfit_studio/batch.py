@@ -6,7 +6,7 @@ The module top is bpy-free, so `run.py` (plain python3) and the operators share 
     blender -b --factory-startup --python-expr "import addon_utils; addon_utils.enable('outfit_studio', default_set=False); \
         import outfit_studio.batch as b; b.main()" -- <command> --base <b> [options]
 
-Commands: import | validate | export-base | export-anims | export-items. Each returns a result dict, written to
+Commands: import | validate | export-base | export-heads | export-anims | export-items. Each returns a result dict, written to
 `--result` as JSON, and the process exits 0 when `ok`, else 1."""
 import argparse
 import json
@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import paths
 
-COMMANDS = ('import', 'validate', 'export-base', 'export-anims', 'export-items')
+COMMANDS = ('import', 'validate', 'export-base', 'export-heads', 'export-anims', 'export-items')
 BOOT = ("import addon_utils; addon_utils.enable('outfit_studio', default_set=False); "
         "import outfit_studio.batch as b; b.main()")
 
@@ -88,7 +88,9 @@ def cmd_import(a):
     from .blender import importer, items, project
     from .core import pipeline_source as ps
     entries = [e for e in ps.latest(ps.discover()) if e['race'] == a.base and (a.set == 'all' or a.set in (e['set_id'], e.get('source_set')))]
-    out = {'base': a.base, 'imported': [], 'skipped': [], 'failed': [], 'created': False}
+    out = {'base': a.base, 'imported': [], 'skipped': [], 'skipped_suspect': [], 'failed': [], 'created': False}
+    if a.approved_only:                                   # only sets approved in the preview's Models tab
+        entries = [e for e in entries if ps.model_approved(e)]
     if not entries:
         out['note'] = 'no converted pipeline output for this base / set'
         return out
@@ -105,14 +107,16 @@ def cmd_import(a):
         if not want and not a.reimport:
             out['skipped'] += [ps.item_id(e['set_id'], t) for t in ps.MODULE_ITEMS[e['module']]]
             continue
-        lod = a.lod if a.lod in e['levels'] else None
         try:
-            if lod is None:
-                raise ValueError(f"LOD {a.lod} not converted for {e['set_id']}/{e['module']} (has {e['levels']})")
+            lod = ps.resolve_lod(e, a.lod)                # 'auto' = the preview's chosen LOD, else 0p4
             t0 = time.time()
-            for r in importer.import_module(ctx, e, lod, only=(None if a.reimport else want)):
-                out['imported'].append({**{k: r[k] for k in ('item_id', 'mode', 'tris', 'fit_median_pct', 'warnings')},
+            for r in importer.import_module(ctx, e, lod, only=(None if a.reimport else want), rigid_output=a.rigid_output,
+                                            bake=not a.no_bake, mirror_left=a.mirror_left):
+                out['imported'].append({**{k: r[k] for k in ('item_id', 'mode', 'tris', 'fit_median_pct', 'warnings', 'input', 'sections')},
                                         'seconds': round(time.time() - t0, 2)})
+        except ps.SuspectModule as ex:
+            print(f'[import] WARNING skipped: {ex}')
+            out['skipped_suspect'].append({'set_id': e['set_id'], 'module': e['module'], 'reason': str(ex)})
         except Exception as ex:
             import traceback
             traceback.print_exc()
@@ -156,7 +160,7 @@ def cmd_export_items(a):
     _open(path)
     import bpy
     ids = _filter(bpy.context, a)
-    r = export_items.export_items(path, a.batch, ids, a.all_status, a.resume)
+    r = export_items.export_items(path, a.batch, ids, a.all_status, a.resume, allow_no_sections=a.allow_no_sections)
     r['ok'] = not r['failed']
     return r
 
@@ -172,6 +176,22 @@ def cmd_export_base(a):
     return {'base': a.base, 'status': 'exported', **export_base.export_base(a.base, out)}
 
 
+def cmd_export_heads(a):
+    """Re-target the head library of a race to its exported base (`bases/<race>/base.json` must exist in the batch); see blender/heads.py."""
+    from .blender import heads
+    if a.base not in heads.HEAD_RACES:
+        return {'base': a.base, 'status': 'skipped', 'reason': 'no head library for this base'}
+    out = Path(a.batch) / 'heads' / a.base
+    if (out / 'catalog.json').exists():
+        if not a.resume:
+            raise FileExistsError(f'{out} already has a head export (use --resume to skip it)')
+        return {'base': a.base, 'status': 'skipped', 'reason': 'exists'}
+    r = heads.export_heads(a.base, a.batch, a.shift, not a.no_dragons, not a.no_sheet, a.limit)
+    r['status'] = 'exported'
+    r['ok'] = 'sheet_error' not in r
+    return r
+
+
 def cmd_export_anims(a):
     from .blender import anims
     r = anims.export_anims(a.base, a.batch, only=[x for x in (a.only or '').split(',') if x] or None, limit=a.limit)
@@ -179,7 +199,7 @@ def cmd_export_anims(a):
     return r
 
 
-HANDLERS = {'import': cmd_import, 'validate': cmd_validate, 'export-base': cmd_export_base,
+HANDLERS = {'import': cmd_import, 'validate': cmd_validate, 'export-base': cmd_export_base, 'export-heads': cmd_export_heads,
             'export-anims': cmd_export_anims, 'export-items': cmd_export_items}
 
 
@@ -188,15 +208,23 @@ def parser():
     p.add_argument('command', choices=COMMANDS)
     p.add_argument('--base', required=True)
     p.add_argument('--set', default='all')
-    p.add_argument('--lod', default='0p4')
+    p.add_argument('--lod', default='auto', help="0p4 | 0p2 | 0p1 | auto (default: the preview's chosen_lod.json, else 0p4)")
     p.add_argument('--batch', default=None)
     p.add_argument('--resume', action='store_true')
     p.add_argument('--all-status', action='store_true')
     p.add_argument('--reimport', action='store_true', help='import: also re-run items that already exist (edited ones go to __reimport)')
     p.add_argument('--project-dir', default=None)
+    p.add_argument('--approved-only', action='store_true', help='import: only sets with models/<set>/model_approval.json approved')
+    p.add_argument('--rigid-output', action='store_true', help='import: use the segment-first / split_pieces rigid pieces of body armour instead of the zone split of the fit lab mesh')
+    p.add_argument('--mirror-left', action='store_true', help='import: gauntlets / boots: mirror the right pieces onto the left instead of taking the wearable own left side')
+    p.add_argument('--no-bake', action='store_true', help='import: do not run fit_symmap.py --bake (a stale baked fit_choice mesh is then refused)')
+    p.add_argument('--allow-no-sections', action='store_true', help='export-items: export items that have no body sections record')
     p.add_argument('--items', default='')
     p.add_argument('--only', default='', help='export-anims: comma separated clip names')
-    p.add_argument('--limit', type=int, default=None, help='export-anims: first N clips only')
+    p.add_argument('--limit', type=int, default=None, help='export-anims: first N clips only; export-heads: first N heads')
+    p.add_argument('--shift', default='auto', choices=('auto', 'fit', 'mesh', 'bone', 'none'), help='export-heads: how the head seats move to the new base (see blender/heads.py)')
+    p.add_argument('--no-dragons', action='store_true', help='export-heads (human_male): skip the dragon heads and dragon_seats.json')
+    p.add_argument('--no-sheet', action='store_true', help='export-heads: skip the check sheet renders')
     p.add_argument('--result', default=None)
     return p
 

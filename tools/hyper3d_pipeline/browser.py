@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 
 from playwright.async_api import async_playwright
 
@@ -199,7 +200,7 @@ def main() -> None:
     args = parser.parse_args()
     if args.command == "prepare" and (args.offset < 0 or args.interval < 1 or args.cycles < 0):
         parser.error("offset and cycles must be nonnegative; interval must be at least one second")
-    if args.command in {"prepare", "login"} and not args.headless and not os.environ.get("DISPLAY"):
+    if args.command in {"prepare", "login"} and not args.headless and sys.platform != "win32" and not os.environ.get("DISPLAY"):
         parser.error("A visible Firefox window needs DISPLAY; use prepare --headless on this machine")
     try:
         asyncio.run(run(args))

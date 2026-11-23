@@ -161,15 +161,16 @@ def check_piece(out, item_id, item_type, obj, channels, ctx):
             add('error', 'missing_morph', f'base shape keys missing on the piece: {gone}')
 
 
-def check_pairs(out, item_id, pieces, plane):
-    """Gauntlet / boot pairs: the left piece must be the mirror image of the right one about the sagittal plane."""
+def check_pairs(out, item_id, pieces, plane, mirrored=()):
+    """Gauntlet / boot pairs: the left piece must be the mirror image of the right one about the sagittal plane (an error for
+    pieces the importer mirrored; a warning for the wearable's own sides, which the fit lab fitted one by one)."""
     by = {o.get('os_piece', o.name): o for o in pieces}
     for name, right in by.items():
         if not name.endswith('_r'):
             continue
         left = by.get(ps.swap_side(name))
         if left is None:
-            out.append(entry('error', item_id, name, 'asymmetric', f'no mirrored counterpart {ps.swap_side(name)}'))
+            out.append(entry('error', item_id, name, 'asymmetric', f'no counterpart {ps.swap_side(name)}'))
             continue
         R, L = importer.piece_vertices(right), importer.piece_vertices(left)
         R2 = R * np.array([-1., 1., 1.]) + np.array([2 * plane, 0., 0.])
@@ -177,7 +178,7 @@ def check_pairs(out, item_id, pieces, plane):
         for obj, d, tag in ((left, dl, 'left'), (right, dr, 'right')):
             bad = np.flatnonzero(d > SYMMETRY_TOL)
             if len(bad):
-                out.append(entry('error', item_id, obj.get('os_piece', obj.name), 'asymmetric',
+                out.append(entry('error' if obj.get('os_piece', obj.name) in mirrored else 'warning', item_id, obj.get('os_piece', obj.name), 'asymmetric',
                                  f'{tag} piece differs from the mirrored {name if tag == "left" else ps.swap_side(name)} '
                                  f'by up to {d.max() * 1000:.1f} mm ({len(bad)} vertices over {SYMMETRY_TOL * 1000:.0f} mm)', verts=bad))
 
@@ -226,10 +227,15 @@ def validate(context, items=None, budget=None, siblings=True, sibling_dir=None):
         stale = it.check_item(coll, ctx['rig_fp'], ctx['base_fp'])
         if stale:
             add('error', 'stale_rig', 'item was built on a different ' + ' and '.join(stale) + ' (re-bind it)')
+        sec = d.get('sections') or {}
+        if sec.get('states') is None:
+            add('warning', 'no_sections', 'no body sections for this item (the body would show through it): ' + '; '.join(sec.get('warnings', [])))
+        elif sec.get('connectors') and not (sec.get('connectors_glb') and Path(sec['connectors_glb']).is_file()):
+            add('error', 'connectors_missing', f"connectors file {sec.get('connectors_glb')} is missing ({sorted(sec['connectors'])})")
         for obj in pieces:
             check_piece(out, item_id, item_type, obj, channels, ctx)
         if item_type in PAIRED and pieces:
-            check_pairs(out, item_id, pieces, ctx['rest']['plane_x'])
+            check_pairs(out, item_id, pieces, ctx['rest']['plane_x'], (d.get('stats') or {}).get('mirrored', ()))
         tris = sum(len(o.data.polygons) for o in pieces)
         if tris > budget:
             add('warning', 'tris_over_budget', f'{tris} triangles, budget {budget}')

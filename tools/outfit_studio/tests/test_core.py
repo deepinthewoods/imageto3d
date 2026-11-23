@@ -2,8 +2,10 @@
 
     python3 tools/outfit_studio/tests/test_core.py
 Real-data checks use models/ and base_views/ read-only and are skipped when a file is missing."""
+import os
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -219,6 +221,259 @@ class SourceTest(unittest.TestCase):
         self.assertEqual(out[3], 'primary')
 
 
+class FittedSourceTest(unittest.TestCase):
+    """Body-fitted wearables / pieces (tools/tripo_pipeline/body_fit.py) are preferred when fresh."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name)
+        self.reduced = self.dir / 'reduced'
+        self.reduced.mkdir()
+        self.entry = {'dir': str(self.dir), 'reduced': str(self.reduced)}
+        self.plain = self.reduced / 'lod_error_0p4__wearable.glb'
+        self.fitted = self.reduced / 'lod_error_0p4__wearable_fitted.glb'
+        self.plain.write_bytes(b'glb')
+
+    def touch(self, path, mtime):
+        path.write_bytes(b'glb')
+        os.utime(path, (mtime, mtime))
+
+    def test_wearable_prefers_fresh_fitted(self):
+        self.assertEqual(ps.wearable_path(self.entry, '0p4'), self.plain)          # nothing fitted yet
+        self.touch(self.plain, 1000)
+        self.touch(self.fitted, 1000)                                              # equal mtime counts as fresh
+        self.assertEqual(ps.wearable_path(self.entry, '0p4'), self.fitted)
+        self.assertTrue(ps.is_fitted(ps.wearable_path(self.entry, '0p4')))
+        self.assertEqual(ps.wearable_path(self.entry, '0p2'), self.reduced / 'lod_error_0p2__wearable.glb')
+
+    def test_wearable_stale_fitted_and_opt_out(self):
+        self.touch(self.fitted, 1000)
+        self.touch(self.plain, 2000)                                               # unfitted rebuilt after the fit
+        self.assertEqual(ps.wearable_path(self.entry, '0p4'), self.plain)
+        self.assertFalse(ps.is_fitted(ps.wearable_path(self.entry, '0p4')))
+        self.touch(self.fitted, 3000)
+        self.assertEqual(ps.wearable_path(self.entry, '0p4'), self.fitted)
+        self.assertEqual(ps.wearable_path(self.entry, '0p4', fitted=False), self.plain)
+        ps.USE_FITTED = False
+        try:
+            self.assertEqual(ps.wearable_path(self.entry, '0p4'), self.plain)
+        finally:
+            ps.USE_FITTED = True
+
+    def pieces(self, sub='segment_first/pieces'):
+        d = self.dir / sub
+        (d / 'lod_0p4').mkdir(parents=True)
+        (d / 'pieces.json').write_text('{}')
+        for n in ('chest', 'pelvis'):
+            self.touch(d / 'lod_0p4' / f'{n}.glb', 1000)
+        return d
+
+    def test_pieces_prefer_complete_fresh_fitted_folder(self):
+        d = self.pieces()
+        plain = ps.pieces_output(self.entry, '0p4')
+        self.assertEqual({n: p.parent.name for n, p in plain.items()}, {'chest': 'lod_0p4', 'pelvis': 'lod_0p4'})
+        (d / 'lod_0p4_fitted').mkdir()
+        self.touch(d / 'lod_0p4_fitted' / 'chest.glb', 1500)
+        self.assertEqual(ps.pieces_output(self.entry, '0p4'), plain)               # pelvis twin missing: all or nothing
+        self.touch(d / 'lod_0p4_fitted' / 'pelvis.glb', 1500)
+        fitted = ps.pieces_output(self.entry, '0p4')
+        self.assertEqual({n: p.parent.name for n, p in fitted.items()}, {'chest': 'lod_0p4_fitted', 'pelvis': 'lod_0p4_fitted'})
+        self.assertTrue(all(ps.is_fitted(p) for p in fitted.values()))
+        self.assertTrue(ps.is_fitted(d / 'lod_0p4_fitted'))
+        self.assertFalse(ps.is_fitted(d / 'lod_0p4'))
+        self.assertEqual(ps.pieces_output(self.entry, '0p4', fitted=False), plain)
+
+    def test_pieces_stale_fitted_piece_falls_back(self):
+        d = self.pieces('pieces')
+        (d / 'lod_0p4_fitted').mkdir()
+        self.touch(d / 'lod_0p4_fitted' / 'chest.glb', 1500)
+        self.touch(d / 'lod_0p4_fitted' / 'pelvis.glb', 500)                       # older than pelvis.glb: stale
+        out = ps.pieces_output(self.entry, '0p4')
+        self.assertEqual({p.parent.name for p in out.values()}, {'lod_0p4'})
+
+
+class FitLabSourceTest(unittest.TestCase):
+    """Input mesh choice of the new game standard (fit_choice.json -> lab default -> aligned_fitted -> aligned -> legacy)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.dir = Path(self.tmp.name) / 'set' / 'job1' / 'elf_male' / 'outfit'
+        self.reduced = self.dir / 'reduced'
+        self.lab = self.dir / 'fitlab' / 'lod_0p4'
+        self.lab.mkdir(parents=True)
+        self.reduced.mkdir()
+        self.entry = {'set_id': 'set', 'source_set': 'set', 'job_id': 'job1', 'race': 'elf_male', 'module': 'outfit',
+                      'dir': str(self.dir), 'reduced': str(self.reduced), 'levels': ['0p4', '0p2']}
+        self.aligned = self.reduced / 'lod_error_0p4__wearable_aligned.glb'
+        self.touch(self.reduced / 'lod_error_0p4__wearable.glb', 1000)
+
+    def touch(self, path, mtime, data=b'glb'):
+        path.write_bytes(data)
+        os.utime(path, (mtime, mtime))
+
+    def index(self, combo='sections_fill__off__none', **extra):
+        import json
+        (self.lab / 'index.json').write_text(json.dumps({'combos': {combo: {'inputs': {'aligned': ps.stamp(self.aligned)}}}, **extra}))
+
+    def test_fallback_chain(self):
+        self.assertEqual(ps.source_choice(self.entry, '0p4')['kind'], 'legacy')
+        self.touch(self.aligned, 1000)
+        self.assertEqual(ps.source_choice(self.entry, '0p4')['kind'], 'aligned')
+        self.touch(self.reduced / 'lod_error_0p4__wearable_aligned_fitted.glb', 1500)
+        self.assertEqual(ps.source_choice(self.entry, '0p4')['kind'], 'aligned_fitted')
+        combo = self.lab / 'sections_fill__off__none.glb'
+        self.touch(combo, 1600)
+        self.assertEqual(ps.source_choice(self.entry, '0p4')['kind'], 'aligned_fitted')       # no index entry: not trusted
+        self.index()
+        got = ps.source_choice(self.entry, '0p4')
+        self.assertEqual((got['kind'], got['path'], got['choice']['strategy']), ('fitlab_default', combo, 'sections_fill'))
+        self.touch(self.aligned, 2000)                                                      # re-aligned after the lab ran: stale
+        self.assertEqual(ps.source_choice(self.entry, '0p4')['kind'], 'aligned')
+
+    def test_other_lods_never_use_the_lab(self):
+        self.touch(self.reduced / 'lod_error_0p2__wearable_aligned.glb', 1000)
+        self.touch(self.reduced / 'lod_error_0p2__wearable_aligned_fitted.glb', 1000)
+        (self.dir / 'fit_choice.json').write_text('{"strategy": "sections_fill", "amount": 100}')
+        got = ps.source_choice(self.entry, '0p2')
+        self.assertEqual(got['kind'], 'aligned_fitted')
+        self.assertIn('fit lab only covers', got['note'])
+
+    def test_fit_choice_needs_bake_until_fresh(self):
+        self.touch(self.aligned, 1000)
+        self.touch(self.lab / 'current__off__none.glb', 1000)
+        (self.dir / 'fit_choice.json').write_text('{"strategy": "current", "amount": 100, "sym": "off", "scope": "none", "lod": "0p4"}')
+        os.utime(self.dir / 'fit_choice.json', (1100, 1100))
+        got = ps.source_choice(self.entry, '0p4')
+        self.assertEqual((got['kind'], got['needs_bake']), ('fitlab_choice', True))
+        self.assertEqual(got['path'], self.reduced / ps.BAKED_NAME)
+        self.assertEqual(got['choice'], {'strategy': 'current', 'amount': 100, 'sym': 'off', 'scope': 'none'})
+        self.touch(self.reduced / ps.BAKED_NAME, 1200)
+        self.assertFalse(ps.source_choice(self.entry, '0p4')['needs_bake'])
+        os.utime(self.dir / 'fit_choice.json', (1300, 1300))                                 # choice changed after the bake
+        self.assertTrue(ps.source_choice(self.entry, '0p4')['needs_bake'])
+        with self.assertRaises(FileNotFoundError):
+            (self.reduced / ps.BAKED_NAME).unlink()
+            ps.resolve_source(self.entry, '0p4', bake=False)
+
+    def test_lod_choice_suspect_and_approval(self):
+        self.assertEqual(ps.resolve_lod(self.entry, 'auto'), '0p4')
+        (self.dir / 'chosen_lod.json').write_text('{"lod": "0p2"}')
+        self.assertEqual(ps.resolve_lod(self.entry, 'auto'), '0p2')
+        self.assertEqual(ps.resolve_lod(self.entry, '0p4'), '0p4')
+        with self.assertRaises(ValueError):
+            ps.resolve_lod(self.entry, '0p1')
+        self.assertEqual(ps.suspect_reasons(self.entry), [])
+        self.index(suspect=True, suspect_reasons=['area ratio'])
+        self.assertEqual(ps.suspect_reasons(self.entry), ['area ratio'])
+        models = Path(self.tmp.name)
+        self.assertFalse(ps.model_approved(self.entry, models))
+        (models / 'set' / 'model_approval.json').write_text('{"approved": true}')
+        self.assertTrue(ps.model_approved(self.entry, models))
+
+
+class SectionsTest(unittest.TestCase):
+    SECS = {'arm_stretch.l#0': {'state': 'hide', 'base_node': 'sec_arm_stretch_l_0', 'connector_node': None},
+            'arm_stretch.l#1': {'state': 'connector', 'base_node': 'sec_arm_stretch_l_1', 'connector_node': 'conn_arm_stretch_l_1'},
+            'thigh_stretch.r#0': {'state': 'connector', 'base_node': 'sec_thigh_stretch_r_0', 'connector_node': 'conn_thigh_stretch_r_0'},
+            'foot.l#0': {'state': 'hide', 'base_node': 'sec_foot_l_0', 'connector_node': None},
+            'neck.x#0': {'state': 'show', 'base_node': 'sec_neck_x_0', 'connector_node': None}}
+
+    def record(self):
+        secs = {}
+        for key, s in self.SECS.items():
+            part, side, index = ps.parse_section_key(key)
+            secs[key] = {**s, 'part': part, 'side': side, 'index': index}
+        return {'sections': secs}
+
+    def test_keys_and_node_names(self):
+        self.assertEqual(ps.parse_section_key('thigh_stretch.l#1'), ('thigh_stretch', 'l', 1))
+        self.assertEqual(ps.parse_section_key('neck.x#0'), ('neck', 'x', 0))
+        self.assertEqual(ps.parse_section_key('spine_01.x#2'), ('spine_01', 'x', 2))
+        self.assertEqual(ps.swap_node_side('conn_thigh_stretch_l_1'), 'conn_thigh_stretch_r_1')
+        self.assertEqual(ps.swap_node_side('conn_neck_x_0'), 'conn_neck_x_0')
+        with self.assertRaises(ValueError):
+            ps.parse_section_key('nonsense')
+
+    def test_whole_item_keeps_every_state(self):
+        states, conns = ps.item_sections(self.record(), 'body_armor')
+        self.assertEqual(states['sec_arm_stretch_l_0'], 'hide')
+        self.assertEqual(sorted(conns), ['conn_arm_stretch_l_1', 'conn_thigh_stretch_r_0'])
+        self.assertEqual(conns['conn_arm_stretch_l_1'], {'section': 'sec_arm_stretch_l_1', 'mirror_of': None})
+
+    def test_gauntlets_and_boots_only_touch_their_limb_parts(self):
+        gs, gc = ps.item_sections(self.record(), 'gauntlets')
+        bs, bc = ps.item_sections(self.record(), 'boots')
+        self.assertEqual((gs['sec_arm_stretch_l_0'], gs['sec_foot_l_0'], sorted(gc)), ('hide', 'show', ['conn_arm_stretch_l_1']))
+        self.assertEqual((bs['sec_arm_stretch_l_0'], bs['sec_foot_l_0'], sorted(bc)), ('show', 'hide', ['conn_thigh_stretch_r_0']))
+
+    def test_symmetry_map_states_and_mirrored_connectors(self):
+        symmap = {'sections': {'l2r': {'limbs': {
+            'states': {'sec_arm_stretch_l_0': 'hide', 'sec_arm_stretch_l_1': 'connector', 'sec_thigh_stretch_r_0': 'show',
+                       'sec_foot_l_0': 'hide', 'sec_neck_x_0': 'show', 'sec_arm_stretch_r_1': 'connector'},
+            'connectors': ['conn_arm_stretch_l_1'], 'mirrored': ['conn_arm_stretch_l_1'], 'hide': []}}}}
+        rec = self.record()
+        rec['sections']['arm_stretch.r#1'] = {'state': 'show', 'base_node': 'sec_arm_stretch_r_1', 'connector_node': None,
+                                              'part': 'arm_stretch', 'side': 'r', 'index': 1}
+        states, conns = ps.item_sections(rec, 'body_armor', symmap, 'l2r', 'limbs')
+        self.assertEqual(states['sec_thigh_stretch_r_0'], 'show')
+        self.assertEqual(conns['conn_arm_stretch_r_1'], {'section': 'sec_arm_stretch_r_1', 'mirror_of': 'conn_arm_stretch_l_1'})
+        self.assertNotIn('conn_thigh_stretch_r_0', conns)
+
+    def test_read_glb_nodes(self):
+        import json
+        import struct
+        v = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0]], '<f4')           # glTF space: (x, y up, z)
+        blob = v.tobytes() + np.array([0, 1, 2], '<u2').tobytes() + b'\0\0'
+        js = {'asset': {'version': '2.0'}, 'scenes': [{'nodes': [0]}], 'nodes': [{'name': 'conn_a', 'mesh': 0}],
+              'meshes': [{'primitives': [{'attributes': {'POSITION': 0}, 'indices': 1}]}],
+              'accessors': [{'bufferView': 0, 'componentType': 5126, 'count': 3, 'type': 'VEC3'},
+                            {'bufferView': 1, 'componentType': 5123, 'count': 3, 'type': 'SCALAR'}],
+              'bufferViews': [{'buffer': 0, 'byteLength': 36}, {'buffer': 0, 'byteOffset': 36, 'byteLength': 6}],
+              'buffers': [{'byteLength': len(blob)}]}
+        j = json.dumps(js).encode()
+        j += b' ' * (-len(j) % 4)
+        data = struct.pack('<4sII', b'glTF', 2, 12 + 8 + len(j) + 8 + len(blob)) + struct.pack('<II', len(j), 0x4E4F534A) + j \
+            + struct.pack('<II', len(blob), 0x004E4942) + blob
+        with tempfile.TemporaryDirectory() as t:
+            p = Path(t) / 'c.glb'
+            p.write_bytes(data)
+            nodes = ps.read_glb_nodes(p)
+        self.assertEqual(list(nodes), ['conn_a'])
+        np.testing.assert_allclose(nodes['conn_a']['v'], [[0, 0, 0], [1, 0, 0], [0, 0, 1]])   # Blender: (x, -z, y)
+        self.assertEqual(nodes['conn_a']['f'].tolist(), [[0, 1, 2]])
+
+
+class BothSidesTest(unittest.TestCase):
+    """Gauntlets / boots take both sides of the wearable as they are (fit lab), unless `mirror` asks for the old behaviour."""
+
+    def setup(self):
+        V, F = grid(3)                                   # 18 faces
+        part = np.array(['forearm_stretch.r'] * 4 + ['hand.r'] * 2 + ['forearm_stretch.l'] * 4 + ['hand.l'] * 2 + ['spine_01.x'] * 6)
+        role = np.array(['primary'] * len(F), dtype='<U12')
+        return V, F, role, part, np.zeros(len(F), int)
+
+    def test_own_left_side_is_used(self):
+        V, F, role, part, src = self.setup()
+        spec = ps.make_items('right_gauntlet_boot', V, F, role, part, src, 0.)['gauntlets']
+        self.assertEqual(sorted(spec['pieces']), ['cuff_l', 'cuff_r', 'hand_l', 'hand_r'])
+        self.assertEqual(spec['mirrored'], [])
+        self.assertEqual(len(spec['pieces']['cuff_l']['F']), 4)
+        self.assertTrue(all(p.endswith('.l') for p in spec['pieces']['cuff_l']['part']))
+        self.assertIn('6 faces outside', ' '.join(spec['warnings']))
+
+    def test_missing_left_is_mirrored_and_mirror_flag(self):
+        V, F, role, part, src = self.setup()
+        part[6:12] = 'spine_01.x'                       # no left limb in the wearable
+        spec = ps.make_items('right_gauntlet_boot', V, F, role, part, src, 0.)['gauntlets']
+        self.assertEqual(sorted(spec['mirrored']), ['cuff_l', 'hand_l'])
+        V, F, role, part, src = self.setup()
+        spec = ps.make_items('right_gauntlet_boot', V, F, role, part, src, 0., mirror=True)['gauntlets']
+        self.assertEqual(sorted(spec['mirrored']), ['cuff_l', 'hand_l'])
+        np.testing.assert_allclose(spec['pieces']['cuff_l']['V'][:, 0], -spec['pieces']['cuff_r']['V'][:, 0])
+
+
 def real_cases():
     ents = {(e['race'], e['module']): e for e in ps.latest(ps.discover())} if paths.MODELS.is_dir() else {}
     return ents
@@ -237,7 +492,7 @@ class RealDataTest(unittest.TestCase):
             if not fit:
                 continue                                    # older manifest: needs the Blender fit (test_blender_import)
             parts = np.load(paths.base_views(race) / 'parts.npz')
-            glb = ps.read_glb(ps.wearable_path(e, '0p4'))
+            glb = ps.read_glb(ps.wearable_path(e, '0p4', fitted=False))
             bp = tf.base_from_review(tf.review_from_native(glb['v'], man), fit)
             _, _, d = mt.closest_points(bp, parts['v'], parts['f'])
             limit = .04 if fit.get('residual_fitted_pct_height', 0) < 1.5 else .10     # a poor manifest fit is reported, not hidden
@@ -246,7 +501,7 @@ class RealDataTest(unittest.TestCase):
             self.assertEqual(len(F), len(glb['f']))
             fd = ps.wearable_face_data(e, '0p4', len(F))
             self.assertIsNotNone(fd, f'{race} {module}: colors.npz arrays do not match the wearable')
-            items = ps.make_items(module, V, F, ps.face_roles(glb), fd['part'], fd['src'], 0.)
+            items = ps.make_items(module, V, F, ps.face_roles(glb), fd['part'], fd['src'], 0., mirror=True)
             self.assertTrue(items)
             for item_type, spec in items.items():
                 faces = sum(len(p['F']) for p in spec['pieces'].values())
@@ -265,11 +520,11 @@ class RealDataTest(unittest.TestCase):
     def test_mirrored_pieces_are_exact_twins(self):
         e = real_cases()[('dwarf_male', 'right_gauntlet_boot')]
         man = ps.load_manifest(e)
-        glb = ps.read_glb(ps.wearable_path(e, '0p4'))
+        glb = ps.read_glb(ps.wearable_path(e, '0p4', fitted=False))
         bp = tf.base_from_review(tf.review_from_native(glb['v'], man), man['parts']['fit'])
         V, F = ps.weld(bp, glb['f'])
         fd = ps.wearable_face_data(e, '0p4', len(F))
-        spec = ps.make_items('right_gauntlet_boot', V, F, ps.face_roles(glb), fd['part'], fd['src'], 0.)['gauntlets']
+        spec = ps.make_items('right_gauntlet_boot', V, F, ps.face_roles(glb), fd['part'], fd['src'], 0., mirror=True)['gauntlets']
         r, l = spec['pieces']['cuff_r'], spec['pieces']['cuff_l']
         np.testing.assert_allclose(l['V'] * [-1, 1, 1], r['V'])
         self.assertTrue((l['src'] == ps.MIRRORED).all())

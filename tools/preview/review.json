@@ -1,0 +1,18 @@
+{
+ "lists": [
+  {
+   "name": "gnome_realign_20261122",
+   "title": "Gnomes re-aligned 2026-11-22 (now vs before)",
+   "before": "archive/realign_gnome_20261122",
+   "after_label": "now (fixed rig)",
+   "before_label": "before (broken rig)",
+   "modules": [
+    "models/breastplate_07_hand_me_down_cuirass/77590726e534/gnome_female/right_gauntlet_boot",
+    "models/leather_14_caravan_outrider_leather/c65d5f8f57ac/gnome_female/right_gauntlet_boot",
+    "models/breastplate_07_hand_me_down_cuirass/77590726e534/gnome_female/body_armor",
+    "models/african_tribal_outfit_05_sahel_indigo_farmer/9e1d2e6718ce/gnome_female/outfit",
+    "models/african_ceremonial_outfit_04_grassland_ceremony_dress/ceed644246e8/gnome_female/outfit"
+   ]
+  }
+ ]
+}

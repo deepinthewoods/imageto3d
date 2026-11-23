@@ -6,7 +6,7 @@ One collection per reduction level (0p4, 0p2, 0p1), laid out side by side along 
 flat base / garment-role (primary, secondary, ...) / uncertain face materials from the GLBs. reduce_model.py calls
 build() itself at the end of a run; use this script to backfill older outputs. When the level's
 `lod_error_<level>_colors.npz` has body parts, each wearable mesh gets the FACE attribute `body_part`
-and the property `body_part_names` (the GLB carries neither; the npz holds them in GLB face order). Wearables with mirrored copies (face_labels.mirror_wear) also get the FACE attributes `mirrored` (1 = copy) and `label_source` ('mirrored' = index 6 of `label_source_names`).
+and the property `body_part_names` (the GLB carries neither; the npz holds them in GLB face order). Wearables with mirrored copies (face_labels.mirror_wear, or the exact reflection of the cut wearable, wearcut.py) get the FACE attribute `mirrored` (1 = copy); wearables with `wearable_label_source_glb_order` (every cut wearable, and the faces wearable when it has copies) get `label_source` ('mirrored' = index 6 of `label_source_names`).
 """
 from pathlib import Path
 import json
@@ -58,18 +58,21 @@ def build(out):
                 mesh.attributes.new('body_part', 'INT', 'FACE').data.foreach_set(
                     'value', z['wearable_body_part_glb_order'].astype(np.int32))
                 mesh['body_part_names'] = json.dumps([str(n) for n in z['body_part_names']])
-            if 'wearable_mirrored_glb_order' in z and len(z['wearable_mirrored_glb_order']) == len(mesh.polygons):
-                # copies mirrored onto the bare anchor side (face_labels.mirror_wear): marked per face
+            n = len(mesh.polygons)
+            if 'wearable_mirrored_glb_order' in z and len(z['wearable_mirrored_glb_order']) == n:
+                # copies mirrored onto the bare anchor side (face_labels.mirror_wear / the cut wearable's exact reflection): marked per face
                 mesh.attributes.new('mirrored', 'INT', 'FACE').data.foreach_set(
                     'value', z['wearable_mirrored_glb_order'].astype(np.int32))
+            if 'wearable_label_source_glb_order' in z and len(z['wearable_label_source_glb_order']) == n:
                 mesh.attributes.new('label_source', 'INT', 'FACE').data.foreach_set(
                     'value', z['wearable_label_source_glb_order'].astype(np.int32))
-                mesh['label_source_names'] = json.dumps([str(n) for n in z['label_source_names']])
+                mesh['label_source_names'] = json.dumps([str(n_) for n_ in z['label_source_names']])
     for area in bpy.context.screen.areas if bpy.context.screen else []:
         if area.type == 'VIEW_3D':
             area.spaces.active.shading.type = 'SOLID'
             area.spaces.active.shading.color_type = 'MATERIAL'
     dest = out / 'wearable.blend'
+    bpy.context.preferences.filepaths.save_version = 0   # no wearable.blend1 beside a rebuilt file
     bpy.ops.wm.save_as_mainfile(filepath=str(dest), compress=True)
     print('WEARABLE_BLEND', dest, flush=True)
     return dest

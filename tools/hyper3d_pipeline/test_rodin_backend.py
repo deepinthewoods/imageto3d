@@ -2,6 +2,7 @@
 import json
 import os
 from pathlib import Path
+import shutil
 import struct
 import sys
 import tempfile
@@ -55,9 +56,11 @@ class FakeSession:
     """Stands in for SeleniumRodin; `stages` is the sequence wait_stage reports."""
     log = []
 
-    def __init__(self, out, stages=(), costs=None, intent_check=None, glb=None):
+    def __init__(self, out, stages=(), costs=None, intent_check=None, glb=None, balance=100.0, url=URL, refused=False,
+                 offline=False):
         self.out, self.stages, self.costs = Path(out), list(stages), costs or {}
         self.glb, self.intent_check = glb, intent_check
+        self.balance, self.url, self.refused, self.offline = balance, url, refused, offline
         FakeSession.log = self.calls = []
 
     def __enter__(self):
@@ -71,6 +74,8 @@ class FakeSession:
 
     def open_workspace(self):
         self.calls.append(('open_workspace',))
+        if self.offline:
+            raise RuntimeError('Reached error page: about:neterror?e=dnsNotFound\nStacktrace: ...')
 
     def prepare_multiview(self, paths, config):
         self.calls.append(('prepare_multiview', [n for n, _ in paths]))
@@ -81,7 +86,13 @@ class FakeSession:
         self.calls.append(('click_free_preview',))
 
     def wait_model_url(self, timeout):
-        return URL
+        return self.url
+
+    def wait_balance(self, timeout):
+        return self.balance
+
+    def insufficient_balance(self):
+        return self.refused
 
     def open_model(self, url):
         self.calls.append(('open_model', url))
@@ -163,6 +174,38 @@ class ViewTests(unittest.TestCase):
         plan = rb.validate_views(make_views(self.root / 'v'), {**CONFIG, 'multi_view': False})
         self.assertEqual(plan['uploaded'], ['front.png'])
 
+    def three_views(self, omitted='back', **marker):
+        folder = make_views(self.root / 'v')
+        (folder / (omitted + '.png')).unlink(missing_ok=True)
+        (folder / 'views_omitted.json').write_text(json.dumps({'omitted': [omitted], 'reason': 'test', **marker}))
+        return folder
+
+    def test_three_view_module_skips_the_omitted_slot(self):
+        for omitted in ('back', 'front_three_quarter', 'back_three_quarter'):
+            plan = rb.validate_views(self.three_views(omitted), CONFIG)
+            self.assertEqual(plan['uploaded'], [n for n in CONFIG['view_order'] if n != omitted + '.png'])
+            self.assertEqual(plan['images'], plan['uploaded'])
+            self.assertEqual(plan['views_omitted'], [omitted])
+            shutil.rmtree(self.root / 'v')
+
+    def test_three_view_marker_is_validated(self):
+        folder = make_views(self.root / 'v')                       # all four exist but the marker omits back
+        (folder / 'views_omitted.json').write_text(json.dumps({'omitted': ['back']}))
+        with self.assertRaisesRegex(ValueError, 'exists'):
+            rb.validate_views(folder, CONFIG)
+        (folder / 'views_omitted.json').write_text(json.dumps({'omitted': ['front']}))
+        with self.assertRaisesRegex(ValueError, 'front is always required'):
+            rb.validate_views(folder, CONFIG)
+        (folder / 'views_omitted.json').write_text(json.dumps({'omitted': ['back', 'front_three_quarter']}))
+        with self.assertRaisesRegex(ValueError, 'exactly one'):
+            rb.validate_views(folder, CONFIG)
+
+    def test_view_missing_without_marker_still_fails(self):
+        folder = make_views(self.root / 'v')
+        (folder / 'back.png').unlink()
+        with self.assertRaisesRegex(ValueError, 'Missing back.png'):
+            rb.validate_views(folder, CONFIG)
+
 
 class CostTests(unittest.TestCase):
     def test_parse(self):
@@ -185,6 +228,65 @@ class PageStateTests(unittest.TestCase):
         self.assertEqual(rb.classify_auth({'one_tap': True, 'logout': True}), 'signed_out')
         self.assertEqual(rb.classify_auth({'logout': True}), 'signed_in')
         self.assertEqual(rb.classify_auth({}), 'unknown')
+
+    def test_a_page_that_never_settles_is_reloaded_before_stopping(self):
+        class Driver:
+            current_url = 'https://hyper3d.ai/workspace/rodin/x'
+
+            def __init__(self, states):
+                self.states = list(states)
+
+            def execute_script(self, js):
+                return self.states.pop(0) if self.states else {}
+
+        class Wf:
+            def __init__(self):
+                self.loads = []
+
+            def navigate(self, driver, url):
+                self.loads.append(url)
+
+        session = rb.SeleniumRodin(CONFIG, tempfile.mkdtemp())
+        session.wf, session.screenshot = Wf(), lambda label: None
+        session.driver = Driver([{}, {'logout': True}])   # the test clock allows one poll per attempt
+        with mock.patch('time.sleep'), mock.patch('time.monotonic', side_effect=range(0, 10 ** 6, 20)):
+            session._require_signed_in(timeout=30)
+        self.assertEqual(session.wf.loads, ['https://hyper3d.ai/workspace/rodin/x'])
+        session.driver, session.wf = Driver([]), Wf()
+        with mock.patch('time.sleep'), mock.patch('time.monotonic', side_effect=range(0, 10 ** 6, 20)):
+            with self.assertRaises(rb.Stop):
+                session._require_signed_in(timeout=30)
+        self.assertEqual(len(session.wf.loads), 2)
+
+    def test_a_stale_part_file_from_an_interrupted_download_does_not_block_the_next(self):
+        class Element:
+            def __init__(self, text='', on_click=None):
+                self.text, self.on_click = text, on_click
+
+            def is_displayed(self):
+                return True
+
+            def get_attribute(self, name):
+                return 'true'
+
+            def click(self):
+                if self.on_click:
+                    self.on_click()
+
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out)
+        session = rb.SeleniumRodin({**CONFIG, 'download_timeout_s': 1}, out)
+        session.downloads.mkdir()
+        (session.downloads / 'base_basic_pbr.glb').touch()          # Firefox's placeholder, left by the crash
+        (session.downloads / 'base_basic_pbr.C6g_2szt.glb.part').write_bytes(b'x' * 100)
+        pack = mock.Mock(text='Pack ... Download')
+        pack.find_elements.return_value = [Element(CONFIG['export_format_label']), Element(CONFIG['texture_resolution'])]
+        session.wf = mock.Mock(scope=mock.Mock(return_value=pack), exact=mock.Mock(return_value=Element(
+            on_click=lambda: make_glb(session.downloads / 'base_basic_pbr(1).glb'))))
+        session._set_checkbox = lambda pack, label, wanted: None
+        with mock.patch('time.sleep'):
+            path, _ = session.export_glb(out, session.config)
+        self.assertEqual(path.name, 'glb_base_basic_pbr(1).glb')
 
     def test_balance(self):
         self.assertEqual(rb.parse_balance('Add On\nAPI\nMCP&CLI\n1310.5\nQuinlan'), 1310.5)
@@ -280,6 +382,56 @@ class FlowTests(unittest.TestCase):
         self.assertEqual(data['input_resolution'], [8, 6])
         self.assertEqual((data['settings']['mesh_mode'], data['settings']['smart_low_poly'], data['settings']['mesh_simplify']), ('Triangle', False, False))
         self.assertTrue((self.out / 'events.jsonl').exists())
+
+    def test_submit_waits_for_the_wallet_and_sets_the_record_aside_when_it_shows_zero(self):
+        session = FakeSession(self.out, balance=0.0)
+        with self.assertRaises(rb.Stop):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertNotIn(('click_free_preview',), session.calls)
+        self.assertFalse((self.out / rb.RECORD).exists())          # a re-run submits again
+        aside = json.loads(next(self.out.glob('studio_submission.not_submitted_*.json')).read_text())
+        self.assertEqual((aside['status'], aside['actions']), ('not_submitted', {}))
+        rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out))
+        self.assertEqual(self.record()['status'], 'submitted')
+
+    def test_an_error_before_the_click_sets_the_record_aside(self):
+        with self.assertRaises(rb.Stop):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out, offline=True))
+        self.assertFalse((self.out / rb.RECORD).exists())          # not a 'preparing' record collect refuses
+        aside = json.loads(next(self.out.glob('studio_submission.not_submitted_*.json')).read_text())
+        self.assertEqual((aside['status'], aside['actions']), ('not_submitted', {}))
+        self.assertIn('dnsNotFound', aside['why'])
+        rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out))
+        self.assertEqual(self.record()['status'], 'submitted')
+
+    def test_insufficient_balance_after_the_click_is_not_left_for_review(self):
+        session = FakeSession(self.out, url=None, refused=True)
+        with self.assertRaises(rb.Stop):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertIn(('click_free_preview',), session.calls)
+        self.assertFalse((self.out / rb.RECORD).exists())
+        aside = json.loads(next(self.out.glob('studio_submission.not_submitted_*.json')).read_text())
+        self.assertEqual((aside['status'], aside['pending_action']), ('not_submitted', None))
+
+    def test_no_model_url_without_a_refusal_still_needs_review(self):
+        rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out, url=None))
+        self.assertEqual(self.record()['status'], 'submission_needs_review')
+
+    def test_three_view_submit_uploads_only_present_views_and_records_omission(self):
+        folder = make_views(self.root / 'three')
+        (folder / 'back.png').unlink()
+        (folder / 'views_omitted.json').write_text(json.dumps({'omitted': ['back'], 'reason': 'refused'}))
+        session = FakeSession(self.out)
+        rb.submit(folder, self.out, config=CONFIG, session_factory=lambda: session)
+        present = [n for n in CONFIG['view_order'] if n != 'back.png']
+        self.assertIn(('prepare_multiview', present), session.calls)
+        data = self.record()
+        self.assertEqual((data['images_uploaded'], data['views_omitted']), (present, ['back']))
+        self.assertEqual(sorted(data['settings']['directions']), sorted(present))
+
+    def test_four_view_record_has_no_views_omitted(self):
+        self.do_submit()
+        self.assertNotIn('views_omitted', self.record())
 
     def test_never_resubmits(self):
         self.do_submit()
@@ -385,16 +537,16 @@ class DispatchTests(unittest.TestCase):
     def test_commands(self):
         out, views = Path('/o'), Path('/v')
         self.assertEqual(convert_job.submit_command('tripo', views, out),
-                         ['node', str(convert_job.TOOLS / 'studio.mjs'), 'submit', '/v', '/o'])
+                         ['node', str(convert_job.TOOLS / 'studio.mjs'), 'submit', str(views), str(out)])
         self.assertEqual(convert_job.collect_command('tripo', out, {'allow_paid': True}),
-                         ['node', str(convert_job.TOOLS / 'studio.mjs'), 'collect', '/o'])
+                         ['node', str(convert_job.TOOLS / 'studio.mjs'), 'collect', str(out)])
         with mock.patch.dict(os.environ, {'HYPER3D_VENV': '/venv'}):
             self.assertEqual(convert_job.submit_command('hyper3d', views, out, True)[-4:],
-                             ['submit', '/v', '/o', '--dry-run'])
+                             ['submit', str(views), str(out), '--dry-run'])
             cmd = convert_job.collect_command('hyper3d', out, {'allow_paid': True, 'accept_preview': True})
-        self.assertEqual((cmd[0], cmd[-3:]), ('/venv/bin/python', ['/o', '--allow-paid', '--accept-preview'][0:0] + cmd[-3:]))
+        self.assertEqual(Path(cmd[0]), Path('/venv') / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python'))
         self.assertIn('--allow-paid', cmd)
-        self.assertEqual(convert_job.collect_command('hyper3d', out)[-1], '/o')
+        self.assertEqual(convert_job.collect_command('hyper3d', out)[-1], str(out))
         self.assertEqual(convert_job.option_value(['--backend=hyper3d'], '--backend'), 'hyper3d')
         self.assertEqual(convert_job.option_value(['--backend', 'tripo'], '--backend'), 'tripo')
         self.assertEqual(convert_job.option_value([], '--backend', 'tripo'), 'tripo')

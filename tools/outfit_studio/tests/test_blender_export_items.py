@@ -144,11 +144,11 @@ def w_verify(batch):
             ok = len(mesh_nodes) == len(rec['nodes']) and all(
                 [doc['materials'][p['material']]['name'] for p in doc['meshes'][n['mesh']]['primitives']] == rec['nodes'][n['name']]['primitives']
                 for n in mesh_nodes)
-            check(f'{tag}: primitives / channel map equal <base>.json ({sum(len(n["primitives"]) for n in rec["nodes"].values())} primitives)', ok)
-            ids = {c['id'] for c in ij['channels']}
+            check(f'{tag}: primitives / material map equal <base>.json ({sum(len(n["primitives"]) for n in rec["nodes"].values())} primitives)', ok)
             names = {doc['materials'][p['material']]['name'] for n in mesh_nodes for p in doc['meshes'][n['mesh']]['primitives']}
-            check(f'{tag}: material names are channel ids', names <= ids and not any(m.startswith('OSCH_') for m in names), sorted(names)[:3])
-            check(f'{tag}: item.json lists this base and its channel ids cover the GLB', base in ij['races'] and names <= ids, str(ij['races']))
+            check(f'{tag}: material names are the colour roles (or skin), no OSCH_ prefix', names <= set(ij['roles']) | {'skin'} and not any(m.startswith('OSCH_') for m in names), sorted(names)[:4])
+            check(f'{tag}: item.json (material schema 2) lists this base, its section states and the role encoding',
+                  base in ij['races'] and base in ij['sections'] and ij['material_schema'] == 2 and ij['role_encoding']['scale'] == 8, str(ij['races']))
             check(f'{tag}: morph weights neutral', all(not any(abs(w) > 1e-7 for w in doc['meshes'][n['mesh']].get('weights', [])) for n in mesh_nodes))
             # Blender re-import
             bpy.ops.wm.read_factory_settings(use_empty=True)
@@ -178,7 +178,7 @@ def w_verify(batch):
                                 gs.setdefault(o.vertex_groups[g.group].name, []).append(g.weight)
                     if set(gs) != set(want) or any(len(w) != len(o.data.vertices) or abs(sum(w) / len(w) - want[k]) > 1e-4 for k, w in gs.items()):
                         bad.append((o.name, 'rigid groups', {k: len(w) for k, w in gs.items()}, want))
-            check(f'{tag}: materials == channel map, rigid pieces weighted to exactly the table bone', not bad, str(bad[:2]))
+            check(f'{tag}: materials == <base>.json, rigid pieces weighted to exactly the table bone', not bad, str(bad[:2]))
             check(f'{tag}: shape keys (bulk_*) present on pieces', keyed == len(meshes) and keyed > 0, f'{keyed}/{len(meshes)}')
             n_items += 1
     check(f'verified {n_items} item layers', n_items >= 9)
@@ -476,14 +476,13 @@ def step_export():
         check(f'run.py export-items {base}: 3 exported', code == 0 and len(r['results']) == 3 and not r['failed'], f'{secs:.1f}s; {per}')
     check('export never saved the outfit files', before == {b: sha(PD / f'{b}_outfits.blend') for b in (*BASES, 'gnome_female')})
     cat = json.loads((BATCH / 'catalog.json').read_text())
-    check('catalog.json lists all 4 bases and 3 items (the gnome set joins the same items)', sorted(cat['bases']) == sorted((*BASES, 'gnome_female')) and len(cat['items']) == 3 and cat['format'] == 'outfit_studio_v1',
+    check('catalog.json lists all 4 bases and 3 items (the gnome set joins the same items)', sorted(cat['bases']) == sorted((*BASES, 'gnome_female')) and len(cat['items']) == 3 and cat['format'] == 'outfit_studio_v2',
           f"{len(cat['bases'])} bases, {len(cat['items'])} items")
     for t in TYPES:
         ij = json.loads((BATCH / 'items' / f'{SET}__{t}' / 'item.json').read_text())
         check(f'item.json {t}: races lists all 4 bases', ij['races'] == sorted((*BASES, 'gnome_female')), str(ij['races']))
     ij = json.loads((BATCH / 'items' / f'{SET}__body_armor' / 'item.json').read_text())
-    ids = [c['id'] for c in ij['channels']]
-    check('item.json channel ids are the union over bases', {'chest', 'chest_secondary'} <= set(ids) and len(ids) == len(set(ids)), str(len(ids)))
+    check('item.json roles are the union over bases (role names, no channel list)', {'primary'} <= set(ij['roles']) and 'channels' not in ij, str(ij['roles']))
     rec = json.loads((BATCH / 'items' / f'{SET}__body_armor' / 'dwarf_female.json').read_text())
     check('<base>.json records mismatch warnings', True, f"{len(rec['warnings'])} warnings")
 
@@ -512,9 +511,7 @@ def step_edit():
     got = {x['item_id'].split('__')[1]: x['status'] for x in r['results']}
     check('--resume re-exports only the edited item', code == 0 and got == {'body_armor': 'exported', 'gauntlets': 'skipped', 'boots': 'skipped'}, str(got))
     ij = json.loads((BATCH / 'items' / f'{SET}__body_armor' / 'item.json').read_text())
-    check('item.json keeps the other bases\' races after re-export', ij['races'] == sorted((*BASES, 'gnome_female')) and ij['channels'][0]['role'] == 'accent', str(ij['races']))
-    rec = json.loads((BATCH / 'items' / f'{SET}__body_armor' / 'dwarf_male.json').read_text())
-    check('<base>.json warns about role mismatch across bases', any('role/material' in w for w in rec['warnings']), str(rec['warnings'][-1:])[:160])
+    check('item.json keeps the other bases\' races after re-export', ij['races'] == sorted((*BASES, 'gnome_female')) and 'accent' in ij['roles'], str(ij['races']))
 
 
 def step_hashcheck():

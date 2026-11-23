@@ -153,6 +153,36 @@ def smooth_weights(V, F, probe, rest, base, rig, hips_vertices=None):
     return names, W
 
 
+def transfer_weights(probe, rest, base, rig):
+    """The base's own weights at the probed points (nearest base face, interpolated), top 4 and normalised, no smoothing:
+    what a piece of base-body geometry (a section connector) needs to move exactly like the body next to it."""
+    names, Wb = base_groups(base, rig)
+    if len(Wb) != rest['n_vertices']:
+        raise ValueError('base vertex count differs from its rest mesh (modifiers that change topology?)')
+    W = np.einsum('nj,njg->ng', probe['bary'], Wb[rest['F'][probe['tri']]])
+    return names, limit(W, table()['smooth']['influences'])
+
+
+def bind_connector(obj, rig, rest, base, probe):
+    """Skin a connector mesh like the base body (transfer_weights) and bind it to the rig."""
+    names, W = transfer_weights(probe, rest, base, rig)
+    set_vertex_weights(obj, names, W)
+    ensure_armature(obj, rig)
+    obj['os_weights'] = 'connector'
+
+
+def weight_report(obj, rig):
+    """{max_influences, max_sum_error, unweighted} over the deform groups of an object (what the export contract needs:
+    at most 4 influences, weights summing to 1)."""
+    names, W = vertex_weights(obj)
+    isdef = np.array([n in deform_bones(rig) for n in names], bool)
+    Wd = W[:, isdef] * (W[:, isdef] > 1e-8)
+    total = Wd.sum(1)
+    return {'max_influences': int((Wd > 0).sum(1).max()) if len(Wd) else 0,
+            'max_sum_error': float(np.abs(total[total > 0] - 1).max()) if (total > 0).any() else 0.,
+            'unweighted': int((total <= 1e-8).sum())}
+
+
 def hips_faces(F, face_part, centroids, rest, margin=0.):
     """Face mask for the hips-dominant blend: body part `skirt`, or below the crotch and between the thighs."""
     mask = np.asarray(face_part) == 'skirt'

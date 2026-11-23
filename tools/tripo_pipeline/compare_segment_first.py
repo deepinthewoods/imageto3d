@@ -32,7 +32,7 @@ SECTION_CLASSES = (0, 1, 3)        # primary, secondary, accent (garment indices
 
 def hp_reference(sfdir):
     z = np.load(Path(sfdir) / 'prep' / 'prep.npz')
-    meta = json.loads((Path(sfdir) / 'prep' / 'prep.json').read_text())
+    meta = json.loads((Path(sfdir) / 'prep' / 'prep.json').read_text(encoding='utf-8-sig'))
     hl = np.load(Path(sfdir) / 'highpoly_labels.npz')
     wear = hl['wear']
     v, f = z['v'].astype(np.float64), z['f'].astype(np.int64)
@@ -75,7 +75,7 @@ def mixed_stats(level, ref):
 
 
 def current_level(cdir, lv):
-    manifest = json.loads((Path(cdir) / 'reduced' / 'manifest.json').read_text())
+    manifest = json.loads((Path(cdir) / 'reduced' / 'manifest.json').read_text(encoding='utf-8-sig'))
     level = sp.load_level(Path(cdir) / 'reduced', lv, manifest)
     z = np.load(Path(cdir) / 'pieces_auto' / f'lod_{lv}' / 'faces.npz', allow_pickle=True)
     return level, z['piece'].astype(np.int64), manifest
@@ -137,10 +137,10 @@ def main(argv):
         cdir, sdir = rest.split(':', 1)
         ref = hp_reference(sdir)
         meta = ref['meta']
-        cur_json = json.loads((Path(cdir) / 'pieces_auto' / 'pieces.json').read_text())
-        sf_json = json.loads((Path(sdir) / 'pieces' / 'pieces.json').read_text())
-        sf_seg = json.loads((Path(sdir) / 'segment_first.json').read_text())
-        cur_manifest = json.loads((Path(cdir) / 'reduced' / 'manifest.json').read_text())
+        cur_json = json.loads((Path(cdir) / 'pieces_auto' / 'pieces.json').read_text(encoding='utf-8-sig'))
+        sf_json = json.loads((Path(sdir) / 'pieces' / 'pieces.json').read_text(encoding='utf-8-sig'))
+        sf_seg = json.loads((Path(sdir) / 'segment_first.json').read_text(encoding='utf-8-sig'))
+        cur_manifest = json.loads((Path(cdir) / 'reduced' / 'manifest.json').read_text(encoding='utf-8-sig'))
         rep = {'levels': {}}
         secs = {}
         for lv in sf_json['levels']:

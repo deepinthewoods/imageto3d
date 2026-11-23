@@ -75,6 +75,21 @@ class SegmentFirstTest(unittest.TestCase):
         lab, _ = sf.potts(ev, np.ones(len(f)), pairs, bare=bare)
         self.assertTrue((lab[:len(f) // 4] == 0).all())
 
+    def test_bare_part_mask_leaves_the_knee_cop_part_free(self):
+        names = ['thigh_stretch.l', 'leg_stretch.l', 'foot.l', 'head.x', 'spine_01.x', 'forearm_stretch.r', 'knee_cop.l']
+        part = np.array([0, 1, 1, 2, 3, 4, 5, 6])
+        self.assertEqual(sf.bare_part_mask(part, names).tolist(), [False, True, True, True, True, False, True, False])
+
+    def test_segment_highpoly_turns_the_knee_sections_on_only_when_asked(self):
+        from unittest import mock
+        seen = []
+        with mock.patch.object(sf.sp, 'build_sections', side_effect=lambda level, spec, method, overlap: seen.append(spec)):
+            sf.segment_highpoly(None, 100)
+            sf.segment_highpoly(None, 100, None, True)
+        self.assertFalse(seen[0].get('knee_cops'))
+        self.assertTrue(seen[1]['knee_cops'])
+        self.assertEqual([s['rigid_method'] for s in seen], ['regions', 'regions'])
+
     def test_douglas_peucker(self):
         t = np.linspace(0, 1, 200)
         P = np.stack([t, .0005 * np.sin(t * 90), np.zeros(200)], 1)

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Validate and stage user-approved front concepts for four-view Tripo jobs.
 
+A module folder may carry `views_omitted.json` (see views_omitted.py): one non-front view is then absent
+by design and the module converts from its three views.
+
 This tool never generates images, submits a Tripo job or marks one completed.
 Only the user moves sets into approved/. The assistant runs claim after a chat
 instruction, generates views with imagegen, and runs ready when all are present.
@@ -23,6 +26,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from palette import Palette  # noqa: E402
+import views_omitted  # noqa: E402
 
 VIEWS = ('front', 'front_three_quarter', 'back', 'back_three_quarter')
 ARMOR = {'body_armor', 'right_gauntlet_boot'}
@@ -93,23 +97,24 @@ def flat_fronts(race: Path) -> dict[str, Path] | None:
 
 
 def unflatten(race: Path) -> None:
-    """Turn the flat concept layout into `<module>/front.png` folders for the view stages.
+    """Turn the flat concept layout into per-module view folders for the view stages.
 
-    Everything else in the folder (prompts, design records, rejected attempts) moves to
-    `.concept_notes/` so it travels with the job but is not mistaken for a view or module.
+    Since 2026-10-28 the concept fronts are NOT views: every file (the `<module>_front.png`
+    concept art included, prompts, design records, rejected attempts) moves to `.concept_notes/`
+    so it travels with the job but is never mistaken for a view. The empty `<module>/` folders
+    are filled by the views task, which generates all four views - front.png included - as edits
+    of the base views, using the concept front only as the design reference.
     """
     fronts = flat_fronts(race)
     if not fronts:
         return
     notes = race / '.concept_notes'
     notes.mkdir(exist_ok=True)
-    keep = set(fronts.values())
     for path in sorted(race.iterdir()):
-        if path.is_file() and path not in keep:
+        if path.is_file():
             shutil.move(str(path), notes / path.name)
-    for module, path in fronts.items():
-        (race / module).mkdir()
-        shutil.move(str(path), race / module / 'front.png')
+    for module in fronts:
+        (race / module).mkdir(exist_ok=True)
 
 
 def anchor_match(front: Path, base_front: Path, palette: Palette) -> float | None:
@@ -193,7 +198,7 @@ def validate_set(root: Path, folder: Path, complete: bool, base_dirs: dict[str, 
         raise ValueError(f'Expected a named set directory: {folder}')
     check_symlinks(folder)
     record_path = folder / '.tripo-job.json'
-    record = json.loads(record_path.read_text()) if record_path.is_file() else {}
+    record = json.loads(record_path.read_text(encoding='utf-8-sig')) if record_path.is_file() else {}
     base_view_root = record.get('base_view_root', 'base_views')
     if base_view_root not in ('base_views', '.base_views'):
         raise ValueError(f'Unexpected base view root: {base_view_root}')
@@ -223,12 +228,18 @@ def validate_set(root: Path, folder: Path, complete: bool, base_dirs: dict[str, 
             raise ValueError(f'{race.name} needs both armor modules or one outfit module; found {sorted(modules)}')
         for module in sorted(modules):
             source = race / module
-            wanted = VIEWS if complete else VIEWS[:1]
+            marker = views_omitted.load(source) if flat is None else None   # ValueError for an invalid marker
+            wanted = tuple(v for v in (VIEWS if complete else VIEWS[:1]) if not marker or v not in marker['omitted'])
+            frozen_entry = next((m.get('views_omitted') for m in record.get('modules', [])
+                                 if m.get('race_gender') == race.name and m.get('module') == module), None)
+            if frozen_entry and frozen_entry.get('sha256') and (not marker or marker['sha256'] != frozen_entry['sha256']):
+                raise ValueError(f'{source}: {views_omitted.MARKER} changed or missing after the job was staged')
             if flat is None:
                 actual = {p.name for p in source.iterdir() if p.suffix.lower() == '.png'}
                 if actual != {view + '.png' for view in wanted}:
                     raise ValueError(f'{source}: expected exactly {list(wanted)} PNG views, found {sorted(actual)}')
-            result['modules'].append({'race_gender': race.name, 'module': module})
+            result['modules'].append({'race_gender': race.name, 'module': module,
+                                      **({'views_omitted': marker} if marker else {})})
             for view in wanted:
                 relative = Path(race.name) / module / (view + '.png')
                 if flat is not None:
@@ -246,7 +257,7 @@ def stage_status(root: Path) -> dict:
 def claim(root: Path, set_name: str, base_views: Path | None = None) -> dict:
     if not clean_name(set_name):
         raise ValueError('Set name must be a single safe folder name')
-    if root == Path(__file__).resolve().parents[2]:
+    if root == Path(__file__).resolve().parents[2] and shutil.which('systemctl'):   # no systemd on Windows: nothing to check
         service = subprocess.run(['systemctl', '--user', 'is-active', 'pixal3d-armor-queue.service'],
                                  capture_output=True, text=True, check=False)
         if service.stdout.strip() == 'active':
@@ -340,7 +351,7 @@ def promote(root: Path, batch: Path, number: str, set_id: str | None = None, rac
     record_path = batch / f'{nn}_{slug}.json'
     if not record_path.is_file():
         raise ValueError(f'Missing record {record_path.name}')
-    meta = json.loads(record_path.read_text())
+    meta = json.loads(record_path.read_text(encoding='utf-8-sig'))
     race = race or meta.get('race_gender')
     if not race or not clean_name(race):
         raise ValueError('Race unknown: pass --race <race_gender> (or put race_gender in the concept json)')
@@ -383,25 +394,32 @@ def ready(root: Path, job_name: str) -> dict:
     record_path = source / '.tripo-job.json'
     if not record_path.is_file():
         raise ValueError('Claimed job record is missing')
-    record = json.loads(record_path.read_text())
+    record = json.loads(record_path.read_text(encoding='utf-8-sig'))
     if record.get('state') != 'generating_other_views':
         raise ValueError(f'Unexpected job state: {record.get("state")}')
     if job_name != f'{record["set"]}--{record["job_id"]}':
         raise ValueError('Job folder does not match frozen record')
-    for path, sha in record['front_hashes'].items():
-        if details['images'].get(path, {}).get('sha256') != sha:
-            raise ValueError(f'Approved front changed after claiming: {path}')
+    # Since 2026-10-28 front.png is a generated view (the concept art sits unchanged in .concept_notes/
+    # and its frozen `front_hashes` stay in the record as provenance), so there is no front to freeze here.
     destination = root / 'multiview_ready' / job_name
     destination.parent.mkdir(parents=True, exist_ok=True)
     if destination.exists():
         raise FileExistsError(destination)
     record['state'] = 'ready_for_tripo'
+    omitted = {(m['race_gender'], m['module']): m['views_omitted'] for m in details['modules'] if m.get('views_omitted')}
+    for entry in record.get('modules', []):   # three-view modules: the omission is part of the frozen job record
+        found = omitted.get((entry.get('race_gender'), entry.get('module')))
+        if found:
+            entry['views_omitted'] = found
+        else:
+            entry.pop('views_omitted', None)
     record['view_hashes'] = {p: meta['sha256'] for p, meta in details['images'].items()}
     record['conversion'] = 'pending_playwright_worker'
     write_json(record_path, record)
     os.rename(source, destination)
     return {'job': job_name, 'path': str(destination), 'views': len(details['images']),
-            'conversion': record['conversion']}
+            'conversion': record['conversion'],
+            **({'views_omitted': {f'{r}/{m}': v['omitted'] for (r, m), v in omitted.items()}} if omitted else {})}
 
 
 def main(argv: list[str] | None = None) -> int:

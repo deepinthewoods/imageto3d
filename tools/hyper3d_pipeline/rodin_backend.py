@@ -21,7 +21,9 @@ is UNVERIFIED against a signed-in session; everything else is offline-tested wit
 """
 import argparse
 import hashlib
+import importlib.util
 import json
+import os
 import re
 import shutil
 import struct
@@ -35,6 +37,18 @@ sys.path.insert(0, str(HERE))
 from job_state import BASE, atomic_json, model_id, now  # noqa: E402
 
 CONFIG = HERE / 'config.json'
+
+
+def _load_views_omitted():
+    """tools/tripo_pipeline/views_omitted.py (three-view module marker), loaded by path so that folder never joins sys.path
+    (it has its own workflow.py/palette.py that must not shadow this folder's modules)."""
+    spec = importlib.util.spec_from_file_location('views_omitted', HERE.parent / 'tripo_pipeline' / 'views_omitted.py')
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+views_omitted = _load_views_omitted()
 RECORD = 'studio_submission.json'
 COST_KINDS = ('geometry', 'material_generate', 'material_confirm')
 STAGES_TO_ACT = {'geometry_preview', 'material_ready', 'material_preview', 'export_ready'}
@@ -42,6 +56,25 @@ STAGES_TO_ACT = {'geometry_preview', 'material_ready', 'material_preview', 'expo
 
 class Stop(Exception):
     """A fail-closed stop: nothing wrong happened, a guard or a missing permission halted the run."""
+
+
+BALANCE_WAIT_S = 60   # the header balance loads late (0, then the real one); Generate with 0 shown = "Insufficient Balance"
+INSUFFICIENT = 'Insufficient Balance'
+
+
+def stat_or_none(path):
+    try:
+        return path.stat()
+    except (FileNotFoundError, PermissionError):   # Windows: a file Firefox is renaming/holding
+        return None
+
+
+def not_submitted(record, why):
+    """Nothing was generated (no click, or Hyper3D refused it): set the record aside so a re-run submits again."""
+    record.save('not_submitted', status='not_submitted', pending_action=None, why=why)
+    aside = record.path.with_name(f'{record.path.stem}.not_submitted_{time.strftime("%Y%m%dT%H%M%S")}.json')
+    record.path.rename(aside)
+    raise Stop(f'{why}; nothing was generated, record moved to {aside.name}, a re-run submits again')
 
 
 # --------------------------------------------------------------------------- config / inputs
@@ -68,9 +101,14 @@ def validate_views(views_dir, config):
     """Check the module's views exist, are 8-bit RGBA PNGs of identical size; returns the upload plan.
 
     With multi_view false only the first view (front) is used. Never resizes anything.
+
+    Three-view modules: a `views_omitted.json` marker in `views_dir` (tools/tripo_pipeline/views_omitted.py) drops that
+    view from the plan, so its slot is simply not uploaded; `images` and `uploaded` list the views that exist and
+    `views_omitted` the omitted names (without .png). Without a marker all of `view_order` must exist.
     """
     views_dir = Path(views_dir)
-    names = list(config['view_order'])
+    omitted = views_omitted.omitted_views(views_dir)
+    names = [n for n in config['view_order'] if n[:-len('.png')] not in omitted]
     for name in names:
         if not (views_dir / name).is_file():
             raise ValueError(f'Missing {name}')
@@ -81,7 +119,7 @@ def validate_views(views_dir, config):
     if config.get('max_images') and len(used) > config['max_images']:
         raise ValueError(f'{len(used)} views exceed the max_images={config["max_images"]} of this config')
     return {'views_dir': str(views_dir.resolve()), 'images': names, 'uploaded': used,
-            'input_resolution': list(dims[0])}
+            'input_resolution': list(dims[0]), 'views_omitted': omitted}
 
 
 def sha256_file(path):
@@ -249,6 +287,7 @@ def _record_data(plan, config, views_dir, out_dir):
     return {
         'backend': 'hyper3d', 'source': plan['views_dir'], 'images': plan['images'],
         'images_uploaded': plan['uploaded'], 'input_resolution': plan['input_resolution'],
+        **({'views_omitted': plan['views_omitted']} if plan.get('views_omitted') else {}),
         'settings': {'workflow': 'Rodin / Image to 3D' + (' / Multi-view' if config.get('multi_view') else ''),
                      'model': config['model'], 'effort': config['effort'],
                      'directions': {k: config['directions'].get(k) for k in plan['uploaded']},
@@ -271,24 +310,35 @@ def submit(views_dir, out_dir, *, config=None, session_factory=None, dry_run=Fal
     record = Record.create(out_dir / RECORD, _record_data(plan, config, views_dir, out_dir))
     session_factory = session_factory or (lambda: SeleniumRodin(config, out_dir))
     with session_factory() as session:
-        session.open_workspace()
-        paths = [(name, Path(plan['views_dir']) / name) for name in plan['uploaded']]
-        prepared = session.prepare_multiview(paths, config) or {}
-        record.save('uploaded', upload_info=prepared)
-        session.screenshot('before_submit')
-        record.save('ready_to_submit', status='ready_to_submit', displayed_cost_credits=0,
-                    ready_at=now())
-        if dry_run:
-            record.save('dry_run', status='dry_run')
-            return record.data
+        try:
+            session.open_workspace()
+            paths = [(name, Path(plan['views_dir']) / name) for name in plan['uploaded']]
+            prepared = session.prepare_multiview(paths, config) or {}
+            record.save('uploaded', upload_info=prepared)
+            session.screenshot('before_submit')
+            record.save('ready_to_submit', status='ready_to_submit', displayed_cost_credits=0,
+                        ready_at=now())
+            if dry_run:
+                record.save('dry_run', status='dry_run')
+                return record.data
+            balance = session.wait_balance(BALANCE_WAIT_S)
+            record.save('balance_before_submit', balance_before_submit=balance)
+        except Stop:
+            raise
+        except Exception as exc:                # 2026-10-27: a DNS error left a 'preparing' record collect refuses
+            not_submitted(record, f'{type(exc).__name__} before the click: {str(exc).splitlines()[0][:200]}')
+        if not balance:                         # 2026-10-27: clicked while the header still showed 0 -> refused
+            not_submitted(record, f'the wallet still showed {balance!r} credits after {BALANCE_WAIT_S} s')
         record.intent('free_preview')           # written before the click: never repeated
         session.click_free_preview()
         record.save('submission_clicked', status='submission_attempted', submit_clicked_at=now())
-        url = session.wait_model_url(90)
+        url = session.wait_model_url(600)       # Rodin can sit on GENERATING for minutes when busy
         session.screenshot('after_submit')
         if url and model_id(url):
             record.bind(url)
             record.save('submitted', status='submitted', after_submit_at=now())
+        elif session.insufficient_balance():
+            not_submitted(record, f'Hyper3D answered "{INSUFFICIENT}" to Free Preview')
         else:
             record.save('needs_review', status='submission_needs_review', after_submit_at=now())
     return record.data
@@ -456,10 +506,9 @@ class SeleniumRodin:
 
     def __enter__(self):
         import workflow as wf
-        from native_browser import PROFILE, BINARY, GECKODRIVER, check_profile
+        from native_browser import PROFILE, BINARY, check_profile, firefox_service, firefox_extra_args
         from selenium import webdriver
         from selenium.webdriver.firefox.options import Options
-        from selenium.webdriver.firefox.service import Service
         self.wf = wf
         try:
             check_profile(PROFILE)
@@ -471,12 +520,19 @@ class SeleniumRodin:
         options.binary_location = BINARY
         options.add_argument('-profile')
         options.add_argument(str(PROFILE))
+        for extra in firefox_extra_args():
+            options.add_argument(extra)
         options.set_preference('browser.download.folderList', 2)
         options.set_preference('browser.download.dir', str(self.downloads.resolve()))
         options.set_preference('browser.download.useDownloadDir', True)
         options.set_preference('browser.helperApps.neverAsk.saveToDisk',
                                'model/gltf-binary,application/octet-stream,application/zip,application/x-zip-compressed')
-        self.driver = webdriver.Firefox(service=Service(GECKODRIVER), options=options)
+        # Linux: private X display so no window pops up (PIPELINE_SHOW_WINDOWS=1 shows it); Windows: None (window shown)
+        sys.path.insert(0, str(HERE.parent))
+        from hidden_display import hidden_display
+        display = hidden_display()
+        env = {**os.environ, 'DISPLAY': display} if display else None
+        self.driver = webdriver.Firefox(service=firefox_service(env=env), options=options)
         self.driver.set_window_size(1500, 1000)
         self.driver.set_page_load_timeout(45)
         return self
@@ -499,24 +555,42 @@ class SeleniumRodin:
             logout: [...document.querySelectorAll('*')].some(e => e.children.length === 0 && e.innerText && e.innerText.trim() === 'Logout')};
     """
 
-    def _require_signed_in(self, timeout=30):
-        """Poll until the page shows a settled signed-in or signed-out state (the header loads late)."""
-        deadline = time.monotonic() + timeout
-        state = 'unknown'
-        while time.monotonic() < deadline:
-            state = classify_auth(self.driver.execute_script(self.AUTH_JS))
-            if state == 'signed_in':
-                return
-            if state == 'signed_out':
-                self.screenshot('signed_out')
-                raise Stop('Hyper3D profile is signed out (Login link / NO_CURRENT_USER / Google One Tap); '
-                           'run ./native.sh login, sign in, close Firefox, resume')
-            time.sleep(2)
+    def _require_signed_in(self, timeout=30, reloads=2):
+        """Poll until the page shows a settled signed-in or signed-out state (the header loads late).
+
+        A page that never settles is reloaded `reloads` times first (2026-10-27: after a DNS hiccup the app
+        stayed a blank dark page)."""
+        for attempt in range(reloads + 1):
+            if attempt:
+                print(f'Hyper3D page did not settle in {timeout} s; reloading ({attempt}/{reloads})', flush=True)
+                self.wf.navigate(self.driver, self.driver.current_url)
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                state = classify_auth(self.driver.execute_script(self.AUTH_JS))
+                if state == 'signed_in':
+                    return
+                if state == 'signed_out':
+                    self.screenshot('signed_out')
+                    raise Stop('Hyper3D profile is signed out (Login link / NO_CURRENT_USER / Google One Tap); '
+                               'run native.sh login (Windows: native.cmd login), sign in, close Firefox, resume')
+                time.sleep(2)
         self.screenshot('auth_unknown')
         raise Stop('Could not confirm a signed-in Hyper3D session (no Logout entry found)')
 
     def read_balance(self):
         return parse_balance(self.driver.find_element('tag name', 'body').text)
+
+    def wait_balance(self, timeout):
+        """The header balance once it is above 0 (it shows 0 until the account loads), else the last value read."""
+        deadline, balance = time.monotonic() + timeout, None
+        while True:
+            balance = self.read_balance()
+            if (balance or 0) > 0 or time.monotonic() >= deadline:
+                return balance
+            time.sleep(2)
+
+    def insufficient_balance(self):
+        return INSUFFICIENT in self.driver.find_element('tag name', 'body').text
 
     # -- submit
     def open_workspace(self):
@@ -642,6 +716,8 @@ class SeleniumRodin:
         while time.monotonic() < deadline:
             if model_id(self.driver.current_url):
                 return self.driver.current_url
+            if self.insufficient_balance():     # refused: no model will appear
+                return None
             time.sleep(2)
         return None
 
@@ -823,14 +899,18 @@ class SeleniumRodin:
         while time.monotonic() < deadline:
             # Firefox leaves an empty <name>.glb placeholder next to <name>.<rand>.glb.part until the download
             # ends (live: 42 MB), so wait until no .part file remains and the file is non-empty and stable.
-            pending = [p for p in self.downloads.iterdir() if p.name.endswith(('.part', '.crdownload'))]
+            # Firefox renames those files while we look, so a file listed a moment ago may be gone (2026-10-27 crash).
+            # Only this click's .part counts: one left by an interrupted earlier collect never finishes
+            # (2026-10-27: a finished re-download sat beside a stale .part until the timeout).
+            pending = [p for p in self.downloads.iterdir() if p.name not in before
+                       and p.name.endswith(('.part', '.crdownload'))]
             fresh = [p for p in self.downloads.iterdir() if p.name not in before
-                     and not p.name.endswith(('.part', '.crdownload')) and p.stat().st_size > 0
-                     and p.stat().st_mtime >= started - 1]
+                     and not p.name.endswith(('.part', '.crdownload')) and (st := stat_or_none(p))
+                     and st.st_size > 0 and st.st_mtime >= started - 1]
             if fresh and not pending:
-                size = fresh[0].stat().st_size
+                size = st.st_size if (st := stat_or_none(fresh[0])) else -1
                 time.sleep(3)
-                if fresh[0].stat().st_size == size:
+                if (st := stat_or_none(fresh[0])) and st.st_size == size:
                     return extract_glb(fresh[0], Path(out_dir)), panel_text
             time.sleep(3)
         raise TimeoutError('Download not found; resume to download again without regenerating')
@@ -859,7 +939,10 @@ def extract_glb(downloaded, out_dir):
     target = out_dir.resolve() / ('glb_' + downloaded.name)
     if target.exists():
         raise FileExistsError(f'Export destination exists: {target}')
-    shutil.copy2(downloaded, target)
+    try:
+        os.link(downloaded, target)  # same bytes as the download: a hard link saves ~40 MB per module
+    except OSError:
+        shutil.copy2(downloaded, target)
     return target
 
 

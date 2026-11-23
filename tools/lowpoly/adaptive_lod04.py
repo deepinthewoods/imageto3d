@@ -14,7 +14,8 @@ import lowpoly_lab as lab
 from planar_patches import planarize
 from build_fit_review02 import samples
 OUT=ROOT/"results/armor_04/adaptive_lod"
-LIB=C.CDLL(str(ROOT/"lib/libmeshoptimizer.so"))
+sys.path.insert(0,str(ROOT.parents[1]/"tools/tripo_pipeline"));import portable
+LIB=C.CDLL(str(ROOT/"lib"/("libmeshoptimizer.dll" if portable.WINDOWS else "libmeshoptimizer.so")))
 FN=LIB.meshopt_simplifyWithAttributes;P=C.c_void_p;S=C.c_size_t
 FN.argtypes=[P,P,S,P,S,S,P,S,P,S,P,S,C.c_float,C.c_uint,P];FN.restype=S
 

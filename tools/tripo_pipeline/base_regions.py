@@ -41,11 +41,15 @@ def measure(blend):
     wrist_x = float(hand[:, 0].min())
     # torso half-width just below the armpit (arms are horizontal in the T-pose)
     band = (n[:, 2] > arm_z[0] - .25) & (n[:, 2] < arm_z[0] - .1)
+    if not band.any():   # low-poly A-posed base with no vertex in that band (gnome_female): widest point below the hand
+        band = n[:, 2] < arm_z[0] - .05   # (clear of the red right hand, which hangs as low as the left)
     shoulder_x = float(np.abs(n[band, 0]).max())
-    ankle_z = float(foot[:, 2].max())
+    ankle_z = float(foot[:, 2].max()) if len(foot) else 0.0   # a base without feet (gnome_female since 2026-10-26)
     # crotch: lowest face centroid on the midline above the feet
     cent = np.array([n[list(p.vertices)].mean(0) for p in obj.data.polygons])
     mid = (np.abs(cent[:, 0]) < .03) & (cent[:, 2] > ankle_z + .1)
+    if not mid.any():    # no face centred on the midline (low-poly legless gnome_female): a wider strip
+        mid = (np.abs(cent[:, 0]) < .1) & (cent[:, 2] > ankle_z + .1)
     crotch_z = float(cent[mid, 2].min())
     return {
         'source_scene': str(Path(blend).resolve()),

@@ -88,7 +88,7 @@ def normalized_triangles(obj):
 
 
 def build(source, palette, dest=None, cameras_path=None, regions_path=None, parts_path=None,
-          base_parts=None, part_fit=None, module=None):
+          base_parts=None, part_fit=None, module=None, omit_views=(), knee_cops=None):
     source = Path(source).resolve()
     pal = face_labels.Palette.coerce(palette)
     colors_by_role = role_colors(pal)
@@ -107,7 +107,7 @@ def build(source, palette, dest=None, cameras_path=None, regions_path=None, part
     parts = None
     if parts_path or base_parts is not None:
         if base_parts is None:
-            base_parts = face_labels.BaseParts.load(parts_path)
+            base_parts = face_labels.BaseParts.load(parts_path, knee_cops=knee_cops)
         v, f, tri_poly = normalized_triangles(textured)
         if part_fit is None:
             scale, shift, fit = face_labels.fit_base(base_parts, v, f)
@@ -120,7 +120,7 @@ def build(source, palette, dest=None, cameras_path=None, regions_path=None, part
     role = np.full(len(textured.data.polygons), pal.unusable, np.int32)
     role[poly] = pal.classify(rgb)[0]  # Tripo meshes: one loop-tri per polygon
     if parts is not None and module is not None and part_fit.clearance is not None:
-        regions = json.loads(Path(regions_path).read_text()) if regions_path else None
+        regions = json.loads(Path(regions_path).read_text(encoding='utf-8-sig')) if regions_path else None
         tri_base = np.flatnonzero(role[tri_poly] == 0)
         threshold = face_labels.off_body_threshold(tri_parts[tri_base], part_fit)
         far = face_labels.off_body_distance(v, f[tri_base], part_fit) >= threshold + face_labels.OFF_BODY_RAMP / 2
@@ -129,7 +129,7 @@ def build(source, palette, dest=None, cameras_path=None, regions_path=None, part
             n_cand = face_labels.face_normals(v, f[cand])[0]
             c_cand = v[f[cand]].mean(1)
             zones = face_labels.part_zones(part_fit.membership(c_cand, n_cand), part_fit.names)
-            allowed = face_labels.wear_prior(c_cand, module, regions, zones) >= face_labels.OFF_BODY_MIN_PRIOR
+            allowed = face_labels.wear_prior(c_cand, module, regions, zones, knee_cops) >= face_labels.OFF_BODY_MIN_PRIOR
             role[tri_poly[cand[allowed]]] = off_body_index
     detected = textured.copy()
     detected.data = textured.data.copy()
@@ -151,7 +151,7 @@ def build(source, palette, dest=None, cameras_path=None, regions_path=None, part
         v, f, _ = normalized_triangles(textured)             # reduce_model's normalized frame
         normals, _ = face_labels.face_normals(v, f)
         tree = BVHTree.FromPolygons(v.tolist(), f.tolist(), all_triangles=True)
-        cams = face_labels.load_cameras(cameras_path, json.loads(Path(regions_path).read_text()))
+        cams = face_labels.load_cameras(cameras_path, json.loads(Path(regions_path).read_text(encoding='utf-8-sig')), omit_views)
         seen = face_labels.visibility(v[f].mean(1), normals, tree, cams) > 0
         shown = textured.copy()
         shown.data = textured.data.copy()

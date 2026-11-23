@@ -1,4 +1,6 @@
 """Check the state moves and frozen-front contract with small temporary images."""
+import contextlib
+import io
 import json
 from pathlib import Path
 import shutil
@@ -72,7 +74,9 @@ class WorkflowTest(unittest.TestCase):
         self.fill_views(job)
         self.assertEqual(workflow.ready(self.root, job['job'])['views'], 4)
 
-    def test_approved_front_hash_is_frozen(self):
+    def test_regenerated_front_passes_ready(self):
+        # Since 2026-10-28 front.png is a generated view, not the frozen concept art: a changed front
+        # must not block ready (the concept art itself stays untouched in .concept_notes/).
         self.make_set('armor02', workflow.ARMOR)
         job = workflow.claim(self.root, 'armor02')
         self.fill_views(job)
@@ -80,9 +84,19 @@ class WorkflowTest(unittest.TestCase):
         picture = Image.open(target).convert('RGBA')
         picture.putpixel((12, 12), (20, 100, 200, 255))
         picture.save(target)
-        with self.assertRaisesRegex(ValueError, 'Approved front changed'):
-            workflow.ready(self.root, job['job'])
-        self.assertTrue(Path(job['path']).is_dir())
+        self.assertEqual(workflow.ready(self.root, job['job'])['views'], 8)   # armor pair: 2 modules x 4 views
+
+    def test_flat_concept_fronts_move_to_notes(self):
+        # The real approval layout: flat <module>_front.png files. claim must park them in .concept_notes/
+        # (design reference only) and leave the module view folders empty for the all-four views task.
+        race = self.root / 'approved' / 'flatset' / 'human_male'
+        race.mkdir(parents=True)
+        shutil.copy2(self.root / 'base_views/human_male/front.png', race / 'outfit_front.png')
+        (race / 'outfit_prompts.json').write_text('{"brief":"robe"}')
+        job = workflow.claim(self.root, 'flatset')
+        notes = Path(job['path']) / 'human_male/.concept_notes'
+        self.assertTrue((notes / 'outfit_front.png').is_file())
+        self.assertEqual(list((Path(job['path']) / 'human_male/outfit').iterdir()), [])
 
     def test_incomplete_armor_pair_rejected(self):
         self.make_set('incomplete', {'body_armor'})
@@ -105,6 +119,89 @@ class WorkflowTest(unittest.TestCase):
         frozen.unlink()
         with self.assertRaisesRegex(ValueError, 'Frozen base view changed or missing'):
             workflow.validate_set(self.root, Path(ready['path']), complete=True)
+
+
+class ThreeViewTest(unittest.TestCase):
+    """A module folder with views_omitted.json converts from the three views that exist (front always required)."""
+    setUp = WorkflowTest.setUp
+    make_set = WorkflowTest.make_set
+    fill_views = WorkflowTest.fill_views
+
+    def claim_with(self, name, omitted='back', module=None):
+        self.make_set(name, workflow.OUTFIT)
+        job = workflow.claim(self.root, name)
+        self.fill_views(job)
+        folder = Path(job['path']) / 'human_male/outfit'
+        if omitted:
+            (folder / (omitted + '.png')).unlink()
+            (folder / 'views_omitted.json').write_text(json.dumps({'omitted': [omitted], 'reason': 'refused', 'date': '2026-10-24'}))
+        return job, folder
+
+    def test_check_complete_and_ready_accept_and_record_the_omission(self):
+        job, folder = self.claim_with('tv01')
+        checked = workflow.validate_set(self.root, Path(job['path']), complete=True)
+        self.assertEqual(sorted(checked['images']), ['human_male/outfit/back_three_quarter.png', 'human_male/outfit/front.png',
+                                                      'human_male/outfit/front_three_quarter.png'])
+        self.assertNotIn('human_male/outfit/back.png', checked['images'])
+        self.assertEqual(checked['modules'][0]['views_omitted']['omitted'], ['back'])
+        ready = workflow.ready(self.root, job['job'])
+        self.assertEqual((ready['views'], ready['views_omitted']), (3, {'human_male/outfit': ['back']}))
+        record = json.loads((Path(ready['path']) / '.tripo-job.json').read_text())
+        entry = record['modules'][0]
+        self.assertEqual((entry['views_omitted']['omitted'], entry['views_omitted']['reason']), (['back'], 'refused'))
+        self.assertEqual(len(record['view_hashes']), 3)
+        self.assertNotIn('human_male/outfit/back.png', record['view_hashes'])
+        # a staged job re-validates against the frozen record (and convert_job reads the omission from folder or record)
+        workflow.validate_set(self.root, Path(ready['path']), complete=True)
+        self.assertEqual(convert_job.module_omitted_views(Path(ready['path']), 'human_male', 'outfit', entry), ['back'])
+
+    def test_every_non_front_view_can_be_omitted(self):
+        for index, omitted in enumerate(workflow.VIEWS[1:]):
+            job, _ = self.claim_with(f'tv_each{index}', omitted)
+            self.assertEqual(workflow.ready(self.root, job['job'])['views'], 3)
+
+    def test_without_marker_a_missing_view_is_still_an_error(self):
+        job, folder = self.claim_with('tv02', omitted=None)
+        (folder / 'back.png').unlink()
+        with self.assertRaisesRegex(ValueError, 'expected exactly'):
+            workflow.ready(self.root, job['job'])
+
+    def test_marker_must_not_omit_front_or_two_views_or_an_existing_view(self):
+        job, folder = self.claim_with('tv03')
+        marker = folder / 'views_omitted.json'
+        for bad, message in (({'omitted': ['front']}, 'front is always required'),
+                             ({'omitted': ['back', 'front_three_quarter']}, 'exactly one'),
+                             ({'omitted': ['front_three_quarter']}, 'exists'),
+                             ({'omitted': []}, 'exactly one'),
+                             ({'omitted': ['sideways']}, 'unknown view'),
+                             ({'reason': 'no list'}, 'needs')):
+            marker.write_text(json.dumps(bad))
+            for complete in (True, False):
+                with self.assertRaisesRegex(ValueError, message):
+                    workflow.validate_set(self.root, Path(job['path']), complete=complete)
+            with self.assertRaisesRegex(ValueError, message):
+                workflow.ready(self.root, job['job'])
+            self.assertTrue(Path(job['path']).is_dir())          # nothing moved
+        marker.write_text('not json')
+        with self.assertRaisesRegex(ValueError, 'not valid JSON'):
+            workflow.validate_set(self.root, Path(job['path']), complete=True)
+
+    def test_marker_changed_after_staging_is_rejected(self):
+        job, folder = self.claim_with('tv04')
+        ready = workflow.ready(self.root, job['job'])
+        marker = Path(ready['path']) / 'human_male/outfit/views_omitted.json'
+        marker.write_text(json.dumps({'omitted': ['back'], 'reason': 'edited later'}))
+        with self.assertRaisesRegex(ValueError, 'changed or missing'):
+            workflow.validate_set(self.root, Path(ready['path']), complete=True)
+        marker.unlink()
+        with self.assertRaisesRegex(ValueError, 'changed or missing|expected exactly'):
+            workflow.validate_set(self.root, Path(ready['path']), complete=True)
+
+    def test_cli_check_and_ready_work(self):
+        job, _ = self.claim_with('tv05')
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(workflow.main(['--root', str(self.root), 'check', job['path'], '--complete']), 0)
+            self.assertEqual(workflow.main(['--root', str(self.root), 'ready', job['job']]), 0)
 
 
 RED, YELLOW, WHITE = (230, 25, 35, 255), (245, 220, 20, 255), (237, 237, 237, 255)

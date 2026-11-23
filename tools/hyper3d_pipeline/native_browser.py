@@ -1,23 +1,102 @@
 """Manual sign-in in normal Firefox, followed by read-only Selenium monitoring."""
 import argparse
 from datetime import datetime, timezone
+import glob
 import json
 import os
 from pathlib import Path
 import re
+import shutil
+import subprocess
+import sys
 import time
 
 from browser import collect_images, save_snapshot, WORKSPACE, LOGIN
+from platform_compat import WINDOWS
 
-PROFILE = Path.home() / "snap/firefox/common/hyper3d-workflow-profile"
+# HYPER3D_PROFILE points parallel conversion workers at their own clone of the signed-in profile
+# Windows: deliberately outside %APPDATA%/%LOCALAPPDATA% so the Microsoft Store (MSIX) Firefox's file virtualisation
+# cannot redirect the profile into its package directory.
+PROFILE = Path(os.environ.get("HYPER3D_PROFILE") or (
+    Path.home() / ".local/share/hyper3d-workflow-profile" if WINDOWS
+    else Path.home() / "snap/firefox/common/hyper3d-workflow-profile"))
 RUNTIME = Path(__file__).resolve().parent / "runs" / "native"
-FIREFOX = "/snap/bin/firefox"
-GECKODRIVER = "/snap/bin/geckodriver"
-BINARY = "/snap/firefox/current/usr/lib/firefox/firefox"
+
+
+def _appx_firefox():
+    """Install folder of the Microsoft Store Firefox. WindowsApps cannot be listed, so ask Appx (about 1 s)."""
+    try:
+        out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                              "(Get-AppxPackage Mozilla.Firefox | Select-Object -First 1).InstallLocation"],
+                             capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return Path(out) / "VFS/ProgramFiles/Firefox Package Root/firefox.exe" if out else None
+
+
+def find_firefox_windows():
+    """firefox.exe to launch/automate: $HYPER3D_FIREFOX, a regular install, the Store (MSIX) package binary,
+    the Store execution alias (last resort: the alias stub is not reliably drivable)."""
+    candidates = [os.environ.get("HYPER3D_FIREFOX")]
+    candidates += [Path(base) / "Mozilla Firefox/firefox.exe"
+                   for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")) if base]
+    candidates += glob.glob(os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "WindowsApps",
+                                         "Mozilla.Firefox_*", "VFS", "ProgramFiles", "Firefox Package Root", "firefox.exe"))
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    appx = _appx_firefox()
+    if appx and appx.is_file():
+        return str(appx)
+    return shutil.which("firefox")
+
+
+if WINDOWS:
+    FIREFOX = BINARY = find_firefox_windows()
+    # None: Selenium Manager downloads/caches a matching geckodriver (~/.cache/selenium); $HYPER3D_GECKODRIVER pins one
+    GECKODRIVER = os.environ.get("HYPER3D_GECKODRIVER") or shutil.which("geckodriver")
+else:
+    FIREFOX = "/snap/bin/firefox"
+    GECKODRIVER = "/snap/bin/geckodriver"
+    BINARY = "/snap/firefox/current/usr/lib/firefox/firefox"
+
+
+def firefox_service(**kwargs):
+    """Selenium geckodriver Service: the pinned GECKODRIVER, or on Windows Selenium Manager's cached download."""
+    from selenium.webdriver.firefox.service import Service
+    return Service(GECKODRIVER, **kwargs) if GECKODRIVER else Service(**kwargs)
+
+
+def firefox_extra_args():
+    """Extra Firefox arguments for automated launches (never the interactive `login`). Windows: -no-remote, so a
+    launch can never hand over to (and open a window in) an already running Firefox that uses another profile, and
+    -headless so no window pops up (verified: WebGL, hover/click and screenshots work, no 'Headless' in the user agent;
+    there is no hidden X display on Windows). PIPELINE_SHOW_WINDOWS=1 shows the window, as on Linux."""
+    if not WINDOWS:
+        return []
+    return ["-no-remote"] + ([] if os.environ.get("PIPELINE_SHOW_WINDOWS") == "1" else ["-headless"])
+
+
+def _profile_in_use_windows(profile):
+    """Firefox holds parent.lock in the profile directory while it runs (and deletes it on a clean exit)."""
+    lock = profile / "parent.lock"
+    if not lock.exists():
+        return False
+    try:
+        with open(lock, "rb"):
+            return False
+    except PermissionError:      # sharing violation: another process has it open
+        return True
+    except OSError:
+        return False
 
 
 def check_profile(profile):
     profile.mkdir(parents=True, exist_ok=True)
+    if WINDOWS:
+        if _profile_in_use_windows(profile):
+            raise ValueError("This workflow Firefox window is already open. Finish signing in and close it before inspect or prepare.")
+        return
     lock = profile / "lock"
     if lock.is_symlink():
         match = re.search(r":\+?(\d+)$", os.readlink(lock))
@@ -61,15 +140,18 @@ def run(args):
     profile = Path(args.profile).expanduser().resolve()
     check_profile(profile)
     if args.command == "login":
-        if not os.environ.get("DISPLAY"):
+        if not WINDOWS and not os.environ.get("DISPLAY"):
             raise ValueError("No desktop display found. Set DISPLAY to your local desktop display.")
+        if not FIREFOX:
+            raise ValueError("Firefox not found. Install it or set HYPER3D_FIREFOX to firefox.exe.")
         print("Opening normal Firefox for manual Hyper3D/Google sign-in. No automation is attached.", flush=True)
         print("After Hyper3D is signed in, close this Firefox window before inspect or prepare.", flush=True)
+        if WINDOWS:   # no exec(): it would not wait for the window to close
+            sys.exit(subprocess.call([FIREFOX, "-no-remote", "-profile", str(profile), LOGIN]))
         os.execv(FIREFOX, [FIREFOX, "--no-remote", "--profile", str(profile), LOGIN])
 
     from selenium import webdriver
     from selenium.webdriver.firefox.options import Options
-    from selenium.webdriver.firefox.service import Service
     from selenium.webdriver.common.by import By
     images = collect_images(args.inputs) if args.command == "prepare" else []
     batch = images[args.offset:args.offset+args.slots]
@@ -77,10 +159,12 @@ def run(args):
     options.binary_location = BINARY
     options.add_argument("-profile")
     options.add_argument(str(profile))
-    if args.headless:
+    for extra in firefox_extra_args():
+        options.add_argument(extra)
+    if args.headless and "-headless" not in firefox_extra_args():
         options.add_argument("-headless")
     # Use the profile in place so its site session persists. Never copy the user's main profile.
-    driver = webdriver.Firefox(service=Service(GECKODRIVER), options=options)
+    driver = webdriver.Firefox(service=firefox_service(), options=options)
     driver.set_page_load_timeout(45)
     try:
         auth_nav = visit(driver, LOGIN)

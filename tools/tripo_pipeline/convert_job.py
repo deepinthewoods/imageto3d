@@ -3,7 +3,9 @@
 Usage (from the imageto3d folder):
   python3 tools/tripo_pipeline/convert_job.py <set>--<job-id> [--dry-run] [--separable] [--piece-colours]
       [--split-method segment-first|per-face|none]
-      [--backend tripo|hyper3d] [--allow-paid --accept-preview]   (the last two only matter for hyper3d)
+      [--backend tripo|hyper3d|formy3d|pixal3d] [--allow-paid --accept-preview]   (--allow-paid: hyper3d + formy3d, --accept-preview: hyper3d)
+      [--max-submits N] [--wearable-method cut|faces] [--knee-cops] [--feature-labels studs|rings[:secondary|:void]|none]
+      [--no-align]
 
 - Takes the job from multiview_ready/ (moving it to processing/) or continues one already in processing/.
 - Modules run strictly one after another: Studio disables Generate while another model of the
@@ -11,7 +13,7 @@ Usage (from the imageto3d folder):
 - Resumable: a module with a submission record is collected, not resubmitted (no double charge);
   a collected module with reduced/manifest.json is skipped.
 - Outputs per module in models/<set>/<job-id>/<race>/<module>/: Tripo OBJ/GLB, source.glb,
-  highpoly.blend, reduced/ (0.4/0.2/0.1% GLBs, wearable GLBs, review.blend, wearable.blend).
+  reduced/ (0.4/0.2/0.1% GLBs, wearable GLBs, review.blend, wearable.blend); highpoly.blend only on demand.
   reduce_model.py finds module, swatches, cameras and body regions from that layout.
 - A module whose Tripo mesh is broken (currently: a doubled interior shell, see reduce_model's
   interior audit) is regenerated with the Studio project's free retries (studio.mjs retry); each
@@ -26,14 +28,62 @@ Usage (from the imageto3d folder):
   `--split-method per-face` runs only that fallback path, `none` skips the step (the default for every other job, including
   separable joint-band jobs). The method used is recorded in .tripo-job.json module_conversion.<race>/<module>.split and in
   <module>/split_step.json.
+- Align step (after the split, before the job record is updated, never fails the conversion; not in --dry-run): `align_body.py <module>`
+  aligns the wearable and the rigid pieces to the game base body (reduced/lod_error_<lv>__wearable_aligned.glb, lod_<lv>_aligned/,
+  fit/align.json, red-body overlays), then `body_fit.py <module> --source aligned` fits them out of the body (..._aligned_fitted.*,
+  fit/body_fit_aligned.json); about 2 minutes per module. Both scripts skip a module whose lock is held, so this process passes its pid
+  in $MODULE_LOCK_OWNER (rewear.module_busy treats a lock held by that pid as free). Log: <module>/align_step.log; record:
+  <module>/align_step.json and module_conversion.<race>/<module>.align {status done|failed|skipped, align {residual_mm before/after,
+  warnings}, fit {warnings, levels.<lv> {poke_after_cm2, max_displacement_mm}}, error?}. `--no-align` skips it, as does `config.json`
+  `"align": {"enabled": false}`; modules converted without it are backfilled with `align_body.py --all` then
+  `body_fit.py --all --source aligned`.
+- Winding step (after the align step; 2026-11-22, never fails the conversion): `fix_winding.py <module> --apply` turns flipped faces
+  of every module GLB (reduced/*.glb, rigid pieces) the right way round: faces wound against their neighbours and closed pieces that
+  are inside-out (not cavities). Only those triangles' corner order changes. Record: module_conversion.<race>/<module>.winding
+  {status, glbs, glbs_fixed, faces_fixed, pieces_needing_review}; per-GLB detail <module>/reduced/winding.json; originals of changed
+  GLBs kept as <name>.glb.prewinding. Older modules: `fix_winding.py --all --apply`.
+- Three-view modules: a module folder with `views_omitted.json` (or a job record entry `views_omitted`) is submitted with
+  the views that exist (the backends skip the omitted slot) and reduced with `--omit-views <view>`, so surfaces only the
+  omitted camera saw count as unseen in the texture-visibility weighting. Recorded in module_conversion.<key>.views_omitted.
+- Knee cops (body_armor only): a module whose prompts json / job record says `"knee_cops": true` (or `--knee-cops`) is reduced
+  with `reduce_model.py --knee-cops` (the base's knee band becomes the body part knee_cop: garment-allowed prior, no bare cost in the
+  wearable cut; the rigid split cuts the cop as its own sections knee_l / knee_r under the thighs) and its segment-first prep gets
+  the same flag and band from the manifest. Recorded in
+  reduced/manifest.json `knee_cops` and .tripo-job.json module_conversion.<race>/<module>.knee_cops.
+- Wearable (garment alone, base removed): reduce_model.py cuts it out of the high-poly mesh (`--wearable-method cut`, the default: clean
+  openings, exact left/right pairs, wearcut.py) and falls back to the faces of the reduced level (`faces`, the previous behaviour) per
+  level on any failure; `--wearable-method faces` here forces the old behaviour. The method actually used and any fallback reason are
+  recorded in .tripo-job.json module_conversion.<race>/<module>.wearable (and in reduced/manifest.json `wearable`).
+- Feature label passes (opt-in, off unless chosen; feature_hooks.py, README "Feature label passes"): `--feature-labels SPEC` here, else the
+  job record's `feature_labels` (a spec, or {"default": spec, "<module>": spec}), else `config.json` `feature_labels.sets[<set id>]`, picks a
+  pass over the high-poly labels: `studs` (round studs keep the tertiary colour), `rings:secondary` (chain-mail ring tubes / centres) or
+  `rings:void` (ring centres removed). It is passed to `reduce_model.py --feature-labels` (the cut wearable and the labelled levels) and to
+  `segment_first.py --feature-labels` (the rigid pieces); `none` switches a configured choice off. Recorded in
+  module_conversion.<race>/<module>.feature_labels (spec, where it came from) and reduced/manifest.json `wearable.feature_labels`.
 - Leaves the job in processing/ with state `converted` and prints which levels need review.
   Moving it to completed/ is a separate step after that review.
+- Pause (tools/pipeline_supervisor.py): while `.codex_jobs/_batch/PAUSE` exists a module that has no `studio_submission.json` yet is not
+  submitted (the process waits and prints once); modules already submitted keep collecting, their Blender steps are frozen by the supervisor.
 --dry-run: opens Studio, fills the form and screenshots it without pressing Generate.
+--max-submits N: submit at most N new modules in this run (e.g. what the Tripo credit balance covers); the others are
+  skipped, the job stays in processing/ with state `partially_converted` and the script exits 3. Re-run (e.g. with
+  another --backend) to continue. A module that already has a submission record is always collected with the backend
+  that submitted it, whatever --backend says, so a job can mix backends.
 --backend hyper3d: optional alternative image->3D step (Hyper3D Rodin, high-poly textured GLB, no Smart
   Low-poly; tools/hyper3d_pipeline/README.md). Tripo stays the default. Submit starts only the FREE preview;
   collect needs --allow-paid --accept-preview and a configured expected credit cost, otherwise it stops with
   a message (exit 1) and the module stays resumable. The Tripo free-retry loop is skipped for hyper3d
   (its retries cost credits): a broken mesh is only flagged for manual review.
+--backend formy3d: optional third backend, Tripo3D H3.1 multi-view through formy3d.com (browser runner in
+  tools/formy3d_pipeline/, textured GLB, no preview stage). Submit is the only paid step: it needs --allow-paid and a
+  displayed Generate price equal to config.json expected_costs.generate, otherwise it stops with a message (exit 1) and
+  nothing is clicked; collect (free download) waits for the model and fetches the GLB. --dry-run fills the form only.
+  Like hyper3d it has no free-retry loop. See tools/formy3d_pipeline/README.md.
+--backend pixal3d: optional FREE local backend (user, 2026-11-18): Pixal3D, camera-aware multi-view TRELLIS.2, on this PC's GPU
+  through WSL (tools/pixal3d_pipeline/, ~4-5 min per module). Submit only stages the views and the job's frozen cameras; the
+  generation runs at collect (resumable). Its output is closed, one component, ~1M faces, 2048 atlas, turned to Tripo's facing.
+  A mesh the reduction flags as broken is regenerated with the next seed, up to config.json `retries` times (no cost).
+  See tools/pixal3d_pipeline/README.md.
 """
 from pathlib import Path
 import json
@@ -42,27 +92,115 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLS = ROOT / 'tools/tripo_pipeline'
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
+import feature_hooks  # noqa: E402
+import portable  # noqa: E402
+import views_omitted  # noqa: E402
+from wearcut_rules import wearable_record  # noqa: E402
 HYPER3D = ROOT / 'tools/hyper3d_pipeline'
-BACKENDS = ('tripo', 'hyper3d')
-BLENDER = os.environ.get('BLENDER', '/usr/local/bin/blender')
+FORMY3D = ROOT / 'tools/formy3d_pipeline'
+PIXAL3D = ROOT / 'tools/pixal3d_pipeline'
+BACKENDS = ('tripo', 'hyper3d', 'formy3d', 'pixal3d')
+PAUSE = ROOT / '.codex_jobs/_batch/PAUSE'   # tools/pipeline_supervisor.py: no new submissions while it exists
+BLENDER = portable.default_blender()   # $BLENDER, else /usr/local/bin/blender (Linux) / the newest installed Blender (Windows)
+portable.utf8_environment()            # Windows: child python / Blender processes read and write UTF-8
 SPLIT_METHODS = ('segment-first', 'per-face', 'none')
+WEARABLE_METHODS = ('cut', 'faces')
 
 
 def write_record(path, record):
-    path.write_text(json.dumps(record, indent=2) + '\n')
+    path.write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
+
+
+# Several queue workers may convert different modules of one job at once: each module is claimed with a lock
+# file, and the job record is only ever read-modified-written under an exclusive lock (portable.file_lock: flock on
+# Linux; on Windows a sidecar `<record>.lock` byte lock that readers take exclusively too).
+def read_record(path):
+    with portable.file_lock(path, exclusive=False, sidecar=True):
+        return json.loads(Path(path).read_text(encoding='utf-8-sig'))
+
+
+def update_record(path, change):
+    with portable.file_lock(path, exclusive=True, sidecar=True):
+        record = json.loads(Path(path).read_text(encoding='utf-8-sig'))
+        change(record)
+        Path(path).write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
+        return record
+
+
+def lock_holder(lock):
+    try:
+        holder = int(lock.read_text(encoding='utf-8').strip())
+    except (OSError, ValueError):
+        return None
+    return holder if portable.pid_alive(holder) else None
+
+
+def claim_module(lock):
+    """Atomically create `lock` holding our pid (link of a complete temp file); take over a dead holder's lock."""
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    temp = lock.with_name(f'{lock.name}.{os.getpid()}')
+    temp.write_text(str(os.getpid()), encoding='utf-8')
+    try:
+        for _ in range(2):
+            try:
+                os.link(temp, lock)
+                return True
+            except FileExistsError:
+                holder = lock_holder(lock)
+                if holder == os.getpid():
+                    return True
+                if holder:
+                    return False
+                lock.unlink(missing_ok=True)
+        return False
+    finally:
+        temp.unlink(missing_ok=True)
+
+
+def module_converted(record, key, out):
+    return key in record.get('module_conversion', {}) and (out / 'reduced' / 'manifest.json').exists()
 
 
 def hyper3d_python():
     """Interpreter with selenium for the Hyper3D browser runner (config.json, overridable by $HYPER3D_VENV)."""
     if os.environ.get('HYPER3D_VENV'):
-        return str(Path(os.environ['HYPER3D_VENV']) / 'bin/python')
-    return json.loads((HYPER3D / 'config.json').read_text())['venv_python']
+        return portable.venv_python_dir(os.environ['HYPER3D_VENV'])
+    config = json.loads((HYPER3D / 'config.json').read_text(encoding='utf-8-sig'))
+    return portable.backend_python(config['venv_python'], config.get('venv_python_windows'))
 
 
-def submit_command(backend, views, out, dry_run=False):
+def formy3d_python():
+    """Interpreter with Playwright for the formy3d browser runner (config.json, overridable by $FORMY3D_VENV)."""
+    if os.environ.get('FORMY3D_VENV'):
+        return portable.venv_python_dir(os.environ['FORMY3D_VENV'])
+    config = json.loads((FORMY3D / 'config.json').read_text(encoding='utf-8-sig'))
+    return portable.backend_python(config['venv_python'], config.get('venv_python_windows'))
+
+
+def pixal3d_retries():
+    """How many times a broken pixal3d mesh is regenerated with the next seed (tools/pixal3d_pipeline/config.json `retries`)."""
+    try:
+        return int(json.loads((PIXAL3D / 'config.json').read_text(encoding='utf-8-sig')).get('retries', 2))
+    except (OSError, ValueError):
+        return 2
+
+
+def submit_command(backend, views, out, dry_run=False, options=None):
+    if backend == 'pixal3d':   # local and free: submit only stages the inputs, the generation runs at collect
+        options = options or {}
+        return [sys.executable, str(PIXAL3D / 'pixal3d_backend.py'), 'submit', str(views), str(out)] \
+            + (['--dry-run'] if dry_run else []) \
+            + (['--seed-offset', str(options['seed_offset'])] if options.get('seed_offset') else [])
+    if backend == 'formy3d':
+        options = options or {}
+        return [formy3d_python(), str(FORMY3D / 'formy3d_backend.py'), 'submit', str(views), str(out)] \
+            + (['--dry-run'] if dry_run else []) + (['--allow-paid'] if options.get('allow_paid') else [])
     if backend == 'hyper3d':
         return [hyper3d_python(), str(HYPER3D / 'rodin_backend.py'), 'submit', str(views), str(out)] \
             + (['--dry-run'] if dry_run else [])
@@ -70,6 +208,10 @@ def submit_command(backend, views, out, dry_run=False):
 
 
 def collect_command(backend, out, options=None):
+    if backend == 'pixal3d':
+        return [sys.executable, str(PIXAL3D / 'pixal3d_backend.py'), 'collect', str(out)]
+    if backend == 'formy3d':
+        return [formy3d_python(), str(FORMY3D / 'formy3d_backend.py'), 'collect', str(out)]
     if backend == 'hyper3d':
         options = options or {}
         return [hyper3d_python(), str(HYPER3D / 'rodin_backend.py'), 'collect', str(out)] \
@@ -95,7 +237,7 @@ def job_is_separable(job, race, module):
     command line forces it."""
     def flagged(path):
         try:
-            text = path.read_text()
+            text = path.read_text(encoding='utf-8-sig')
             data = json.loads(text)
         except (OSError, ValueError):
             return False
@@ -115,7 +257,7 @@ def job_is_piece_colours(job, race, module):
     `--piece-colours` on the command line forces it."""
     def flagged(path):
         try:
-            text = path.read_text()
+            text = path.read_text(encoding='utf-8-sig')
             data = json.loads(text)
         except (OSError, ValueError):
             return False
@@ -127,10 +269,56 @@ def job_is_piece_colours(job, race, module):
     return any(flagged(c) for c in candidates if c.is_file())
 
 
-def collect_and_reduce(key, out, backend='tripo', options=None, separable=False, piece_colours=False):
+def job_is_knee_cops(job, race, module):
+    """True when a body_armor module's records say it has knee cops (plate cuisses that continue over the knee and end just below it):
+    a truthy `knee_cops` key in the module's prompts json (`<race>/<module>/prompts.json`, `<race>/<module>_prompts.json`,
+    `<race>/.concept_notes/...`), in `.tripo-job.json`, or in that module's `.tripo-job.json` `modules[]` entry. Key only, no word
+    matching: concept text that says "no knee cops" must not switch it on. Always False for other modules.
+    `--knee-cops` on the command line forces it for every body_armor module of the job."""
+    if module != 'body_armor':
+        return False
+
+    def flagged(path):
+        try:
+            data = json.loads(path.read_text(encoding='utf-8-sig'))
+        except (OSError, ValueError):
+            return False
+        if not isinstance(data, dict):
+            return False
+        if data.get('knee_cops'):
+            return True
+        return any(isinstance(m, dict) and m.get('race_gender') == race and m.get('module') == module and m.get('knee_cops')
+                   for m in data.get('modules') or ())
+    candidates = [job / '.tripo-job.json', job / race / module / 'prompts.json', job / race / f'{module}_prompts.json',
+                  job / race / '.concept_notes' / f'{module}_prompts.json', job / race / '.concept_notes' / 'prompts.json']
+    return any(flagged(c) for c in candidates if c.is_file())
+
+
+def knee_cop_record(info):
+    """What a reduction recorded about the knee band (manifest `knee_cops`) for the job record: band fraction, prior source and the
+    faces moved per side (module_conversion.<race>/<module>.knee_cops)."""
+    cops = info.get('knee_cops') or {}
+    out = {'enabled': bool(cops.get('enabled')), 'band_fraction': cops.get('band_fraction'), 'above_fraction': cops.get('above_fraction'),
+           'prior': cops.get('prior')}
+    if cops.get('sides'):
+        out['sides'] = {k: v.get('faces_moved', v.get('reason')) for k, v in cops['sides'].items()}
+    return out
+
+
+def module_omitted_views(job, race, module, entry=None):
+    """Views a three-view module is converted without: the module folder's views_omitted.json, else the job record entry
+    (`modules[].views_omitted.omitted`). [] for an ordinary four-view module; ValueError for an invalid marker."""
+    omitted = views_omitted.omitted_views(job / race / module)
+    if not omitted and entry and isinstance(entry.get('views_omitted'), dict):
+        omitted = views_omitted.parse(entry['views_omitted'])
+    return omitted
+
+
+def collect_and_reduce(key, out, backend='tripo', options=None, separable=False, piece_colours=False, omit_views=(), wearable_method=None,
+                       knee_cops=False, feature_labels=None):
     """Collect a submitted module from Studio (if needed), then reduce it; returns (state, manifest)."""
     submission = out / 'studio_submission.json'
-    state = json.loads(submission.read_text())
+    state = json.loads(submission.read_text(encoding='utf-8-sig'))
     if state.get('backend', 'tripo') != backend:
         raise SystemExit(f'{key}: submission record belongs to backend {state.get("backend", "tripo")!r}, '
                          f'not {backend!r}; inspect {submission}')
@@ -145,22 +333,29 @@ def collect_and_reduce(key, out, backend='tripo', options=None, separable=False,
             if run.returncode != 0:  # a guard stop (credits/permissions/sign-in) leaves the module resumable
                 raise SystemExit(f'{key}: {backend} collect stopped (exit {run.returncode}); '
                                  f'fix what it printed and re-run; record {submission}')
-        state = json.loads(submission.read_text())
+        state = json.loads(submission.read_text(encoding='utf-8-sig'))
     source = out / 'source.glb'
     if not source.exists():
-        shutil.copy2(state['exports']['GLB']['path'], source)
+        try:
+            os.link(state['exports']['GLB']['path'], source)  # identical bytes; a hard link instead of a ~40 MB copy
+        except OSError:
+            shutil.copy2(state['exports']['GLB']['path'], source)
     manifest = out / 'reduced' / 'manifest.json'
     if not manifest.exists():
         print(f'== {key}: reduce', flush=True)
         subprocess.run([BLENDER, '-b', '-t', '6', '--python', str(TOOLS / 'reduce_model.py'), '--',
-                        str(source), str(out / 'reduced')] + (['--separable'] if separable else []) + (['--adaptive-hue', 'on'] if piece_colours else []), check=True, cwd=ROOT)
-    return state, json.loads(manifest.read_text())
+                        str(source), str(out / 'reduced')] + (['--separable'] if separable else []) + (['--adaptive-hue', 'on'] if piece_colours else [])
+                       + (['--omit-views', ','.join(omit_views)] if omit_views else [])
+                       + (['--wearable-method', wearable_method] if wearable_method else [])
+                       + (['--knee-cops'] if knee_cops else [])
+                       + (['--feature-labels', feature_labels] if feature_labels else []), check=True, cwd=ROOT)
+    return state, json.loads(manifest.read_text(encoding='utf-8-sig'))
 
 
 def segment_first_config():
     """config.json `segment_first` block (default_method, venv_python, levels); {} when absent."""
     try:
-        return json.loads((TOOLS / 'config.json').read_text()).get('segment_first') or {}
+        return json.loads((TOOLS / 'config.json').read_text(encoding='utf-8-sig')).get('segment_first') or {}
     except (OSError, ValueError):
         return {}
 
@@ -168,14 +363,12 @@ def segment_first_config():
 def segment_first_python():
     """Interpreter with numpy + scipy + Pillow for segment_first.py: $SEGMENT_FIRST_PYTHON, config.json segment_first.venv_python,
     else the characters/.venv beside the imageto3d folder. Raises FileNotFoundError naming every place it looked."""
-    candidates = [os.environ.get('SEGMENT_FIRST_PYTHON'), segment_first_config().get('venv_python'),
-                  str(ROOT.parent / '.venv/bin/python')]
+    candidates = portable.venv_python_candidates(ROOT, segment_first_config().get('venv_python'))
     for candidate in candidates:
-        if candidate and Path(candidate).is_file():
+        if Path(candidate).is_file():
             return candidate
     raise FileNotFoundError('no python with numpy+scipy for segment_first.py; looked for $SEGMENT_FIRST_PYTHON, '
-                            f'config.json segment_first.venv_python and {ROOT.parent / ".venv/bin/python"} '
-                            f'(tried: {[c for c in candidates if c]})')
+                            f'config.json segment_first.venv_python and the characters/.venv (tried: {candidates})')
 
 
 def choose_split_method(requested, module, piece_colours, separable):
@@ -200,28 +393,30 @@ def choose_split_method(requested, module, piece_colours, separable):
 def relative(path):
     """`path` relative to ROOT when it lies under it, else as it is."""
     try:
-        return str(Path(path).relative_to(ROOT))
+        return Path(path).relative_to(ROOT).as_posix()   # job records hold forward slashes on every OS
     except ValueError:
         return str(path)
 
 
-def run_logged(command, log, label):
-    """Run `command` from ROOT with its output in `log`; raises RuntimeError with the log tail on a non-zero exit."""
+def run_logged(command, log, label, env=None, append=False):
+    """Run `command` from ROOT with its output in `log` (appended with `append`); raises RuntimeError with the log tail on a non-zero
+    exit. `env`: the child's environment (default: ours)."""
     log.parent.mkdir(parents=True, exist_ok=True)
-    with open(log, 'w') as handle:
-        run = subprocess.run(command, cwd=ROOT, stdout=handle, stderr=subprocess.STDOUT)
+    with open(log, 'a' if append else 'w') as handle:
+        run = subprocess.run(command, cwd=ROOT, stdout=handle, stderr=subprocess.STDOUT, **({'env': env} if env is not None else {}))
     if run.returncode != 0:
-        tail = ' | '.join(log.read_text(errors='replace').strip().splitlines()[-6:])
+        tail = ' | '.join(log.read_text(encoding='utf-8', errors='replace').strip().splitlines()[-6:])
         raise RuntimeError(f'{label} exited {run.returncode} (log {log}): {tail}')
 
 
-def segment_first_split(out, module):
+def segment_first_split(out, module, feature_labels=None):
     """Segment-first split of a reduced module folder: prep (Blender) then segment_first.py; both skipped when their output exists.
-    Inputs (cameras, regions, palette) are the ones the reduction recorded in reduced/manifest.json."""
+    Inputs (cameras, regions, palette) are the ones the reduction recorded in reduced/manifest.json. `feature_labels`: opt-in label pass
+    spec for the high-poly labels the sections are cut from (feature_hooks.py)."""
     sf = out / 'segment_first'
     prep = sf / 'prep'
     if not (prep / 'prep.npz').exists():
-        manifest = json.loads((out / 'reduced' / 'manifest.json').read_text())
+        manifest = json.loads((out / 'reduced' / 'manifest.json').read_text(encoding='utf-8-sig'))
         sf.mkdir(parents=True, exist_ok=True)
         command = [BLENDER, '-b', '-t', '6', '--python', str(TOOLS / 'segment_first_prep.py'), '--',
                    str(out / 'source.glb'), str(prep), '--module', module]
@@ -229,6 +424,13 @@ def segment_first_split(out, module):
             command += ['--cameras', manifest['cameras']]
         if manifest.get('regions'):
             command += ['--regions', manifest['regions']]
+        cops = manifest.get('knee_cops') or {}
+        if cops.get('enabled'):                 # knee-cop module: the prep relabels the knee band as knee_cop parts like the reduction did
+            command += ['--knee-cops', '--knee-cop-band', str(cops['band_fraction'])]
+            if cops.get('above_fraction') is not None:
+                command += ['--knee-cop-above', str(cops['above_fraction'])]
+        if manifest.get('omit_views'):          # three-view module: the omitted camera does not count as having seen a surface
+            command += ['--omit-views', ','.join(manifest['omit_views'])]
         if manifest.get('palette'):             # the palette the reduction used (job snapshot / base), frozen beside the run
             write_record(sf / 'palette_used.json', manifest['palette'])
             command += ['--palette', str(sf / 'palette_used.json')]
@@ -241,7 +443,8 @@ def segment_first_split(out, module):
     print(f'== {out.parent.name}/{module}: split (segment-first): pieces', flush=True)
     levels = segment_first_config().get('levels')
     run_logged([segment_first_python(), str(TOOLS / 'segment_first.py'), str(out), str(sf), '--reduced', str(out / 'reduced'),
-                '--source', str(out / 'source.glb'), '--prep-dir', str(prep)] + (['--levels', levels] if levels else []),
+                '--source', str(out / 'source.glb'), '--prep-dir', str(prep)] + (['--levels', levels] if levels else [])
+               + (['--feature-labels', feature_labels] if feature_labels else []),
                sf / 'segment_first.log', 'segment_first.py')
     if not (sf / 'pieces' / 'pieces.json').exists():
         raise RuntimeError(f'segment_first.py wrote no pieces/pieces.json (log {sf / "segment_first.log"})')
@@ -265,26 +468,31 @@ def per_face_split(out, module):
     return pieces
 
 
-def split_step(out, module, method, why=''):
+def split_step(out, module, method, why='', feature_labels=None):
     """Run the split `method` on the reduced module folder `out`; never raises. Returns the record written to
     <out>/split_step.json and .tripo-job.json: {method (used), requested, why, status done|fallback|failed|skipped,
-    outputs, fallback_reason?, error?}. A failed segment-first falls back to the per-face split_pieces."""
+    outputs, fallback_reason?, error?, feature_labels?}. A failed segment-first falls back to the per-face split_pieces (which has no
+    feature label pass: the record then says so)."""
     record = {'requested': method, 'method': method, 'why': why}
+    if feature_labels and method != 'none':
+        record['feature_labels'] = feature_labels
     if method == 'none':
         record['status'] = 'skipped'
         return record
     try:
         if method == 'segment-first':
             try:
-                record['outputs'] = relative(segment_first_split(out, module))
+                record['outputs'] = relative(segment_first_split(out, module, feature_labels))
                 record['status'] = 'done'
             except Exception as error:  # noqa: BLE001  the split must never fail the conversion
                 record['fallback_reason'] = f'segment-first failed: {error}'
                 print(f'WARNING {out.parent.name}/{module}: {record["fallback_reason"]}; falling back to '
                       f'split_pieces --rigid auto', flush=True)
                 record['method'], record['status'] = 'per-face', 'fallback'
+                record.pop('feature_labels', None)
                 record['outputs'] = relative(per_face_split(out, module))
         else:
+            record.pop('feature_labels', None)
             record['outputs'] = relative(per_face_split(out, module))
             record['status'] = 'done'
     except Exception as error:  # noqa: BLE001
@@ -295,12 +503,151 @@ def split_step(out, module, method, why=''):
     return record
 
 
+def align_config():
+    """config.json `align` block (enabled); {} when absent."""
+    try:
+        return json.loads((TOOLS / 'config.json').read_text(encoding='utf-8-sig')).get('align') or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def align_disabled_reason(args):
+    """Why the align step is off (`--no-align`, config.json align.enabled false), else None."""
+    if '--no-align' in args:
+        return '--no-align'
+    if align_config().get('enabled', True) is False:
+        return 'config.json align.enabled is false'
+    return None
+
+
+def tool_status(log, tag):
+    """(status, detail) from the last `<tag> <status> <module> ...` line align_body.py / body_fit.py print into `log`;
+    ('failed', 'no status line') when there is none."""
+    status, detail = 'failed', 'no status line'
+    try:
+        lines = log.read_text(encoding='utf-8', errors='replace').splitlines()
+    except OSError:
+        return status, detail
+    for line in lines:
+        words = line.split(None, 2)
+        if len(words) >= 2 and words[0] == tag:
+            status, detail = words[1], (words[2] if len(words) > 2 else '')
+    return status, detail
+
+
+def align_step(out, module):
+    """Align the module's wearable and rigid pieces to the game base body (align_body.py) and fit them out of it
+    (body_fit.py --source aligned); never raises. Writes <out>/align_step.json (log: <out>/align_step.log) and returns
+    {status done|failed|skipped, align: {status, detail?, residual_mm: {before, after}, warnings}, fit: {status, detail?, warnings,
+    levels: {<lv>: {poke_after_cm2, max_displacement_mm}}}, error?}. `done` = both scripts reported done or fresh; `skipped` = a script
+    reported skipped (e.g. no cached base); `failed` = a script failed or crashed. The scripts check the module lock; our pid goes to
+    them in $MODULE_LOCK_OWNER so that the lock this process holds does not make them skip the module."""
+    record = {'status': 'skipped'}
+    log = out / 'align_step.log'
+    print(f'== {out.parent.name}/{module}: align to the base body, then fit', flush=True)
+    env = dict(os.environ, MODULE_LOCK_OWNER=str(os.getpid()))
+    try:
+        python = segment_first_python()
+        run_logged([python, str(TOOLS / 'align_body.py'), str(out)], log, 'align_body.py', env=env)
+        status, detail = tool_status(log, 'ALIGN_BODY')
+        record['align'] = {'status': status, **({'detail': detail[:300]} if detail and status not in ('done', 'fresh') else {})}
+        align_json = out / 'fit' / 'align.json'
+        if status in ('done', 'fresh') and align_json.is_file():
+            data = json.loads(align_json.read_text(encoding='utf-8-sig'))
+            residuals = data.get('residuals') or {}
+            record['align'].update({'residual_mm': {'before': (residuals.get('current') or {}).get('mean_mm'),
+                                                    'after': (residuals.get('stage12') or {}).get('mean_mm')},
+                                    'warnings': len(data.get('warnings') or [])})
+        if status == 'failed':
+            raise RuntimeError(f'align_body.py reported failure (log {log}): {detail[:200]}')
+        if align_json.is_file() and status in ('done', 'fresh'):
+            summary_dir = tempfile.mkdtemp(prefix='body_fit_step_')  # body_fit.py writes a summary; keep it off experiments/
+            try:
+                run_logged([python, str(TOOLS / 'body_fit.py'), str(out), '--source', 'aligned',
+                            '--summary', str(Path(summary_dir) / 'summary.json')], log, 'body_fit.py', env=env, append=True)
+            finally:
+                shutil.rmtree(summary_dir, ignore_errors=True)
+            status, detail = tool_status(log, 'BODY_FIT')
+            record['fit'] = {'status': status, **({'detail': detail[:300]} if detail and status not in ('done', 'fresh') else {})}
+            fit_json = out / 'fit' / 'body_fit_aligned.json'
+            if status in ('done', 'fresh', 'warnings') and fit_json.is_file():
+                data = json.loads(fit_json.read_text(encoding='utf-8-sig'))
+                levels = {}
+                for lv, row in (data.get('levels') or {}).items():
+                    wear = (row or {}).get('wearable') or {}
+                    levels[lv] = {'poke_after_cm2': ((wear.get('push') or {}).get('poke_residual') or {}).get('area_cm2'),
+                                  'max_displacement_mm': (wear.get('displacement') or {}).get('max_mm')}
+                record['fit'].update({'warnings': len(data.get('warnings') or []), 'levels': levels})
+            if status == 'failed':
+                raise RuntimeError(f'body_fit.py reported failure (log {log}): {detail[:200]}')
+            record['status'] = 'done' if status in ('done', 'fresh', 'warnings') else 'skipped'
+        else:
+            record['status'] = 'skipped'
+    except Exception as error:  # noqa: BLE001  the align step must never fail the conversion
+        record['status'], record['error'] = 'failed', str(error)
+        print(f'WARNING {out.parent.name}/{module}: align step failed ({error}); the reduction and split are intact', flush=True)
+    if out.is_dir():
+        write_record(out / 'align_step.json', record)
+    return record
+
+
+def winding_step(out, module):
+    """Turn flipped faces of the module's GLBs the right way round (fix_winding.py --apply: faces wound against their neighbours, closed
+    pieces that are inside-out; only the corner order of those triangles changes, so face order and sidecar arrays stay valid); never
+    raises. Returns {status done|failed, glbs, glbs_fixed, faces_fixed, pieces_needing_review, error?}; per-GLB detail in
+    <out>/reduced/winding.json, log <out>/winding_step.log."""
+    log = out / 'winding_step.log'
+    record = {'status': 'failed'}
+    try:
+        run_logged([segment_first_python(), str(TOOLS / 'fix_winding.py'), str(out), '--apply'], log, 'fix_winding.py',
+                   env=dict(os.environ, MODULE_LOCK_OWNER=str(os.getpid())))
+        rep = json.loads((out / 'reduced' / 'winding.json').read_text(encoding='utf-8'))
+        record = {'status': 'done', 'glbs': len(rep), 'glbs_fixed': sum(1 for v in rep.values() if v.get('fixed')),
+                  'faces_fixed': sum(v.get('flipped', 0) for v in rep.values() if v.get('fixed')),
+                  'pieces_needing_review': sum(v.get('pieces_needing_review', 0) for v in rep.values())}
+        errors = [k for k, v in rep.items() if v.get('error')]
+        if errors:
+            record['errors'] = errors[:5]
+    except Exception as error:  # noqa: BLE001  never fails the conversion
+        record['error'] = str(error)[:300]
+        print(f'WARNING {out.parent.name}/{module}: winding step failed ({error}); the GLBs are unchanged', flush=True)
+    return record
+
+
+def align_summary(record):
+    """One-line digest of an align_step record for the `== <key>: align ...` line."""
+    align, fit = record.get('align') or {}, record.get('fit') or {}
+    parts = [f'align {align["status"]}'] if align else []
+    residual = align.get('residual_mm') or {}
+    if residual.get('before') is not None and residual.get('after') is not None:
+        parts.append(f'residual {residual["before"]:.1f} -> {residual["after"]:.1f} mm')
+    if fit:
+        pokes = [v['poke_after_cm2'] for v in (fit.get('levels') or {}).values() if v.get('poke_after_cm2') is not None]
+        parts.append(f'fit {fit["status"]}' + (f' (poke after {max(pokes):.1f} cm2)' if pokes else ''))
+    if record.get('error'):
+        parts.append(record['error'][:120])
+    return ', '.join(parts)
+
+
 def regenerate_reason(info):
     """A Tripo mesh worth regenerating: currently a doubled interior shell (reduce_model's audit)."""
     interior = info.get('interior') or {}
     share = interior.get('interior_area_share', 0)
     if share >= interior.get('threshold', float('inf')):
         return {'slug': 'interior_shell', 'text': f'doubled interior shell ({share:.0%} of the area is enclosed)'}
+    return None
+
+
+def pixal3d_regenerate_reason(info):
+    """regenerate_reason for a pixal3d mesh. Its reference remesh wraps every thin sheet as a closed two-sided skin, so the
+    raw audit always reports ~50% enclosed area; reduce_model strips that inner layer (trial 2026-11-18: 53% -> 2.6%, Tripo
+    7%). Only a mesh still enclosed after the strip is worth regenerating."""
+    interior = info.get('interior') or {}
+    after = (interior.get('after_strip') or {}).get('interior_area_share') if interior.get('stripped') else None
+    if after is None:
+        return regenerate_reason(info)
+    if after >= interior.get('threshold', float('inf')):
+        return {'slug': 'interior_shell', 'text': f'interior shell left after the strip ({after:.0%} of the area is enclosed)'}
     return None
 
 
@@ -313,6 +660,17 @@ def main(argv):
         raise SystemExit(f'--backend must be one of {BACKENDS}, not {backend!r}')
     options = {'allow_paid': '--allow-paid' in argv[1:], 'accept_preview': '--accept-preview' in argv[1:]}
     requested_split = option_value(argv[1:], '--split-method')
+    max_submits = int(option_value(argv[1:], '--max-submits', -1))
+    wearable_method = option_value(argv[1:], '--wearable-method')
+    if wearable_method is not None and wearable_method not in WEARABLE_METHODS:
+        raise SystemExit(f'--wearable-method must be one of {WEARABLE_METHODS}, not {wearable_method!r}')
+    cli_feature_labels = option_value(argv[1:], '--feature-labels')
+    if cli_feature_labels is not None:
+        try:
+            feature_hooks.normalise_spec(cli_feature_labels)
+        except ValueError as error:
+            raise SystemExit(str(error))
+    submits, skipped = 0, []
     if requested_split is not None and requested_split not in SPLIT_METHODS:
         raise SystemExit(f'--split-method must be one of {SPLIT_METHODS}, not {requested_split!r}')
     job = ROOT / 'processing' / job_name
@@ -325,13 +683,18 @@ def main(argv):
             subprocess.run([sys.executable, str(TOOLS / 'workflow.py'), 'check', str(staged), '--complete'],
                            check=True, stdout=subprocess.DEVNULL)
             job.parent.mkdir(exist_ok=True)
-            os.rename(staged, job)
+            try:
+                os.rename(staged, job)
+            except FileNotFoundError:  # another worker moved it first
+                if not job.is_dir():
+                    raise
         else:
             job = staged
     record_path = job / '.tripo-job.json'
-    record = json.loads(record_path.read_text())
+    record = read_record(record_path)
     record.setdefault('module_conversion', {})
-    summary, errors = {}, []
+    locks = ROOT / 'models' / record['set'] / record['job_id'] / '.module_locks'
+    summary, errors, elsewhere = {}, [], []
     for entry in record['modules']:
         race, module = entry['race_gender'], entry['module']
         key = f'{race}/{module}'
@@ -339,23 +702,68 @@ def main(argv):
         if separable:
             print(f'== {key}: separable job (joint-band palette)', flush=True)
         piece_colours = '--piece-colours' in argv[1:] or job_is_piece_colours(job, race, module)
+        knee_cops = ('--knee-cops' in argv[1:] and module == 'body_armor') or job_is_knee_cops(job, race, module)
+        omit_views = module_omitted_views(job, race, module, entry)
+        try:
+            feature_labels, feature_source = feature_hooks.resolve_spec(record['set'], module, record, cli_feature_labels)
+        except ValueError as error:
+            raise SystemExit(f'{key}: {error}')
+        if feature_labels:
+            print(f'== {key}: feature label pass {feature_labels} ({feature_source})', flush=True)
+        if omit_views:
+            print(f'== {key}: three-view module (omitted: {", ".join(omit_views)}); visibility weighting skips that camera', flush=True)
         if piece_colours:
             print(f'== {key}: per-piece base colours job (standard palette, adaptive hue fit on)', flush=True)
+        if knee_cops:
+            print(f'== {key}: knee cops (the knee band is garment-allowed and its own rigid section knee_l / knee_r)', flush=True)
         out = ROOT / 'models' / record['set'] / record['job_id'] / race / module
         if dry_run:  # never leave a dry-run record where the real submission will go
             out = Path(tempfile.mkdtemp(prefix=f'tripo_dryrun_{module}_'))
         submission = out / 'studio_submission.json'
         env = dict(os.environ, **({'TRIPO_DRY_RUN': '1'} if dry_run else {}))
+        if (out / 'reduced' / 'manifest.json').exists() and key in record['module_conversion']:
+            summary[key] = 'already converted'
+            continue
+        if not submission.exists() and 0 <= max_submits <= submits:
+            skipped.append(key)
+            summary[key] = 'skipped: --max-submits reached'
+            continue
+        if not dry_run and not submission.exists() and PAUSE.exists():
+            print(f'== {key}: PAUSED (supervisor PAUSE file); waiting before a new submission', flush=True)
+            while PAUSE.exists():
+                time.sleep(15)
+        lock = locks / f'{race}__{module}.lock'
+        if not dry_run:
+            if not claim_module(lock):
+                elsewhere.append(key)
+                summary[key] = 'being converted by another worker'
+                continue
+            if module_converted(read_record(record_path), key, out):  # finished by another worker meanwhile
+                lock.unlink(missing_ok=True)
+                summary[key] = 'already converted'
+                continue
+        if submission.exists():  # collect with the backend that submitted it
+            module_backend = json.loads(submission.read_text(encoding='utf-8-sig')).get('backend', 'tripo')
+        else:
+            module_backend = backend
+            submits += 1
         if not submission.exists():
             print(f'== {key}: submit', flush=True)
-            subprocess.run(submit_command(backend, job / race / module, out, dry_run),
-                           check=True, cwd=ROOT, env=env)
+            if module_backend in ('formy3d', 'pixal3d'):
+                run = subprocess.run(submit_command(module_backend, job / race / module, out, dry_run, options), cwd=ROOT, env=env)
+                if run.returncode != 0:  # a guard stop (--allow-paid/price/sign-in; pixal3d: bad inputs) leaves the module resumable
+                    raise SystemExit(f'{key}: {module_backend} submit stopped (exit {run.returncode}); '
+                                     f'fix what it printed and re-run')
+            else:
+                subprocess.run(submit_command(module_backend, job / race / module, out, dry_run),
+                               check=True, cwd=ROOT, env=env)
         if dry_run:
-            summary[key] = f'dry run: form filled, nothing submitted; screenshot {out / "before_submit.png"}'
+            summary[key] = (f'dry run: inputs staged in {out / "pixal3d_input"}, nothing generated' if module_backend == 'pixal3d'
+                            else f'dry run: form filled, nothing submitted; screenshot {out / "before_submit.png"}')
             continue
-        state, info = collect_and_reduce(key, out, backend, options, separable, piece_colours)
-        # Hyper3D retries cost credits, so only Tripo's free-retry loop runs; a broken hyper3d mesh is flagged
-        reason = regenerate_reason(info) if backend == 'tripo' else None
+        state, info = collect_and_reduce(key, out, module_backend, options, separable, piece_colours, omit_views, wearable_method, knee_cops, feature_labels)
+        # Hyper3D/formy3d retries cost credits, so only Tripo's free-retry loop runs; a broken mesh is flagged
+        reason = regenerate_reason(info) if module_backend == 'tripo' else None
         previous = record['module_conversion'].get(key, {})
         while reason and not previous.get('free_retries_exhausted'):
             # a broken Tripo mesh is regenerated with the project's free retries, never by paying again
@@ -363,7 +771,7 @@ def main(argv):
             os.rename(out, failed)
             print(f'== {key}: {reason["text"]}; moved to {failed.name}; free retry', flush=True)
             run = subprocess.run(['node', str(TOOLS / 'studio.mjs'), 'retry', str(failed), str(out)], cwd=ROOT)
-            retry_state = json.loads(submission.read_text()) if submission.exists() else {}
+            retry_state = json.loads(submission.read_text(encoding='utf-8-sig')) if submission.exists() else {}
             if run.returncode != 0:
                 if retry_state.get('status') != 'no_free_retries':
                     if not out.exists():  # never leave the module empty: a resume would pay for a new submission
@@ -373,41 +781,97 @@ def main(argv):
                 n = len(list(out.parent.glob(module + '_retry_exhausted_record*'))) + 1
                 os.rename(out, out.parent / f'{module}_retry_exhausted_record{n:02d}')
                 os.rename(failed, out)
-                state, info = collect_and_reduce(key, out, separable=separable)
+                state, info = collect_and_reduce(key, out, separable=separable, omit_views=omit_views, wearable_method=wearable_method, knee_cops=knee_cops, feature_labels=feature_labels)
                 previous = {'free_retries_exhausted': True}
                 errors.append(f'{key}: {reason["text"]} and all free retries are used; '
                               f'needs manual review (do not pay for another generation blindly)')
                 break
-            state, info = collect_and_reduce(key, out, separable=separable)
+            state, info = collect_and_reduce(key, out, separable=separable, omit_views=omit_views, wearable_method=wearable_method, knee_cops=knee_cops, feature_labels=feature_labels)
             reason = regenerate_reason(info)
-        if backend != 'tripo' and regenerate_reason(info):
-            errors.append(f'{key}: {regenerate_reason(info)["text"]}; hyper3d has no free retry, '
+        # pixal3d is local and free: a broken mesh is regenerated with the next seed (each attempt is kept beside the module)
+        seed_offset = 0
+        while module_backend == 'pixal3d' and pixal3d_regenerate_reason(info) and seed_offset < pixal3d_retries():
+            seed_offset += 1
+            reason = pixal3d_regenerate_reason(info)
+            failed = out.parent / f'{module}_attempt{len(list(out.parent.glob(module + "_attempt*"))) + 1:02d}_{reason["slug"]}'
+            os.rename(out, failed)
+            print(f'== {key}: {reason["text"]}; moved to {failed.name}; regenerating with seed offset {seed_offset}', flush=True)
+            run = subprocess.run(submit_command('pixal3d', job / race / module, out, options={'seed_offset': seed_offset}), cwd=ROOT)
+            if run.returncode != 0:
+                raise SystemExit(f'{key}: pixal3d resubmit stopped (exit {run.returncode}); the previous attempt is {failed}')
+            state, info = collect_and_reduce(key, out, 'pixal3d', options, separable, piece_colours, omit_views, wearable_method,
+                                             knee_cops, feature_labels)
+        if module_backend == 'pixal3d' and pixal3d_regenerate_reason(info):
+            errors.append(f'{key}: {pixal3d_regenerate_reason(info)["text"]}; still broken after {seed_offset} pixal3d regeneration(s), '
+                          f'needs manual review')
+        elif module_backend != 'tripo' and regenerate_reason(info):
+            errors.append(f'{key}: {regenerate_reason(info)["text"]}; {module_backend} has no free retry, '
                           f'needs manual review (do not pay for another generation blindly)')
         method, why = choose_split_method(requested_split, module, piece_colours, separable)
-        split = split_step(out, module, method, why)
+        split = split_step(out, module, method, why, feature_labels)
         if method != 'none':
             print(f'== {key}: split {split["status"]} ({split["method"]})', flush=True)
+        no_align = align_disabled_reason(argv[1:])
+        align = {'status': 'skipped', 'why': no_align} if no_align else align_step(out, module)
+        print(f'== {key}: align {align["status"]} ({no_align or align_summary(align)})', flush=True)
+        winding = winding_step(out, module)
+        print(f'== {key}: winding {winding["status"]} ({winding.get("faces_fixed", 0)} faces fixed in {winding.get("glbs_fixed", 0)} GLBs'
+              f'{", " + str(winding["pieces_needing_review"]) + " pieces need review" if winding.get("pieces_needing_review") else ""}'
+              f'{", " + winding["error"][:120] if winding.get("error") else ""})', flush=True)
         levels = info['levels']
         review = [k for k, v in levels.items()
                   if not v['mesh_checks_pass'] or v['material_review_required']]
-        record['module_conversion'][key] = {'backend': backend, 'project_id': state.get('project_id'),
-                                            'models': str(out.relative_to(ROOT)),
+        record['module_conversion'][key] = {'backend': module_backend, 'project_id': state.get('project_id'),
+                                            'models': out.relative_to(ROOT).as_posix(),
                                             'levels_needing_review': review,
                                             'split': split,
+                                            'align': align,
+                                            'winding': winding,
+                                            'wearable': wearable_record(info),
+                                            **({'views_omitted': omit_views} if omit_views else {}),
+                                            **({'knee_cops': knee_cop_record(info)} if knee_cops else {}),
+                                            **({'feature_labels': {'spec': feature_labels, 'source': feature_source,
+                                                                   **({k: info['wearable']['feature_labels'][k] for k in ('skipped', 'holes', 'studs', 'fixed')
+                                                                       if k in info.get('wearable', {}).get('feature_labels', {})})}}
+                                               if feature_labels else {}),
                                             **({'free_retries_exhausted': True, 'needs_manual_review':
                                                 regenerate_reason(info)['text']}
                                                if previous.get('free_retries_exhausted') and regenerate_reason(info) else {})}
-        write_record(record_path, record)
+        entry_done = record['module_conversion'][key]
+        record = update_record(record_path, lambda r: r.setdefault('module_conversion', {}).__setitem__(key, entry_done))
+        lock.unlink(missing_ok=True)
         summary[key] = {k: v['triangles'] for k, v in levels.items()} | {'review': review}
+    unfinished = []
     if not dry_run:
-        record['state'] = 'converted_with_errors' if errors else 'converted'
-        record['conversion'] = f'{backend}_and_reduction_done_pending_review'
-        write_record(record_path, record)
-    print(json.dumps({'job': str(job.relative_to(ROOT)), 'modules': summary}, indent=2))
+        def finish(r):
+            r.setdefault('conversion_errors', []).extend(e for e in errors if e not in r['conversion_errors'])
+            base = ROOT / 'models' / r['set'] / r['job_id']
+            unfinished[:] = [f'{e["race_gender"]}/{e["module"]}' for e in r['modules']
+                             if not module_converted(r, f'{e["race_gender"]}/{e["module"]}',
+                                                     base / e['race_gender'] / e['module'])]
+            if unfinished and not skipped:
+                return  # other workers still own modules; whoever finishes the last one sets the state
+            backends = sorted({v.get('backend', 'tripo') for v in r['module_conversion'].values()}) or [backend]
+            r['state'] = ('partially_converted' if skipped else
+                          'converted_with_errors' if r['conversion_errors'] else 'converted')
+            r['conversion'] = f'{"+".join(backends)}_and_reduction_done_pending_review'
+        update_record(record_path, finish)
+        if not unfinished:
+            try:
+                locks.rmdir()
+            except OSError:
+                pass
+    print(json.dumps({'job': job.relative_to(ROOT).as_posix(), 'modules': summary}, indent=2))
     for line in errors:
         print(f'ERROR {line}', file=sys.stderr)
     if errors:
         raise SystemExit(1)
+    if skipped:
+        print(f'PARTIAL {len(skipped)} module(s) not submitted (--max-submits {max_submits}): {skipped}', file=sys.stderr)
+        raise SystemExit(3)
+    if unfinished:
+        print(f'SHARED {len(unfinished)} module(s) still being converted by other workers: {unfinished}', file=sys.stderr)
+        raise SystemExit(4)
 
 
 if __name__ == '__main__':

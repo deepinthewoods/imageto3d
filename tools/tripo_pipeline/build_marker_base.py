@@ -1,6 +1,11 @@
 """Build a studio-plain semantic-marker scene for one race from its Armourforge V2 project.
 
-Usage: blender -b --python tools/tripo_pipeline/build_marker_base.py -- <race> <out.blend>
+Usage: blender -b --python tools/tripo_pipeline/build_marker_base.py -- <race> <out.blend> [--add OBJECT=PART ...] [--white]
+
+--add joins another project mesh to `base` with every face given body part PART (e.g. the gnome's
+unrigged `location head` as head.x); only `base` and the added objects are used, so separate meshes
+such as the gnome's `feet` stay out. --white recolours the three anchor materials to the
+white_anchor_v2 #EDEDED exactly as assets/marker_bases_white/make_white_scenes.py does.
 
 Opens the frozen human-male scene (assets/studio_plain_input.blend: lights, world, camera,
 render settings, the six marker/armor materials) and replaces its single `studio_plain` mesh
@@ -17,8 +22,9 @@ magenta); this script does not reproduce those 8 triangles, so human_male keeps 
 Bone-weight rules were tried first and failed on the other races (heads mostly red).
 """
 from pathlib import Path
-import collections, json, re, sys
+import argparse, collections, json, re, sys
 
+import bmesh
 import bpy
 import numpy as np
 
@@ -27,9 +33,32 @@ TEMPLATE = ROOT / 'assets/studio_plain_input.blend'
 FIT = 0.8
 MARKER = {'head.x': 1, 'hand.l': 2, 'foot.l': 3}
 MATS = ('body_red', 'head_yellow', 'left_hand_magenta', 'left_foot_cyan', 'armor_green', 'armor_blue')
+ANCHORS = ('head_yellow', 'left_hand_magenta', 'left_foot_cyan')
 
 
-def main(race, out):
+def srgb_to_lin(c):
+    c /= 255
+    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+
+
+WHITE = (srgb_to_lin(0xED),) * 3 + (1.0,)
+
+
+def recolour(mat, base):
+    """Same recolour as make_white_scenes.py: Principled Base Color, diffuse_color and the grain MIX_RGB pair."""
+    mat.diffuse_color = base
+    done = 0
+    for n in mat.node_tree.nodes:
+        if n.type == 'BSDF_PRINCIPLED':
+            n.inputs['Base Color'].default_value = base; done += 1
+        elif n.type == 'MIX_RGB':
+            n.inputs[1].default_value = tuple(c * 0.72 for c in base[:3]) + (1.0,)
+            n.inputs[2].default_value = tuple(min(1.0, c * 1.18) for c in base[:3]) + (1.0,)
+            done += 1
+    assert done == 2, (mat.name, done)
+
+
+def main(race, out, add=(), white=False):
     out = Path(out)
     if out.exists():
         raise SystemExit(f'Output exists; preserve it: {out}')
@@ -44,11 +73,15 @@ def main(race, out):
     bpy.data.meshes.remove(old_mesh)
 
     with bpy.data.libraries.load(str(project)) as (src, dst):
-        dst.objects = ['base']
-    base = dst.objects[0]
+        dst.objects = ['base'] + [name for name, _ in add]
+    base, extras = dst.objects[0], dst.objects[1:]
+    if None in extras:
+        raise SystemExit(f'Missing --add object in {project}: {[n for (n, _), o in zip(add, extras) if o is None]}')
     rig = base.parent
     scene.collection.objects.link(base)
     scene.collection.objects.link(rig)
+    for obj in extras:
+        scene.collection.objects.link(obj)
     rig.data.pose_position = 'REST'
     dg = bpy.context.evaluated_depsgraph_get()
     ev = base.evaluated_get(dg)
@@ -56,6 +89,25 @@ def main(race, out):
     if len(me.vertices) != len(base.data.vertices):
         raise SystemExit('Evaluated mesh changed vertex count')
     me.transform(base.matrix_world)
+    if extras:
+        names = [re.sub(r'\.\d{3}$', '', m.name).removeprefix('bone_') if m else '' for m in me.materials]
+        bm = bmesh.new()
+        bm.from_mesh(me)
+        for obj, (_, part) in zip(extras, add):
+            if part not in names:
+                raise SystemExit(f'--add part {part!r} is not a body part of base: {names}')
+            extra = bpy.data.meshes.new_from_object(obj.evaluated_get(dg))
+            extra.transform(obj.matrix_world)
+            first = len(bm.faces)
+            bm.from_mesh(extra)
+            bm.faces.ensure_lookup_table()
+            if len(bm.faces) != first + len(extra.polygons):
+                raise SystemExit(f'Joining {obj.name} did not append its faces')
+            for i in range(first, len(bm.faces)):
+                bm.faces[i].material_index = names.index(part)
+            bpy.data.meshes.remove(extra)
+        bm.to_mesh(me)
+        bm.free()
     v = np.array([x.co[:] for x in me.vertices])
     low, high = v.min(0), v.max(0)
     centre = (low + high) / 2
@@ -87,6 +139,11 @@ def main(race, out):
     scene.collection.objects.link(obj)
 
     bpy.data.objects.remove(base)
+    for obj in extras:
+        bpy.data.objects.remove(obj)
+    if white:
+        for name in ANCHORS:
+            recolour(bpy.data.materials[name], WHITE)
     arm_data = rig.data
     bpy.data.objects.remove(rig)
     bpy.data.armatures.remove(arm_data)
@@ -98,14 +155,18 @@ def main(race, out):
               'scale': scale, 'centre': centre.tolist(),
               'vertices': len(me.vertices), 'faces': len(me.polygons),
               'faces_per_material': {MATS[i]: counts[i] for i in range(len(MATS))},
-              'normalised_bbox': {'min': n.min(0).tolist(), 'max': n.max(0).tolist()}}
+              'normalised_bbox': {'min': n.min(0).tolist(), 'max': n.max(0).tolist()},
+              'added': {name: part for name, part in add}, 'white_anchor': white}
     out.parent.mkdir(parents=True, exist_ok=True)
     bpy.ops.wm.save_as_mainfile(filepath=str(out), compress=False)
     print('MARKER_BASE', json.dumps(record), flush=True)
 
 
 if __name__ == '__main__':
-    args = sys.argv[sys.argv.index('--') + 1:]
-    if len(args) != 2:
-        raise SystemExit(__doc__)
-    main(*args)
+    parser = argparse.ArgumentParser(usage=__doc__)
+    parser.add_argument('race')
+    parser.add_argument('out')
+    parser.add_argument('--add', action='append', default=[], metavar='OBJECT=PART')
+    parser.add_argument('--white', action='store_true')
+    a = parser.parse_args(sys.argv[sys.argv.index('--') + 1:])
+    main(a.race, a.out, [tuple(x.rsplit('=', 1)) for x in a.add], a.white)

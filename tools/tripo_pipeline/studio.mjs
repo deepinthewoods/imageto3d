@@ -1,34 +1,77 @@
 /** Tripo Studio Firefox multi-view submit/collect. Requires a signed-in ordinary Firefox profile. */
 import { firefox } from 'playwright';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
 const [command, sourceArg, outputArg, topologyArg] = process.argv.slice(2);
-if (!['submit', 'collect', 'retry'].includes(command)) throw new Error('Usage: node studio.mjs submit <views_dir> <output_dir> [Triangle|Quad] | collect <output_dir> | retry <previous_output_dir> <output_dir>');
+if (!['submit', 'collect', 'retry', 'balance'].includes(command)) throw new Error('Usage: node studio.mjs submit <views_dir> <output_dir> [Triangle|Quad] | collect <output_dir> | retry <previous_output_dir> <output_dir> | balance');
 if (['submit','retry'].includes(command) && (!sourceArg || !outputArg)) throw new Error(`${command} needs two directories`);
 if (command === 'collect' && !sourceArg) throw new Error('Collect needs output_dir');
 const DEFAULT_TOPOLOGY = 'Triangle';
 const source = command === 'submit' ? path.resolve(sourceArg) : null;
-const output = path.resolve(command === 'collect' ? sourceArg : outputArg);
+const output = command === 'balance' ? null : path.resolve(command === 'collect' ? sourceArg : outputArg);
 const topology = topologyArg ?? DEFAULT_TOPOLOGY;
 if (command === 'submit' && !['Triangle','Quad'].includes(topology)) throw new Error('Topology must be Triangle or Quad');
 const views = ['front.png','front_three_quarter.png','back_three_quarter.png','back.png'];
-const recordPath = path.join(output,'studio_submission.json');
+// Studio upload slots by label, in the same order as `views`.
+const slotLabels = {'front.png':'Front','front_three_quarter.png':'Left','back_three_quarter.png':'Right','back.png':'Back'};
+// Three-view modules: <views_dir>/views_omitted.json {"omitted":["back"],"reason":..,"date":..} (tools/tripo_pipeline/views_omitted.py
+// has the same rules): front is always required, exactly one other view (or exactly both three-quarter views: a
+// two-view front + back module) may be omitted and an omitted view's PNG must not exist.
+function readOmitted(dir){
+ const file=path.join(dir,'views_omitted.json');
+ if(!fs.existsSync(file))return {omitted:[],marker:null};
+ const data=JSON.parse(fs.readFileSync(file,'utf8'));
+ if(!data||!Array.isArray(data.omitted))throw new Error('views_omitted.json needs {"omitted":["<view>"],"reason":..,"date":..}');
+ const names=data.omitted.map(n=>String(n).replace(/\.png$/,''));
+ if(names.includes('front'))throw new Error('views_omitted.json: front is always required and cannot be omitted');
+ const known=views.map(v=>v.replace(/\.png$/,''));
+ const unknown=names.filter(n=>!known.includes(n));
+ if(unknown.length)throw new Error(`views_omitted.json: unknown view ${unknown.join(',')}`);
+ const twoView=names.length===2&&names.includes('front_three_quarter')&&names.includes('back_three_quarter');
+ if(names.length!==1&&!twoView)throw new Error(`views_omitted.json: omit exactly one non-front view, or both three-quarter views; got ${JSON.stringify(names)}`);
+ for(const n of names)if(fs.existsSync(path.join(dir,n+'.png')))throw new Error(`views_omitted.json omits ${n} but ${n}.png exists`);
+ return {omitted:names,marker:{omitted:names,reason:data.reason??null,date:data.date??null}};
+}
+const recordPath = output && path.join(output,'studio_submission.json');
 const profile = path.join(process.env.XDG_DATA_HOME ?? path.join(os.homedir(),'.local','share'),'tripo-studio-playwright-firefox');
 const write = record => fs.writeFileSync(recordPath,JSON.stringify(record,null,2)+'\n');
 const cookieScript = fileURLToPath(new URL('./import_firefox_cookies.py',import.meta.url));
-function getCookies(){return JSON.parse(execFileSync('python3',[cookieScript],{encoding:'utf8'}));}
+// Windows (2026-11-08): `python` (python3 there is a different interpreter); no ordinary Firefox profile to copy cookies from,
+// so a missing profile means: rely on the persistent Playwright profile's own Tripo login (log in once in that window).
+const PY = process.platform==='win32' ? 'python' : 'python3';
+function getCookies(){
+ let cookies;
+ try{
+  const run=spawnSync(PY,['-X','utf8',cookieScript],{encoding:'utf8',stdio:['ignore','pipe','pipe']});
+  if(run.status!==0)throw Object.assign(new Error((run.stderr||'').trim().split('\n').pop()||`exit ${run.status}`),{status:run.status});
+  cookies=JSON.parse(run.stdout);
+ }catch(err){
+  if(process.platform!=='win32')throw err;
+  console.error(`Tripo cookie import failed (${String(err.message).slice(0,200)}); using the Playwright profile login`);return [];
+ }
+ if(process.platform==='win32'&&!cookies.length)console.error('Tripo cookie import found no unexpired Tripo cookies in the ordinary Firefox profile (sign in to Tripo there, or set TRIPO_FIREFOX_PROFILE); using the Playwright profile login');
+ return cookies;
+}
 function pngInfo(file){
  const bytes=fs.readFileSync(file).subarray(0,26);
  if(bytes.length<26||!bytes.subarray(0,8).equals(Buffer.from([137,80,78,71,13,10,26,10]))||bytes.toString('ascii',12,16)!=='IHDR')throw new Error(`Expected PNG: ${file}`);
  if(bytes[24]!==8||bytes[25]!==6)throw new Error(`Expected 8-bit RGBA PNG: ${file}`);
  return [bytes.readUInt32BE(16),bytes.readUInt32BE(20)];
 }
+// Windows: no private display, so the browser runs headless (PIPELINE_SHOW_WINDOWS=1 shows it). Linux hides it on Xvfb instead.
+const HEADLESS=process.platform==='win32'&&process.env.PIPELINE_SHOW_WINDOWS!=='1';
+// Run the browser on a private X display so no window pops up (PIPELINE_SHOW_WINDOWS=1 shows it); see tools/hidden_display.py.
+function browserEnv(){
+ if(process.platform==='win32')return undefined;
+ const display=execFileSync(PY,[fileURLToPath(new URL('../hidden_display.py',import.meta.url)),'start','--parent',String(process.pid)],{encoding:'utf8'}).trim();
+ return display?{...process.env,DISPLAY:display}:undefined;
+}
 async function openStudio(url){
- const context=await firefox.launchPersistentContext(profile,{headless:false,viewport:{width:1440,height:900},acceptDownloads:true});
+ const context=await firefox.launchPersistentContext(profile,{headless:HEADLESS,env:browserEnv(),viewport:{width:1440,height:900},acceptDownloads:true});
  try{
   await context.addCookies(getCookies());const page=context.pages()[0]??await context.newPage();
   await page.goto(url,{waitUntil:'domcontentloaded',timeout:60000});
@@ -36,16 +79,31 @@ async function openStudio(url){
   return {context,page};
  }catch(err){await context.close();throw err;}
 }
+// Close promo/announcement dialogs whose backdrop would block every click (seen 2026-10-24).
+async function dismissDialogs(page,shotDir){
+ await page.waitForTimeout(2500);
+ for(let i=0;i<4;i++){
+  const overlay=page.locator('div.fixed.inset-0[data-state="open"]');
+  if(!(await overlay.count().catch(()=>0)))return;
+  if(shotDir&&i===0)await page.screenshot({path:path.join(shotDir,'dialog_dismissed.png')}).catch(()=>{});
+  await page.keyboard.press('Escape').catch(()=>{});
+  await page.locator('[role="dialog"] button[aria-label*="lose" i], [role="dialog"] button:has-text("Close"), [role="dialog"] button:has-text("Got it"), [role="dialog"] button:has-text("Skip"), [role="dialog"] button:has-text("Later")').first().click({timeout:1000}).catch(()=>{});
+  await page.waitForTimeout(800);
+ }
+}
 async function submit(){
  if(fs.existsSync(recordPath))throw new Error(`Submission record already exists; collect or inspect before retrying: ${recordPath}`);
- for(const name of views)if(!fs.existsSync(path.join(source,name)))throw new Error(`Missing ${name}`);
- const dimensions=views.map(name=>pngInfo(path.join(source,name)));
+ const {omitted,marker}=readOmitted(source);
+ const present=views.filter(name=>!omitted.includes(name.replace(/\.png$/,'')));
+ for(const name of present)if(!fs.existsSync(path.join(source,name)))throw new Error(`Missing ${name}`);
+ const dimensions=present.map(name=>pngInfo(path.join(source,name)));
  if(dimensions.some(([width,height])=>width!==dimensions[0][0]||height!==dimensions[0][1]))throw new Error(`Multi-view inputs have different native dimensions: ${JSON.stringify(dimensions)}`);
  fs.mkdirSync(output,{recursive:true});
  const polycountMax=topology==='Quad'?50000:2000000;
- const record={source,images:views,input_resolution:dimensions[0],settings:{workflow:'HD Model / Multi Images to 3D',model:'H3.0',texture:'2K',pbr:false,topology,remove_lighting:true,polycount_max:polycountMax},status:'preparing',started_at:new Date().toISOString()};write(record);
+ const record={source,images:present,...(omitted.length?{views_omitted:marker}:{}),input_resolution:dimensions[0],settings:{workflow:'HD Model / Multi Images to 3D',model:'H3.0',texture:'2K',pbr:false,topology,remove_lighting:true,polycount_max:polycountMax},status:'preparing',started_at:new Date().toISOString()};write(record);
  const {context,page}=await openStudio('https://studio.tripo3d.ai/workspace/generate');
  try{
+  await dismissDialogs(page,output);
   await page.locator('div[class*="i-tripo:multi-view"]').click();
   if(await page.getByText('H3.1 – Best Quality').count()){
    await page.getByText('H3.1 – Best Quality').click();await page.getByText('H3.0 – Fast & Balanced').click();
@@ -65,7 +123,29 @@ async function submit(){
   if(await lighting.getAttribute('aria-checked')!=='true')throw new Error('Remove Lighting did not enable');
   const files=page.locator('input[type=file][accept^="image/"]');
   if(await files.count()!==4)throw new Error('Expected four image upload slots');
-  for(const name of views){await files.first().setInputFiles(path.join(source,name));await page.waitForTimeout(700);}
+  // A filled slot loses its input, so the remaining inputs are looked up by their Front/Left/Right/Back label each time;
+  // an omitted view's slot simply stays empty.
+  const labelsNow=()=>page.evaluate(()=>[...document.querySelectorAll('input[type=file][accept^="image/"]')].map(el=>{let a=el;for(let k=0;k<3&&a.parentElement;k++)a=a.parentElement;return (a.innerText.match(/Front|Left|Right|Back/)??[''])[0];}));
+  const pending=async()=>{const now=await labelsNow();return present.filter(name=>now.includes(slotLabels[name]));};
+  // Studio uploads asynchronously and a failed upload ("Upload failed. Please try again.") empties its slot again some
+  // seconds later, while Generate stays enabled. So wait until every slot has stayed filled for 8 s, re-uploading any
+  // slot that came back empty (at most 6 re-uploads), and check again right before the click.
+  let stable=0,reuploads=0;
+  for(let tick=0;tick<90&&stable<8;tick++){
+   const todo=await pending();
+   if(todo.length){
+    stable=0;
+    if((reuploads+=todo.length)>present.length+6)throw new Error(`Studio did not keep the uploads for: ${todo.join(', ')}`);
+    for(const name of todo){
+     const index=(await labelsNow()).indexOf(slotLabels[name]);
+     await files.nth(index).setInputFiles(path.join(source,name));await page.waitForTimeout(1500);
+    }
+   }else stable++;
+   await page.waitForTimeout(1000);
+  }
+  if(stable<8)throw new Error('Studio uploads did not settle');
+  const left=await labelsNow();const expectLeft=views.filter(v=>!present.includes(v)).map(v=>slotLabels[v]).sort().join();
+  if(left.slice().sort().join()!==expectLeft)throw new Error(`Upload slots left empty ${JSON.stringify(left)}, expected ${expectLeft||'none'}`);
   await page.waitForTimeout(2000);
   const cost=topology==='Quad'?30:25;
   const generate=page.getByRole('button',{name:new RegExp(`Generate\\s*${cost}`)}).first();
@@ -87,12 +167,17 @@ async function submit(){
    if(Date.now()>queueDeadline)throw new Error('Generate stayed disabled; another Studio generation may be stuck');
    record.status='waiting_for_studio_queue';write(record);await page.waitForTimeout(15000);
   }
+  if((await pending()).length)throw new Error(`Upload slot emptied before Generate: ${(await pending()).join(', ')}`);
   record.status='submission_attempted';record.submit_clicked_at=new Date().toISOString();write(record);
   await generate.click();await page.waitForTimeout(7000);
   record.response=responses[0]??null;record.project_id=record.response?.project_id??page.url().match(/[a-f0-9-]{36}$/)?.[0]??null;
   record.status=record.response?.code===0&&record.project_id?'submitted':'submission_needs_review';record.after_submit_at=new Date().toISOString();write(record);
   await page.screenshot({path:path.join(output,'after_submit.png')});
   console.log(JSON.stringify({status:record.status,project_id:record.project_id,task_id:record.response?.task_id,cost}));
+ }catch(err){
+  // never clicked Generate: move the record aside so a resume submits fresh instead of stopping on it
+  if(record.status==='preparing'&&fs.existsSync(recordPath))fs.renameSync(recordPath,recordPath.replace(/\.json$/,`.preparing_failed_${Date.now()}.json`));
+  throw err;
  }finally{await context.close();}
 }
 async function downloadFormat(page,format,record){
@@ -147,6 +232,11 @@ async function retry(){
   console.log(JSON.stringify({status:record.status,project_id:record.project_id,free_retries_left:left-1}));
  }finally{await context.close();}
 }
+// A slow reload (seen headless on Windows, 2026-11-09: 30 s domcontentloaded timeout while the model was generating)
+// must not abort the collect poll: wait longer, then just poll the page again.
+async function reloadPage(page){
+ await page.reload({waitUntil:'domcontentloaded',timeout:120000}).catch(err=>console.error(`reload slow (${err.message.split('\n')[0]}); polling again`));
+}
 async function collect(){
  const record=JSON.parse(fs.readFileSync(recordPath));
  if(!record.project_id)throw new Error('Submission has no project ID; review record manually');
@@ -159,13 +249,13 @@ async function collect(){
    // after a free retry the old version can stay on screen until the new one is generated
    if(record.retry_of&&await page.getByText(/Generating/).count()){
     if(Date.now()>readyDeadline)throw new Error('Retry still generating');
-    await page.waitForTimeout(30000);await page.reload({waitUntil:'domcontentloaded'});continue;
+    await page.waitForTimeout(30000);await reloadPage(page);continue;
    }
    await page.getByRole('button',{name:'Export',exact:true}).first().waitFor({timeout:60000}).catch(()=>{});
    const body=await page.locator('body').innerText();top=body.match(/Topology\s+(Quad|Triangle)/)?.[1];faces=Number(body.match(/Faces\s+(\d+)/)?.[1]);vertices=Number(body.match(/Vertices\s+(\d+)/)?.[1]);
    if(top&&faces)break;
    if(Date.now()>readyDeadline)throw new Error('Model is not ready or topology counts unavailable');
-   await page.waitForTimeout(30000);await page.reload({waitUntil:'domcontentloaded'});
+   await page.waitForTimeout(30000);await reloadPage(page);
   }
   record.studio_result={topology:top,faces,vertices,inspected_at:new Date().toISOString()};write(record);
   await page.screenshot({path:path.join(output,'studio_result.png')});
@@ -173,4 +263,13 @@ async function collect(){
   record.status='exported';write(record);console.log(JSON.stringify({status:record.status,project_id:record.project_id,...record.studio_result,exports:record.exports}));
  }finally{await context.close();}
 }
-if(command==='submit')await submit();else if(command==='retry')await retry();else await collect();
+// Read-only: print the account's credit balance as JSON ({"credits": N or null}).
+async function balance(){
+ const {context,page}=await openStudio('https://studio.tripo3d.ai/workspace/generate');
+ try{
+  let credits=null;
+  for(let i=0;i<20&&credits===null;i++){await page.waitForTimeout(1000);credits=Number((await page.locator('body').innerText()).match(/(\d{1,7})\s*\n\s*Upgrade/)?.[1]??NaN);if(Number.isNaN(credits))credits=null;}
+  console.log(JSON.stringify({credits}));
+ }finally{await context.close();}
+}
+if(command==='submit')await submit();else if(command==='retry')await retry();else if(command==='balance')await balance();else await collect();
