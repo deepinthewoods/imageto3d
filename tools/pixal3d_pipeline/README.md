@@ -4,7 +4,7 @@
 Pixal3D through the C++ port `pixal3d.cpp` (`trellis-cli --views`). Pixal3D is TRELLIS.2 with
 camera-aware multi-view conditioning: it projects each view's image features into the 3D grid through that view's real
 camera, so it takes our four views with the cameras of the job's frozen `.base_views/<race>/transforms.json` (the dwarf
-20-degree front three-quarter and the gnome back-left camera need nothing special). Added 2026-11-18 at the user's request
+20-degree front three-quarter and the gnome back three-quarter camera (back-left until 2026-11-22, back-right since) need nothing special). Added 2026-11-18 at the user's request
 after a side-by-side with Tripo and TRELLIS.2 (ComfyUI); Tripo stays the default backend.
 
 Cost: none (local). Time: ~4.5 min per module (generation) plus the usual reduction/split/align.

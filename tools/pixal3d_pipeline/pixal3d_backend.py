@@ -11,7 +11,7 @@ collect path. Nothing here costs credits, so convert_job may regenerate a broken
 Inputs: the module's view PNGs (8-bit RGBA, alpha baked in; no matting is done) and the cameras of the job's frozen
 `.base_views/<race>/transforms.json` (else base_views/<race>/transforms.json), restricted to the views that exist (a
 three-view module passes three frames; the multiview weights are validated at four). Pixal3D is camera-aware, so the
-dwarf 20-degree front three-quarter and the gnome back-left camera need nothing special.
+dwarf 20-degree front three-quarter and the gnome back three-quarter camera need nothing special.
 
 Output: Pixal3D writes its model facing glTF -Z; Tripo's face +Z, which reduce_model's visibility weighting and the
 base fit assume. The download is therefore rotated `rotate_y_deg` (180) about the up axis, in the vertex data itself

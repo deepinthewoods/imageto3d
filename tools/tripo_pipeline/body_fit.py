@@ -84,7 +84,36 @@ FLAT_DEG = 5.                 # an edge counts as flat when its dihedral angle w
 PART_SHARE = .15              # a body part counts as covered by a piece when this share of its vertices has it as closest
 LARGE_PUSH_MM = 60.
 CELL = .03                    # ray grid cell (m)
-POKE_OUT = .25                # body sample counts as covered when armour is hit this far along its outward normal
+# RayGrid.hits, Body.closest and Body.winding on the GPU (gpu_geometry.py, OpenGL compute via moderngl) when BODY_FIT_GPU=1; off by default (the CPU path is unchanged). Work
+# below GPU_MIN_TESTS rays x triangles stays on the CPU (the upload costs more); a GPU error switches the process back to the CPU.
+GPU_MIN_TESTS = 2e5
+GPU_WINDING = False           # the GPU winding number (float32) flips inside/outside for ~0.3 % of points lying on the skin even with
+                              # the float64 fallback for points it flags, and saves only ~1.3 s per fitting job: kept on the CPU
+_GPU_ENV = os.environ.get('BODY_FIT_GPU', '').strip().lower()      # '1' / 'all', or a comma list of: rays, closest, raster, winding
+_GPU_PARTS = set() if _GPU_ENV in ('', '0') else ({'rays', 'closest', 'raster'} if _GPU_ENV in ('1', 'all', 'true', 'yes') else set(_GPU_ENV.split(',')))
+_GPU_ON = bool(_GPU_PARTS)
+_gpu_mod = None
+
+
+def _gpu():
+    global _gpu_mod
+    if _gpu_mod is None:                                     # one shared copy per process (visibility.py uses the same GPU context)
+        _gpu_mod = sys.modules.get('gpu_geometry')
+        if _gpu_mod is None:
+            spec = importlib.util.spec_from_file_location('gpu_geometry', HERE / 'gpu_geometry.py')
+            _gpu_mod = importlib.util.module_from_spec(spec)
+            sys.modules['gpu_geometry'] = _gpu_mod
+            spec.loader.exec_module(_gpu_mod)
+    return _gpu_mod
+
+
+def _gpu_failed(e):
+    global _GPU_ON
+    _GPU_ON = False
+    print(f'body_fit: GPU ray test failed ({type(e).__name__}: {e}); CPU from now on in this process', file=sys.stderr, flush=True)
+
+
+POKE_OUT = .25               # body sample counts as covered when armour is hit this far along its outward normal
 POKE_NEAR_OUT = .04           # first stage of the outward (cover) search; the rest of POKE_OUT only for samples still uncovered
 POKE_IN = .12                 # ... and as poking when armour is hit this far behind its surface (and the hit point is inside the body)
 POKE_SPACING_PCT = .5         # sample spacing on the body surface, % of the body height
@@ -213,10 +242,20 @@ class Body:
         z = np.load(BASE_CACHE / f'{race}.npz', allow_pickle=False)
         return cls(z['V'], z['F'], z['part'], z['part_names'])
 
-    def closest(self, P, chunk=1024):
+    def closest(self, P, chunk=1024, _cpu=False):
         """(distance (k,), triangle (k,), barycentric (k,3)) of the exact closest body point to every point."""
         P = np.asarray(P, np.float64)
         K = len(P)
+        if _GPU_ON and 'closest' in _GPU_PARTS and not _cpu and K * len(self.F) >= GPU_MIN_TESTS:
+            try:                     # the GPU picks the nearest triangle, the point is computed here in float64; ties are settled on the CPU
+                ti, tie = _gpu().closest_tri(self, self.A, self.B, self.C, P)
+                bb = tri_closest(P, self.A[ti], self.B[ti], self.C[ti])
+                dd = np.linalg.norm(P - (bb[:, :1] * self.A[ti] + bb[:, 1:2] * self.B[ti] + bb[:, 2:] * self.C[ti]), axis=1)
+                if tie.any():
+                    dd[tie], ti[tie], bb[tie] = self.closest(P[tie], chunk, _cpu=True)
+                return dd, ti, bb
+            except Exception as e:  # noqa: BLE001
+                _gpu_failed(e)
         dist, tri, bary = np.empty(K), np.empty(K, np.int64), np.empty((K, 3))
         kn = min(8, len(self.F))
         for s in range(0, K, chunk):
@@ -246,12 +285,21 @@ class Body:
             dist[s:s + n], tri[s:s + n], bary[s:s + n] = mn, ti[sel], bb[sel]
         return dist, tri, bary
 
-    def winding(self, P, chunk_pairs=600_000):
+    def winding(self, P, chunk_pairs=600_000, _cpu=False):
         """Generalized winding number of the body at every point (1 inside, 0 outside, robust to small holes)."""
         P = np.asarray(P, np.float64)
         out = np.zeros(len(P))
         box = np.all((P >= self.lo) & (P <= self.hi), axis=1)
         idx = np.flatnonzero(box)
+        if _GPU_ON and (GPU_WINDING or 'winding' in _GPU_PARTS) and not _cpu and len(idx) * len(self.F) >= GPU_MIN_TESTS:
+            try:
+                w, unsure = _gpu().winding(self, self.A, self.B, self.C, P[idx])
+                if unsure.any():                                       # points on / next to the surface: float64 on the CPU
+                    w[unsure] = self.winding(P[idx[unsure]], chunk_pairs, _cpu=True)
+                out[idx] = w
+                return out
+            except Exception as e:  # noqa: BLE001
+                _gpu_failed(e)
         step = max(1, chunk_pairs // max(1, len(self.F)))
         for s in range(0, len(idx), step):
             ii = idx[s:s + step]
@@ -708,6 +756,11 @@ class RayGrid:
                'tri_in': np.full(n, -1, np.int64), 'uv_in': np.zeros((n, 2))}
         if not self.n or not n:
             return out
+        if _GPU_ON and 'rays' in _GPU_PARTS and n * self.n >= GPU_MIN_TESTS:
+            try:
+                return _gpu().ray_hits(self, P, N, t_lo, t_hi, eps)
+            except Exception as e:  # noqa: BLE001
+                _gpu_failed(e)
         steps = int(np.ceil((t_hi - t_lo) / (self.cell / 2))) + 1
         ts = np.linspace(t_lo, t_hi, steps)
         for s in range(0, n, chunk):

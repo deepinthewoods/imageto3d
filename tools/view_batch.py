@@ -125,14 +125,26 @@ CAMERAS = ('front_three_quarter is from the character\'s front-LEFT, 45 degrees 
            'from 45 degrees below (undersides, inner legs and crotch visible, head small and partly hidden; '
            'anatomical-right side nearest the camera). Match Image 1\'s camera exactly; do not revert to a level side '
            'view.')
-# Gnome-only back three-quarter camera (user, 2026-10-26; base_views/gnome_female/transforms.json): back-LEFT, 10 degrees below.
-GNOME_CAMERAS = ('front_three_quarter is from the character\'s front-LEFT, 45 degrees around, looking DOWN from 45 '
+# Gnome back three-quarter camera. 2026-10-26..2026-11-22 it was the back-LEFT (45 degrees around, 10 below); jobs whose frozen
+# .base_views snapshot still has that camera (transforms.json view_set ...back_left...) keep this text:
+GNOME_CAMERAS_BACK_LEFT = ('front_three_quarter is from the character\'s front-LEFT, 45 degrees around, looking DOWN from 45 '
                  'degrees above (shoulders and tops visible; the anatomical-left side nearest the camera). back is level '
                  'from directly behind. back_three_quarter (a GNOME-ONLY camera) is from the character\'s back-LEFT, 45 '
                  'degrees around from straight behind, looking UP only slightly from 10 degrees below (almost level): '
                  'the anatomical-LEFT side is nearest the camera, the near arm reaches out to the viewer\'s left and ends '
                  'in the bare white left hand, and the anatomical-right arm is hidden behind the body. It is NOT the usual '
                  'back-right view; do not mirror it. Match Image 1\'s camera exactly.')
+# Since 2026-11-23 (user: "generate the view from the other side ... we can't just flip it because some of the outfits are asymmetrical
+# intentionally"): back-RIGHT, 45 degrees around, 10 degrees below, so Tripo's Right slot (studio.mjs) really shows the right side.
+GNOME_CAMERAS = ('front_three_quarter is from the character\'s front-LEFT, 45 degrees around, looking DOWN from 45 '
+                 'degrees above (shoulders and tops visible; the anatomical-left side nearest the camera). back is level '
+                 'from directly behind. back_three_quarter (the gnome camera) is from the character\'s back-RIGHT, 45 '
+                 'degrees around from straight behind, looking UP only slightly from 10 degrees below (almost level): '
+                 'the anatomical-RIGHT side is nearest the camera, the near right arm reaches out to the viewer\'s right '
+                 'and ends in the red right hand (or the right glove of a gauntlet module), and the white left hand is '
+                 'hidden behind the body. Draw the design as it really looks from the right side: do NOT copy or mirror '
+                 'the left side or the front three-quarter (designs can be asymmetric on purpose). Match Image 1\'s '
+                 'camera exactly.')
 
 
 # Dwarf-only front three-quarter camera (user, 2026-10-26; base_views/dwarf_*/transforms.json): 20 degrees above, not 45.
@@ -143,8 +155,17 @@ DWARF_CAMERAS = CAMERAS.replace(
 assert DWARF_CAMERAS != CAMERAS
 
 
-def cameras(race):
-    return GNOME_CAMERAS if race.startswith('gnome') else DWARF_CAMERAS if race.startswith('dwarf') else CAMERAS
+def cameras(race, base_dir=None):
+    """Camera text for a race; for gnomes it follows the job's frozen base snapshot (back-left before 2026-11-23, back-right since)."""
+    if race.startswith('gnome'):
+        view_set = ''
+        if base_dir is not None and (Path(base_dir) / 'transforms.json').is_file():
+            try:
+                view_set = json.loads((Path(base_dir) / 'transforms.json').read_text(encoding='utf-8')).get('view_set', '')
+            except (OSError, ValueError):
+                view_set = ''
+        return GNOME_CAMERAS_BACK_LEFT if 'back_left' in view_set else GNOME_CAMERAS
+    return DWARF_CAMERAS if race.startswith('dwarf') else CAMERAS
 
 STYLE = ('Matte papercraft cardstock, broad planes, crisp folds. Garment hues are exactly green ~#19D228 primary, blue '
          '~#1E41EB secondary, yellow ~#F5DC14 tertiary and magenta ~#E119DC accent (only those the design uses), lit '
@@ -210,7 +231,8 @@ def add_task(name, prompt, refs, outputs, priority, gate=None):
 ACCOUNT_LIMIT_PROBE = 3600   # seconds; retry an account usage limit hourly instead of waiting for its date
 MIN_FREE = 2 * 2**30   # don't start image jobs with less free disk (the disk filled on 2026-10-26)
 # Races converted from front + back only. Gnomes were (user rule 2026-10-25) until the footless gnome base with its
-# back-left camera (2026-10-26); held gnome tasks made before that keep their views_omitted.json markers.
+# own back three-quarter camera (back-left 2026-10-26, back-right since 2026-11-23); held gnome tasks made before that keep their
+# views_omitted.json markers.
 TWO_VIEW_RACES = ()
 
 
@@ -270,7 +292,7 @@ Output dir: {module_dir}/
 {"Generate ONLY back.png. Do NOT generate front_three_quarter.png or back_three_quarter.png (views_omitted.json in the module dir lists them; leave it as is)." if two_view and not regen_front else ("Generate ONLY front.png and back.png (views_omitted.json lists the three-quarter views; leave it as is)." if two_view else "Generate, in this order: front.png (an edit of the base front), front_three_quarter.png (use your saved front.png as an extra design reference), back.png, then back_three_quarter.png (use your saved back.png as an extra design reference).")} {("The approved concept art is " + str(concept_front) + " - the DESIGN REFERENCE ONLY: copy its garment design (parts, colours, folds, coverage), never its framing; it is an unchecked sketch and must NOT be saved or copied as a view." if concept_front else "There is no concept front to reference; follow the design line below.")}
 For each view, Image 1 is the matching base view (edit target): {job}/.base_views/{race}/<view>.png; Image 2 is the approved front design. Attached refs: {"base back" if two_view else "base front_three_quarter, base back, base back_three_quarter (in that order)"}, then the approved front.
 
-Cameras (state these explicitly in the prompts): {cameras(race)}
+Cameras (state these explicitly in the prompts): {cameras(race, job / ".base_views" / race)}
 
 Coverage: {coverage(module, race, flags.get('knee_cops'))} Show only this module.
 Design (from the approved front's design record): {design_line(notes, module)}
