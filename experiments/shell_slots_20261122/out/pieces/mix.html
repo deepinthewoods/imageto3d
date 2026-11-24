@@ -1,0 +1,94 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Mix and match pieces</title>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<style>
+html,body{height:100%;overflow:hidden}
+body{margin:0;font:13px system-ui,sans-serif;background:#1f242c;color:#dde;display:flex;height:100vh}
+#side{width:340px;flex:none;overflow:auto;padding:10px;box-sizing:border-box;background:#262c36}
+#side h2{font-size:13px;margin:14px 0 6px;color:#9ab}
+.row{display:flex;align-items:center;gap:6px;margin:4px 0}
+.row label{width:92px;flex:none;color:#bcd}
+.row select{flex:1;min-width:0}
+#main{flex:1;position:relative;overflow:hidden;min-width:0}
+#bar{position:absolute;top:8px;left:8px;right:8px;display:flex;gap:14px;align-items:center;background:#262c36e0;padding:8px 10px;border-radius:6px;flex-wrap:wrap}
+#notes{position:absolute;bottom:8px;left:8px;max-width:640px;max-height:40%;overflow:auto;background:#262c36e0;padding:8px 10px;border-radius:6px;white-space:pre-wrap;font:11px ui-monospace,monospace}
+canvas{display:block;position:absolute;inset:0;width:100%!important;height:100%!important}
+button{cursor:pointer}
+</style></head>
+<body>
+<div id="side"><b>Mix and match pieces (2026-11-24)</b>
+<div style="color:#9ab;margin-top:6px">Every module is built alone against the bare game body and cut to its slot. Its skin ends exactly on the game body's
+own ring (neck, elbows, knees, wrists, ankles), so any pieces of one race join there. Garment that runs past a ring overlaps the next piece.
+"bare" is the game body's own skin for that slot.</div>
+<h2>Character</h2>
+<div class="row"><label>race</label><select id="race"></select></div>
+<div class="row"><label>scheme</label><select id="scheme"><option value="armour">armour</option><option value="outfit">outfit</option></select></div>
+<div class="row"><label></label><span><input type="checkbox" id="pair" checked> left follows right</span></div>
+<div id="slots"></div>
+<div class="row"><label></label><button id="rnd">random</button> <button id="same">all from one set</button></div>
+<h2>Show</h2>
+<div class="row"><label></label><span><input type="checkbox" id="tint"> colour by piece</span></div>
+<div class="row"><label></label><span><input type="checkbox" id="inside" checked> backs red</span></div>
+<div class="row"><label></label><span><input type="checkbox" id="wire"> wireframe</span></div>
+<div class="row"><label></label><span title="Game-body faces inside garment pieces (skin kept around / under the garment). Bare pieces stay."><input type="checkbox" id="gamebody" checked> game body faces in garment pieces</span></div>
+</div>
+<div id="main"><div id="bar">
+<label>Amount <input id="amt" type="range" min="0" max="100" value="100"> <span id="amtv">100</span>%</label>
+<span style="color:#9ab">Amount = garment pushed out of the game body (the expansion step)</span>
+</div><div id="notes"></div></div>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+// back faces red: the SAME material, double sided; the fragment shader paints every back-facing pixel red (gl_FrontFacing),
+// so red is exactly where a face is seen from behind (no copy of the mesh, nothing to drift with the Amount morph or z-fight)
+function backRed(m){m.side=THREE.DoubleSide;m.onBeforeCompile=sh=>{sh.fragmentShader=sh.fragmentShader.replace('#include <dithering_fragment>','#include <dithering_fragment>\n\tif(!gl_FrontFacing)gl_FragColor=vec4(1.0,0.0,0.0,1.0);')};m.customProgramCacheKey=()=>'backred';m.needsUpdate=true;return m}
+const ROLE={skin:'#dbab87',primary:'#19d228',secondary:'#1e41eb',tertiary:'#f5dc14',accent:'#e119dc',joint:'#14dceb'};
+const TINTS=['#e6194b','#3cb44b','#ffe119','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6','#bfef45','#fabed4'];
+const SCHEMES={armour:['head','torso','lower_arm.r','lower_arm.l','lower_leg.r','lower_leg.l'],
+               outfit:['head','outfit','hand.r','hand.l','foot.r','foot.l']};
+const main=document.getElementById('main'),renderer=new THREE.WebGLRenderer({antialias:false});renderer.setPixelRatio(Math.max(devicePixelRatio,2));/* no MSAA (it drew back faces as red hairlines on silhouettes): render at 2x or more and let the browser scale down */main.prepend(renderer.domElement);
+const scene=new THREE.Scene();scene.background=new THREE.Color('#323944');
+scene.add(new THREE.HemisphereLight(0xffffff,0x445566,1.4));const dl=new THREE.DirectionalLight(0xffffff,1.6);dl.position.set(2,4,3);scene.add(dl);const dl2=new THREE.DirectionalLight(0xffffff,.6);dl2.position.set(-3,2,-2);scene.add(dl2);
+const camera=new THREE.PerspectiveCamera(35,1,.01,100);const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;
+const loader=new GLTFLoader();const group=new THREE.Group();scene.add(group);let first=true,token=0;
+function resize(){const w=main.clientWidth,h=main.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix()}
+new ResizeObserver(resize).observe(main);resize();
+(function frame(){controls.update();renderer.render(scene,camera);requestAnimationFrame(frame)})();
+const idx=await (await fetch('index.json?v='+Date.now())).json();
+const P=idx.pieces;
+const races=[...new Set(P.map(p=>p.race))].sort();
+const raceSel=document.getElementById('race');races.forEach(r=>raceSel.add(new Option(r,r)));
+const $=id=>document.getElementById(id);
+function piecesFor(race,slot){return P.filter(p=>p.race===race&&p.slot===slot).sort((a,b)=>(a.set==='bare'?-1:b.set==='bare'?1:a.set.localeCompare(b.set)))}
+function short(s){return s==='bare'?'bare':s.replace(/_(outfit|armor|armour)_?/,' ').replace(/_/g,' ')}
+function buildSlots(){const race=raceSel.value,box=$('slots');box.innerHTML='';
+ for(const slot of SCHEMES[$('scheme').value]){const opts=piecesFor(race,slot);if(!opts.length)continue;
+  const row=document.createElement('div');row.className='row';row.innerHTML=`<label>${slot}</label>`;const sel=document.createElement('select');sel.id='s_'+slot;
+  opts.forEach(p=>sel.add(new Option(short(p.set),p.set)));row.append(sel);box.append(row);
+  sel.onchange=()=>{if($('pair').checked&&slot.endsWith('.r')){const o=$('s_'+slot.slice(0,-2)+'.l');if(o&&[...o.options].some(x=>x.value===sel.value))o.value=sel.value}
+   if($('scheme').value==='outfit'&&slot==='outfit')feetForOutfit();show()}}
+ if($('scheme').value==='outfit')feetForOutfit();show()}
+function feetForOutfit(){const race=raceSel.value,o=$('s_outfit');if(!o)return;const rec=P.find(p=>p.race===race&&p.slot==='outfit'&&p.set===o.value);
+ for(const s of ['l','r']){const f=$('s_foot.'+s);if(!f)continue;const bare=(rec?.bare_feet||[]).includes('foot.'+s);f.disabled=!bare;f.parentElement.style.opacity=bare?1:.4}}
+function chosen(){const out=[];for(const slot of SCHEMES[$('scheme').value]){const s=$('s_'+slot);if(!s||s.disabled)continue;const rec=P.find(p=>p.race===raceSel.value&&p.slot===slot&&p.set===s.value);if(rec)out.push(rec)}return out}
+function styleAll(){let k=0;group.children.forEach(root=>{const tint=TINTS[(k++)%TINTS.length];const backs=[];root.traverse(n=>{if(n.userData.back)backs.push(n)});backs.forEach(b=>b.parent.remove(b));
+ root.traverse(n=>{if(!n.isMesh||n.userData.back)return;n.userData.matName??=n.material.name;const role=(n.userData.matName||'skin:x').split(':')[0];
+  const col=$('tint').checked?(role==='skin'?'#cfc6bd':tint):(ROLE[role]||'#888');
+  n.material=new THREE.MeshStandardMaterial({color:col,flatShading:true,roughness:.85,side:THREE.DoubleSide,wireframe:$('wire').checked});
+  if($('inside').checked)backRed(n.material);})})}
+function bodyVis(){const on=$('gamebody').checked;group.children.forEach((root,i)=>{if(root.userData.bare)return;root.traverse(n=>{if(n.isMesh&&!n.userData.back){const p=(n.userData.matName||'').split(':')[1];if(['band','game','patch'].includes(p))n.visible=on}})})}
+function amount(){const v=+$('amt').value;$('amtv').textContent=v;group.traverse(n=>{if(n.isMesh&&n.morphTargetInfluences){const d=n.morphTargetDictionary||{};if('fill' in d)n.morphTargetInfluences[d.fill]=v/100}})}
+async function show(){const t=++token;const recs=chosen();const roots=await Promise.all(recs.map(r=>loader.loadAsync(r.glb).then(g=>g.scene)));if(t!==token)return;
+ group.clear();roots.forEach((r,i)=>{r.userData.bare=recs[i].set==='bare';group.add(r)});styleAll();amount();bodyVis();
+ const box=new THREE.Box3().setFromObject(group),size=box.getSize(new THREE.Vector3());
+ if(first&&size.length()>0){const c=box.getCenter(new THREE.Vector3()),r=size.length();camera.position.set(c.x+r*.25,c.y+r*.15,c.z+r*1.25);controls.target.copy(c);first=false}
+ $('notes').textContent=recs.map(r=>`${r.slot.padEnd(12)} ${short(r.set).slice(0,44).padEnd(44)} ${String(r.faces).padStart(5)} faces`+(r.overhang_loops?`  ${r.overhang_loops} edge(s) past the ring (overlap)`:'')).join('\n')}
+function pick(slot,fn){const s=$('s_'+slot);if(s&&!s.disabled)s.value=fn([...s.options].map(o=>o.value))}
+$('rnd').onclick=()=>{for(const slot of SCHEMES[$('scheme').value]){if(slot==='head')continue;pick(slot,v=>{const w=v.filter(x=>x!=='bare');return w.length?w[Math.floor(Math.random()*w.length)]:v[0]})}
+ if($('pair').checked)for(const l of ['lower_arm','lower_leg']){const r=$('s_'+l+'.r'),lo=$('s_'+l+'.l');if(r&&lo)lo.value=r.value}if($('scheme').value==='outfit')feetForOutfit();show()};
+$('same').onclick=()=>{const t=$('s_torso')?.value;if(!t||t==='bare')return;for(const slot of SCHEMES.armour){const s=$('s_'+slot);if(s&&[...s.options].some(o=>o.value===t))s.value=t}show()};
+raceSel.onchange=()=>{first=true;buildSlots()};$('scheme').onchange=buildSlots;
+['tint','inside','wire'].forEach(id=>$(id).onchange=()=>{styleAll();bodyVis()});$('gamebody').onchange=bodyVis;$('amt').oninput=amount;
+buildSlots();
+</script></body></html>

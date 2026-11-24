@@ -1,0 +1,113 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Mix and match layers</title>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<style>
+html,body{height:100%;overflow:hidden}
+body{margin:0;font:13px system-ui,sans-serif;background:#1f242c;color:#dde;display:flex;height:100vh}
+#side{width:360px;flex:none;overflow:auto;padding:12px;box-sizing:border-box;background:#262c36}
+#side h2{font-size:13px;margin:16px 0 8px;color:#9ab}
+.pick{margin:8px 0}
+.pick .lbl{display:flex;justify-content:space-between;color:#bcd;margin-bottom:3px}
+.pick .lbl .n{color:#789;font-size:11px}
+.pick .ctl{display:flex;gap:4px}
+.pick select{flex:1;min-width:0;font-size:13px;padding:3px}
+.pick button{width:34px;font-size:15px;line-height:1}
+.pick.off{opacity:.4}
+.row{display:flex;align-items:center;gap:6px;margin:4px 0}
+#main{flex:1;position:relative;overflow:hidden;min-width:0}
+#bar{position:absolute;top:8px;left:8px;right:8px;display:flex;gap:14px;align-items:center;background:#262c36e0;padding:8px 10px;border-radius:6px;flex-wrap:wrap}
+#notes{position:absolute;bottom:8px;left:8px;max-width:680px;max-height:40%;overflow:auto;background:#262c36e0;padding:8px 10px;border-radius:6px;white-space:pre-wrap;font:11px ui-monospace,monospace}
+canvas{display:block;position:absolute;inset:0;width:100%!important;height:100%!important}
+button{cursor:pointer}
+.hint{color:#9ab;font-size:12px;line-height:1.4}
+</style></head>
+<body>
+<div id="side"><b>Mix and match layers</b>
+<div class="hint" style="margin-top:6px">Each layer is cut from its own generated model (its garment and its own skin) and stitched onto the
+game body's fixed neck / elbow / knee rings, so any armour, gloves and boots of a race join there. "bare" is the game body's own
+skin for that part. An outfit is the whole body below the neck (hands and feet included), so gloves and boots are off with an outfit.</div>
+<h2>Character</h2>
+<div id="picks"></div>
+<div class="row" style="margin-top:10px"><button id="rnd">random</button><button id="same">gloves + boots from the armour's set</button></div>
+<div class="hint">Keys: click a ◀ ▶ pair, or focus a dropdown and use the arrow keys.</div>
+<h2>Show</h2>
+<div class="row"><input type="checkbox" id="tint"><label for="tint">colour by layer</label></div>
+<div class="row"><input type="checkbox" id="inside" checked><label for="inside">backs red (inside showing)</label></div>
+<div class="row"><input type="checkbox" id="wire"><label for="wire">wireframe</label></div>
+</div>
+<div id="main"><div id="bar">
+<label>Amount <input id="amt" type="range" min="0" max="100" value="100"> <span id="amtv">100</span>%</label>
+<span style="color:#9ab">Amount = a too-slim garment pushed out to the base body's shape (fades out at the joins)</span>
+</div><div id="notes"></div></div>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+// back faces red: the SAME material, double sided; the fragment shader paints every back-facing pixel red (gl_FrontFacing),
+// so red is exactly where a face is seen from behind (no copy of the mesh, nothing to drift with the Amount morph or z-fight)
+function backRed(m){m.side=THREE.DoubleSide;m.onBeforeCompile=sh=>{sh.fragmentShader=sh.fragmentShader.replace('#include <dithering_fragment>','#include <dithering_fragment>\n\tif(!gl_FrontFacing)gl_FragColor=vec4(1.0,0.0,0.0,1.0);')};m.customProgramCacheKey=()=>'backred';m.needsUpdate=true;return m}
+const ROLE={skin:'#dbab87',primary:'#19d228',secondary:'#1e41eb',tertiary:'#f5dc14',accent:'#e119dc',joint:'#14dceb'};
+const TINTS=['#e6194b','#3cb44b','#ffe119','#4363d8','#f58231','#911eb4','#42d4f4','#f032e6','#bfef45','#fabed4'];
+const $=id=>document.getElementById(id);
+const main=$('main'),renderer=new THREE.WebGLRenderer({antialias:false});renderer.setPixelRatio(Math.max(devicePixelRatio,2));/* no MSAA (it drew back faces as red hairlines on silhouettes): render at 2x or more and let the browser scale down */main.prepend(renderer.domElement);
+const scene=new THREE.Scene();scene.background=new THREE.Color('#323944');
+scene.add(new THREE.HemisphereLight(0xffffff,0x445566,1.4));const dl=new THREE.DirectionalLight(0xffffff,1.6);dl.position.set(2,4,3);scene.add(dl);const dl2=new THREE.DirectionalLight(0xffffff,.6);dl2.position.set(-3,2,-2);scene.add(dl2);
+const camera=new THREE.PerspectiveCamera(35,1,.01,100);const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;
+const loader=new GLTFLoader();const group=new THREE.Group();scene.add(group);let first=true,token=0;
+function resize(){const w=main.clientWidth,h=main.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix()}
+new ResizeObserver(resize).observe(main);resize();
+(function frame(){controls.update();renderer.render(scene,camera);requestAnimationFrame(frame)})();
+const P=(await (await fetch('index.json?v='+Date.now())).json()).pieces;
+const races=[...new Set(P.map(p=>p.race))].sort();
+const short=s=>s==='bare'?'bare':s.replace(/_(outfit|armor|armour)_?/,' ').replace(/_/g,' ');
+const setsFor=(race,slot)=>[...new Set(P.filter(p=>p.race===race&&p.slot===slot&&p.set!=='bare').map(p=>p.set))].sort();
+const rec=(race,slot,set)=>P.find(p=>p.race===race&&p.slot===slot&&p.set===set);
+// the four pickers: race, armour (armour sets, then whole-body outfits), gloves (both forearms + hands), boots (both shins + feet)
+const PICKS=[{id:'race',label:'race'},{id:'armour',label:'armour / outfit'},{id:'gloves',label:'gloves'},{id:'boots',label:'boots'}];
+for(const k of PICKS){const d=document.createElement('div');d.className='pick';d.id='p_'+k.id;
+ d.innerHTML=`<div class="lbl"><span>${k.label}</span><span class="n" id="n_${k.id}"></span></div><div class="ctl"><button data-d="-1" title="previous">◀</button><select id="s_${k.id}"></select><button data-d="1" title="next">▶</button></div>`;
+ $('picks').append(d);
+ d.querySelectorAll('button').forEach(b=>b.onclick=()=>step(k.id,+b.dataset.d));
+ $('s_'+k.id).onchange=()=>k.id==='race'?fillOptions(true):(sync(),show())}
+races.forEach(r=>$('s_race').add(new Option(r,r)));
+if(races.includes('human_male'))$('s_race').value='human_male';
+function setOptions(sel,groups,keep){const old=keep??sel.value;sel.innerHTML='';
+ for(const [name,items] of groups){if(!items.length)continue;const parent=name?Object.assign(document.createElement('optgroup'),{label:name}):sel;
+  items.forEach(([v,t])=>parent.appendChild(new Option(t,v)));if(name)sel.append(parent)}
+ const vals=[...sel.options].map(o=>o.value);sel.value=vals.includes(old)?old:vals[0]}
+function fillOptions(raceChanged){const race=$('s_race').value;if(raceChanged)first=true;
+ const arm=setsFor(race,'torso'),out=setsFor(race,'outfit');
+ setOptions($('s_armour'),[['',[['bare','bare']]],['Armour',arm.map(s=>['torso|'+s,short(s)])],['Outfits (whole body)',out.map(s=>['outfit|'+s,short(s)])]],
+  $('s_armour').value&&$('s_armour').value!=='bare'?$('s_armour').value:'bare');
+ setOptions($('s_gloves'),[['',[['bare','bare'],...setsFor(race,'lower_arm.r').map(s=>[s,short(s)])]]]);
+ setOptions($('s_boots'),[['',[['bare','bare'],...setsFor(race,'lower_leg.r').map(s=>[s,short(s)])]]]);
+ sync();show()}
+function sync(){const outfit=$('s_armour').value.startsWith('outfit|');
+ for(const k of ['gloves','boots']){$('s_'+k).disabled=outfit;$('p_'+k).classList.toggle('off',outfit);$('p_'+k).querySelectorAll('button').forEach(b=>b.disabled=outfit)}
+ for(const k of PICKS){const s=$('s_'+k.id),n=s.options.length;$('n_'+k.id).textContent=n?`${s.selectedIndex+1} / ${n}`:''}}
+function step(id,d){const s=$('s_'+id);if(s.disabled||!s.options.length)return;s.selectedIndex=(s.selectedIndex+d+s.options.length)%s.options.length;
+ if(id==='race')fillOptions(true);else{sync();show()}}
+function chosen(){const race=$('s_race').value,out=[];const a=$('s_armour').value;
+ out.push(rec(race,'head','bare'));
+ if(a.startsWith('outfit|')){out.push(rec(race,'outfit',a.slice(7)));return out.filter(Boolean)}
+ out.push(rec(race,'torso',a==='bare'?'bare':a.slice(6)));
+ for(const [k,limb] of [['gloves','lower_arm'],['boots','lower_leg']])for(const side of ['r','l'])out.push(rec(race,`${limb}.${side}`,$('s_'+k).value)||rec(race,`${limb}.${side}`,'bare'));
+ return out.filter(Boolean)}
+function styleAll(){let k=0;group.children.forEach(root=>{const tint=TINTS[(k++)%TINTS.length];const backs=[];root.traverse(n=>{if(n.userData.back)backs.push(n)});backs.forEach(b=>b.parent.remove(b));
+ root.traverse(n=>{if(!n.isMesh||n.userData.back)return;n.userData.matName??=n.material.name;const role=(n.userData.matName||'skin:x').split(':')[0];
+  const col=$('tint').checked?(role==='skin'?'#cfc6bd':tint):(ROLE[role]||'#888');
+  n.material=new THREE.MeshStandardMaterial({color:col,flatShading:true,roughness:.85,side:THREE.DoubleSide,wireframe:$('wire').checked});
+  if($('inside').checked)backRed(n.material);})})}
+function amount(){const v=+$('amt').value;$('amtv').textContent=v;group.traverse(n=>{if(n.isMesh&&n.morphTargetInfluences){const d=n.morphTargetDictionary||{};if('fill' in d)n.morphTargetInfluences[d.fill]=v/100}})}
+async function show(){const t=++token;const recs=chosen();const roots=await Promise.all(recs.map(r=>loader.loadAsync(r.glb).then(g=>g.scene)));if(t!==token)return;
+ group.clear();roots.forEach(r=>group.add(r));styleAll();amount();
+ const box=new THREE.Box3().setFromObject(group),size=box.getSize(new THREE.Vector3());
+ if(first&&size.length()>0){const c=box.getCenter(new THREE.Vector3()),r=size.length();camera.position.set(c.x+r*.25,c.y+r*.15,c.z+r*1.25);controls.target.copy(c);first=false}
+ $('notes').textContent=recs.map(r=>`${r.slot.padEnd(12)} ${short(r.set).slice(0,48).padEnd(48)} ${String(r.faces).padStart(5)} faces`+(r.mirrored_from_right?'  (mirrored from the right)':'')).join('\n')}
+function pickRandom(id){const s=$('s_'+id);const opts=[...s.options].filter(o=>o.value!=='bare');if(opts.length)s.value=opts[Math.floor(Math.random()*opts.length)].value}
+$('rnd').onclick=()=>{const s=$('s_armour'),arm=[...s.options].filter(o=>o.value.startsWith('torso|'));if(arm.length)s.value=arm[Math.floor(Math.random()*arm.length)].value;pickRandom('gloves');pickRandom('boots');sync();show()};
+$('same').onclick=()=>{const a=$('s_armour').value;if(!a.startsWith('torso|'))return;const set=a.slice(6);
+ for(const k of ['gloves','boots']){const s=$('s_'+k);s.value=[...s.options].some(o=>o.value===set)?set:'bare'}sync();show()};
+['tint','inside','wire'].forEach(id=>$(id).onchange=styleAll);$('amt').oninput=amount;
+fillOptions(true);
+</script></body></html>

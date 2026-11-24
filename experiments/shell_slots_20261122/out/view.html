@@ -1,0 +1,141 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Shell / slot prototype</title>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"}}</script>
+<style>
+html,body{height:100%;overflow:hidden}
+body{margin:0;font:13px system-ui,sans-serif;background:#1f242c;color:#dde;display:flex;height:100vh}
+#side{width:330px;flex:none;overflow:auto;padding:10px;box-sizing:border-box;background:#262c36}
+#side h2{font-size:13px;margin:14px 0 6px;color:#9ab}
+.item{padding:6px 8px;border-radius:5px;cursor:pointer;margin:2px 0}
+.item:hover{background:#334}
+.item.on{background:#3d4b63}
+#main{flex:1;position:relative;overflow:hidden;min-width:0}
+#bar{position:absolute;top:8px;left:8px;right:8px;display:flex;gap:14px;align-items:center;background:#262c36e0;padding:8px 10px;border-radius:6px;flex-wrap:wrap}
+#notes{position:absolute;bottom:8px;left:8px;max-width:620px;max-height:42%;overflow:auto;background:#262c36e0;padding:8px 10px;border-radius:6px;white-space:pre-wrap;font:11px ui-monospace,monospace}
+label{user-select:none}
+canvas{display:block;position:absolute;inset:0;width:100%!important;height:100%!important}
+.legend span{display:inline-block;width:10px;height:10px;margin:0 3px 0 8px;vertical-align:middle}
+</style></head>
+<body>
+<div id="side"><b>Shell / slot prototype (2026-11-22)</b>
+<div style="color:#9ab;margin-top:6px">Outfits: the generator's own full mesh (skin snapped onto the game body; game head / hands / feet attached at seams).<br>
+Armour: slot pieces that end exactly on the game body's rings at neck, elbows and knees, so pieces of different sets fit together.</div>
+<div style="margin:8px 0;display:flex;gap:6px;flex-wrap:wrap"><select id="raceF"><option value="">all races</option></select>
+<select id="kindF"><option value="">outfits + armour</option><option value="outfit">outfits</option><option value="armour">armour</option></select>
+<input id="searchF" placeholder="search" style="width:110px"></div><div id="list"></div></div>
+<div id="main"><div id="bar">
+<label>Amount <input id="amt" type="range" min="0" max="100" value="100"> <span id="amtv">100</span>%</label>
+<span id="opts" style="display:inline-flex;gap:10px;align-items:center;flex-wrap:wrap;border-left:1px solid #556;padding-left:10px">
+<label title="The result as built, options chosen automatically per model: whole-mirror symmetry for modules generated from one side only (old gnome jobs) whose design is symmetric in its own front/back views, sleeve shift for a malformed arm on an asymmetric design, otherwise none; coarse game bodies (gnome, dwarf) subdivided to 100 mm before cutting, flat skin merged back afterwards. Untick to choose the options yourself; a combination not built yet is built on request."><input id="optAuto" type="checkbox" checked> <b>automatic</b></label>
+<label title="(a) Where pulling the game skin's edge out onto a garment edge would fold skin triangles over (their back shows red), that stretch is not joined: the garment edge is tucked under the skin instead"><input id="optA" type="checkbox"> fold-safe joins</label>
+<label title="(b) Make the module's arms / halves symmetric. The better side is the arm that sits closer to the game arm. Gauntlets / boots are mirrored anyway; garments that are asymmetric by design should stay off">symmetry <select id="optB">
+<option value="off">off</option>
+<option value="sleeve_shift">sleeve: shift onto mirrored better arm</option>
+<option value="sleeve_average">sleeve: average both arms</option>
+<option value="sleeve_copy">sleeve: copy better arm + stitch</option>
+<option value="whole_mirror">whole: mirror better half</option></select></label>
+<label title="(c) Flatten spikes in the generated mesh: a vertex standing out of its neighbours' plane on long thin triangles is moved into that plane; dangling thin triangles are dropped"><input id="optC" type="checkbox"> spike cleanup</label>
+<label title="(d) Split the game body's triangles near garment edges (down to 15 mm) so narrow bare-skin strips such as a V-neck are cut in instead of lost"><input id="optD" type="checkbox"> refine game mesh at garment edges</label>
+<label title="(e) Thresholds follow the meshes instead of fixed millimetres: a skin edge may move further onto a garment edge where the game triangles are big, the cut searches as deep as the generated skin actually sits, thin triangles are judged by shape, refinement scales with the module's triangles, and anatomical distances (gauntlet centring, symmetry shoulder offsets) with body height"><input id="optE" type="checkbox"> density-aware thresholds</label>
+<span id="vstatus" style="color:#fc6"></span></span>
+<label id="infll" title="How much of the gnome inflation (garments generated slimmer than the game body, widened out to it) to keep: 100% = as fitted, 0% = as generated. Only results that were inflated have it.">Inflation <input id="infl" type="range" min="0" max="100" value="100"> <span id="inflv">100</span>%</label>
+<label><input id="prov" type="checkbox"> provenance colours</label>
+<label><input id="gen" type="checkbox" checked> generator mesh beside it</label>
+<label title="The same aligned generator mesh again, see-through, with the game body (cyan wireframe) where the result puts it"><input id="genbody" type="checkbox" checked> generator on the game body</label>
+<label><input id="ghost" type="checkbox"> game body ghost</label>
+<label title="Faces taken from the GAME body (prov band = slot skin, game = head / hands / bare feet, patch = game faces in garment colour). Untick to see only what comes from the generated model (garment, lips, stitches)."><input id="gamebody" type="checkbox" checked> game body faces</label>
+<label><input id="wire" type="checkbox"> wireframe</label>
+<label title="Show the inside (back) of every face in pure red: openings into a garment, holes and flipped faces stand out"><input id="inside" type="checkbox" checked> inside colour (red)</label>
+<span class="legend" id="legend"></span>
+</div><div id="notes"></div></div>
+<script type="module">
+import * as THREE from 'three';
+import {GLTFLoader} from 'three/addons/loaders/GLTFLoader.js';
+import {OrbitControls} from 'three/addons/controls/OrbitControls.js';
+// back faces red: the SAME material, double sided; the fragment shader paints every back-facing pixel red (gl_FrontFacing),
+// so red is exactly where a face is seen from behind (no copy of the mesh, nothing to drift with the Amount morph or z-fight)
+function backRed(m){m.side=THREE.DoubleSide;m.onBeforeCompile=sh=>{sh.fragmentShader=sh.fragmentShader.replace('#include <dithering_fragment>','#include <dithering_fragment>\n\tif(!gl_FrontFacing)gl_FragColor=vec4(1.0,0.0,0.0,1.0);')};m.customProgramCacheKey=()=>'backred';m.needsUpdate=true;return m}
+const ROLE={skin:'#dbab87',primary:'#19d228',secondary:'#1e41eb',tertiary:'#f5dc14',accent:'#e119dc',joint:'#14dceb'};
+const PROV={game:'#8cc7f2',band:'#739ef2',lip:'#fa9926',stitch:'#ff4019',tripoSkin:'#db8c73',mirrorSkin:'#f2d98c'};
+const main=document.getElementById('main'),renderer=new THREE.WebGLRenderer({antialias:false});renderer.setPixelRatio(Math.max(devicePixelRatio,2));/* no MSAA (it drew back faces as red hairlines on silhouettes): render at 2x or more and let the browser scale down */main.prepend(renderer.domElement);
+const scene=new THREE.Scene();scene.background=new THREE.Color('#323944');
+scene.add(new THREE.HemisphereLight(0xffffff,0x445566,1.4));const dl=new THREE.DirectionalLight(0xffffff,1.6);dl.position.set(2,4,3);scene.add(dl);const dl2=new THREE.DirectionalLight(0xffffff,.6);dl2.position.set(-3,2,-2);scene.add(dl2);
+const camera=new THREE.PerspectiveCamera(35,1,.01,100);const controls=new OrbitControls(camera,renderer.domElement);controls.enableDamping=true;
+const loader=new GLTFLoader();let current=null,group=new THREE.Group();scene.add(group);let first=true;
+function resize(){const w=main.clientWidth,h=main.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix()}
+new ResizeObserver(resize).observe(main);resize();
+(function frame(){controls.update();renderer.render(scene,camera);requestAnimationFrame(frame)})();
+function colourOf(name,prov){const [role,p]=(name||'skin:tripo').split(':');if(!prov)return ROLE[role]||'#888';if(p==='game')return PROV.game;if(p==='band')return PROV.band;if(p==='lip')return PROV.lip;if(p==='stitch')return PROV.stitch;if(role==='skin')return p==='mirror'?PROV.mirrorSkin:PROV.tripoSkin;return ROLE[role]||'#888'}
+function style(root,opts=root.userData.styleOpts||{}){root.userData.styleOpts=opts;const backs=[];root.traverse(n=>{if(n.userData.back)backs.push(n)});backs.forEach(b=>{b.parent.remove(b);b.material.dispose()});
+ const inside=document.getElementById('inside').checked&&!opts.transparent;root.traverse(n=>{if(!n.isMesh||n.userData.back)return;const name=n.material.name;n.userData.matName??=name;const m=new THREE.MeshStandardMaterial({color:colourOf(n.userData.matName,document.getElementById('prov').checked),flatShading:true,side:THREE.DoubleSide,roughness:.85,wireframe:document.getElementById('wire').checked,...opts});m.name=n.userData.matName;n.material.dispose();n.material=m;
+  if(inside)backRed(n.material);})}
+function bodyVis(){const on=document.getElementById('gamebody').checked;current?.result?.traverse(n=>{if(n.isMesh&&!n.userData.back){const p=(n.userData.matName||n.material.name||'').split(':')[1];if(['band','game','patch'].includes(p))n.visible=on}})}
+document.getElementById('gamebody').onchange=bodyVis;
+function setAmount(){const v=+document.getElementById('amt').value,f=+document.getElementById('infl').value;document.getElementById('amtv').textContent=v;document.getElementById('inflv').textContent=f;
+ current?.result?.traverse(n=>{if(n.isMesh&&n.morphTargetInfluences){const d=n.morphTargetDictionary||{fill:0};if('fill' in d)n.morphTargetInfluences[d.fill]=v/100;if('deflate' in d)n.morphTargetInfluences[d.deflate]=1-f/100}})}
+async function show(rec){document.querySelectorAll('.item').forEach(e=>e.classList.toggle('on',e.dataset.name===rec.name));
+ group.clear();current={rec};const res=(await loader.loadAsync(rec.glb+'?v='+Date.now())).scene;style(res);group.add(res);current.result=res;bodyVis();
+ const gens=Object.keys(rec.ghosts).filter(k=>k.startsWith('tripo'));current.gen=new THREE.Group();let dx=0;
+ const box=new THREE.Box3().setFromObject(res),size=box.getSize(new THREE.Vector3());
+ for(const g of gens){const s=(await loader.loadAsync(rec.ghosts[g]+'?v='+Date.now())).scene;style(s);dx+=size.x*1.15;s.position.x=dx;current.gen.add(s)}
+ group.add(current.gen);current.gen.visible=document.getElementById('gen').checked;
+ // the aligned generator mesh again, see-through, with the game body inside it (cyan wireframe): where the generator's body sits against the game body
+ const baseScene=(await loader.loadAsync(rec.ghosts.base)).scene;current.genbody=new THREE.Group();
+ for(const g of gens){const s=(await loader.loadAsync(rec.ghosts[g]+'?v='+Date.now())).scene;style(s,{transparent:true,opacity:.45,depthWrite:false});dx+=size.x*1.15;s.position.x=dx;current.genbody.add(s);
+  const b=baseScene.clone(true);b.traverse(n=>{if(n.isMesh)n.material=new THREE.MeshBasicMaterial({color:'#5fe0ff',transparent:true,opacity:.7,wireframe:true})});b.position.x=dx;current.genbody.add(b);
+  const solid=baseScene.clone(true);solid.traverse(n=>{if(n.isMesh)n.material=new THREE.MeshBasicMaterial({color:'#1b6f86',transparent:true,opacity:.35,depthWrite:false})});solid.position.x=dx;current.genbody.add(solid)}
+ group.add(current.genbody);current.genbody.visible=document.getElementById('genbody').checked;
+ const base=(await loader.loadAsync(rec.ghosts.base)).scene;base.traverse(n=>{if(n.isMesh){n.material=new THREE.MeshBasicMaterial({color:'#ffffff',transparent:true,opacity:.18,wireframe:true})}});current.base=base;group.add(base);base.visible=document.getElementById('ghost').checked;
+ if(first){const c=box.getCenter(new THREE.Vector3()),r=size.length();camera.position.set(c.x+r*.25,c.y+r*.15,c.z+r*1.25);controls.target.copy(c);first=false}
+ const inf=document.getElementById('infl');inf.disabled=!rec.inflation;document.getElementById('infll').style.opacity=rec.inflation?1:.4;
+ setAmount();notes(rec)}
+function notes(rec){const s=rec.seams||{},lines=[`${rec.name}   (${rec.kind}, ${rec.race}, ${rec.seconds}s)`,`module: ${rec.module}`];
+ const L=rec.load?.snap?rec.load:rec.load?.body_armor;if(L?.snap)lines.push(`skin snapped onto the game body: ${L.snap.skin_vertices} vertices, median ${L.snap.snap_mm.p50.toFixed(1)} mm, p95 ${L.snap.snap_mm.p95.toFixed(1)} mm; garment near openings followed by up to ${L.snap.garment_follow_mm_max.toFixed(1)} mm`);
+ for(const [k,v] of Object.entries(s)){if(typeof v!=='object'||v===null){lines.push(`${k}: ${v}`);continue}const bits=[];if('bare' in v)bits.push(v.bare?'bare skin at the seam':'GARMENT at the seam (cut through it)');if(v.island)bits.push('game part is its own island: opening hidden inside it');if('garment_faces' in v)bits.push(`garment ${v.garment_faces} faces kept whole${v.garment_dropped_cm2?` (${v.garment_dropped_cm2} cm2 outside the slot dropped)`:''}; game skin ${v.game_skin_faces} faces; ${v.joined_runs} joins over ${v.joined_garment_edges} garment edges${v.move_mm?` (edge moved ${v.move_mm[0]}/${v.move_mm[1]} mm)`:''}; ${v.free_garment_edges} free garment edges (overhang) with ${v.lip_faces} lip faces, ${v.pushed_vertices} vertices pushed clear`);if(v.skin_join)bits.push(`game skin up to the garment edge (${v.skin_join.outfit_skin_faces_replaced} outfit skin faces replaced, edge moved ${v.skin_join.move_mm[0]}/${v.skin_join.move_mm[1]} mm median/max)`);if(v.band)bits.push(`game skin band ${v.band.range_mm[0].toFixed(0)}-${v.band.range_mm[1].toFixed(0)} mm (tilt ${v.band.tilt_deg}°)`);if(v.stitch?.hem)bits.push(`hem stitch (${v.stitch.hem.removed_skin_faces} generator skin faces replaced)`);if(v.stitch)bits.push(`stitch: ${v.stitch.ring_vertices}->${v.stitch.canonical_vertices} verts, gap max ${v.stitch.gap_mm_max.toFixed(0)} mm${v.stitch.strip_role!=='skin'?', strip is '+v.stitch.strip_role:''}`);if(v.stitch_mirror)bits.push(`mirrored piece stitch gap max ${v.stitch_mirror.gap_mm_max.toFixed(0)} mm`);if(v.error)bits.push('NOTE: '+v.error);if(v.why&&!v.stitch)bits.push(v.why);lines.push(`${k}: ${bits.join('; ')}`)}
+ {const parts=[rec.variant?`variant ${rec.variant}`:(rec.options?`automatic settings: ${rec.options}`:'automatic settings')];const loads=rec.load?.snap?[rec.load]:Object.values(rec.load||{});
+  for(const L of loads){if(L?.auto_symmetry){const a=L.auto_symmetry;parts.push(`automatic: arm excess ${a.arm_excess_radii??'-'} game-arm radii (threshold ${a.threshold}) — ${a.reason}`)}
+   if(L?.symmetry){const y=L.symmetry;parts.push(`symmetry ${y.method}: better side ${y.better_side} (arm offset l ${y.arm_offset_mm?.l} / r ${y.arm_offset_mm?.r} mm)${y.moved_mm_max?', moved max '+JSON.stringify(y.moved_mm_max)+' mm':''}${y.loops_stitched!==undefined?`, ${y.loops_stitched}/${y.loops_copied} edge loops stitched, edge moved ${JSON.stringify(y.edge_moved_mm)} mm`:''}${y.skipped?' — skipped: '+y.skipped:''}`)}
+   if(L?.spikes)parts.push(`spikes: ${L.spikes.folded_slivers_collapsed??0} folded slivers collapsed, ${L.spikes.spike_vertices_flattened} spike vertices flattened (max ${L.spikes.flattened_mm_max} mm), ${L.spikes.dangling_slivers_dropped} dangling slivers dropped`)}
+  const left=Object.values(rec.seams||{}).filter(v=>v&&typeof v==='object'&&'joins_left_out_for_folds' in v).map(v=>v.joins_left_out_for_folds);if(left.length)parts.push(`fold-safe joins: ${left.join(' / ')} game edge vertices left unjoined`);const fsc=rec.seams?.folded_slivers_collapsed_in_result;if(fsc!==undefined)parts.push(`finished mesh: ${fsc} folded slivers collapsed`);const wt=rec.watertight;if(wt)parts.push(`watertightness: ${wt.open_m} m of open edges (cracks ${wt.crack_m} m, gaps ${wt.gap_m} m, free edges ${wt.free_m} m), ${wt.nonmanifold_edges} non-manifold edges`);const ip=rec.seams?.imprint||rec.seams?.outfit;if(ip&&ip.attached!==undefined)parts.push(`joins: ${ip.attached} garment openings joined to the body, ${ip.free} left free, ${ip.regions_removed} of ${ip.regions} body regions removed under the garment`);const inv=rec.seams?.inverted_faces_flipped;if(inv)parts.push(`finished mesh: ${inv} faces that were wound the wrong way round turned over`);const fm=rec.seams?.flat_skin_merged;if(fm)parts.push(`flat game skin merged back: ${fm.faces_before} -> ${fm.faces_after} faces (lossless)`);
+  const dens=Object.entries(rec.seams||{}).filter(([k,v])=>v&&typeof v==='object'&&v.density).map(([k,v])=>`${k}: cut searches ${v.density.iso_in_mm} mm in, module median edge ${v.density.module_median_edge_mm} mm`);if(dens.length)parts.push('density-aware: '+dens.join('; '));
+  lines.push(parts.join('\n'))}
+ const di=rec.inflation;lines.push(di?`inflation (slider 100%): ${di.vertices_moved} vertices widened, median ${di.median_moved_mm} mm, max ${di.max_mm} mm`:'inflation: none (garment not generated too slim)');
+ const f=rec.fill;if(f)lines.push(`fill (amount 100): ${f.vertices_moved} vertices moved, mean ${f.moved_mm_mean_moved?.toFixed(1)} mm, max ${f.moved_mm_max?.toFixed(0)} mm`);
+ lines.push(`faces ${rec.stats.faces}`);document.getElementById('notes').textContent=lines.join('\n')}
+function legend(){document.getElementById('legend').innerHTML=document.getElementById('prov').checked?Object.entries({'game part':PROV.game,'game skin (module slot)':PROV.band,'overhang lip':PROV.lip,stitch:PROV.stitch,'generator skin':PROV.tripoSkin,'mirrored skin':PROV.mirrorSkin}).map(([k,c])=>`<span style="background:${c}"></span>${k}`).join(''):''}
+const BASE_KEY='a0-boff-c0-d0-e0';let baseRec=null,vtoken=0;
+function optKey(){const g=id=>document.getElementById(id);return `a${g('optA').checked?1:0}-b${g('optB').value}-c${g('optC').checked?1:0}-d${g('optD').checked?1:0}-e${g('optE').checked?1:0}`}
+function vstatus(t){document.getElementById('vstatus').textContent=t}
+async function pick(rec){baseRec=rec;await loadVariant()}
+async function loadVariant(retry){if(!baseRec&&current?.rec)baseRec=idx.results.find(r=>r.name===current.rec.name)||current.rec;if(!baseRec)return;const tok=++vtoken,k=optKey();
+ const auto=document.getElementById('optAuto').checked;
+ for(const id of ['optA','optB','optC','optD','optE'])document.getElementById(id).disabled=auto;
+ if(auto){vstatus('');return show(baseRec)}
+ let r=null;try{r=await (await fetch(`api/variant?name=${encodeURIComponent(baseRec.name)}&key=${k}${retry?'&retry=1':''}`)).json()}catch(e){}
+ if(tok!==vtoken)return;
+ if(!r||!r.status){                       // no serve.py (a plain file server): load a variant built beforehand by build_variants.py
+  let rec=null;try{const q=await fetch(`variants/${baseRec.name}__${k}.json?v=${Date.now()}`);if(q.ok)rec=await q.json()}catch(e){}
+  if(tok!==vtoken)return;
+  if(rec){vstatus('');return show(rec)}
+  vstatus('this combination is not built yet: run build_variants.py, or serve.py to build on request');return}
+ if(r.status==='ready'){vstatus('');return show(r.rec)}
+ if(r.status==='failed'){vstatus('build failed (click to retry): '+r.error.trim().split('\n').slice(-1)[0]);document.getElementById('vstatus').onclick=()=>loadVariant(true);return}
+ if(r.status==='error'){vstatus(r.error);return}
+ vstatus(r.status==='building'?`building this variant… ${r.elapsed} s (about 1 min)`:`queued (#${r.position}) — another variant is building`);
+ setTimeout(()=>{if(tok===vtoken)loadVariant()},3000)}
+for(const id of ['optAuto','optA','optB','optC','optD','optE'])document.getElementById(id).onchange=()=>loadVariant();
+document.getElementById('amt').oninput=setAmount;document.getElementById('infl').oninput=setAmount;
+for(const id of ['prov','wire','inside'])document.getElementById(id).onchange=()=>{if(current){style(current.result);current.gen.children.forEach(c=>style(c));current.genbody?.children.forEach(c=>{if(c.userData.styleOpts)style(c)});setAmount()}legend()};
+document.getElementById('gen').onchange=e=>{if(current)current.gen.visible=e.target.checked};
+document.getElementById('genbody').onchange=e=>{if(current?.genbody)current.genbody.visible=e.target.checked};
+document.getElementById('ghost').onchange=e=>{if(current)current.base.visible=e.target.checked};
+const idx=await (await fetch('index.json?v='+Date.now())).json();const list=document.getElementById('list');let kind='';
+function buildList(){list.innerHTML='';let kind='';const rf=document.getElementById('raceF').value,kf=document.getElementById('kindF').value,q=document.getElementById('searchF').value.toLowerCase();
+ for(const r of idx.results){if(rf&&r.race!==rf)continue;if(kf&&r.kind!==kf)continue;if(q&&!r.name.toLowerCase().includes(q))continue;
+  if(r.kind!==kind){kind=r.kind;const h=document.createElement('h2');h.textContent=kind==='outfit'?'Outfits (shell)':'Armour (slots)';list.append(h)}
+  const d=document.createElement('div');d.className='item'+(current?.rec?.name===r.name?' on':'');d.dataset.name=r.name;d.textContent=r.name.replace(/^(outfit|armour)__/,'');d.onclick=()=>pick(r);list.append(d)}}
+{const races=[...new Set(idx.results.map(r=>r.race))].sort();const sel=document.getElementById('raceF');for(const r of races){const o=document.createElement('option');o.value=r;o.textContent=r;sel.append(o)}}
+for(const id of ['raceF','kindF'])document.getElementById(id).onchange=buildList;document.getElementById('searchF').oninput=buildList;
+buildList();
+if(idx.results.length)pick(idx.results[0]);legend();
+</script></body></html>

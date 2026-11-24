@@ -8,6 +8,22 @@
 !/PROMPTING_GUIDE.md
 !/TRIPO_HANDOFF.md
 !/tools/
+# The shell/slot/layer prototype's processing code + viewer pages (user 2026-11-24: "I just wanna be able to go back to this");
+# its generated outputs (out/ GLBs, scenes, renders) stay local
+!/experiments/
+/experiments/*
+!/experiments/shell_slots_20261122/
+/experiments/shell_slots_20261122/*
+!/experiments/shell_slots_20261122/*.py
+!/experiments/shell_slots_20261122/out/
+/experiments/shell_slots_20261122/out/*
+!/experiments/shell_slots_20261122/out/*.html
+!/experiments/shell_slots_20261122/out/pieces/
+/experiments/shell_slots_20261122/out/pieces/*
+!/experiments/shell_slots_20261122/out/pieces/mix.html
+!/experiments/shell_slots_20261122/out/layers/
+/experiments/shell_slots_20261122/out/layers/*
+!/experiments/shell_slots_20261122/out/layers/mix.html
 
 tools/lowpoly/lib/
 node_modules/
