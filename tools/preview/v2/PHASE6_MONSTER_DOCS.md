@@ -72,6 +72,9 @@ so this repository gets no lock files.
    `.codex_jobs/_app/paid_log.jsonl`), then `tools/reduce_monster.py` (five levels). It waits while conversions are paused or
    held and, in Auto mode, until the user is away (the Queue tab's **Run now** overrides the idle gate). It resumes from the
    record and never pays twice.
+   **Paid limit for agents (user, 2026-11-25):** Claude/Codex may start at most four Hyper3D conversions in total without
+   asking (the v2 pilot uses two of them); conversions the user starts in the app are the user's own. The imageto3d Queue
+   setting `paid_budget_hyper3d` is informational only.
 6. **Review (the user, in the app).** The variant reaches the 3D tab: pick the level and **Approve** (writes `chosen_lod.json`
    `{"lod", "approved": true}`); it then shows in Completed (**Unapprove** sends it back). **Reconvert** (paid, confirmed) is only
    offered in the 3D tab.
