@@ -230,16 +230,34 @@ def promotion_of(folder: Path) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def claimed_promotion(root: Path, set_name: str, promotion_id: str) -> str | None:
-    """The job folder (`<stage>/<set>--<job>`) a claim moved the promotion `promotion_id` of `set_name` into, if any."""
+def claimed_promotions(root: Path, set_name: str, promotion_id: str) -> list[str]:
+    """Every job folder (`<stage>/<set>[_<suffix>]--<job>`) that carries the promotion mark `promotion_id` (a claim moved it there)."""
+    found = []
     for stage in JOB_STAGES:
         parent = root / stage
         if not parent.is_dir():
             continue
-        for folder in parent.iterdir():
-            if folder.name.split('--')[0] == set_name and '--' in folder.name and promotion_of(folder) == promotion_id:
-                return f'{stage}/{folder.name}'
-    return None
+        for folder in sorted(parent.iterdir()):
+            prefix = folder.name.split('--')[0]
+            if '--' in folder.name and (prefix == set_name or prefix.startswith(set_name + '_')) and promotion_of(folder) == promotion_id:
+                found.append(f'{stage}/{folder.name}')
+    return found
+
+
+def claimed_promotion(root: Path, set_name: str, promotion_id: str) -> str | None:
+    """The job folder (`<stage>/<set>--<job>`) a claim moved the promotion `promotion_id` of `set_name` into, if any."""
+    found = claimed_promotions(root, set_name, promotion_id)
+    return found[0] if found else None
+
+
+def locate_promotion(root: Path, set_name: str, promotion_id: str) -> list[str]:
+    """Where the promotion `promotion_id` lives now, resolved from the marks alone (never from the intent's `promoted` flag; phase 4 review
+    F13): `approved/<set>` when that folder carries the mark, plus every claimed job folder that carries it."""
+    places = []
+    folder = root / 'approved' / set_name
+    if folder.is_dir() and promotion_of(folder) == promotion_id:
+        places.append(f'approved/{set_name}')
+    return places + claimed_promotions(root, set_name, promotion_id)
 
 
 def withdraw_approved(root: Path, set_name: str, promotion_id: str | None) -> tuple[str, Path | None]:
@@ -306,10 +324,20 @@ def _write_sidecar(root: Path, rec: dict) -> None:
 
 def _rollback_flat(root: Path, rec: dict) -> None:
     """Undo an interrupted flat move: withdraw the promoted set (legacy approve; only the folder carrying THIS promotion's mark, re-check R7), put
-    the files back, remove the sidecar."""
-    approved = rec.get('approved_set')
-    if approved and (rec.get('promoted') or (root / 'approved' / approved).exists()):
-        withdraw_approved(root, approved, rec.get('promotion_id'))
+    the files back, remove the sidecar. The promotion is located by its id in approved/ AND in every claimed job folder, whatever the intent's
+    `promoted` flag says (phase 4 review F13: the supervisor may have claimed it in the crash window before the flag was saved): a claimed
+    promotion is live work and is never rolled back (409; Complete it instead)."""
+    approved, promotion = rec.get('approved_set'), rec.get('promotion_id')
+    if approved and promotion:
+        places = locate_promotion(root, approved, promotion)
+        claimed = [p for p in places if not p.startswith('approved/')]
+        if claimed:
+            raise guard.Conflict(f'the promotion of {approved} was already claimed ({", ".join(claimed)}): it is live and cannot be rolled back; '
+                                 'choose Complete instead')
+        if places:
+            withdraw_approved(root, approved, promotion)
+    elif approved and (rec.get('promoted') or (root / 'approved' / approved).exists()):
+        withdraw_approved(root, approved, promotion)          # no id: "manual check needed" (never withdraws an unproven folder)
     _back_pairs(root, rec.get('files') or [])
     sidecar = rec.get('sidecar')
     if sidecar:
@@ -324,10 +352,16 @@ def _complete_flat(root: Path, rec: dict) -> None:
     intent has an id), or already CLAIMED by the supervisor (a job folder carrying this promotion id; phase 1 review #4)."""
     if rec.get('verb') == 'approve':
         approved, promotion = rec.get('approved_set'), rec.get('promotion_id')
-        folder = root / 'approved' / approved if approved else None
-        here = bool(folder) and folder.is_dir() and (promotion is None or promotion_of(folder) == promotion)
-        if not here and not (approved and promotion and claimed_promotion(root, approved, promotion)):
+        if not approved:
             raise ValueError('The promotion did not finish; roll this back instead')
+        if not promotion:
+            # an entry from before promotions carried an id: approved/<set> cannot be proven to be its promotion (F13: never accepted by name)
+            raise guard.Conflict(MANUAL_CHECK.format(set=approved))
+        places = locate_promotion(root, approved, promotion)
+        if not places:
+            raise ValueError('The promotion did not finish; roll this back instead')
+        if len(places) > 1:
+            raise guard.Conflict(f'the promotion of {approved} is in several places ({", ".join(places)}): ambiguous; resolve it by hand')
     _write_sidecar(root, rec)
     _move_pairs(root, rec.get('files') or [])
 
@@ -482,6 +516,7 @@ def resolve_intent(root: Path, intent_id: str, verb: str) -> dict:
     rec = guard.read_intent(root, intent_id)
     kind = rec.get('kind')
     owner = guard.intent_set(rec)                   # also a pre-fix intent without `set` (from its decision path, re-check R12)
+    result: dict = {'ok': True, 'undo': None}
     with serve.LOCK, (decisions.set_lock(root, owner) if owner and NAME.fullmatch(owner) else nullcontext()):
         if kind == 'files_tx':
             rec = guard.read_intent(root, intent_id)            # (re-read under the set lock)
@@ -500,7 +535,10 @@ def resolve_intent(root: Path, intent_id: str, verb: str) -> dict:
             raise ValueError('This recovery entry cannot be resolved here; its file is in .codex_jobs/_app/intents/')
         guard.finish_intent(root, intent_id)
         serve.log_action(root, f'recovery_{verb}', rec.get('label'), None, 'ok')
-    return {'ok': True, 'undo': None}
+        if kind == 'flat_move' and verb == 'complete' and rec.get('verb') == 'approve':
+            # a completed legacy approval is an approval: the same idempotent convert-list update as the normal path (F13)
+            result = add_to_convert_list(root, rec.get('approved_set'), result)
+    return result
 
 
 def recover_transactions(root: Path) -> list[str]:
@@ -595,7 +633,8 @@ def concept_action(root: Path, verb: str, item_id: str, args: dict) -> dict:
 
 
 def add_to_convert_list(root: Path, set_name: str | None, result: dict) -> dict:
-    """After a v2 approve landed `set_name` in approved/: `convert_list.add_sets(root, [set])` (lines `<set>` and `<set>_*`). The move stands
+    """After a v2 approve landed `set_name` in approved/: `convert_list.add_sets(root, [set])` (the exact family ids `<set>`, `<set>_<race>`,
+    `<set>_gnome`; never a wildcard, DESIGN_PHASE4.md I.6). The move stands
     whatever happens here: a failure (or a `!` exclude that still matches the set) is a `warning` in the response."""
     notes = []
     try:
@@ -729,7 +768,8 @@ def task_approved(root: Path, task: dict, derived: dict | None = None) -> bool:
     if task.get('lane') == 'bare':
         race = args.get('race') or task.get('unit')
         derived = derived or catalog.derive_all(root)
-        return any(info['locked'] and race in info['races'] for info in derived['sets'].values())
+        # a damaged set (F14) cannot say which races it needs: its bare work is not withdrawn because of it
+        return any((info['locked'] and race in info['races']) or info.get('derive_error') for info in derived['sets'].values())
     set_name = task.get('set_name')
     if not isinstance(set_name, str) or not NAME.fullmatch(set_name):
         return False
@@ -960,11 +1000,13 @@ def approve_aligned(root: Path, set_name: str, rev: object, args: dict) -> dict:
                 except TimeoutError:
                     raise guard.Busy('a layer build of this set is being published right now; try again in a moment') from None
             changes, units, ready_units, bare_dirs = [], {}, {race: {} for race in races}, {}
+            fresh_fp: dict[str, str | None] = {}
             for key, (unit, module, lod) in modules.items():
                 ptr, problem = builds.module_snapshot(module, lod, fresh=True)
                 if not ptr or ptr['build_id'] != shown_builds.get(key):
                     changes.append(f'build {key}: {shown_builds.get(key)} displayed, {ptr["build_id"] if ptr else "none (" + str(problem) + ")"} now')
                     continue
+                fresh_fp[key] = ptr.get('fingerprint')
                 out_root, folder = module / 'layers', module / 'layers' / ptr['build_id']
                 slots = {}
                 for slot in sorted(ptr['slots']):
@@ -984,6 +1026,25 @@ def approve_aligned(root: Path, set_name: str, rev: object, args: dict) -> dict:
                 bare_dirs[race] = builds.rel_path(root, builds.contained(out_root / ptr['build_id'], out_root))
             if changes:
                 raise guard.Changed('the layers changed while approving (' + '; '.join(changes[:6]) + '); review them again', changes=changes)
+            # Phase 4 review F11: the pinned source digest and the input fingerprints are validated AGAIN here, at commit, under the publish
+            # locks: a LOD file (or another input) replaced while this request waited for the locks is a 409 before any manifest is written.
+            late = []
+            for key, (unit, module, lod) in modules.items():
+                try:
+                    if builds.file_sha256(builds.source_glb(module, lod)) != approved[key].get('glb_sha256'):
+                        late.append(f'{key} (the approved LOD file changed while approving)')
+                    elif builds.lb().fingerprint_module(module, lod) != fresh_fp.get(key):
+                        late.append(f'{key} (the inputs changed while approving)')
+                except OSError as exc:
+                    late.append(f'{key} ({exc})')
+            for race in races:
+                try:
+                    if builds.lb().fingerprint_bare(race) != bare_ptrs[race].get('fingerprint'):
+                        late.append(f'bare {race} (code or game body changed while approving)')
+                except OSError as exc:
+                    late.append(f'bare {race} ({exc})')
+            if late:
+                raise guard.StaleBuild('the layers became stale while approving: ' + ', '.join(late[:8]) + '; review them again', changes=late)
             stamp, approval_id = guard.now(), uuid.uuid4().hex
             ready = {'schema': 1, 'set': set_name, 'kind': info['kind'], 'approved_at': stamp, 'approval_id': approval_id,
                      'races': {race: {'amount': given[race], 'units': ready_units[race]} for race in races}, 'bare': bare_dirs}
@@ -1130,7 +1191,10 @@ def set_amount(root: Path, data: object) -> dict:
 
 
 QUEUE_OPS = ('retry', 'cancel', 'kill_retry', 'rebuild_stale')
-PIPELINE_OPS = ('service', 'mode', 'settings', 'check_tripo', 'release', 'view_retry', 'convert_reset')     # phase 4 (DESIGN_PHASE4.md H)
+PIPELINE_OPS = ('service', 'mode', 'settings', 'check_tripo', 'release', 'view_retry', 'convert_reset', 'accept_drift')     # phase 4 (H)
+SHA256 = re.compile(r'[0-9a-f]{64}')
+DRIFT = ' colour DRIFT'
+MAX_DRIFT_IMAGES = 32
 MODE_VALUES = {'auto': 'views-run', 'pause-conversions': 'pause-conversions', 'pause': 'pause', 'run': 'run',
                'views-run': 'views-run', 'pause_conversions': 'pause-conversions', 'pause_all': 'pause', 'run_now': 'run'}
 TASK_NAME = re.compile(r'[a-z]+(?:--[A-Za-z0-9_-]+){1,4}')
@@ -1190,19 +1254,100 @@ def convert_reset(root: Path, job: object) -> dict:
 
 
 def release_set(root: Path, set_id: object) -> dict:
-    """op release: `convert_list.add_sets(root, [set])` for a set the worker ignores (held: not in the convert list). The set must be a known
-    one: the set id of a staged job (or its base set) or a catalog set; an exclude that still matches is reported as a warning."""
-    if not isinstance(set_id, str) or not convert_list.SET_RE.match(set_id):
+    """op release: `convert_list.add_sets` for a set the worker ignores (held: not in the convert list). The set id (the approval grammar,
+    serve.NAME) must EXACTLY be the set of a staged job (catalog.job_set of its folder name: `S`, `S_<race>`, `S_gnome` all belong to `S`) or a
+    catalog set; a prefix of other sets is not (`plate` never releases `plate_01`; phase 4 review F3). Only exact ids are written: the set's
+    family ids plus the exact prefix of each of its staged jobs. An exclude that still matches is reported as a warning."""
+    if not isinstance(set_id, str) or not NAME.fullmatch(set_id):
         raise ValueError('set must be a set id')
-    staged = {job['set'] for job in convert_list.staged_jobs(root)}
-    known = set_id in staged or any(s.startswith(set_id + '_') for s in staged) or set_id in catalog.derive_all(root)['sets']
-    if not known:
+    races = serve._base_races(root)
+    prefixes = sorted({job['set'] for job in convert_list.staged_jobs(root) if catalog.job_set(job['job'], races) == set_id})
+    if not prefixes and set_id not in catalog.derive_all(root)['sets']:
         raise catalog.NotFound(f'Unknown set {set_id}')
-    added = convert_list.add_sets(root, [set_id])
+    added = convert_list.add_sets(root, [set_id], extra=prefixes)
     result = {'ok': True, 'set': set_id} | added
     if added['excluded']:
         result['warning'] = f'{set_id} is still excluded by {", ".join(added["excluded"][set_id])}: remove that line from convert_sets.txt by hand'
     return result
+
+
+def drift_images(reasons: list[str]) -> dict:
+    """progress.drift_images (kept here for callers of the first version)."""
+    import progress
+    return progress.drift_images(reasons)
+
+
+def accept_drift(root: Path, key: object, images: object, note: object = None) -> dict:
+    """op accept_drift {key, images: [{path, sha256}], note?}: the Accept of a colour-drift hold (DESIGN_PHASE4.md E.5, review F18). Hash-bound
+    exactly like `pipeline_supervisor.py accept-drift`: each image must be one the hold `key` (supervisor_state.json `holds`) names as drifted,
+    inside the hold's scope (`processing_views/<job>/` for a job hold, `concepts/<set>/` for a set hold), and its CURRENT bytes must have the
+    sha256 the client reviewed (409 `changed` otherwise). The digests are appended to `.codex_jobs/_batch/advance.json` `accepted_drift`
+    ({sha256, image, note, date}, the supervisor's own format); the supervisor re-opens the hold at its next pass (its gate signature includes
+    the accepted digests). Nothing else in advance.json changes."""
+    import hashlib
+    import progress
+    holds = progress.read_holds(root)
+    if not isinstance(key, str) or not key or key not in holds:
+        raise catalog.NotFound(f'no supervisor hold {key!r}')
+    reasons = [str(r) for r in holds[key].get('reasons') or []]
+    if not progress.drift_images(reasons):
+        raise ValueError(f'the hold {key} has no colour drift to accept')
+    if not isinstance(images, list) or not images or len(images) > MAX_DRIFT_IMAGES:
+        raise ValueError(f'images must be a list of 1 to {MAX_DRIFT_IMAGES} {{path, sha256}} entries')
+    if note is not None and (not isinstance(note, str) or len(note) > 300):
+        raise ValueError('note must be text (at most 300 characters)')
+    # the same pairs GET /api/v2/queue `holds[].images` lists: the drifted images inside the hold's scope, with their CURRENT digests
+    current = {item['path']: item['sha256'] for item in progress.drift_hold_images(root, key, reasons)}
+    checked, changed = [], []
+    for entry in images:
+        if not isinstance(entry, dict) or not isinstance(entry.get('path'), str) or not isinstance(entry.get('sha256'), str) \
+                or not SHA256.fullmatch(entry['sha256']):
+            raise ValueError('each image needs a path and its lowercase hex sha256')
+        rel = entry['path'].replace('\\', '/')
+        if rel not in current:
+            raise ValueError(f'{rel} is not an image the hold {key} names as colour drift (inside its scope)')
+        digest = hashlib.sha256((root / rel).read_bytes()).hexdigest()       # never the cached digest: the bytes as they are now
+        if digest != entry['sha256']:
+            changed.append(f'{rel}: reviewed {entry["sha256"][:12]}, now {digest[:12]}')
+        checked.append({'path': rel, 'sha256': digest})
+    if changed:
+        raise guard.Changed('an image changed since it was reviewed (' + '; '.join(changed[:4]) + '); review it again', changes=changed)
+    advance = _batch(root) / 'advance.json'
+    text = note or 'colour drift reviewed and accepted in the preview app (hash-bound)'
+    accepted, already = [], []
+    with guard.os_lock(_batch(root) / 'advance.lock'):
+        for _attempt in range(3):
+            try:
+                data = json.loads(advance.read_text(encoding='utf-8-sig')) if advance.exists() else {}
+            except (OSError, ValueError) as exc:
+                raise ValueError(f'advance.json cannot be read ({exc}); nothing was accepted') from None
+            if not isinstance(data, dict):
+                raise ValueError('advance.json does not hold an object; nothing was accepted')
+            entries = data.setdefault('accepted_drift', [])
+            if not isinstance(entries, list):
+                raise ValueError('advance.json accepted_drift is not a list; nothing was accepted')
+            have = {e.get('sha256') for e in entries if isinstance(e, dict)}
+            accepted, already = [], []
+            for item in checked:
+                if item['sha256'] in have:
+                    already.append(item)
+                    continue
+                entries.append({'sha256': item['sha256'], 'image': item['path'], 'note': text, 'date': guard.now()})
+                have.add(item['sha256'])
+                accepted.append(item)
+            if accepted:
+                guard.write_atomic(advance, (json.dumps(data, indent=2) + '\n').encode('utf-8'))
+            try:     # the supervisor rewrites advance.json without a lock (auto-waiver): make sure our digests survived
+                now_have = {e.get('sha256') for e in json.loads(advance.read_text(encoding='utf-8-sig')).get('accepted_drift', [])
+                            if isinstance(e, dict)}
+            except (OSError, ValueError, AttributeError):
+                now_have = set()
+            if all(item['sha256'] in now_have for item in checked):
+                break
+        else:
+            raise guard.Busy('advance.json was rewritten while accepting; try again')
+    serve.log_action(root, 'accept_drift', f'hold {key}', '.codex_jobs/_batch/advance.json', f'ok {len(accepted)} image(s)')
+    return {'ok': True, 'key': key, 'accepted': accepted, 'already': already, 'advance': '.codex_jobs/_batch/advance.json'}
 
 
 def pipeline_op(root: Path, data: dict, ctx: dict | None) -> dict:
@@ -1240,6 +1385,9 @@ def pipeline_op(root: Path, data: dict, ctx: dict | None) -> dict:
     elif op == 'view_retry':
         result = view_retry(root, data.get('name'))
         detail = str(data.get('name'))
+    elif op == 'accept_drift':
+        result = accept_drift(root, data.get('key'), data.get('images'), data.get('note'))
+        detail = f'{data.get("key")}: accepted {len(result["accepted"])} image(s), {len(result["already"])} already accepted'
     else:
         result = convert_reset(root, data.get('job'))
         detail = f'{data.get("job")} (was {result["count_before"]})'

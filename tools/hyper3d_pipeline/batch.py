@@ -7,6 +7,7 @@ import time
 import zipfile
 
 import workflow as w
+from browser_lock import BrowserLock
 from job_state import Job, verify_zip
 from platform_compat import lock_nonblocking
 
@@ -175,6 +176,8 @@ def main():
     args=parser.parse_args()
     if not args.allow_paid:
         parser.error('--allow-paid is required for the requested 2-credit-per-sheet workflow')
+    # Hyper3D browser lock (browser_lock.py), taken before the profile check and held for the life of this process
+    profile_lock=BrowserLock().acquire()  # noqa: F841
     w.check_profile(w.PROFILE)
     options=w.Options()
     options.page_load_strategy="eager"

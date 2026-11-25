@@ -41,6 +41,11 @@ from test_v2 import V2Case  # noqa: E402
 ALL_OFF = {'services': {'supervisor': False, 'views': False, 'convert': False}}
 
 
+def fam(set_id):
+    """The exact convert-list ids of a set in the V2Case fixture (races dwarf_male, human_male; DESIGN_PHASE4.md I.6)."""
+    return [set_id, f'{set_id}_dwarf_male', f'{set_id}_human_male']
+
+
 def wait_for(condition, timeout=30.0, what='condition'):
     end = time.monotonic() + timeout
     while time.monotonic() < end:
@@ -229,7 +234,7 @@ class ServerServicesTest(TempRoot):
         self.assertEqual(queue['services']['services']['views']['pid'], hand.pid)
         self.assertTrue(queue['services']['managed'])
         status, state = self.call('GET', '/api/v2/state')
-        self.assertEqual(state['status']['services'], {'ok': True, 'problems': []})
+        self.assertEqual(state['status']['services'], {'ok': True, 'problems': [], 'managed': True, 'scanned': True})
         status, body = self.call('POST', '/api/v2/queue', {'op': 'service', 'name': 'views', 'action': 'stop'})
         self.assertEqual((status, body['ok'], body['pending']), (200, True, True))
         wait_for(lambda: not self.running('views'), what='views to stop')
@@ -267,18 +272,18 @@ class ConvertListOnApproveTest(V2Case):
         status, result = self.act('concepts:one', 'approve')
         self.assertEqual(status, 200, result)
         self.assertTrue((self.root / 'approved/one').is_dir())
-        self.assertEqual(result['convert_list']['added'], ['one', 'one_*'])
-        self.assertEqual(self.lines(), ['one', 'one_*'])
+        self.assertEqual(result['convert_list']['added'], fam('one'))                     # exact ids only (DESIGN_PHASE4.md I.6)
+        self.assertEqual(self.lines(), fam('one'))
         self.concept('two', 'provisional')
         self.assertEqual(self.act('provisional:two', 'approve')[0], 200)
-        self.assertEqual(self.lines(), ['one', 'one_*', 'two', 'two_*'])
+        self.assertEqual(self.lines(), fam('one') + fam('two'))
         self.concept('three')
         self.assertEqual(self.act('concepts:three', 'provisional')[0], 200)                 # the first hop is no processing request
         self.assertNotIn('three', self.lines())
         # approving again after an unapprove + approve keeps one line per pattern
         self.assertEqual(self.act('approved:one', 'unapprove', args={'to': 'concepts'})[0], 200)
         status, result = self.act('concepts:one', 'approve')
-        self.assertEqual((status, result['convert_list']['added'], result['convert_list']['present']), (200, [], ['one', 'one_*']))
+        self.assertEqual((status, result['convert_list']['added'], result['convert_list']['present']), (200, [], fam('one')))
         self.assertEqual(self.lines().count('one'), 1)
 
     def test_legacy_promote_adds_the_promoted_set(self):
@@ -288,7 +293,7 @@ class ConvertListOnApproveTest(V2Case):
         (batch / '01_plate.json').write_text('{"race_gender": "human_male"}')
         status, result = self.act('legacy:batch:01_plate', 'approve')
         self.assertEqual(status, 200, result)
-        self.assertEqual(self.lines(), ['batch_01_plate', 'batch_01_plate_*'])
+        self.assertEqual(self.lines(), fam('batch_01_plate'))
 
     def test_a_failing_convert_list_is_a_warning_and_the_move_stands(self):
         self.concept('one')
@@ -309,7 +314,7 @@ class ConvertListOnApproveTest(V2Case):
         status, result = self.act('concepts:one', 'approve')
         self.assertEqual(status, 200)
         self.assertIn('excluded by !one', result['warning'])
-        self.assertEqual(self.lines(), ['!one', 'one', 'one_*'])
+        self.assertEqual(self.lines(), ['!one'] + fam('one'))
 
 
 class QueueOpsTest(V2Case):
@@ -351,7 +356,7 @@ class QueueOpsTest(V2Case):
         self.assertEqual((unit['progress']['held_kind'], unit['progress']['held_reason']), ('convert_list', 'not in convert list'))
         self.assertIn('not in convert list', [b['text'] for b in item['card']['badges']])
         status, body = self.op(op='release', set='r')
-        self.assertEqual((status, body['added']), (200, ['r', 'r_*']))
+        self.assertEqual((status, body['added']), (200, fam('r')))
         _s, queue = self.get('/api/v2/queue')
         self.assertEqual(queue['conversions']['held'], [])
         self.assertIsNone(self.unit('r')[0]['progress']['held_kind'])
@@ -508,7 +513,7 @@ class ProgressTest(V2Case):
         self.assertIn('views task failed', dwarf['progress']['held_reason'])
         _s, queue = self.get('/api/v2/queue')
         self.assertEqual(queue['holds'][0] | {'reasons': None}, {'key': 's--a1b2c3d4e5f6', 'reasons': None, 'set': 's', 'job': 's--a1b2c3d4e5f6',
-                                                                  'gnome': False, 'drift': False})
+                                                                  'gnome': False, 'drift': False, 'images': []})
 
     def test_set_level_hold_of_an_unclaimed_race(self):
         self.job('s', 'a1b2c3d4e5f6', 'processing_views')
@@ -620,6 +625,522 @@ class SettingsReaderTest(V2Case):
             orchestrator.pool_status(self.root, 999.0, None)
             builds.stall_minutes(self.root)
         self.assertEqual(load.call_count, 2)
+
+
+# ======================================================================================= phase 4 review (review_v2_phase4_20261125)
+
+import hashlib  # noqa: E402
+import subprocess  # noqa: E402
+
+import guard  # noqa: E402
+import psutil  # noqa: E402
+from test_phase4 import CONVERT_ONLY, VIEWS_ONLY  # noqa: E402
+
+LOCK_HOLDER = '''import sys, time
+sys.path.insert(0, sys.argv[2])
+from claim_lock import try_lock
+handle = open(sys.argv[1], 'a+b')
+assert try_lock(handle)
+print('locked', flush=True)
+time.sleep(120)
+'''
+
+
+class ReviewServicesTest(TempRoot):
+    """Findings 2, 5, 6, 8, 16, 20 against the fake services of a temp root."""
+
+    def popen(self, *args):
+        proc = subprocess.Popen([sys.executable, *args], cwd=str(self.root), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.popens.append(proc)
+        return proc
+
+    def lock_holder(self, path):
+        proc = subprocess.Popen([sys.executable, '-c', LOCK_HOLDER, str(path), str(TOOLS / 'tripo_pipeline')], stdout=subprocess.PIPE, text=True)
+        self.popens.append(proc)
+        self.assertEqual(proc.stdout.readline().strip(), 'locked')
+        return proc
+
+    def hold(self):
+        return services.read_hold(self.root)
+
+    def sup(self):
+        found = self.running('supervisor')
+        return found[0] if found else None
+
+    # ---------------------------------------------------------------------------------------------------------------- F5
+    def test_f5_command_lines_are_parsed_like_the_interpreter_and_the_daemon(self):
+        root, py = str(self.root), sys.executable
+        sup, views, conv = (services.SERVICES[n] for n in ('supervisor', 'views', 'convert'))
+        cases = [
+            (views, [py, '-c', 'import time', 'tools/view_batch.py', 'run'], None),          # the reviewer's unrelated driver
+            (views, [py, 'driver.py', 'tools/view_batch.py', 'run'], None),
+            (views, [py, '-m', 'view_batch', 'run'], None),
+            (views, [py, '-u', 'tools/view_batch.py', 'run'], 'match'),
+            (views, [py, '-X', 'utf8', '-Wignore', 'tools/view_batch.py', 'run', '--parallel', '8'], 'match'),
+            (views, [py, 'tools/view_batch.py', 'status'], None),
+            (views, [py, 'tools/view_batch.py', 'run', '--help'], None),
+            (conv, [py, 'tools/convert_queue.py', '--worker=2'], None),                    # the reviewer's worker 2
+            (conv, [py, 'tools/convert_queue.py', '--worker', '2'], None),
+            (conv, [py, 'tools/convert_queue.py', '--work', '2'], None),                   # an argparse prefix
+            (conv, [py, 'tools/convert_queue.py', '--worker=1'], 'match'),
+            (conv, [py, 'tools/convert_queue.py', '--sets-file', 'x'], 'match'),          # default worker 1
+            (conv, [py, 'tools/convert_queue.py', '--worker', '2', '--worker', '1'], 'match'),   # the last one wins
+            (sup, [py, 'tools/pipeline_supervisor.py', 'run'], 'match'),
+            (sup, [py, 'tools/pipeline_supervisor.py', '--root', str(Path(root).parent / 'elsewhere'), 'run'], None),   # another root
+            (sup, [py, 'tools/pipeline_supervisor.py', '--root', root, 'run'], 'match'),
+            (sup, [py, 'tools/pipeline_supervisor.py', '--root=.', 'run'], 'match'),
+            (sup, [py, 'tools/pipeline_supervisor.py', 'run', '--dry-run'], None),         # one pass, not the daemon
+            (sup, [py, 'tools/pipeline_supervisor.py', 'stop'], None),
+        ]
+        for svc, cmd, want in cases:
+            with self.subTest(cmd=cmd[1:]):
+                self.assertEqual(services.identify(root, svc, cmd, root), want)
+        self.assertEqual(services.identify(root, views, [py, 'tools/view_batch.py', 'run'], None), 'unverified')     # cwd unknown
+        self.assertEqual(services.identify(root, views, [py, str(self.root / 'tools/view_batch.py'), 'run'], None), 'match')
+        self.assertIsNone(services.identify(root, views, [py, str(Path(root).parent / 'x' / 'tools/view_batch.py'), 'run'], None))
+        long_cmd = [py, '-u'] + ['-X', 'utf8'] * 6 + ['tools/view_batch.py', 'run']    # no bounded token scan
+        self.assertEqual(services.identify(root, views, long_cmd, root), 'match')
+
+    def test_f5_the_reviewers_processes_are_never_adopted(self):
+        other = Path(tempfile.mkdtemp(prefix='v2p4r_other_')).resolve()
+        try:
+            self.popen('tools/convert_queue.py', '--sets-file', 'x', '--worker=2')
+            self.popen('tools/pipeline_supervisor.py', '--root', str(other), 'run')
+            self.popen('-c', 'import time; time.sleep(60)', str(self.root / 'tools/view_batch.py'), 'run')
+            time.sleep(1.0)
+            found, maybe = services.scan_full(self.root)
+            self.assertEqual({k: v for k, v in found.items() if v}, {})
+            self.assertEqual({k: v for k, v in maybe.items() if v}, {})
+            w1 = self.popen('tools/convert_queue.py', '--worker=1')
+            self.wait_for(lambda: self.running('convert'), what='worker 1 spelled --worker=1')
+            self.assertEqual([i['pid'] for i in self.running('convert')], [w1.pid])
+        finally:
+            shutil.rmtree(other, ignore_errors=True)
+
+    def test_f5_an_unverified_lookalike_blocks_every_start(self):
+        settings.save(self.root, VIEWS_ONLY)
+        ghost = {'pid': 4242, 'ppid': 0, 'create_time': 1.0, 'cmdline': [sys.executable, 'tools/view_batch.py', 'run'], 'cwd': None}
+        real = services.scan_full
+
+        def scan_full(root, names=None):
+            found, maybe = real(root, names)
+            if 'views' in maybe:
+                maybe['views'] = maybe['views'] + [ghost]
+            return found, maybe
+        with mock.patch.object(services, 'scan_full', side_effect=scan_full):
+            events = services.tick(self.root)['events']
+            self.assertTrue(any('could not be verified' in e for e in events), events)
+            with self.assertRaisesRegex(services.ServiceError, 'could not be verified'):
+                services.start(self.root, 'views')
+        self.assertEqual(self.running('views'), [])
+        status = services.status(self.root)['services']['views']
+        self.assertEqual(status['state'], 'waiting')
+        self.assertTrue(any(p.startswith('views: not started') for p in progress.problems(services.status(self.root)['services'])))
+
+    def test_f5_a_held_view_runner_lock_blocks_a_second_runner(self):
+        settings.save(self.root, VIEWS_ONLY)
+        holder = self.lock_holder(self.root / '.codex_jobs/_batch/view_runner.lock')
+        events = services.tick(self.root)['events']
+        self.assertTrue(any('view_runner.lock is held' in e for e in events), events)
+        self.assertEqual(self.running('views'), [])
+        holder.kill()
+        holder.wait(10)
+        self.assertTrue(any(e.startswith('views: started') for e in services.tick(self.root)['events']))
+
+    def test_f5_a_signal_goes_only_to_a_rechecked_handle(self):
+        sleeper = self.popen('-c', 'import time; time.sleep(60)')
+        inst = {'pid': sleeper.pid, 'create_time': psutil.Process(sleeper.pid).create_time(), 'cmdline': ['x']}
+        with self.assertRaisesRegex(services.ServiceError, 'no longer the views service'):
+            services._terminate(self.root, services.SERVICES['views'], inst)          # same pid + create time, but not the view runner
+        self.assertIsNone(sleeper.poll())
+
+    def test_f5_the_server_keeps_its_writer_lock_while_the_services_thread_runs(self):
+        settings.save(self.root, {'services': {'supervisor': False, 'views': False, 'convert': False}})
+        web = Path(tempfile.mkdtemp(prefix='v2p4r_web_'))
+        (web / 'index.html').write_text('<html><head></head></html>')
+        try:
+            srv = server.create_server(self.root, port=0, web=web, extra_hosts=[], manage_services=True, services_interval=3600.0)
+            manager, lock = srv.services, srv.lock
+            with mock.patch.object(manager, 'stop', return_value=False):          # a stop request is still running
+                srv.server_close()
+            probe = guard.ServerLock(self.root)
+            self.assertFalse(probe.acquire())                                     # no second writer (and manager) can start meanwhile
+            self.assertTrue(manager.stop())
+            lock.release()
+            self.assertTrue(probe.acquire())
+            probe.release()
+        finally:
+            shutil.rmtree(web, ignore_errors=True)
+
+    # ---------------------------------------------------------------------------------------------------------------- F2
+    def test_f2_manager_start_holds_conversions_until_the_supervisor_ticked(self):
+        settings.save(self.root, {'services': {'supervisor': True, 'views': False, 'convert': True}})
+        services.begin_management(self.root)
+        hold = self.hold()
+        self.assertEqual(hold['owner_pid'], os.getpid())
+        self.assertIn('manager start', hold['reason'])
+        events = services.tick(self.root)['events']
+        self.assertTrue(any(e.startswith('supervisor: started') for e in events), events)
+        self.assertTrue(any(e.startswith('convert: waiting for the supervisor') for e in events), events)   # start order (F2)
+        self.assertEqual(self.running('convert'), [])
+        self.assertTrue(self.hold())
+        self.wait_for(lambda: services.supervisor_ticked(self.root, self.sup(), hold['since_unix']), what='a supervisor tick')
+        events = services.tick(self.root)['events']
+        self.assertTrue(any('conversion hold released' in e for e in events), events)
+        self.assertTrue(any(e.startswith('convert: started') for e in events), events)
+        self.assertIsNone(self.hold())
+
+    def test_f2_stopping_the_supervisor_writes_the_hold_first_and_keeps_it(self):
+        settings.save(self.root, {'services': {'supervisor': True, 'views': False, 'convert': False}})
+        self.spawn('supervisor')
+        services.tick(self.root)
+        self.assertIsNone(self.hold())
+        seen = []
+        real = services.subprocess.run
+
+        def run(cmd, **kwargs):
+            seen.append(self.hold())                                               # the hold exists when `stop` is sent
+            return real(cmd, **kwargs)
+        with mock.patch.object(services.subprocess, 'run', side_effect=run):
+            services.stop(self.root, 'supervisor', wait=10)
+        self.assertTrue(seen and seen[0] and 'supervisor stop' in seen[0]['reason'])
+        for _ in range(2):
+            services.tick(self.root)                                                # the supervisor stays stopped: the hold stays
+        self.assertTrue(self.hold())
+        self.assertEqual(services.status(self.root)['hold']['owner'], 'this server')
+        services.start(self.root, 'supervisor')
+        self.wait_for(lambda: 'conversion hold released' in ' '.join(services.tick(self.root)['events']), what='the new supervisor tick')
+        self.assertIsNone(self.hold())
+
+    def test_f2_restart_keeps_a_continuous_hold_across_the_gap(self):
+        settings.save(self.root, {'services': {'supervisor': True, 'views': False, 'convert': False}})
+        old = self.spawn('supervisor')
+        services.tick(self.root)
+        self.ctl('pipeline_supervisor', {'no_tick': True})                          # the new supervisor has not completed a tick yet
+        services.restart(self.root, 'supervisor', wait=10)
+        old.wait(10)
+        hold = self.hold()
+        self.assertIn('supervisor restart', hold['reason'])
+        # the OLD supervisor's last tick (after the hold was written, on its way out) never releases the hold of the new one
+        (self.root / '.codex_jobs/_batch/supervisor_tick.json').write_text(json.dumps({'pid': old.pid, 'time': time.time() + 60}))
+        self.assertFalse(services.supervisor_ticked(self.root, self.sup(), hold['since_unix']))
+        self.assertFalse(any('released' in e for e in services.tick(self.root)['events']))
+        self.assertTrue(self.hold())
+        self.ctl('pipeline_supervisor', {})
+        self.wait_for(lambda: 'conversion hold released' in ' '.join(services.tick(self.root)['events']), what='the new supervisor tick')
+
+    def test_f2_hold_ownership_rules(self):
+        now = time.time()
+        sup = {'pid': 999999, 'create_time': 5.0}
+        batch = self.root / '.codex_jobs/_batch'
+        (batch / 'supervisor_tick.json').write_text(json.dumps({'pid': 999999, 'create_time': 5.0, 'time': now + 5}))
+        sleeper = self.popen('-c', 'import time; time.sleep(60)')
+        live = {'since_unix': now - 3600, 'reason': 'by hand', 'owner_pid': sleeper.pid, 'owner_create_time': psutil.Process(sleeper.pid).create_time()}
+        services.hold_path(self.root).write_text(json.dumps(live))
+        self.assertEqual(services.begin_management(self.root), [])                # a live other owner: never touched
+        self.assertIsNone(services.release_hold(self.root, sup))
+        self.assertEqual(self.hold()['owner_pid'], sleeper.pid)
+        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
+        dead.wait(10)
+        services.hold_path(self.root).write_text(json.dumps({'since_unix': now - 30, 'reason': 'recent', 'owner_pid': dead.pid}))
+        self.assertIsNone(services.assert_hold(self.root, 'tick'))                # a recent hold of an exited owner stays as it is
+        self.assertIsNone(services.release_hold(self.root, sup))
+        services.hold_path(self.root).write_text(json.dumps({'since_unix': now - 3600, 'reason': 'stale', 'owner_pid': dead.pid}))
+        self.assertIn('stale', services.assert_hold(self.root, 'tick'))          # older than 10 min: replaced by ours
+        self.assertEqual(self.hold()['owner_pid'], os.getpid())
+        self.assertFalse(services.supervisor_ticked(self.root, {'pid': 1, 'create_time': 5.0}, 0))      # another pid
+        self.assertFalse(services.supervisor_ticked(self.root, {'pid': 999999, 'create_time': 50.0}, 0))  # same pid, another process
+        self.assertFalse(services.supervisor_ticked(self.root, sup, now + 10))  # a tick before the hold
+        self.assertIn('released', services.release_hold(self.root, sup))
+        self.assertIsNone(self.hold())
+
+    # ---------------------------------------------------------------------------------------------------------------- F16
+    def test_f16_an_unreadable_settings_file_never_starts_a_disabled_worker(self):
+        settings.save(self.root, {'services': {'supervisor': False, 'views': False, 'convert': False}})
+        settings.load(self.root)
+        settings.path(self.root).write_text('{broken', encoding='utf-8')
+        services.tick(self.root)
+        self.assertEqual({k: v for k, v in services.scan(self.root).items() if v}, {})    # the last valid policy: everything off
+        settings._LAST.clear()                                                    # a fresh server process with the broken file
+        events = services.tick(self.root)['events']
+        self.assertEqual({k: v for k, v in services.scan(self.root).items() if v}, {})
+        self.assertTrue(any('not started' in e for e in events), events)
+
+    # ---------------------------------------------------------------------------------------------------------------- F8
+    def test_f8_check_tripo_is_busy_while_the_browser_lock_is_held(self):
+        holder = self.lock_holder(credits.browser_lock_path(self.root))
+        result = credits.check_tripo(self.root, run=lambda root: (0, '{"credits": 5}', ''))
+        self.assertEqual(result['status'], 'busy')
+        self.assertIn('browser_tripo.lock', result['message'])
+        check = orchestrator.TripoCheck(self.root, run=lambda root: (0, '{"credits": 5}', ''), busy=lambda: [])
+        self.assertEqual(check.request()['status'], 'busy')
+        holder.kill()
+        holder.wait(10)
+        self.assertEqual(credits.check_tripo(self.root, run=lambda root: (0, '{"credits": 5}', ''))['status'], 'ok')
+
+    def test_f8_only_a_numeric_balance_of_a_successful_check_counts(self):
+        self.assertEqual(credits.check_tripo(self.root, run=lambda root: (0, 'x\n{"credits": 40}\n', ''))['credits'], 40)
+        for code, out in ((1, '{"credits": 12}'), (0, '{"credits": null}'), (3, '{"credits": null}'), (0, '{"credits": "12"}'),
+                          (0, '{"credits": true}'), (0, 'no json')):
+            with self.subTest(code=code, out=out):
+                self.assertEqual(credits.check_tripo(self.root, run=lambda root: (code, out, ''))['status'], 'error')
+                self.assertEqual(credits.tripo_state(self.root)['credits'], 40)      # the last good observation stays
+
+    def test_f8_a_balance_check_during_a_hyper3d_scan_is_not_lost(self):
+        sub = self.root / 'models/s/j/human_male/outfit/studio_submission.json'
+        sub.parent.mkdir(parents=True)
+        sub.write_text(json.dumps({'balances': [{'credits': 9, 'at': '2026-11-25T10:00:00+00:00', 'stage': 'x'}]}))
+        real = credits.submission_files
+
+        def racing(root, extra_roots=None):
+            files = real(root, extra_roots)
+            credits.check_tripo(root, run=lambda r: (0, '{"credits": 77}', ''))   # written while the scan runs
+            return files
+        with mock.patch.object(credits, 'submission_files', side_effect=racing):
+            credits.scan_hyper3d(self.root, extra_roots=[])
+        cache = credits.read_cache(self.root)
+        self.assertEqual((cache['tripo']['credits'], cache['hyper3d']['best']['credits']), (77, 9))
+
+
+# ------------------------------------------------------------------------------------------------- catalog / actions / progress
+
+class ReviewActionsTest(V2Case):
+    """Findings 3, 13, 14, 18, 19 through the API of a temp root."""
+
+    def op(self, **body):
+        return self.post('/api/v2/queue', body)
+
+    def lines(self):
+        path = self.root / '.codex_jobs/_batch/convert_sets.txt'
+        return path.read_text(encoding='utf-8').splitlines() if path.exists() else []
+
+    # ---------------------------------------------------------------------------------------------------------------- F3
+    def test_f3_release_needs_an_exact_set_never_a_prefix(self):
+        self.job('plate_01', 'a1b2c3d4e5f6', 'multiview_ready', state='ready_for_tripo')
+        self.job('plate_02', 'b1b2c3d4e5f6', 'multiview_ready', state='ready_for_tripo')
+        status, body = self.op(op='release', set='plate')                          # the reviewer's typo
+        self.assertEqual(status, 404, body)
+        self.assertEqual(self.lines(), [])
+        self.assertEqual(convert_list.pending_jobs(self.root), [])
+        status, body = self.op(op='release', set='plate_01')
+        self.assertEqual((status, body['added']), (200, fam('plate_01')))
+        self.assertEqual([j['job'] for j in convert_list.pending_jobs(self.root)], ['plate_01--a1b2c3d4e5f6'])
+        self.assertFalse(any('*' in line for line in self.lines()))
+        # a race-suffixed staged job belongs to its base set (catalog.job_set); a part of the suffix does not
+        self.job('cape', 'c1b2c3d4e5f6', 'multiview_ready', units=(('dwarf_male', 'outfit'),), suffix='_dwarf_male', state='ready_for_tripo')
+        self.assertEqual(self.op(op='release', set='cape_dwarf')[0], 404)
+        status, body = self.op(op='release', set='cape')
+        self.assertEqual(status, 200, body)
+        self.assertIn('cape_dwarf_male', body['added'])
+        self.assertIn('cape_dwarf_male--c1b2c3d4e5f6', [j['job'] for j in convert_list.pending_jobs(self.root)])
+
+    def test_f3_red_coat_approve_and_release_share_one_grammar(self):
+        self.concept('red-coat')
+        status, result = self.act('concepts:red-coat', 'approve')
+        self.assertEqual(status, 200, result)
+        self.assertNotIn('warning', result)                                          # the reviewer got a list warning here
+        self.assertEqual(result['convert_list']['added'], fam('red-coat'))
+        self.job('red-coat', 'a1b2c3d4e5f6', 'multiview_ready', state='ready_for_tripo')
+        status, body = self.op(op='release', set='red-coat')                        # the reviewer got a 400 here
+        self.assertEqual((status, body['added'], body['present']), (200, [], fam('red-coat')))
+        self.assertEqual(self.op(op='release', set='red coat')[0], 400)
+
+    # ---------------------------------------------------------------------------------------------------------------- F13
+    def legacy(self):
+        batch = self.root / 'concepts/batch'
+        batch.mkdir(parents=True, exist_ok=True)
+        (batch / '01_plate__outfit.png').write_bytes(b'png')
+        (batch / '01_plate.json').write_text('{"race_gender": "human_male"}')
+        return batch
+
+    def crashed_promotion(self, promotion='p-123', claimed=True, promoted=False):
+        """The crash window of the reviewer: promote published approved/<set> with its mark, the parent never saved promoted=true, and
+        (claimed) the supervisor then claimed the folder."""
+        batch = self.legacy()
+        approved = self.root / 'approved/batch_01_plate'
+        (approved / 'human_male').mkdir(parents=True)
+        (approved / actions.PROMOTION_MARK).write_text(json.dumps({'promotion_id': promotion}))
+        if claimed:
+            target = self.root / 'processing_views/batch_01_plate--a1b2c3d4e5f6'
+            approved.rename(target)
+            (target / '.tripo-job.json').write_text(json.dumps({'set': 'batch_01_plate', 'job_id': 'a1b2c3d4e5f6', 'state': 'claimed',
+                                                                'modules': [{'race_gender': 'human_male', 'module': 'outfit'}]}))
+        files = [{'src': f'concepts/batch/{f.name}', 'dst': f'trash/concepts/batch/{f.name}'} for f in sorted(batch.iterdir())]
+        intent = guard.new_intent(self.root, {'kind': 'flat_move', 'verb': 'approve', 'label': 'approve 01_plate', 'files': files,
+                                              'sidecar': {'path': 'trash/concepts/batch/01_plate.preview-origin.json',
+                                                          'content': {'kind': 'legacy', 'src': 'concepts/batch', 'approved_set': 'batch_01_plate',
+                                                                      'promotion_id': promotion}},
+                                              'approved_set': 'batch_01_plate', 'promoted': promoted, 'promotion_id': promotion})
+        guard.abandon_intent(intent)
+        return intent, batch
+
+    def test_f13_rollback_refuses_a_promotion_claimed_before_the_flag_was_saved(self):
+        intent, batch = self.crashed_promotion()
+        status, body = self.act(f'intent:{intent}', 'rollback')
+        self.assertEqual(status, 409, body)
+        self.assertIn('already claimed', body['error'])
+        self.assertTrue((self.root / 'processing_views/batch_01_plate--a1b2c3d4e5f6').is_dir())
+        self.assertEqual([i['id'] for i in guard.list_intents(self.root)], [intent])   # the Recovery card stays
+        status, body = self.act(f'intent:{intent}', 'complete')                     # Complete is the way out, with the list update
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['convert_list']['added'], fam('batch_01_plate'))
+        self.assertEqual(sorted(p.name for p in batch.iterdir()), [])
+        self.assertEqual(guard.list_intents(self.root), [])
+
+    def test_f13_rollback_withdraws_an_unclaimed_promotion_whatever_the_flag(self):
+        intent, batch = self.crashed_promotion(claimed=False)
+        status, body = self.act(f'intent:{intent}', 'rollback')
+        self.assertEqual(status, 200, body)
+        self.assertFalse((self.root / 'approved/batch_01_plate').exists())
+        self.assertTrue(any((self.root / '.codex_jobs/_app/withdrawn').iterdir()))
+
+    def test_f13_complete_never_accepts_a_folder_by_name_and_refuses_ambiguity(self):
+        approved = self.root / 'approved/batch_01_plate'
+        (approved / 'human_male').mkdir(parents=True)                                 # an unrelated approved folder of the same name
+        self.legacy()
+        intent = guard.new_intent(self.root, {'kind': 'flat_move', 'verb': 'approve', 'label': 'approve 01_plate', 'files': [],
+                                              'approved_set': 'batch_01_plate', 'promoted': True, 'sidecar': None})
+        guard.abandon_intent(intent)
+        status, body = self.act(f'intent:{intent}', 'complete')
+        self.assertEqual(status, 409, body)
+        self.assertIn('manual check needed', body['error'])
+        trashed = self.root / 'trash/concepts/batch'
+        self.assertFalse(trashed.exists() and any(trashed.iterdir()))
+        # the same promotion id in two places: ambiguous
+        (approved / actions.PROMOTION_MARK).write_text(json.dumps({'promotion_id': 'p-9'}))
+        copy = self.root / 'processing_views/batch_01_plate--b1b2c3d4e5f6'
+        copy.mkdir(parents=True)
+        (copy / actions.PROMOTION_MARK).write_text(json.dumps({'promotion_id': 'p-9'}))
+        guard.update_intent(self.root, intent, promotion_id='p-9')
+        status, body = self.act(f'intent:{intent}', 'complete')
+        self.assertEqual(status, 409, body)
+        self.assertIn('ambiguous', body['error'])
+
+    # ---------------------------------------------------------------------------------------------------------------- F14
+    def test_f14_a_malformed_job_never_stops_the_other_sets(self):
+        self.job('good', 'a1b2c3d4e5f6', 'processing_views')
+        self.job('odd', 'b1b2c3d4e5f6', 'processing_views', extra={'conversion_errors': 'boom', 'modules': [{'race_gender': 'human_male',
+                                                                                                             'module': 'outfit'}, 7]})
+        derived = catalog.derive_all(self.root)
+        self.assertEqual(derived['sets']['good']['stage'], 'approved')
+        odd = derived['sets']['odd']
+        self.assertIsNone(odd.get('derive_error'))
+        self.assertTrue(any('conversion_errors is a str' in w for u in odd['units'] for w in u['warnings']))
+        orch = orchestrator.Orchestrator(self.root, scan_stale=False)
+        self.assertEqual(orch.reconcile()['errors'], [])                             # the reviewer got a TypeError for every set here
+        # an exception inside the scan of one job, and inside the derivation of one set
+        self.job('ugly', 'c1b2c3d4e5f6', 'processing_views')
+        real_scan, real_derive = catalog._job_scan, catalog.derive_set
+
+        def scan(folder, deps):
+            if folder.name.startswith('ugly'):
+                raise TypeError('unhashable thing')
+            return real_scan(folder, deps)
+
+        def derive(root, name, *args, **kwargs):
+            if name == 'good':
+                raise KeyError('broken')
+            return real_derive(root, name, *args, **kwargs)
+        catalog.invalidate()
+        with mock.patch.object(catalog, '_job_scan', side_effect=scan), mock.patch.object(catalog, 'derive_set', side_effect=derive):
+            derived = catalog._derive_all(self.root)
+            out = orch.reconcile()
+            state = catalog._build_state(self.root)
+        self.assertIn('TypeError', derived['sets']['ugly']['derive_error'])
+        self.assertIn('KeyError', derived['sets']['good']['derive_error'])
+        self.assertIsNone(derived['sets']['odd'].get('derive_error'))                # the healthy one is still derived
+        self.assertTrue(any('ugly' in e and 'skipped' in e for e in out['errors']), out['errors'])
+        cards = {c['name']: c for c in state['tabs']['approved']}
+        self.assertTrue(any(b['text'].startswith('damaged:') for b in cards['ugly']['badges']))
+        self.assertIn('odd', cards)
+
+    # ---------------------------------------------------------------------------------------------------------------- F18
+    def drift_hold(self):
+        folder = self.job('s', 'a1b2c3d4e5f6', 'processing_views', units=(('dwarf_male', 'outfit'),))
+        image = folder / 'dwarf_male/outfit/back.png'
+        image.write_bytes(b'\x89PNG drifted back')
+        batch = self.root / '.codex_jobs/_batch'
+        batch.mkdir(parents=True, exist_ok=True)
+        holds = {'s--a1b2c3d4e5f6': {'sig': 'x', 'reasons': ['dwarf_male: back.png colour DRIFT (primary hue 331)']}}
+        (batch / 'supervisor_state.json').write_text(json.dumps({'holds': holds, 'sets': {}}))
+        (batch / 'advance.json').write_text(json.dumps({'sets': [{'pattern': 'x_*'}], 'auto_accept_view_drift': False}))
+        return image
+
+    def test_f18_accept_drift_is_hash_bound_and_uses_the_supervisors_record(self):
+        image = self.drift_hold()
+        rel = image.relative_to(self.root).as_posix()
+        digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        _s, queue = self.get('/api/v2/queue')
+        hold = queue['holds'][0]
+        self.assertTrue(hold['drift'])
+        self.assertEqual(hold['images'], [{'path': rel, 'sha256': digest, 'race': 'dwarf_male'}])     # what the Accept button sends
+        key = 's--a1b2c3d4e5f6'
+        status, body = self.op(op='accept_drift', key=key, images=[{'path': rel, 'sha256': '0' * 64}])
+        self.assertEqual((status, body['code']), (409, 'changed'))                    # reviewed bytes are not the current ones
+        status, body = self.op(op='accept_drift', key=key, images=[{'path': rel.replace('back', 'front'), 'sha256': digest}])
+        self.assertEqual(status, 400)                                                 # not an image the hold names
+        status, body = self.op(op='accept_drift', key=key, images=[{'path': '../x/back.png', 'sha256': digest}])
+        self.assertEqual(status, 400)
+        self.assertEqual(self.op(op='accept_drift', key='nope', images=[{'path': rel, 'sha256': digest}])[0], 404)
+        advance = json.loads((self.root / '.codex_jobs/_batch/advance.json').read_text())
+        self.assertNotIn('accepted_drift', advance)                                   # nothing written so far
+        status, body = self.op(op='accept_drift', key=key, images=[{'path': rel, 'sha256': digest}])
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body['accepted'], [{'path': rel, 'sha256': digest}])
+        advance = json.loads((self.root / '.codex_jobs/_batch/advance.json').read_text())
+        self.assertEqual([e['sha256'] for e in advance['accepted_drift']], [digest])
+        self.assertEqual((advance['sets'], advance['auto_accept_view_drift']), ([{'pattern': 'x_*'}], False))   # the rest is kept
+        self.assertEqual(self.op(op='accept_drift', key=key, images=[{'path': rel, 'sha256': digest}])[1]['already'], [{'path': rel, 'sha256': digest}])
+        ops = [e['detail'] for e in taskqueue.for_root(self.root).events() if e['kind'] == 'op']
+        self.assertTrue(any(d.startswith('accept_drift: s--a1b2c3d4e5f6: accepted 1') for d in ops), ops)
+        import pipeline_supervisor
+        sup = pipeline_supervisor.Supervisor(self.root, dry_run=True)
+        self.assertIn(digest, sup.accepted_drift())                                    # the supervisor reads it as its own
+
+    # ---------------------------------------------------------------------------------------------------------------- F19
+    def test_f19_progress_never_borrows_another_jobs_views(self):
+        old = self.job('s', 'a1b2c3d4e5f6', 'completed', units=(('human_male', 'outfit'), ('dwarf_male', 'outfit')), state='converted')
+        batch = self.root / '.codex_jobs/_batch'
+        for sub in ('tasks', 'status'):
+            (batch / sub).mkdir(parents=True, exist_ok=True)
+        name = 'views--s--dwarf_male--outfit'                                         # an older base-set task of the OLD job
+        outputs = [str(old / 'dwarf_male/outfit' / f'{v}.png') for v in progress.VIEWS]
+        (batch / 'tasks' / f'{name}.json').write_text(json.dumps({'name': name, 'outputs': outputs}))
+        (batch / 'status' / f'{name}.json').write_text(json.dumps({'state': 'done', 'attempts': 1, 'jobs': [{'job': 'x'}]}))
+        new = self.job('s', 'b1b2c3d4e5f6', 'processing_views', units=(('dwarf_male', 'outfit'),), suffix='_dwarf_male')
+        (new / 'dwarf_male/outfit/front.png').unlink()                                # a fresh job with zero PNGs
+        unit, _item = self.unit('s', 'dwarf_male')
+        self.assertEqual(unit['job'], 'b1b2c3d4e5f6')
+        self.assertEqual((unit['progress']['views_done'], unit['progress']['views_total'], unit['progress']['views_task']), (0, 4, None))
+        own = 'views--s_dwarf_male--dwarf_male--outfit'
+        (batch / 'tasks' / f'{own}.json').write_text(json.dumps({'name': own, 'outputs': [str(new / 'dwarf_male/outfit' / f'{v}.png')
+                                                                                            for v in progress.VIEWS]}))
+        unit, _item = self.unit('s', 'dwarf_male')
+        self.assertEqual((unit['progress']['views_task'], unit['progress']['views_done']), (own, 0))
+
+    def test_f19_a_failed_monster_task_log_is_read_under_the_monster_root(self):
+        batch = self.root / '.codex_jobs/_batch'
+        for sub in ('tasks', 'status'):
+            (batch / sub).mkdir(parents=True, exist_ok=True)
+        name = 'monster--Goblin--extra'
+        (batch / 'tasks' / f'{name}.json').write_text(json.dumps({'name': name, 'outputs': [], 'launcher': 'monsters'}))
+        (batch / 'status' / f'{name}.json').write_text(json.dumps({'state': 'failed', 'attempts': 2, 'jobs': [{'job': 'goblin-a02'}]}))
+        log = self.mroot / '.codex_jobs/goblin-a02/log.txt'
+        log.parent.mkdir(parents=True)
+        log.write_text('the monster launcher said: rate limited\n')
+        (self.root / '.codex_jobs/goblin-a02').mkdir(parents=True)
+        (self.root / '.codex_jobs/goblin-a02/log.txt').write_text('a character job of the same name\n')
+        failed = progress.views_section(self.root)['failed']
+        self.assertEqual(len(failed), 1)
+        self.assertIn('the monster launcher said', failed[0]['log_tail'])
+
+    # ------------------------------------------------------------------------------------------------- the header status
+    def test_status_services_carries_managed_and_scanned(self):
+        self.assertEqual(progress.status_summary(self.root, [], None, scanned=False)['services'],
+                         {'ok': True, 'problems': [], 'managed': True, 'scanned': False})
+        self.assertIsNone(progress.status_summary(self.root, None, None)['services'])     # without --manage-services
+        _s, state = self.get('/api/v2/state')
+        self.assertIsNone(state['status']['services'])
 
 
 if __name__ == '__main__':

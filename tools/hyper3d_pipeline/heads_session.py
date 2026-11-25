@@ -4,6 +4,9 @@ import json,time
 import workflow as w
 import batch
 from selenium.webdriver.common.by import By
+from browser_lock import BrowserLock
+# Hyper3D browser lock (browser_lock.py), taken before the profile check and held for the life of this process
+PROFILE_LOCK=BrowserLock().acquire()
 w.check_profile(w.PROFILE)
 options=w.Options();options.page_load_strategy='eager';options.binary_location=w.BINARY
 options.add_argument('-profile');options.add_argument(str(w.PROFILE))

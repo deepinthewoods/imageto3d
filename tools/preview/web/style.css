@@ -371,3 +371,16 @@ details.q-sec>summary h3{margin:0;font-size:.95rem;text-transform:uppercase;lett
 .prog-views{font-size:.85rem;color:#bfd0e9}
 .unit-progress .unit-error{flex-basis:100%;margin:0}
 @media(max-width:650px){.svc-actions{margin-left:0}.q-mode-row button{flex:1 1 100%}.status-chip{font-size:.7rem;padding:.2rem .5rem}}
+
+/* phase 4 fix (review finding 18): service requests, drift images, list editor */
+.svc-req{flex-basis:100%;display:flex;align-items:center;gap:.6rem;font-size:.82rem;color:#bfd0e9;overflow-wrap:anywhere}
+.svc-req.tone-warn{color:#e0c98a}
+.svc-req.tone-ok{color:#9fe0bf}
+.svc-req.tone-error{color:#ffc0c6}
+.svc-req button{padding:.1rem .5rem;font-size:.75rem}
+.q-drift-images{margin:.4rem 0;padding-left:1.2rem;max-height:12rem;overflow:auto;font-size:.82rem;overflow-wrap:anywhere}
+.q-list-edit{display:flex;flex-direction:column;gap:.35rem;align-items:flex-start}
+.q-list-rows{display:flex;flex-direction:column;gap:.3rem;width:100%}
+.q-list-row{display:flex;gap:.4rem;align-items:center}
+.q-list-row input{flex:1;max-width:22rem;background:#1b2029;color:#f4f5f8;border:1px solid #465063;border-radius:8px;padding:.35rem .5rem}
+.q-list-edit button,.q-list-row button{padding:.2rem .7rem}

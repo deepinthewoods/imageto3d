@@ -62,8 +62,15 @@ Usage (from the imageto3d folder):
   module_conversion.<race>/<module>.feature_labels (spec, where it came from) and reduced/manifest.json `wearable.feature_labels`.
 - Leaves the job in processing/ with state `converted` and prints which levels need review.
   Moving it to completed/ is a separate step after that review.
-- Pause (tools/pipeline_supervisor.py): while `.codex_jobs/_batch/PAUSE` exists a module that has no `studio_submission.json` yet is not
-  submitted (the process waits and prints once); modules already submitted keep collecting, their Blender steps are frozen by the supervisor.
+- Pause / conversion hold (tools/pipeline_supervisor.py; DESIGN_PHASE4 I.1): while `.codex_jobs/_batch/CONVERT_HOLD` exists (the preview
+  app's service manager keeps it while the supervisor is stopped, restarting or has not completed a tick yet) or `.codex_jobs/_batch/PAUSE`
+  exists with "conversions" in its scope (an unreadable PAUSE counts), the process waits (prints once) before EVERY paid step: a new
+  submission (Tripo, Hyper3D, formy3d; also a pixal3d one, as before), and a Hyper3D collect with --allow-paid of a module that was
+  submitted earlier (its geometry/material confirmations cost credits). The free Tripo collect and the free Tripo retry do not wait;
+  heavy local (Blender) steps are frozen by the supervisor as before.
+- Tripo browser lock (DESIGN_PHASE4 I.3): every studio.mjs call (submit, collect, retry) runs under
+  `.codex_jobs/_batch/browser_tripo.lock` (tripo_browser_lock.py), the lock the convert worker's and the preview app's balance checks take;
+  a busy lock is waited for. A paid step re-checks the pause/hold after it got the lock.
 --dry-run: opens Studio, fills the form and screenshots it without pressing Generate.
 --max-submits N: submit at most N new modules in this run (e.g. what the Tripo credit balance covers); the others are
   skipped, the job stays in processing/ with state `partially_converted` and the script exits 3. Re-run (e.g. with
@@ -101,12 +108,16 @@ if str(TOOLS) not in sys.path:
 import feature_hooks  # noqa: E402
 import portable  # noqa: E402
 import views_omitted  # noqa: E402
+from tripo_browser_lock import tripo_browser_lock  # noqa: E402
 from wearcut_rules import wearable_record  # noqa: E402
 HYPER3D = ROOT / 'tools/hyper3d_pipeline'
 FORMY3D = ROOT / 'tools/formy3d_pipeline'
 PIXAL3D = ROOT / 'tools/pixal3d_pipeline'
 BACKENDS = ('tripo', 'hyper3d', 'formy3d', 'pixal3d')
-PAUSE = ROOT / '.codex_jobs/_batch/PAUSE'   # tools/pipeline_supervisor.py: no new submissions while it exists
+PAUSE = ROOT / '.codex_jobs/_batch/PAUSE'   # tools/pipeline_supervisor.py: no paid step while it exists (scope "conversions")
+CONVERT_HOLD = ROOT / '.codex_jobs/_batch/CONVERT_HOLD'   # preview app service manager (DESIGN_PHASE4 I.1): no paid step while it exists
+_IMPORT_ROOT = ROOT
+GATE_POLL = 15   # seconds between looks at PAUSE / CONVERT_HOLD while a paid step waits
 BLENDER = portable.default_blender()   # $BLENDER, else /usr/local/bin/blender (Linux) / the newest installed Blender (Windows)
 portable.utf8_environment()            # Windows: child python / Blender processes read and write UTF-8
 SPLIT_METHODS = ('segment-first', 'per-face', 'none')
@@ -115,6 +126,66 @@ WEARABLE_METHODS = ('cut', 'faces')
 
 def write_record(path, record):
     path.write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
+
+
+def gate_files():
+    """(PAUSE, CONVERT_HOLD) of the current ROOT (a test that points ROOT at a temp root gets that root's files; one that
+    patched the constants keeps them)."""
+    if ROOT == _IMPORT_ROOT:
+        return PAUSE, CONVERT_HOLD
+    batch = ROOT / '.codex_jobs' / '_batch'
+    return batch / 'PAUSE', batch / 'CONVERT_HOLD'
+
+
+def _gate_json(path):
+    try:
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def conversion_gate():
+    """Why a paid step must wait right now, else None: CONVERT_HOLD exists, or PAUSE exists and its scope covers conversions
+    (a PAUSE without a readable scope counts: fail closed)."""
+    pause, hold = gate_files()
+    if hold.exists():
+        data = _gate_json(hold) or {}
+        return f'CONVERT_HOLD: {data.get("reason") or "conversion hold"}'
+    if pause.exists():
+        data = _gate_json(pause)
+        scope = (data or {}).get('scope')
+        if not isinstance(scope, list) or 'conversions' in scope:
+            return f'PAUSE: {(data or {}).get("reason") or "supervisor pause"}'
+    return None
+
+
+def wait_for_gate(key, step):
+    """Block (printing once) while conversion_gate() says a paid step must wait; returns at once when it is open."""
+    announced = False
+    while True:
+        reason = conversion_gate()
+        if not reason:
+            break
+        if not announced:
+            print(f'== {key}: PAUSED ({reason}); waiting before {step}', flush=True)
+            announced = True
+        time.sleep(GATE_POLL)
+    if announced:
+        print(f'== {key}: pause/hold lifted; {step}', flush=True)
+
+
+def run_studio(command, key, step, paid, **kwargs):
+    """subprocess.run(command, **kwargs) of a studio.mjs call under the Tripo browser lock (waited for). A paid step first waits
+    for the pause/hold gate and checks it again once it holds the lock (a pause may have started while it waited)."""
+    while True:
+        if paid:
+            wait_for_gate(key, step)
+        with tripo_browser_lock(ROOT, what=f'convert_job {key} {step}',
+                                announce=lambda text: print(f'== {key}: {text} before {step}', flush=True)):
+            if paid and conversion_gate():
+                continue
+            return subprocess.run(command, **kwargs)
 
 
 # Several queue workers may convert different modules of one job at once: each module is claimed with a lock
@@ -327,8 +398,11 @@ def collect_and_reduce(key, out, backend='tripo', options=None, separable=False,
     if state.get('status') != 'exported' or 'GLB' not in state.get('exports', {}):
         print(f'== {key}: collect', flush=True)
         if backend == 'tripo':
-            subprocess.run(collect_command('tripo', out), check=True, cwd=ROOT)
+            run_studio(collect_command('tripo', out), key, 'Tripo collect', paid=False, check=True, cwd=ROOT)
         else:
+            if backend == 'hyper3d' and (options or {}).get('allow_paid'):
+                # its geometry / material confirmations cost credits: an existing submission waits like a new one
+                wait_for_gate(key, 'a paid Hyper3D collect')
             run = subprocess.run(collect_command(backend, out, options), cwd=ROOT)
             if run.returncode != 0:  # a guard stop (credits/permissions/sign-in) leaves the module resumable
                 raise SystemExit(f'{key}: {backend} collect stopped (exit {run.returncode}); '
@@ -728,10 +802,8 @@ def main(argv):
             skipped.append(key)
             summary[key] = 'skipped: --max-submits reached'
             continue
-        if not dry_run and not submission.exists() and PAUSE.exists():
-            print(f'== {key}: PAUSED (supervisor PAUSE file); waiting before a new submission', flush=True)
-            while PAUSE.exists():
-                time.sleep(15)
+        if not dry_run and not submission.exists():
+            wait_for_gate(key, 'a new submission')
         lock = locks / f'{race}__{module}.lock'
         if not dry_run:
             if not claim_module(lock):
@@ -749,14 +821,20 @@ def main(argv):
             submits += 1
         if not submission.exists():
             print(f'== {key}: submit', flush=True)
-            if module_backend in ('formy3d', 'pixal3d'):
-                run = subprocess.run(submit_command(module_backend, job / race / module, out, dry_run, options), cwd=ROOT, env=env)
-                if run.returncode != 0:  # a guard stop (--allow-paid/price/sign-in; pixal3d: bad inputs) leaves the module resumable
-                    raise SystemExit(f'{key}: {module_backend} submit stopped (exit {run.returncode}); '
-                                     f'fix what it printed and re-run')
+            if module_backend == 'tripo':   # the Tripo browser lock; a real submit re-checks the pause/hold under it
+                run_studio(submit_command(module_backend, job / race / module, out, dry_run), key, 'a new Tripo submission',
+                           paid=not dry_run, check=True, cwd=ROOT, env=env)
             else:
-                subprocess.run(submit_command(module_backend, job / race / module, out, dry_run),
-                               check=True, cwd=ROOT, env=env)
+                if not dry_run:
+                    wait_for_gate(key, f'a new {module_backend} submission')
+                if module_backend in ('formy3d', 'pixal3d'):
+                    run = subprocess.run(submit_command(module_backend, job / race / module, out, dry_run, options), cwd=ROOT, env=env)
+                    if run.returncode != 0:  # a guard stop (--allow-paid/price/sign-in; pixal3d: bad inputs) leaves the module resumable
+                        raise SystemExit(f'{key}: {module_backend} submit stopped (exit {run.returncode}); '
+                                         f'fix what it printed and re-run')
+                else:
+                    subprocess.run(submit_command(module_backend, job / race / module, out, dry_run),
+                                   check=True, cwd=ROOT, env=env)
         if dry_run:
             summary[key] = (f'dry run: inputs staged in {out / "pixal3d_input"}, nothing generated' if module_backend == 'pixal3d'
                             else f'dry run: form filled, nothing submitted; screenshot {out / "before_submit.png"}')
@@ -770,7 +848,8 @@ def main(argv):
             failed = out.parent / f'{module}_attempt{len(list(out.parent.glob(module + "_attempt*"))) + 1:02d}_{reason["slug"]}'
             os.rename(out, failed)
             print(f'== {key}: {reason["text"]}; moved to {failed.name}; free retry', flush=True)
-            run = subprocess.run(['node', str(TOOLS / 'studio.mjs'), 'retry', str(failed), str(out)], cwd=ROOT)
+            run = run_studio(['node', str(TOOLS / 'studio.mjs'), 'retry', str(failed), str(out)], key, 'Tripo free retry',
+                             paid=False, cwd=ROOT)
             retry_state = json.loads(submission.read_text(encoding='utf-8-sig')) if submission.exists() else {}
             if run.returncode != 0:
                 if retry_state.get('status') != 'no_free_retries':

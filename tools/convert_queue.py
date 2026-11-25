@@ -21,11 +21,25 @@ counts there (`<job>.fails`). Worker N > 1 drives Hyper3D through its own clone 
 After a job converts (and once before an idle exit) finish_sets.py --apply moves every set that is converted for all
 races from processing/ to completed/ (flock-serialized, errors only logged).
 
-While .codex_jobs/_batch/PAUSE exists (tools/pipeline_supervisor.py) no job is started (PAUSED, once).
+While .codex_jobs/_batch/PAUSE exists with "conversions" in its scope (tools/pipeline_supervisor.py; an unreadable PAUSE counts)
+or .codex_jobs/_batch/CONVERT_HOLD exists (the preview app's service manager keeps it while the supervisor is stopped, restarting
+or has not completed a tick yet; DESIGN_PHASE4 I.1) no job is started (PAUSED, once per reason). convert_job.py itself waits
+before every paid step too (a Hyper3D collect of an existing submission included).
 
-Graceful stop (preview app v2): creating .codex_jobs/_batch/convert_worker.stop makes a worker exit before it takes its next
-job (it deletes the file, emits `STOP requested; exiting`, runs finish() like the idle exit); a conversion in flight completes
-first. A stop file left from before a worker started is removed at start.
+Tripo balance (review_v2_phase4 finding 4): `studio.mjs balance` runs under the Tripo browser lock
+(.codex_jobs/_batch/browser_tripo.lock, tripo_browser_lock.py) and counts only when it exits 0 with a numeric `credits`. An
+unreadable balance (nonzero exit, null credits, parse error, timeout, busy browser) never switches to the fallback backend and
+never marks Tripo as used up: the job is held (`HOLD <job>: Tripo balance unreadable ...`, not counted as a failure), its lock is
+released, and the balance is read again before the next submission. The last good reading is kept in memory and named in the
+message.
+
+Graceful stop (DESIGN_PHASE4 I.2): the preview app writes .codex_jobs/_batch/convert_worker<N>.stop = {pid, create_time,
+request, time} naming ONE worker process. Worker N honours only a file naming its own pid and create_time (worker 2 never
+touches worker 1's file): between jobs it writes convert_worker<N>.stopping = {pid, time}, emits `STOP requested; exiting`,
+runs finish() (which offloads the sets it completes), then removes both files and exits; a conversion in flight completes
+first. A stop file naming a dead process is left to the app, except that a worker removes its own number's stale files at start.
+Legacy: worker 1 still honours the bare .codex_jobs/_batch/convert_worker.stop of the first phase-4 app (removed at start when
+left from before; deleted when honoured).
 
 --backend pixal3d (user, 2026-11-18): convert every job with the free local Pixal3D backend only (no Tripo balance check, no
 Hyper3D); one generation at a time per machine (the backend's GPU lock), so one pixal3d worker is enough. --fallback pixal3d: use
@@ -51,11 +65,15 @@ MAX_TRIES = 3
 LOGS = ROOT / '.codex_jobs' / '_batch' / 'convert_logs'
 LOCKS = ROOT / '.codex_jobs' / '_batch' / 'convert_locks'
 PAUSE = ROOT / '.codex_jobs' / '_batch' / 'PAUSE'   # written by tools/pipeline_supervisor.py while the screen is on
-STOP_FILE = ROOT / '.codex_jobs' / '_batch' / 'convert_worker.stop'   # graceful stop: written by the preview app (services.py)
+STOP_FILE = ROOT / '.codex_jobs' / '_batch' / 'convert_worker.stop'   # legacy graceful stop (worker 1 only; see the docstring)
 STOP_NAP = 5   # seconds: the longest a waiting worker sleeps before it looks at the stop file again
+BALANCE_RETRY = 300   # seconds a job held for an unreadable Tripo balance waits before the balance is read again
+BALANCE_LOCK_WAIT = 600   # seconds the balance check waits for the Tripo browser lock (a v2 balance check, a running studio call)
+WORKER = 1   # this process's --worker number (set in main)
 sys.path.insert(0, str(ROOT / 'tools' / 'tripo_pipeline'))
 from convert_job import claim_module, lock_holder, module_converted, read_record  # noqa: E402
 import portable  # noqa: E402  (also puts PYTHONUTF8=1 into the environment of the convert_job children on Windows)
+from tripo_browser_lock import TripoBrowserBusy, tripo_browser_lock  # noqa: E402
 import finish_sets  # noqa: E402
 import offload_models  # noqa: E402
 PROFILES = Path.home() / 'snap/firefox/common'
@@ -74,17 +92,147 @@ def emit(line):
 def nap(seconds):
     """time.sleep in slices so a stop request is noticed within STOP_NAP seconds."""
     end = time.time() + seconds
-    while time.time() < end and not STOP_FILE.exists():
+    while time.time() < end and not stop_request(WORKER):
         time.sleep(min(STOP_NAP, max(0.0, end - time.time())))
 
 
-def tripo_balance():
-    run = subprocess.run(['node', str(ROOT / 'tools/tripo_pipeline/studio.mjs'), 'balance'],
-                         capture_output=True, text=True, encoding='utf-8', cwd=ROOT, timeout=300)
+# ------------------------------------------------------------------ gate (PAUSE / CONVERT_HOLD) and graceful stop
+
+def batch_file(name):
+    return ROOT / '.codex_jobs' / '_batch' / name
+
+
+def read_json(path):
     try:
-        return json.loads(run.stdout.strip().splitlines()[-1])['credits']
-    except (IndexError, ValueError, KeyError):
+        data = json.loads(path.read_text(encoding='utf-8-sig'))
+    except (OSError, ValueError):
         return None
+    return data if isinstance(data, dict) else None
+
+
+def conversions_blocked():
+    """Why no job may start now, else None: CONVERT_HOLD exists, or PAUSE exists and its scope covers conversions (a PAUSE
+    without a readable scope counts)."""
+    hold = batch_file('CONVERT_HOLD')
+    if hold.exists():
+        return f'CONVERT_HOLD: {(read_json(hold) or {}).get("reason") or "conversion hold"}'
+    if PAUSE.exists():
+        scope = (read_json(PAUSE) or {}).get('scope')
+        if not isinstance(scope, list) or 'conversions' in scope:
+            return 'PAUSE file'
+    return None
+
+
+_IDENTITY = []
+
+
+def own_identity():
+    """(pid, create_time or None) of this process (create_time from psutil when it is installed)."""
+    if not _IDENTITY:
+        try:
+            import psutil
+            created = psutil.Process(os.getpid()).create_time()
+        except Exception:   # noqa: BLE001  no psutil: the pid alone identifies the worker
+            created = None
+        _IDENTITY.append((os.getpid(), created))
+    return _IDENTITY[0]
+
+
+def names_me(data):
+    """True when a stop request names this process (pid and, when both sides know it, create_time within 1 s)."""
+    pid, created = own_identity()
+    try:
+        if int(data.get('pid')) != pid:
+            return False
+        if created is not None and data.get('create_time') is not None:
+            return abs(float(data['create_time']) - created) < 1
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def worker_files(worker):
+    return batch_file(f'convert_worker{worker}.stop'), batch_file(f'convert_worker{worker}.stopping')
+
+
+def stop_request(worker):
+    """The stop file addressed to this process, else None: convert_worker<N>.stop naming our pid/create_time; for worker 1
+    also the legacy bare convert_worker.stop."""
+    stop, _ = worker_files(worker)
+    data = read_json(stop) if stop.exists() else None
+    if data and names_me(data):
+        return stop
+    if worker == 1 and STOP_FILE.exists():
+        return STOP_FILE
+    return None
+
+
+def clear_stale_stop(worker):
+    """At start: remove this worker number's .stop / .stopping files that name a dead process (a request for an earlier
+    worker that never saw it), and the legacy bare file for worker 1."""
+    for path in worker_files(worker):
+        if not path.exists():
+            continue
+        data = read_json(path) or {}
+        try:
+            pid = int(data.get('pid') or 0)
+        except (TypeError, ValueError):
+            pid = 0
+        if not portable.pid_alive(pid) or (pid == os.getpid() and not names_me(data)):
+            path.unlink(missing_ok=True)
+    if worker == 1:
+        STOP_FILE.unlink(missing_ok=True)   # a stop requested before this start is stale
+
+
+def honour_stop(worker, path):
+    """Acknowledge (convert_worker<N>.stopping), finish and offload like the idle exit, then remove both files."""
+    _, stopping = worker_files(worker)
+    if path != STOP_FILE:
+        stopping.write_text(json.dumps({'pid': os.getpid(), 'time': datetime.now().isoformat(timespec='seconds')}),
+                            encoding='utf-8')
+    else:
+        path.unlink(missing_ok=True)
+    emit('STOP requested; exiting')
+    finish()
+    if path != STOP_FILE:
+        path.unlink(missing_ok=True)
+        stopping.unlink(missing_ok=True)
+
+
+# ------------------------------------------------------------------ Tripo balance
+
+def read_tripo_balance(wait=None):
+    """(credits, None) from `studio.mjs balance` under the Tripo browser lock, or (None, why) when it cannot be read: the
+    browser is busy past `wait` (default BALANCE_LOCK_WAIT) seconds, studio.mjs times out or exits non-zero, or its last line
+    is not JSON with a numeric, non-negative `credits`. Callers must treat (None, why) as unknown, never as zero."""
+    wait = BALANCE_LOCK_WAIT if wait is None else wait
+    try:
+        with tripo_browser_lock(ROOT, what=f'convert_queue balance (worker {WORKER})', wait=wait,
+                                announce=lambda text: emit(f'BALANCE: {text}')):
+            run = subprocess.run(['node', str(ROOT / 'tools/tripo_pipeline/studio.mjs'), 'balance'],
+                                 capture_output=True, text=True, encoding='utf-8', errors='replace', cwd=ROOT, timeout=300)
+    except TripoBrowserBusy as error:
+        return None, str(error)
+    except subprocess.TimeoutExpired:
+        return None, 'studio.mjs balance timed out after 300 s'
+    except OSError as error:
+        return None, f'studio.mjs balance could not run: {error}'
+    lines = (run.stdout or '').strip().splitlines()
+    if run.returncode != 0:
+        tail = ' | '.join(((run.stderr or '').strip().splitlines() or lines)[-2:])[:200]
+        return None, f'studio.mjs balance exit {run.returncode}' + (f': {tail}' if tail else '')
+    try:
+        credits = json.loads(lines[-1])['credits']
+    except (IndexError, ValueError, KeyError, TypeError):
+        return None, 'studio.mjs balance printed no JSON balance'
+    if isinstance(credits, bool) or not isinstance(credits, (int, float)) or credits < 0 or credits != credits:
+        return None, f'studio.mjs balance gave no numeric balance ({credits!r})'
+    return credits, None
+
+
+def tripo_balance():
+    """The Tripo balance or None when it cannot be read (see read_tripo_balance; None is unknown, never zero)."""
+    return read_tripo_balance()[0]
 
 
 def fails(name):
@@ -212,28 +360,30 @@ def main(argv=None):
     parser.add_argument('--fallback', choices=('hyper3d', 'pixal3d'), default='hyper3d',
                         help='backend for the modules left when the Tripo credits run out (default hyper3d)')
     args = parser.parse_args(argv)
-    global TAG
+    global TAG, WORKER
+    WORKER = args.worker
     if args.worker > 1:
         TAG = f'[w{args.worker}] '
         profile = PROFILES / f'hyper3d-workflow-profile-w{args.worker}'
         if not profile.is_dir():
             raise SystemExit(f'missing profile clone {profile}')
         os.environ['HYPER3D_PROFILE'] = str(profile)
-    sets, tripo_done, idle, low, paused = set(args.sets.split(',')), args.no_tripo, False, False, False
-    STOP_FILE.unlink(missing_ok=True)   # a stop requested before this start is stale
+    sets, tripo_done, idle, low, paused = set(args.sets.split(',')), args.no_tripo, False, False, None
+    last_balance, balance_hold = None, None   # last good Tripo reading (credits, time); the unreadable-balance reason last reported
+    clear_stale_stop(args.worker)
     while True:
-        if STOP_FILE.exists():
-            STOP_FILE.unlink(missing_ok=True)
-            emit('STOP requested; exiting')
-            finish()
+        stop = stop_request(args.worker)
+        if stop:
+            honour_stop(args.worker, stop)
             return
-        if PAUSE.exists():
-            if not paused:
-                emit('PAUSED (PAUSE file); not starting conversions')
-                paused = True
+        blocked = conversions_blocked()
+        if blocked:
+            if paused != blocked:
+                emit(f'PAUSED ({blocked}); not starting conversions')
+                paused = blocked
             nap(min(args.poll, 30))
             continue
-        paused = False
+        paused = None
         free = shutil.disk_usage(ROOT).free
         if free < MIN_FREE:
             if not low:
@@ -267,13 +417,30 @@ def main(argv=None):
         if args.backend == 'pixal3d':
             code = convert(job, ['--backend', 'pixal3d'])
         elif not tripo_done:
-            balance = tripo_balance()
+            balance, problem = read_tripo_balance()
+            if balance is None:
+                # unknown is not zero (finding 4): no fallback backend, tripo_done unchanged; hold the job and read again
+                if balance_hold != problem:
+                    last = (f'; last good balance {last_balance[0]} at {last_balance[1]}' if last_balance else '')
+                    emit(f'HOLD {job.name}: Tripo balance unreadable ({problem}); not converting it on any backend, '
+                         f'retrying in {min(args.poll, BALANCE_RETRY)} s{last}')
+                    balance_hold = problem
+                release(job.name)
+                nap(min(args.poll, BALANCE_RETRY))
+                continue
+            balance_hold = None
+            last_balance = (balance, datetime.now().isoformat(timespec='seconds'))
             emit(f'BALANCE tripo {balance}')
-            submits = max(0, ((balance or 0) - args.reserve) // TRIPO_COST)
+            submits = max(0, (balance - args.reserve) // TRIPO_COST)
             if submits:
                 code = convert(job, ['--max-submits', str(submits)])
-            if balance is not None and balance - args.reserve < TRIPO_COST * 2:
-                tripo_done = (tripo_balance() or 0) - args.reserve < TRIPO_COST
+            if balance - args.reserve < TRIPO_COST * 2:
+                after, problem = read_tripo_balance()
+                if after is None:
+                    emit(f'BALANCE tripo unreadable after {job.name} ({problem}); Tripo stays on, read again before the next job')
+                else:
+                    last_balance = (after, datetime.now().isoformat(timespec='seconds'))
+                    tripo_done = after - args.reserve < TRIPO_COST
         name = job.name
         if code == 3 and args.tripo_only and args.backend == 'tripo':
             emit(f'STOP {name}: Tripo credits exhausted and --tripo-only is set; no Hyper3D fallback, worker exiting')

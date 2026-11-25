@@ -18,6 +18,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from native_browser import PROFILE, BINARY, GECKODRIVER, check_profile  # noqa: E402
+from browser_lock import BrowserLock  # noqa: E402
 from job_state import BASE, MINE  # noqa: E402
 from rodin_backend import SeleniumRodin, classify_auth  # noqa: E402
 
@@ -55,6 +56,8 @@ def main():
             raise SystemExit(f'refusing to click {text!r}')
     out = Path(args.out) if args.out else HERE / 'probe' / datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
     out.mkdir(parents=True, exist_ok=True)
+    # Hyper3D browser lock (browser_lock.py), taken before the profile check and held for the life of this process
+    profile_lock = BrowserLock().acquire()  # noqa: F841
     try:
         check_profile(PROFILE)
     except ValueError as exc:

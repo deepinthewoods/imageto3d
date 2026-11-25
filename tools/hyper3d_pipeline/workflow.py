@@ -17,6 +17,7 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
 
+from browser_lock import open_profile
 from job_state import Job, BASE, model_id, verify_zip, atomic_json, now
 from native_browser import PROFILE, BINARY, check_profile, firefox_service, firefox_extra_args
 from platform_compat import lock_nonblocking
@@ -306,7 +307,6 @@ def main():
                 raise ValueError('Saved export changed; inspect before continuing')
             print('Already complete:', job.data['output']['path'])
             return
-        check_profile(PROFILE)
         options = Options()
         options.page_load_strategy = "eager"
         options.binary_location = BINARY
@@ -318,17 +318,22 @@ def main():
         options.set_preference('browser.download.dir', str(Path.home()/'Downloads'))
         options.set_preference('browser.download.useDownloadDir', True)
         options.set_preference('browser.helperApps.neverAsk.saveToDisk', 'application/zip,application/octet-stream,application/x-zip-compressed')
-        driver = webdriver.Firefox(service=firefox_service(), options=options)
-        driver.set_window_size(1500, 1000)
-        driver.set_page_load_timeout(45)
+        # the Hyper3D browser lock (browser_lock.py) is taken before the profile check and held until Firefox quits
+        driver, browser_lock = open_profile(lambda: check_profile(PROFILE),
+                                            lambda: webdriver.Firefox(service=firefox_service(), options=options))
         try:
+            driver.set_window_size(1500, 1000)
+            driver.set_page_load_timeout(45)
             advance(driver, job, args.allow_paid, args.accept_preview, args.inspect)
         except (Exception, KeyboardInterrupt) as exc:
             job.save('interrupted', last_error=type(exc).__name__ + ': ' + str(exc).splitlines()[0])
             screenshot(driver, job, 'interrupted')
             raise
         finally:
-            driver.quit()
+            try:
+                driver.quit()
+            finally:
+                browser_lock.release()
 
 
 if __name__ == '__main__':

@@ -24,7 +24,15 @@ new task field only when it is (re)started.
 While .codex_jobs/_batch/PAUSE exists with "views" in its scope (tools/pipeline_supervisor.py: a manual pause; a screen-on
 pause only stops conversions) no new job starts (PAUSED, once); running ones continue.
 
-Events (stdout and .codex_jobs/_batch/events.log): DONE <task> ok|flags=..., RETRY, FAILED, LIMIT until <time>, IDLE, PAUSED.
+Single instance and launch reservation (DESIGN_PHASE4 I.5, review_v2_phase4 finding 10): `run` holds the OS byte lock
+.codex_jobs/_batch/view_runner.lock for its whole life; a second `run` prints a message and exits 1. Before it spawns a job the
+runner writes the task status {state: "launching", job, started} (the job also goes into `jobs`), and only after the spawn
+`running`. On (re)start a `launching` task whose job folder (`<launcher root>/.codex_jobs/<job>`, the monster root for monster
+tasks) exists, or whose launcher process still runs, is adopted as `running`; otherwise it goes back to `pending` (its unused
+job entry is dropped), so a stop between the spawn and the status write can never launch a second job for the same outputs.
+
+Events (stdout and .codex_jobs/_batch/events.log): DONE <task> ok|flags=..., RETRY, FAILED, LIMIT until <time>, IDLE, PAUSED,
+START, ADOPT, RESET.
 """
 import argparse
 import json
@@ -578,8 +586,97 @@ def job_alive(job, status, root=None):
     return (datetime.now() - started).total_seconds() < 5400 + 600
 
 
+INSTANCE_LOCK = 'view_runner.lock'
+LOCK_OFFSET = 1 << 20   # Windows: the locked byte, far past the pid text (as pipeline_supervisor.py / claim_lock.py)
+
+
+def acquire_instance_lock():
+    """The runner's single-instance OS byte lock (BATCH/view_runner.lock); the open handle, or None when another runner
+    holds it. The kernel frees it when the holder dies; the file is never deleted."""
+    path = BATCH / INSTANCE_LOCK
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, 'a+b')
+    try:
+        if os.name == 'nt':
+            import msvcrt
+            handle.seek(LOCK_OFFSET)
+            try:
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            finally:
+                handle.seek(0)
+        else:
+            import fcntl
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    handle.seek(0)
+    handle.truncate()
+    handle.write(f'{os.getpid()}\n'.encode())
+    handle.flush()
+    return handle
+
+
+def launcher_alive(job):
+    """True when a launcher process for `job` still runs (its command line names codex_imagegen.sh and the job)."""
+    if os.name != 'nt':
+        return subprocess.run(['pgrep', '-f', f'codex_imagegen.sh {job} '], capture_output=True).returncode == 0
+    try:
+        import psutil
+    except ImportError:
+        return False
+    for proc in psutil.process_iter(['cmdline']):
+        line = ' '.join(proc.info['cmdline'] or ()).replace('\\', '/')
+        if 'codex_imagegen.sh' in line and f' {job} ' in f'{line} ':
+            return True
+    return False
+
+
+def reconcile_launching():
+    """Start-up: settle every task a previous runner left in `launching` (it stopped between the reservation and the spawn
+    being recorded): adopted as `running` when its job folder exists or its launcher still runs, else back to `pending`."""
+    for path in sorted(STATUS.glob('*.json')):
+        status = load(path)
+        if not isinstance(status, dict) or status.get('state') != 'launching':
+            continue
+        name = path.stem
+        task = load(TASKS / path.name) or {}
+        jobs = status.setdefault('jobs', [])
+        job = status.get('job') or (jobs[-1]['job'] if jobs else None)
+        try:
+            root = launcher_root(task)
+        except ValueError:
+            root = ROOT
+        if job and ((root / '.codex_jobs' / job).exists() or launcher_alive(job)):
+            if not jobs or jobs[-1].get('job') != job:
+                jobs.append({'job': job, 'started': status.get('started') or datetime.now().isoformat(timespec='seconds')})
+            status['state'] = 'running'
+            emit(f'ADOPT {name}: {job} was launched before the runner restarted')
+        else:
+            if jobs and jobs[-1].get('job') == job:
+                jobs.pop()
+            status['state'] = 'pending'
+            emit(f'RESET {name}: {job} was reserved but never launched; pending again')
+        status.pop('job', None)
+        status.pop('started', None)
+        save(path, status)
+
+
 def run(args):
-    """Jobs are tracked by their .codex_jobs/<job>/.done marker, so a restarted runner adopts jobs still in flight."""
+    """Jobs are tracked by their .codex_jobs/<job>/.done marker, so a restarted runner adopts jobs still in flight. One
+    instance only (view_runner.lock); returns 1 at once when another runner holds it."""
+    handle = acquire_instance_lock()
+    if handle is None:
+        print(f'view_batch run is already running ({BATCH / INSTANCE_LOCK} is held); exiting', file=sys.stderr)
+        return 1
+    try:
+        reconcile_launching()
+        return _run_loop(args)
+    finally:
+        handle.close()
+
+
+def _run_loop(args):
     procs = {}
     pause_until, idle_reported, low_disk, paused = 0, False, False, False
     while True:
@@ -679,13 +776,28 @@ def run(args):
                 prompt_file = BATCH / 'prompts' / f'{job}.md'
                 prompt_file.parent.mkdir(parents=True, exist_ok=True)
                 prompt_file.write_text(prompt)
-                procs[task['name']] = subprocess.Popen(
-                    [*SHELL, str(root / 'tools/codex_imagegen.sh'), job, str(prompt_file),
-                     *(fix(r) for r in task['refs'])],
-                    cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                    env={**os.environ, 'CODEX_TIMEOUT': '5400'})
+                # reservation BEFORE the spawn: a runner stopped in between is reconciled at its next start (finding 10)
+                started = datetime.now().isoformat(timespec='seconds')
+                status.update(state='launching', job=job, started=started)
+                status['jobs'].append({'job': job, 'started': started})
+                save(STATUS / f'{task["name"]}.json', status)
+                try:
+                    procs[task['name']] = subprocess.Popen(
+                        [*SHELL, str(root / 'tools/codex_imagegen.sh'), job, str(prompt_file),
+                         *(fix(r) for r in task['refs'])],
+                        cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        env={**os.environ, 'CODEX_TIMEOUT': '5400'})
+                except OSError as exc:   # nothing was started: back to pending, the reservation is dropped
+                    status['jobs'].pop()
+                    status['state'] = 'pending'
+                    status.pop('job', None)
+                    status.pop('started', None)
+                    save(STATUS / f'{task["name"]}.json', status)
+                    emit(f'RETRY {task["name"]}: could not start {job} ({exc})')
+                    continue
                 status['state'] = 'running'
-                status['jobs'].append({'job': job, 'started': datetime.now().isoformat(timespec='seconds')})
+                status.pop('job', None)
+                status.pop('started', None)
                 save(STATUS / f'{task["name"]}.json', status)
                 emit(f'START {job}')
         time.sleep(10)
@@ -728,8 +840,10 @@ def main():
     sub.add_parser('status')
     args = parser.parse_args()
     BATCH.mkdir(parents=True, exist_ok=True)
-    {'add-views': add_views, 'add-fronts': add_fronts, 'add-concepts': add_concepts, 'run': run,
-     'status': show_status}[args.command](args)
+    result = {'add-views': add_views, 'add-fronts': add_fronts, 'add-concepts': add_concepts, 'run': run,
+              'status': show_status}[args.command](args)
+    if args.command == 'run' and result:
+        sys.exit(result)
 
 
 if __name__ == '__main__':

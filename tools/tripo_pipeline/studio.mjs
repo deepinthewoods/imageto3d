@@ -263,13 +263,15 @@ async function collect(){
   record.status='exported';write(record);console.log(JSON.stringify({status:record.status,project_id:record.project_id,...record.studio_result,exports:record.exports}));
  }finally{await context.close();}
 }
-// Read-only: print the account's credit balance as JSON ({"credits": N or null}).
+// Read-only: print the account's credit balance as JSON ({"credits": N or null}). A balance it could not read ({"credits": null})
+// exits 2, so no caller mistakes "unknown" for a reading (review_v2_phase4 finding 4; a browser error exits 1 as before).
 async function balance(){
  const {context,page}=await openStudio('https://studio.tripo3d.ai/workspace/generate');
  try{
   let credits=null;
   for(let i=0;i<20&&credits===null;i++){await page.waitForTimeout(1000);credits=Number((await page.locator('body').innerText()).match(/(\d{1,7})\s*\n\s*Upgrade/)?.[1]??NaN);if(Number.isNaN(credits))credits=null;}
   console.log(JSON.stringify({credits}));
+  if(credits===null){console.error('Tripo balance not found on the page');process.exitCode=2;}
  }finally{await context.close();}
 }
 if(command==='submit')await submit();else if(command==='retry')await retry();else if(command==='balance')await balance();else await collect();

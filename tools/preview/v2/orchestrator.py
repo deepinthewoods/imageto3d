@@ -450,6 +450,23 @@ class Orchestrator:
             return None
         return value
 
+    def _receipt_builder_alive(self, task: dict, result: dict, now: float) -> bool:
+        """A result exists, but the builder of the attempt may still run (review F12): the wrapper confirms the exit with `builder_exited`;
+        otherwise the builder named by the result, the claim or the row must be verifiably gone (an older wrapper's receipt with a normal exit code
+        counts as exited)."""
+        if result.get('builder_exited') is True:
+            return False
+        if 'builder_exited' not in result and not result.get('start_error') and isinstance(result.get('exit'), int) and result['exit'] >= 0:
+            return False
+        claim = self._claim(task) or {}
+        if result.get('builder_pid'):
+            pid, created = result['builder_pid'], result.get('builder_create')
+        elif claim.get('builder_pid'):
+            pid, created = claim['builder_pid'], claim.get('builder_create')
+        else:
+            pid, created = task.get('builder_pid'), task.get('builder_create')
+        return bool(pid) and identity_ok(pid, created, task.get('started'), now)
+
     def _builder_alive(self, task: dict, claim: dict | None, now: float) -> bool:
         """The attempt's builder (from the claim, else the row) is still the live recorded process."""
         claim = claim or {}
@@ -459,8 +476,14 @@ class Orchestrator:
 
     def _check_active(self, task: dict, now: float) -> str:
         """Settle one starting / running / orphan attempt: 'finished', 'lost', 'killed', 'kill_failed', 'adopted' (starting -> running),
-        'orphaned' (running -> orphan: the wrapper died, its builder lives; the slot stays taken) or 'alive'."""
+        'orphaned' (running -> orphan: the wrapper died, its builder lives; the slot stays taken) or 'alive'. A result whose builder is still
+        running (a receipt written before the builder exited, review F12) does not free the slot: the attempt is kept as orphan until it is gone."""
         result = self._read_result(task)
+        if result is not None and self._receipt_builder_alive(task, result, now):
+            if task['state'] != 'orphan' and self.queue.mark_orphan(task['id'], task.get('token')):
+                self.notes.append(f'task {task["id"]}: a result was written while its builder still runs (orphan; the worker slot stays taken)')
+                return 'orphaned'
+            return 'alive'
         if result is not None:
             self._finish(task, result)
             return 'finished'
@@ -488,7 +511,7 @@ class Orchestrator:
         if task['state'] != 'orphan' and same_process(task, now):
             return 'alive'
         result = self._read_result(task)                       # the wrapper may have written it just before it exited
-        if result is not None:
+        if result is not None and not self._receipt_builder_alive(task, result, now):
             self._finish(task, result)
             return 'finished'
         if self._builder_alive(task, claim, now):              # re-check R6: the slot is held until the builder is gone too
@@ -616,21 +639,22 @@ class Orchestrator:
         return (st.st_ino, st.st_ctime_ns)
 
     def reconcile(self) -> dict:
-        """Make the queue agree with the decisions (the queue is a derived cache, review F7 / F9). Idempotent. A missing, empty or repaired
-        database first adopts the surviving attempts (re-check R5); each set is reconciled on its own (a failure is logged, R10)."""
+        """Make the queue agree with the decisions (the queue is a derived cache, review F7 / F9). Idempotent. Every NEW database (missing,
+        replaced, repaired, or the first one this orchestrator sees) first merges the surviving attempts into it by attempt identity, whatever
+        rows it already holds (re-check R5, phase 4 review F12); each set is reconciled on its own (a failure is logged, R10)."""
         out = {'repaired': None, 'adopted': 0, 'recovered': [], 'queued': {}, 'cancelled': 0, 'revoked': [], 'quarantined': [], 'errors': []}
         health = self.queue.check()
         if health.get('corrupt'):
             out['repaired'] = self.repair_queue()
         else:
             ident = self._db_identity()
-            if ident != self._claims_scanned and self.queue.count() == 0:
+            if ident != self._claims_scanned:
                 out['adopted'] = self.adopt_claims()
                 if out['adopted']:
-                    note = f'the queue database was missing or empty: {out["adopted"]} running build(s) re-adopted from their claims'
+                    note = f'the queue database was new or replaced: {out["adopted"]} running build(s) merged back in from their claims'
                     self.notes.append(note)
                     self.queue.event('adopt', note)
-                self._claims_scanned = self._db_identity() if out['adopted'] else ident
+                self._claims_scanned = self._db_identity()
         out['recovered'] = actions.recover_transactions(self.root)
         derived = catalog.derive_all(self.root)
         for name, info in sorted(derived['sets'].items()):
@@ -647,6 +671,10 @@ class Orchestrator:
 
     def _reconcile_set(self, name: str, info: dict, out: dict) -> None:
         if info.get('recovering'):
+            return
+        if info.get('derive_error'):                           # a damaged set (review F14): shown with its error, never acted on
+            text = f'reconcile {name}: skipped, the set could not be derived ({info["derive_error"][:200]})'
+            out['errors'].append(text)
             return
         if info['decisions_error']:
             if info.get('ready') is not None:                   # an active manifest nobody can verify any more (R4)
@@ -676,9 +704,12 @@ class Orchestrator:
     def _cancel_withdrawn(self, derived: dict) -> int:
         """Cancel queued tasks whose approval is gone or changed (and queued bare tasks no approved set needs)."""
         cancelled = 0
+        damaged = {name for name, info in derived['sets'].items() if info.get('derive_error')}
         for task in self.queue.tasks(state='queued', limit=5000):
             if self._approved_in(derived, task):
                 continue
+            if (task['lane'] == 'bare' and damaged) or task.get('set_name') in damaged:
+                continue                                       # a damaged derivation proves nothing about the approval (F14)
             if self.queue.cancel(task['id'], 'no matching approval (reconcile)'):
                 cancelled += 1
         return cancelled
@@ -707,7 +738,7 @@ class Orchestrator:
         with decisions.set_lock(self.root, name):
             catalog.invalidate()
             fresh = catalog.derive_one(self.root, name)
-            if not fresh or fresh.get('ready') is None or fresh.get('recovering'):
+            if not fresh or fresh.get('ready') is None or fresh.get('recovering') or fresh.get('derive_error'):
                 return None
             if fresh['decisions_error']:
                 kind, reason = 'quarantine', quarantine_reason or f'the set decision file is unreadable: {fresh["decisions_error"]}'
@@ -738,9 +769,11 @@ class Orchestrator:
         return {'kept': str(kept) if kept else None, 'adopted': adopted}
 
     def adopt_claims(self) -> int:
-        """Re-insert every attempt that is still alive into a lost / empty / rebuilt queue (re-check R5): each attempt's task file without a
-        result; alive = its claim's wrapper is the recorded live process, or (no usable claim yet) a live process carries its token on the command
-        line. A claim whose wrapper died while its builder still runs is adopted as `orphan` (its slot stays taken, R6). Returns how many."""
+        """Merge every attempt that is still alive into a new / replaced / rebuilt queue (re-check R5, review F12): each attempt's task file
+        without a result; alive = its claim's wrapper is the recorded live process, or its builder is, or (no usable claim yet) a live process
+        carries its token on the command line. Merged by attempt identity (taskqueue.adopt_attempt): a row of the same key that is queued /
+        failed / cancelled / done becomes this running attempt (so it is never started a second time); the same token is already known. A
+        claim whose wrapper died while its builder still runs is adopted as `orphan` (its slot stays taken, R6). Returns how many were merged."""
         if not self.logs.is_dir():
             return 0
         now, adopted, tokens = time.time(), 0, None
@@ -768,12 +801,19 @@ class Orchestrator:
                 (pid, created), started = found, spec_file.stat().st_mtime
             task = source['task']
             try:
-                new_id = self.queue.insert_running(task.get('lane'), task.get('key'), task.get('set'), task.get('unit'), task.get('args') or {},
-                                                   int(source.get('attempt') or 1), source['token'], source.get('log'), pid, created, started,
-                                                   int(task.get('max_attempts') or 3), approval_gen=task.get('approval_gen'))
+                outcome, new_id = self.queue.adopt_attempt(task.get('lane'), task.get('key'), task.get('set'), task.get('unit'),
+                                                           task.get('args') or {}, int(source.get('attempt') or 1), source['token'], source.get('log'),
+                                                           pid, created, started, int(task.get('max_attempts') or 3),
+                                                           approval_gen=task.get('approval_gen'))
             except (taskqueue.QueueError, ValueError, TypeError):
                 continue
-            if new_id is None:
+            if outcome == 'conflict':
+                text = (f'task {new_id}: another live attempt of {task.get("key")} (token {str(source["token"])[:8]}) survives beside the one in '
+                        'the queue; it was not merged (its builder keeps running)')
+                if text not in self.notes:
+                    self.notes.append(text)
+                continue
+            if outcome not in ('inserted', 'merged'):
                 continue
             adopted += 1
             if source.get('builder_pid'):
@@ -964,13 +1004,17 @@ class ServiceManager:
         self.thread = threading.Thread(target=self._loop, name='services', daemon=True)
         self.thread.start()
 
-    def stop(self, timeout: float = 30.0) -> None:
-        """Stop the thread (a request being executed finishes first). The services themselves are never stopped by this."""
+    def stop(self, timeout: float | None = 120.0) -> bool:
+        """Stop the thread (a request being executed finishes first). The services themselves are never stopped by this. True when the thread
+        has exited; False when it still runs after `timeout` (a long stop request): the server then KEEPS its writer lock (review F5), so no
+        second manager can start before this one is gone (the process exit releases the lock)."""
         self.stop_event.set()
         with self.cond:
             self.cond.notify_all()
         if self.thread and self.thread is not threading.current_thread():
             self.thread.join(timeout)
+            return not self.thread.is_alive()
+        return True
 
     def wake(self) -> None:
         """Run a tick now (after a settings change)."""
@@ -1010,9 +1054,9 @@ class ServiceManager:
                 self.services.start(self.root, name, settings)
                 outcome = {'ok': True, 'pending': False, 'message': f'{name} started'}
             elif action == 'stop':
-                outcome = self.services.stop(self.root, name, settings=settings)
+                outcome = self.services.stop(self.root, name, settings=settings, request=req['id'])
             else:
-                outcome = self.services.restart(self.root, name, settings=settings)
+                outcome = self.services.restart(self.root, name, settings=settings, request=req['id'])
             ok, pending, message = True, bool(outcome.get('pending')), str(outcome.get('message') or '')
         except self.services.ServiceError as exc:
             ok, pending, message = False, False, str(exc)
@@ -1038,7 +1082,17 @@ class ServiceManager:
             self._event('tick', str(text))
         return result
 
+    def begin(self) -> None:
+        """The manager's first step, before any tick or request (DESIGN_PHASE4.md I.1): the conversion hold exists before a convert worker is
+        started or adopted. A failure is a manager error (each tick asserts the hold again while no supervisor runs)."""
+        try:
+            for text in self.services.begin_management(self.root):
+                self._event('tick', text)
+        except Exception as exc:  # noqa: BLE001
+            self.errors = (self.errors + [f'begin: {type(exc).__name__}: {exc}'])[-20:]
+
     def _loop(self) -> None:
+        self.begin()
         while not self.stop_event.is_set():
             with self.cond:
                 req = self.requests.pop(0) if self.requests else None
@@ -1103,10 +1157,14 @@ class TripoCheck:
 
     def request(self) -> dict:
         """{ok: true, status: "running", pending: true} once the check started; {ok: false, status: "busy", message} (HTTP 200, the
-        credits.check_tripo shape) while a check runs or a convert_job.py uses the browser profile. The result goes to `view()["last"]`."""
+        credits.check_tripo shape) while a check runs, the Tripo browser lock (DESIGN_PHASE4.md I.3) is held or a convert_job.py uses the
+        browser profile. The result goes to `view()["last"]`."""
+        import credits
         with self.lock:
             if self.thread and self.thread.is_alive():
                 return {'ok': False, 'status': 'busy', 'message': 'a balance check is already running'}
+            if credits.tripo_browser_busy(self.root):
+                return {'ok': False, 'status': 'busy', 'message': 'the Tripo browser profile is in use (browser_tripo.lock is held); check again later'}
             users = self._users()
             if users:
                 return {'ok': False, 'status': 'busy',

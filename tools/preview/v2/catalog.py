@@ -119,15 +119,19 @@ def _job_scan(folder: Path, deps: dict) -> dict:
     record = read_json(folder / '.tripo-job.json')
     top = serve._listing(str(folder), deps) or {}
     retired = '.pixal3d-job.json' in top and '.tripo-job.json' not in top       # a retired Pixal3D job: inventoried, never work
+    problems = []                                   # record fields of the wrong type: ignored, reported (phase 4 review F14)
+    for field, kind in (('modules', list), ('conversion_errors', list), ('module_conversion', dict)):
+        if field in record and record[field] is not None and not isinstance(record[field], kind):
+            problems.append(f'.tripo-job.json: {field} is a {type(record[field]).__name__}, not a {kind.__name__}; ignored')
     modules = []
-    for entry in record.get('modules') or []:
+    for entry in record.get('modules') if isinstance(record.get('modules'), list) else []:
         if isinstance(entry, dict) and isinstance(entry.get('race_gender'), str) and isinstance(entry.get('module'), str):
             modules.append((entry['race_gender'], entry['module']))
     by_view = {(v['name'], v['module']): v['images'] for v in views}
     if not modules:
         modules = sorted(by_view)
     errors = {}
-    for text in record.get('conversion_errors') or []:
+    for text in record.get('conversion_errors') if isinstance(record.get('conversion_errors'), list) else []:
         if isinstance(text, str) and ': ' in text:
             key, _, message = text.partition(': ')
             errors[key] = message
@@ -144,11 +148,17 @@ def _job_scan(folder: Path, deps: dict) -> dict:
                 warnings[key] = found
             if levels:
                 review_levels[key] = levels
-    return {'record_set': record.get('set') if isinstance(record.get('set'), str) else None,
-            'job_id': record.get('job_id') if isinstance(record.get('job_id'), str) else None,
-            'state': record.get('state'), 'conversion': record.get('conversion'), 'retired': retired,
-            'modules': sorted(set(modules)), 'views': by_view, 'errors': errors, 'backends': backends,
-            'warnings': warnings, 'review_levels': review_levels, 'converted': sorted(conversion)}
+    return {'record_set': record.get('set') if isinstance(record.get('set'), str) and NAME.fullmatch(record['set']) else None,
+            'job_id': record.get('job_id') if isinstance(record.get('job_id'), str) and NAME.fullmatch(record['job_id']) else None,
+            'state': record.get('state') if isinstance(record.get('state'), str) else None, 'conversion': record.get('conversion'),
+            'retired': retired, 'modules': sorted(set(modules)), 'views': by_view, 'errors': errors, 'backends': backends,
+            'warnings': warnings, 'review_levels': review_levels, 'converted': sorted(conversion), 'problems': problems, 'scan_error': None}
+
+
+def _broken_job(error: str) -> dict:
+    """What a job folder whose scan failed contributes (F14): nothing but the error, so the set is shown as damaged."""
+    return {'record_set': None, 'job_id': None, 'state': None, 'conversion': None, 'retired': False, 'modules': [], 'views': {}, 'errors': {},
+            'backends': {}, 'warnings': {}, 'review_levels': {}, 'converted': [], 'problems': [], 'scan_error': error}
 
 
 def job_set(name: str, races: list[str]) -> str:
@@ -173,7 +183,10 @@ def scan_jobs(root: Path, races: list[str]) -> tuple[dict[str, list[dict]], list
         for name in sorted(n for n, is_dir in (serve._listing(str(parent)) or {}).items() if is_dir and not n.startswith('.') and '--' in n):
             folder = parent / name
             seen.add(str(folder))
-            info = serve._memo('v2job', root, folder, lambda deps, f=folder: _job_scan(f, deps))
+            try:
+                info = serve._memo('v2job', root, folder, lambda deps, f=folder: _job_scan(f, deps))
+            except Exception as exc:  # noqa: BLE001  (one damaged job never stops the scan of the others, F14)
+                info = _broken_job(f'{stage}/{name}: scan failed ({type(exc).__name__}: {exc})')
             set_name = job_set(name, races)
             job_id = info['job_id'] or name.partition('--')[2]
             job = info | {'name': name, 'stage': stage, 'rel': f'{stage}/{name}', 'id': job_id, 'set': set_name,
@@ -260,7 +273,11 @@ def ready_facts(path: Path) -> dict:
 def scan_models(root: Path, races: list[str], plan: dict[str, list[str]]) -> dict[str, dict]:
     """{set id: {'jobs': merged over its model dirs, 'decisions', 'decisions_error'}}; `plan` = {set id: [models/ folder names]} (model_sets())."""
     def one(model_set: str) -> dict:
-        return serve._memo('v2models', root, root / 'models' / model_set, lambda deps: _models_scan(root, model_set, races, deps))
+        try:
+            return serve._memo('v2models', root, root / 'models' / model_set, lambda deps: _models_scan(root, model_set, races, deps))
+        except Exception as exc:  # noqa: BLE001  (isolated per model folder, F14: its set is shown damaged)
+            return {'jobs': {}, 'decisions': None, 'decisions_error': None, 'ready': None,
+                    'scan_error': f'models/{model_set}: scan failed ({type(exc).__name__}: {exc})'}
     wanted = sorted({ms for sets in plan.values() for ms in sets})
     scanned = dict(zip(wanted, serve.POOL.map(one, wanted)))
     out = {}
@@ -270,7 +287,9 @@ def scan_models(root: Path, races: list[str], plan: dict[str, list[str]]) -> dic
             for job_id, by_race in scanned[ms]['jobs'].items():
                 merged.setdefault(job_id, {}).update(by_race)
         own = scanned.get(set_name) or {'decisions': None, 'decisions_error': None}
-        out[set_name] = {'jobs': merged, 'decisions': own['decisions'], 'decisions_error': own['decisions_error'], 'ready': own.get('ready')}
+        errors = [scanned[ms]['scan_error'] for ms in sets if scanned[ms].get('scan_error')]
+        out[set_name] = {'jobs': merged, 'decisions': own['decisions'], 'decisions_error': own['decisions_error'], 'ready': own.get('ready'),
+                         'scan_error': '; '.join(errors) or None}
     return out
 
 
@@ -455,6 +474,8 @@ def derive_set(root: Path, set_name: str, jobs: list[dict], models: dict, races:
     for unit in units:
         job = job_by_id.get(unit['job']) if unit['job'] else None
         unit['progress'] = progress.unit_progress(root, set_name, unit, job, facts) if facts is not None else None
+        if job and job.get('problems'):
+            unit['warnings'] = list(unit['warnings']) + [p for p in job['problems'] if p not in unit['warnings']]
     live = [u for u in units if u['status'] != 'dropped']
     blocking = [u for u in live if u['status'] not in ('reduced', 'pin_missing')]
     kind = _kind_of(modules)
@@ -495,6 +516,37 @@ def derive_all(root: Path) -> dict:
     return _cached('derive', root, lambda: _derive_all(root))
 
 
+def _scan_errors(jobs: list[dict], models: dict | None) -> list[str]:
+    return [job['scan_error'] for job in jobs if job.get('scan_error')] + ([models['scan_error']] if (models or {}).get('scan_error') else [])
+
+
+def damaged_set(set_name: str, jobs: list[dict], models: dict | None, error: str) -> dict:
+    """The info of a set whose scan or derivation failed (phase 4 review F14): visible (Approved tab, with the error as a badge), READ-ONLY
+    (`decisions_error` is set, so every write refuses) and skipped by the orchestrator's reconcile (`derive_error`: no task is queued or
+    cancelled and no ready.json is revoked on the strength of a broken derivation)."""
+    try:
+        dec, _dec_error = decisions.interpret(set_name, (models or {}).get('decisions'), (models or {}).get('decisions_error'))
+    except Exception:  # noqa: BLE001
+        dec, _dec_error = decisions.interpret(set_name, None, None)
+    return {'name': set_name, 'kind': 'legacy', 'modules': [], 'stage': 'approved', 'units': [], 'builds': {}, 'build_counts': {},
+            'bare_snaps': {}, 'bare_builds': {}, 'amount_changed': False, 'decisions': dec, 'decisions_error': f'the set could not be derived: {error}',
+            'derive_error': error, 'rev': dec['rev'], 'jobs': jobs, 'required_races': [], 'not_converted': [], 'locked': bool(dec['lod_approval']),
+            'races': [], 'ready': (models or {}).get('ready'), 'not_completed': [], 'recovering': []}
+
+
+def _derive_or_damaged(root: Path, set_name: str, jobs: list[dict], models: dict | None, races: list[str], fronts: dict | None,
+                       intents: list[dict], facts=None) -> dict:
+    """derive_set, isolated per set (F14): a scan error of one of its jobs / model folders or an exception of the derivation gives the damaged
+    set (with its error) instead of breaking the derivation of every set."""
+    errors = _scan_errors(jobs, models)
+    if errors:
+        return damaged_set(set_name, jobs, models, '; '.join(errors)[:500])
+    try:
+        return derive_set(root, set_name, jobs, models, races, fronts, intents, facts)
+    except Exception as exc:  # noqa: BLE001
+        return damaged_set(set_name, jobs, models, f'{type(exc).__name__}: {exc}'[:500])
+
+
 def _derive_all(root: Path) -> dict:
     races = serve._base_races(root)
     jobs, retired = scan_jobs(root, races)
@@ -502,18 +554,20 @@ def _derive_all(root: Path) -> dict:
     fronts = fronts_index(root, races)
     intents = guard.list_intents(root)
     facts = progress.Facts(root, races, lambda prefix: job_set(prefix, races))
-    sets = {name: derive_set(root, name, jobs[name], models.get(name), races, fronts.get(name), intents, facts) for name in sorted(jobs)}
+    sets = {name: _derive_or_damaged(root, name, jobs[name], models.get(name), races, fronts.get(name), intents, facts) for name in sorted(jobs)}
     return {'races': races, 'sets': sets, 'retired': retired}
 
 
 def derive_one(root: Path, set_name: str) -> dict | None:
-    """One set, derived fresh from the folders (no TTL cache): what a write must check against, under the set's lock."""
+    """One set, derived fresh from the folders (no TTL cache): what a write must check against, under the set's lock (a damaged set comes back
+    as damaged_set: read-only)."""
     races = serve._base_races(root)
     jobs, _retired = scan_jobs(root, races)
     if set_name not in jobs:
         return None
     models = scan_models(root, races, {set_name: model_sets(set_name, jobs[set_name])})
-    return derive_set(root, set_name, jobs[set_name], models[set_name], races, fronts_index(root, races).get(set_name), guard.list_intents(root))
+    return _derive_or_damaged(root, set_name, jobs[set_name], models[set_name], races, fronts_index(root, races).get(set_name),
+                              guard.list_intents(root))
 
 
 # ------------------------------------------------------------------------------------------------------------------ cards
@@ -557,7 +611,9 @@ def set_card(root: Path, info: dict) -> dict:
     counts = _counts(units)
     badges = []
     thumbnail = model = kind = None
-    if info['decisions_error']:
+    if info.get('derive_error'):
+        badges.append({'text': f'damaged: {info["derive_error"][:160]}', 'tone': 'error'})
+    elif info['decisions_error']:
         badges.append({'text': 'decisions unreadable', 'tone': 'error'})
     if info.get('recovering'):
         badges.append({'text': 'recovering: read-only', 'tone': 'error'})

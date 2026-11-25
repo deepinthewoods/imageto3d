@@ -173,6 +173,7 @@ export function mountQueue(container) {
     unmount() {
       alive = false;
       unsubscribe();
+      sections.dispose();
       clearInterval(timer);
       container.replaceChildren();
     },

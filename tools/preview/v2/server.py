@@ -57,7 +57,7 @@ STATIC_TYPES = {'.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'te
                 '.png': 'image/png', '.svg': 'image/svg+xml', '.ico': 'image/x-icon', '.map': 'application/json', '.txt': 'text/plain',
                 '.woff': 'font/woff', '.woff2': 'font/woff2', '.wasm': 'application/wasm', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.webp': 'image/webp'}
 FILE_SUFFIXES = ('.png', '.jpg', '.jpeg', '.webp', '.glb')
-BODY_LIMIT = 4096
+BODY_LIMIT = 16384
 THUMB_LIMIT = 8 * 1024 * 1024
 PLACEHOLDER = ('<!doctype html><html><head><meta charset="utf-8"><title>Preview v2</title></head><body>'
                '<p>Preview v2 backend is running. The web app (tools/preview/web/index.html) has not been written yet.</p></body></html>')
@@ -146,15 +146,22 @@ def queue_extras(root: Path, ctx: dict) -> dict:
         disk = {'free': usage.free, 'total': usage.total, 'path': str(root)}
     except OSError as exc:
         disk = {'free': None, 'total': None, 'error': str(exc)}
+    try:
+        import services
+        hold = services.hold_state(root)
+    except Exception as exc:  # noqa: BLE001  (display only)
+        hold = {'reason': f'unknown ({type(exc).__name__}: {exc})'}
     return {'services': services_view(ctx), 'mode': modes.snapshot(root), 'credits': credits_view(root, ctx), 'disk': disk,
             'views': progress.views_section(root), 'conversions': progress.conversions_section(root),
-            'holds': progress.holds_section(root, lambda prefix: catalog.job_set(prefix, races)), 'settings': app_settings.load(root)}
+            'holds': progress.holds_section(root, lambda prefix: catalog.job_set(prefix, races)), 'settings': app_settings.load(root),
+            'settings_health': app_settings.health(root, reload=False), 'convert_hold': hold}
 
 
 def status_of(root: Path, ctx: dict) -> dict:
     """`state.status` (DESIGN_PHASE4.md H): the header chip. services_problems is None without --manage-services."""
     manager = ctx.get('services')
-    return progress.status_summary(root, manager.problems() if manager else None, queue_health(root))
+    return progress.status_summary(root, manager.problems() if manager else None, queue_health(root),
+                                   scanned=(manager.last_tick is not None) if manager else None)
 
 
 # ------------------------------------------------------------------------------------------------------- path containment
@@ -294,7 +301,7 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
             elif path == '/api/v2/state':
                 data = dict(catalog.state(root))
                 data['server'] = {'read_only': bool(ctx.get('read_only')), 'message': ctx.get('message'), 'notes': list(ctx.get('notes') or []),
-                                  'orchestrator': bool(ctx.get('orchestrator'))}
+                                  'orchestrator': bool(ctx.get('orchestrator')), 'manage_services': bool(ctx.get('services')), 'pid': os.getpid()}
                 data['queue_health'] = queue_health(root)
                 data['status'] = status_of(root, ctx)
                 self.send_json(200, data)
@@ -400,14 +407,18 @@ class Server(ThreadingHTTPServer):
     services: orchestrator.ServiceManager | None = None
 
     def server_close(self) -> None:
+        keep_lock = False
         if self.services:
-            self.services.stop()               # the services thread only: the services themselves keep running
-            self.services = None
+            # the services thread only: the services themselves keep running. A thread still busy with a stop request keeps the writer lock
+            # held until this process exits (review F5): no other server may start a second manager meanwhile.
+            keep_lock = not self.services.stop()
+            if not keep_lock:
+                self.services = None
         if self.orchestrator:
             self.orchestrator.stop()           # the thread and its lock; running builds are detached and keep going
             self.orchestrator = None
         super().server_close()
-        if self.lock:
+        if self.lock and not keep_lock:
             self.lock.release()
             self.lock = None
 

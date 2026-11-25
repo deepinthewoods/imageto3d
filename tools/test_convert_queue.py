@@ -1,0 +1,289 @@
+"""convert_queue.py: the Tripo balance (review_v2_phase4 finding 4), the CONVERT_HOLD / PAUSE gate (DESIGN_PHASE4 I.1), the
+Tripo browser lock around the balance check (I.3, finding 8) and the per-worker graceful stop (I.2, finding 6).
+Temp roots; studio.mjs and convert_job.py are never run.
+
+    python -X utf8 -m pytest tools/test_convert_queue.py -q
+"""
+import json
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import convert_queue as cq  # noqa: E402
+import tripo_browser_lock as tbl  # noqa: E402
+
+REAL_NAP = cq.nap
+
+
+def done(stdout='', returncode=0, stderr=''):
+    return subprocess.CompletedProcess([], returncode, stdout, stderr)
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.batch = self.root / '.codex_jobs' / '_batch'
+        (self.batch / 'convert_locks').mkdir(parents=True)
+        self.job = self.root / 'processing' / 'set_a--abc'
+        self.naps, self.finished, self.converts = [], [], []
+        self.on_nap = None
+        patches = [mock.patch.object(cq, 'ROOT', self.root), mock.patch.object(cq, 'EVENTS', self.batch / 'convert_events.log'),
+                   mock.patch.object(cq, 'LOCKS', self.batch / 'convert_locks'), mock.patch.object(cq, 'PAUSE', self.batch / 'PAUSE'),
+                   mock.patch.object(cq, 'STOP_FILE', self.batch / 'convert_worker.stop'), mock.patch.object(cq, 'MIN_FREE', 0),
+                   mock.patch.object(cq, 'nap', self.nap), mock.patch.object(cq, 'finish', self.finish),
+                   mock.patch.object(cq, 'release', lambda name: None),
+                   mock.patch.object(cq, 'convert', lambda job, args: self.converts.append(list(args)) or self.code),
+                   mock.patch.object(cq.portable, 'process_running', lambda pattern: pattern.startswith('view_batch')),
+                   mock.patch.object(cq, 'WORKER', 1)]
+        self.code = 0
+        for patch in patches:
+            patch.start()
+        self.addCleanup(lambda: [p.stop() for p in reversed(patches)])
+
+    def nap(self, seconds):
+        self.naps.append(seconds)
+        if self.on_nap:
+            self.on_nap(len(self.naps))
+
+    def finish(self, name=None):
+        self.finished.append((name, self.stopping_exists()))
+
+    def stopping_exists(self, worker=1):
+        return (self.batch / f'convert_worker{worker}.stopping').exists()
+
+    def events(self):
+        path = self.batch / 'convert_events.log'
+        return path.read_text(encoding='utf-8').splitlines() if path.exists() else []
+
+    def my_stop(self, worker=1, **extra):
+        pid, created = cq.own_identity()
+        path = self.batch / f'convert_worker{worker}.stop'
+        path.write_text(json.dumps({'pid': pid, 'create_time': created, 'request': 'r1', 'time': 'now', **extra}))
+        return path
+
+    def stop_on_nap(self, n=1, worker=1):
+        def on_nap(count):
+            if count >= n:
+                self.my_stop(worker)
+        self.on_nap = on_nap
+
+
+class BalanceReadTests(Base):
+    def read(self, result):
+        with mock.patch.object(cq.subprocess, 'run', side_effect=[result] if not callable(result) else result):
+            return cq.read_tripo_balance(wait=0)
+
+    def test_only_a_successful_numeric_reading_counts(self):
+        self.assertEqual(self.read(done('noise\n{"credits": 120}\n')), (120, None))
+        self.assertEqual(self.read(done('{"credits": 0}')), (0, None))
+        for result, why in ((done('{"credits": null}', 2, 'Tripo balance not found'), 'exit 2'),
+                            (done('{"credits": null}'), 'no numeric balance'),          # an old studio.mjs: exit 0 with null
+                            (done('{"credits": true}'), 'no numeric balance'),
+                            (done('{"credits": -5}'), 'no numeric balance'),
+                            (done('{"credits": "12"}'), 'no numeric balance'),
+                            (done('Error: page crashed', 1, 'TimeoutError: x'), 'exit 1: TimeoutError'),
+                            (done('not json'), 'no JSON balance'),
+                            (done(''), 'no JSON balance')):
+            credits, problem = self.read(result)
+            self.assertIsNone(credits, result)
+            self.assertIn(why, problem)
+
+    def test_a_timeout_or_missing_node_is_unreadable(self):
+        def timeout(*a, **k):
+            raise subprocess.TimeoutExpired('node', 300)
+
+        def missing(*a, **k):
+            raise FileNotFoundError('node')
+        self.assertEqual(self.read(timeout), (None, 'studio.mjs balance timed out after 300 s'))
+        self.assertIn('could not run', self.read(missing)[1])
+
+    def test_the_check_runs_under_the_tripo_browser_lock_and_reports_busy(self):
+        seen = []
+
+        def run(cmd, **kw):
+            with open(tbl.lock_path(self.root), 'a+b') as probe:
+                seen.append(not tbl.try_lock(probe))
+            return done('{"credits": 50}')
+        self.assertEqual(self.read(run), (50, None))
+        self.assertEqual(seen, [True])
+        with tbl.tripo_browser_lock(self.root, what='v2 balance check'):
+            with mock.patch.object(cq.subprocess, 'run', side_effect=AssertionError('ran while busy')):
+                credits, problem = cq.read_tripo_balance(wait=0)
+        self.assertIsNone(credits)
+        self.assertIn('Tripo browser busy', problem)
+
+
+class BalanceLoopTests(Base):
+    """main(): an unreadable balance holds the job; it never falls back to Hyper3D and never ends Tripo for the worker."""
+
+    def run_main(self, balances, next_jobs=None, argv=()):
+        readings = iter(balances)
+        jobs = iter(next_jobs or [(self.job, True)] * 10)
+        with mock.patch.object(cq, 'read_tripo_balance', lambda wait=None: next(readings)), \
+                mock.patch.object(cq, 'next_job', lambda sets: next(jobs)):
+            cq.main(['--sets', 'set_a', '--poll', '1', *argv])
+
+    def test_an_unreadable_balance_never_dispatches_hyper3d(self):
+        """The reviewer's case: auto mode, the balance missing -> before the fix `--backend hyper3d --allow-paid` ran."""
+        self.stop_on_nap(1)
+        self.run_main([(None, 'studio.mjs balance exit 2: Tripo balance not found')])
+        self.assertEqual(self.converts, [])                         # nothing ran, on any backend
+        events = self.events()
+        self.assertTrue(any('HOLD set_a--abc: Tripo balance unreadable (studio.mjs balance exit 2' in l for l in events), events)
+        self.assertFalse(any('PARTIAL' in l or 'FAILED' in l for l in events), events)
+        self.assertFalse((self.batch / 'convert_locks' / 'set_a--abc.fails').exists())   # a hold is not a failure
+
+    def test_after_a_hold_the_balance_is_read_again_and_tripo_continues(self):
+        self.stop_on_nap(2)
+        self.run_main([(None, 'busy'), (200, None), (None, 'busy')])
+        self.assertEqual(self.converts, [['--max-submits', '8']])   # Tripo, not Hyper3D, once the balance was readable
+        self.assertTrue(any(l.endswith('BALANCE tripo 200') for l in self.events()))
+
+    def test_an_unreadable_recheck_does_not_end_tripo(self):
+        """Low balance, then the re-check fails: Tripo stays on (before the fix `(None or 0) < 25` set tripo_done)."""
+        self.code = 0
+        self.stop_on_nap(1)
+        self.run_main([(30, None), (None, 'exit 1'), (None, 'exit 1')])
+        self.assertEqual(self.converts, [['--max-submits', '1']])
+        events = self.events()
+        self.assertTrue(any('BALANCE tripo unreadable after set_a--abc (exit 1); Tripo stays on' in l for l in events), events)
+        self.assertTrue(any('HOLD set_a--abc: Tripo balance unreadable (exit 1)' in l and 'last good balance 30' in l
+                            for l in events), events)                # the next job read the balance again
+
+    def test_a_readable_zero_balance_still_falls_back(self):
+        self.code = 3
+        self.on_nap = None
+        jobs = [(self.job, True), (None, False)]
+        self.stop_on_nap(1)
+        self.run_main([(10, None), (10, None)], next_jobs=jobs)
+        self.assertEqual(self.converts, [['--backend', 'hyper3d', '--allow-paid', '--accept-preview']])
+
+    def test_the_hold_is_reported_once_per_reason(self):
+        self.stop_on_nap(3)
+        self.run_main([(None, 'busy')] * 3)
+        self.assertEqual(sum('HOLD set_a--abc' in l for l in self.events()), 1)
+
+
+class GateTests(Base):
+    def test_convert_hold_starts_no_job(self):
+        (self.batch / 'CONVERT_HOLD').write_text(json.dumps({'since': 'x', 'reason': 'supervisor restart'}))
+        self.stop_on_nap(1)
+        with mock.patch.object(cq, 'next_job', side_effect=AssertionError('took a job')):
+            cq.main(['--sets', 'x', '--no-tripo'])
+        self.assertTrue(any('PAUSED (CONVERT_HOLD: supervisor restart); not starting conversions' in l for l in self.events()))
+
+    def test_pause_scope_decides(self):
+        self.assertIsNone(cq.conversions_blocked())
+        cq.PAUSE.write_text(json.dumps({'scope': ['views']}))
+        self.assertIsNone(cq.conversions_blocked())
+        cq.PAUSE.write_text(json.dumps({'scope': ['conversions']}))
+        self.assertEqual(cq.conversions_blocked(), 'PAUSE file')
+        cq.PAUSE.write_text('not json')
+        self.assertEqual(cq.conversions_blocked(), 'PAUSE file')
+        cq.PAUSE.unlink()
+        (self.batch / 'CONVERT_HOLD').write_text('')
+        self.assertEqual(cq.conversions_blocked(), 'CONVERT_HOLD: conversion hold')
+
+
+class WorkerStopTests(Base):
+    def test_worker_honours_its_own_file_acknowledges_finishes_then_cleans_up(self):
+        self.stop_on_nap(1)
+        with mock.patch.object(cq, 'next_job', lambda sets: (None, False)):
+            cq.main(['--sets', 'x', '--no-tripo'])
+        self.assertEqual(self.finished, [(None, True)])             # finish (and its offload) ran after the .stopping ack
+        self.assertFalse((self.batch / 'convert_worker1.stop').exists())
+        self.assertFalse(self.stopping_exists())
+        self.assertTrue(self.events()[-1].endswith('STOP requested; exiting'))
+
+    def test_a_request_during_a_conversion_is_honoured_before_the_next_job(self):
+        taken = []
+
+        def next_job(sets):
+            taken.append(1)
+            return self.job, True
+
+        def convert(job, args):
+            self.my_stop()
+            return 0
+        with mock.patch.object(cq, 'next_job', next_job), mock.patch.object(cq, 'convert', convert):
+            cq.main(['--sets', 'x', '--no-tripo'])
+        self.assertEqual(len(taken), 1)
+        self.assertEqual(self.finished, [('set_a--abc', False), (None, True)])
+
+    def test_a_file_naming_another_process_is_ignored_and_kept(self):
+        stop = self.batch / 'convert_worker1.stop'
+        seen = []
+
+        def on_nap(count):
+            if count == 1:      # a request for another worker-1 process (e.g. the one the app thinks is running)
+                stop.write_text(json.dumps({'pid': 4, 'create_time': 1.0, 'request': 'not for us'}))
+            elif count == 2:
+                seen.append((cq.stop_request(1), stop.exists()))
+                pid, _ = cq.own_identity()
+                stop.write_text(json.dumps({'pid': pid, 'create_time': 1.0, 'request': 'pid reused'}))   # our pid, wrong create time
+            elif count == 3:
+                seen.append((cq.stop_request(1), stop.exists()))
+                self.my_stop()
+        self.on_nap = on_nap
+        with mock.patch.object(cq, 'next_job', lambda sets: (None, False)):
+            cq.main(['--sets', 'x', '--no-tripo'])
+        if cq.own_identity()[1] is not None:
+            self.assertEqual(seen, [(None, True), (None, True)])     # ignored and kept both times
+        self.assertEqual(len(self.naps), 3)
+        self.assertEqual(self.finished, [(None, True)])
+
+    def test_worker_two_never_consumes_worker_ones_files(self):
+        profiles = self.root / 'profiles'
+        (profiles / 'hyper3d-workflow-profile-w2').mkdir(parents=True)
+        mine = self.my_stop(worker=1)                               # addressed to worker 1 (it names this pid, but worker 1)
+        legacy = self.batch / 'convert_worker.stop'
+        legacy.write_text('stop')
+        seen = []
+
+        def on_nap(count):
+            seen.append((mine.exists(), legacy.exists()))
+            if count == 2:
+                self.my_stop(worker=2)
+        self.on_nap = on_nap
+        with mock.patch.object(cq, 'PROFILES', profiles), mock.patch.dict(os.environ), \
+                mock.patch.object(cq, 'next_job', lambda sets: (None, False)):
+            cq.main(['--sets', 'x', '--no-tripo', '--worker', '2'])
+        self.assertEqual(seen, [(True, True), (True, True)])        # worker 2 left both alone
+        self.assertTrue(mine.exists() and legacy.exists())
+        self.assertFalse((self.batch / 'convert_worker2.stop').exists())
+        self.assertEqual(self.finished, [(None, False)])            # finish ran for worker 2's own stop
+
+    def test_stale_files_of_a_dead_worker_are_removed_at_start(self):
+        stop, stopping = self.batch / 'convert_worker1.stop', self.batch / 'convert_worker1.stopping'
+        dead = subprocess.run([sys.executable, '-c', 'import os; print(os.getpid())'], capture_output=True, text=True)
+        pid = int(dead.stdout)
+        stop.write_text(json.dumps({'pid': pid, 'create_time': 1.0}))
+        stopping.write_text(json.dumps({'pid': pid, 'time': 'x'}))
+        seen = []
+
+        def on_nap(count):
+            seen.append((stop.exists(), stopping.exists()))
+            self.my_stop()
+        self.on_nap = on_nap
+        with mock.patch.object(cq, 'next_job', lambda sets: (None, False)):
+            cq.main(['--sets', 'x', '--no-tripo'])
+        self.assertEqual(seen, [(False, False)])                     # removed at start; the worker went on to IDLE
+        self.assertTrue(any('IDLE' in l for l in self.events()))
+
+    def test_the_real_nap_wakes_for_its_own_request(self):
+        import time
+        self.my_stop()
+        started = time.time()
+        REAL_NAP(30)
+        self.assertLess(time.time() - started, 2)
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -7,6 +7,7 @@ The service manager is tested against FAKE services: tiny python scripts placed 
 manager's process patterns for that temp root only (it resolves the script path against the process cwd), so the live supervisor / view runner /
 convert worker of the real checkout are invisible to these tests. Every process a test starts is killed in tearDown.
 """
+from datetime import datetime
 import json
 import os
 from pathlib import Path
@@ -37,7 +38,7 @@ import psutil  # noqa: E402
 
 
 FAKE = textwrap.dedent('''
-    import json, pathlib, sys, time
+    import datetime, json, os, pathlib, sys, time
     stem = pathlib.Path(__file__).stem
     root = pathlib.Path.cwd()
     batch, app = root / '.codex_jobs' / '_batch', root / '.codex_jobs' / '_app'
@@ -47,18 +48,42 @@ FAKE = textwrap.dedent('''
     if stem == 'pipeline_supervisor' and sys.argv[-1] == 'stop':
         (batch / 'supervisor.stop').write_text('stop')
         sys.exit(0)
-    stopfile = {'pipeline_supervisor': 'supervisor.stop', 'convert_queue': 'convert_worker.stop'}.get(stem)
+    worker = int(sys.argv[sys.argv.index('--worker') + 1]) if '--worker' in sys.argv else 1
+    stopfile = {'pipeline_supervisor': 'supervisor.stop', 'convert_queue': f'convert_worker{worker}.stop'}.get(stem)
     ctl_path = app / f'fake_{stem}.json'
     t0 = time.time()
+
+    def event(text):
+        with open(batch / 'convert_events.log', 'a') as handle:
+            handle.write(f'{datetime.datetime.now():%m-%d %H:%M:%S} {text}\\n')
+
+    def names_me(path):
+        try:
+            return json.loads(path.read_text()).get('pid') == os.getpid()
+        except (OSError, ValueError, AttributeError):
+            return False
+    if stem == 'convert_queue' and (json.loads(ctl_path.read_text()) if ctl_path.exists() else {}).get('sleep_event'):
+        event('PAUSED (PAUSE file); not starting conversions')
     while True:
         ctl = json.loads(ctl_path.read_text()) if ctl_path.exists() else {}
-        if stopfile and not ctl.get('ignore_stop') and (batch / stopfile).exists():
+        if stem == 'pipeline_supervisor' and not ctl.get('no_tick'):     # the supervisor's end-of-tick record (DESIGN_PHASE4 I.1)
+            tmp = batch / f'supervisor_tick.{os.getpid()}.tmp'
+            tmp.write_text(json.dumps({'pid': os.getpid(), 'time': time.time(), 'mode': 'auto', 'paused': False}))
+            try:
+                os.replace(tmp, batch / 'supervisor_tick.json')
+            except OSError:                                  # a reader has it open (Windows): the next pass writes it
+                pass
+        if stem == 'pipeline_supervisor' and not ctl.get('ignore_stop') and (batch / stopfile).exists():
             (batch / stopfile).unlink()
-            if stem == 'pipeline_supervisor':
-                (batch / 'PAUSE').unlink(missing_ok=True)   # like Supervisor.release_all on exit
-            if stem == 'convert_queue':
-                with open(batch / 'convert_events.log', 'a') as handle:
-                    handle.write('11-25 10:00:00 STOP requested; exiting\\n')
+            (batch / 'PAUSE').unlink(missing_ok=True)   # like Supervisor.release_all on exit
+            break
+        if stem == 'convert_queue' and not ctl.get('ignore_stop') and names_me(batch / stopfile):   # the per-worker stop (I.2)
+            (batch / f'convert_worker{worker}.stopping').write_text(json.dumps({'pid': os.getpid(), 'time': time.time()}))
+            while (json.loads(ctl_path.read_text()) if ctl_path.exists() else {}).get('busy'):
+                time.sleep(0.05)                         # finishing the job in flight
+            event('STOP requested; exiting')
+            (batch / stopfile).unlink(missing_ok=True)
+            (batch / f'convert_worker{worker}.stopping').unlink(missing_ok=True)
             break
         if ctl.get('exit_after') is not None and time.time() - t0 >= ctl['exit_after']:
             if ctl.get('idle_exit'):
@@ -69,6 +94,8 @@ FAKE = textwrap.dedent('''
 ''')
 SCRIPTS = {'supervisor': 'tools/pipeline_supervisor.py', 'views': 'tools/view_batch.py', 'convert': 'tools/convert_queue.py',
            'convert_job': 'tools/tripo_pipeline/convert_job.py'}
+VIEWS_ONLY = {'services': {'supervisor': False, 'views': True, 'convert': False}}
+CONVERT_ONLY = {'services': {'supervisor': False, 'views': False, 'convert': True}}
 
 
 class TempRoot(unittest.TestCase):
@@ -144,10 +171,35 @@ class TempRoot(unittest.TestCase):
 class SettingsTest(TempRoot):
     def test_defaults_when_the_file_is_missing_or_broken(self):
         self.assertEqual(settings.load(self.root), settings.DEFAULTS)
+        self.assertEqual(settings.health(self.root)['source'], 'defaults')
         settings.path(self.root).write_text('{not json', encoding='utf-8')
-        self.assertEqual(settings.load(self.root), settings.DEFAULTS)
+        self.assertEqual(settings.load(self.root), settings.DEFAULTS)              # the last valid policy (the defaults of the missing file)
         settings.path(self.root).write_text('[1, 2]', encoding='utf-8')
         self.assertEqual(settings.load(self.root), settings.DEFAULTS)
+        self.assertEqual(settings.health(self.root)['source'], 'last_valid')
+
+    def test_an_unreadable_file_keeps_the_last_valid_policy_or_holds_starts(self):
+        """Review F16: a read failure never turns a disabled service back on."""
+        settings.save(self.root, {'services': {'convert': False}, 'tripo': 'off'})
+        self.assertFalse(settings.load(self.root)['services']['convert'])
+        settings.path(self.root).write_text('{"services": {"convert": fal', encoding='utf-8')    # a torn / broken write
+        loaded = settings.load(self.root)
+        self.assertFalse(loaded['services']['convert'])
+        health = settings.health(self.root)
+        self.assertEqual((health['source'], health['hold_starts']), ('last_valid', False))
+        self.assertIn('not valid JSON', health['error'])
+        # a fresh process (no last valid policy) with a broken file: defaults for display, but every start is held
+        settings._LAST.clear()
+        self.assertEqual(settings.load(self.root), settings.DEFAULTS)
+        self.assertTrue(settings.health(self.root)['hold_starts'])
+        with self.assertRaises(settings.SettingsError):                          # nothing to merge a patch onto
+            settings.save(self.root, {'view_parallel': 3})
+        events = services.tick(self.root)['events']
+        self.assertTrue(any('not started' in e and 'settings.json' in e for e in events), events)
+        self.assertEqual({k: v for k, v in services.scan(self.root).items() if v}, {})
+        self.assertTrue(any('settings' in e for e in services.status(self.root)['errors']))
+        settings.path(self.root).write_text(json.dumps({'services': {'supervisor': False, 'views': False, 'convert': False}}), encoding='utf-8')
+        self.assertFalse(settings.health(self.root)['hold_starts'])
 
     def test_load_merges_a_legacy_file_and_replaces_invalid_values(self):
         settings.path(self.root).write_text(json.dumps({
@@ -158,7 +210,8 @@ class SettingsTest(TempRoot):
         self.assertEqual(loaded['layer_workers_present'], 1)          # invalid -> default
         self.assertEqual(loaded['view_parallel'], 8)
         self.assertEqual(loaded['tripo'], 'off')
-        self.assertEqual(loaded['services'], {'supervisor': True, 'views': True, 'convert': False})
+        self.assertEqual(loaded['services'], {'supervisor': True, 'views': False, 'convert': False})   # invalid flag: off, never a start (F16)
+        self.assertTrue(any('services.views' in p for p in settings.health(self.root)['problems']))
         self.assertEqual(loaded['allowed_hosts'], [])                  # one bad entry invalidates the list
         self.assertNotIn('extra', loaded)
         self.assertEqual(set(loaded), set(settings.DEFAULTS))          # a superset of what the orchestrator reads
@@ -305,36 +358,53 @@ class ConvertListTest(TempRoot):
         self.assertEqual(sorted((j['set'], j['reason']) for j in convert_list.held_jobs(self.root)),
                          [('bad_set', 'excluded'), ('other_set', 'unlisted')])
 
-    def test_add_sets_appends_idempotently_and_keeps_everything_else(self):
+    def races(self, *races):
+        for race in races:
+            (self.root / 'base_views' / race).mkdir(parents=True, exist_ok=True)
+            (self.root / 'base_views' / race / 'palette.json').write_text('{}', encoding='utf-8')
+
+    def test_add_sets_appends_exact_family_ids_idempotently_and_keeps_everything_else(self):
+        """DESIGN_PHASE4.md I.6: `<set>`, `<set>_<race>` for every race with a palette.json and `<set>_gnome`; never a wildcard."""
+        self.races('human_male', 'gnome_female')
+        (self.root / 'base_views' / 'no_palette').mkdir(parents=True)
         original = '# header\nalpha_*\n\n!beta_*\n# tail comment\ngamma'
         self.sets_file(original)                                              # no trailing newline
         result = convert_list.add_sets(self.root, ['delta_01_x'])
-        self.assertEqual(result['added'], ['delta_01_x', 'delta_01_x_*'])
+        family = ['delta_01_x', 'delta_01_x_gnome_female', 'delta_01_x_human_male', 'delta_01_x_gnome']
+        self.assertEqual(result['added'], family)
         text = convert_list.list_path(self.root).read_text(encoding='utf-8')
-        self.assertEqual(text, original + '\ndelta_01_x\ndelta_01_x_*\n')
+        self.assertEqual(text, original + '\n' + ''.join(f + '\n' for f in family))
+        self.assertFalse(any('*' in line for line in family))
         again = convert_list.add_sets(self.root, ['delta_01_x', 'eps_02'])
-        self.assertEqual(again['added'], ['eps_02', 'eps_02_*'])
-        self.assertEqual(again['present'], ['delta_01_x', 'delta_01_x_*'])
-        self.assertEqual(convert_list.list_path(self.root).read_text(encoding='utf-8').count('delta_01_x'), 2)
-        self.assertTrue(convert_list.matches('delta_01_x_gnome', convert_list.patterns(self.root)))   # a gnome job is `<set>_gnome--<id>`
+        self.assertEqual(again['added'], ['eps_02', 'eps_02_gnome_female', 'eps_02_human_male', 'eps_02_gnome'])
+        self.assertEqual(again['present'], family)
+        pats = convert_list.patterns(self.root)
+        self.assertTrue(convert_list.matches('delta_01_x_gnome', pats))         # the historical gnome-only job `<set>_gnome--<id>`
+        self.assertTrue(convert_list.matches('delta_01_x_gnome_female', pats))
+        self.assertFalse(convert_list.matches('delta_01_x_other', pats))         # no wildcard: an unrelated name never matches
+        self.assertEqual(convert_list.add_sets(self.root, ['zeta'], extra=['zeta_legacy'])['added'][-1], 'zeta_legacy')
 
     def test_add_sets_keeps_crlf_creates_the_file_and_reports_excludes(self):
         self.assertEqual(convert_list.patterns(self.root), [])
         convert_list.add_sets(self.root, 'first_set')
-        self.assertEqual(convert_list.list_path(self.root).read_text(encoding='utf-8'), 'first_set\nfirst_set_*\n')
+        self.assertEqual(convert_list.list_path(self.root).read_text(encoding='utf-8'), 'first_set\n')
         self.sets_file('# h\r\n!blocked_*\r\n')
         result = convert_list.add_sets(self.root, ['blocked_set'])
         self.assertEqual(result['excluded'], {'blocked_set': ['!blocked_*']})
-        self.assertEqual(convert_list.list_path(self.root).read_bytes(), b'# h\r\n!blocked_*\r\nblocked_set\r\nblocked_set_*\r\n')
+        self.assertEqual(convert_list.list_path(self.root).read_bytes(), b'# h\r\n!blocked_*\r\nblocked_set\r\n')
         self.assertFalse(convert_list.is_listed(self.root, 'blocked_set'))     # still excluded: only the user can lift the `!`
 
-    def test_add_sets_rejects_bad_ids(self):
-        for bad in ('', 'Has Space', '../x', 'a/b', 'UPPER', '*'):
+    def test_add_sets_rejects_bad_ids_with_the_approval_grammar(self):
+        import serve
+        self.assertEqual(convert_list.NAME.pattern, serve.NAME.pattern)        # ONE set-name grammar for approve and release (F3)
+        for bad in ('', 'Has Space', '../x', 'a/b', '*', 'x*', '!x', '#x', '-x', 'a?b', '[a]'):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 convert_list.add_sets(self.root, [bad])
         self.assertFalse(convert_list.list_path(self.root).exists())
+        self.assertEqual(convert_list.add_sets(self.root, ['red-coat', 'Upper_1'])['added'], ['red-coat', 'Upper_1'])
 
     def test_add_sets_is_safe_under_concurrent_writers(self):
+        self.races('human_male')
         self.sets_file('# x\n')
         threads = [threading.Thread(target=convert_list.add_sets, args=(self.root, [f'set_{i}'])) for i in range(12)]
         for t in threads:
@@ -344,6 +414,25 @@ class ConvertListTest(TempRoot):
         lines = convert_list.patterns(self.root)
         self.assertEqual(len(lines), 24)
         self.assertEqual(len(set(lines)), 24)
+
+    def test_eligible_jobs_follow_the_workers_rules(self):
+        """Review F20: work = a listed staged job under MAX_TRIES failures with a module nobody converts."""
+        self.sets_file('s\n')
+        self.stage('multiview_ready', 's')
+        self.assertEqual([j['job'] for j in convert_list.eligible_jobs(self.root)], ['s--aaa111'])
+        locks = self.root / '.codex_jobs/_batch/convert_locks'
+        locks.mkdir(parents=True)
+        (locks / 's--aaa111.fails').write_text(str(convert_list.MAX_TRIES))
+        self.assertEqual(convert_list.eligible_jobs(self.root), [])            # stuck: the worker would only exit idle again
+        self.assertFalse(services.has_work(self.root))
+        (locks / 's--aaa111.fails').write_text('2')
+        self.assertTrue(services.has_work(self.root))
+        mod_locks = self.root / 'models/s/aaa111/.module_locks'
+        mod_locks.mkdir(parents=True)
+        (mod_locks / 'human_male__outfit.lock').write_text(str(os.getpid()))  # a live holder converts the only module
+        self.assertEqual(convert_list.eligible_jobs(self.root), [])
+        import convert_queue
+        self.assertEqual(convert_list.MAX_TRIES, convert_queue.MAX_TRIES)
 
     def test_held_jobs_skip_converted_and_finished_jobs(self):
         self.sets_file('listed_set\n')
@@ -482,11 +571,32 @@ class CreditsTest(TempRoot):
 # --------------------------------------------------------------------------------------------------------------------------- services
 
 class ServicesTest(TempRoot):
-    def tick(self, now=None, **overrides):
-        return services.tick(self.root, {**settings.load(self.root), **overrides} if overrides else None, now=now)
+    def tick(self, now=None, holds=False, **overrides):
+        """services.tick; the conversion-hold events (I.1, tested on their own) are dropped unless `holds`."""
+        result = services.tick(self.root, {**settings.load(self.root), **overrides} if overrides else None, now=now)
+        if not holds:
+            result['events'] = [e for e in result['events'] if 'conversion hold' not in e]
+        return result
 
     def rec(self, name):
         return services.read_record(self.root, name)
+
+    def settle(self, **overrides):
+        """Tick until every enabled service runs (the convert worker starts only after the supervisor's first tick, I.1); returns the events.
+        Then one more tick, so the hold release / adoption events are behind us."""
+        cfg = {**settings.load(self.root), **overrides}
+        events = []
+        end = time.monotonic() + 20
+        while time.monotonic() < end:
+            events += self.tick(**overrides)['events']
+            if all(self.running(n) for n, on in cfg['services'].items() if on):
+                break
+            time.sleep(0.2)
+        else:
+            self.fail('services did not settle')
+        time.sleep(0.2)
+        events += self.tick(**overrides)['events']
+        return events
 
     def test_commands_follow_the_settings(self):
         cfg = settings.load(self.root)
@@ -538,7 +648,15 @@ class ServicesTest(TempRoot):
 
     def test_starts_missing_enabled_services_detached_and_only_once(self):
         result = self.tick()
-        self.assertEqual(sorted(e.split(':')[0] for e in result['events']), ['convert', 'supervisor', 'views'])
+        started = sorted(e.split(':')[0] for e in result['events'] if ': started' in e)
+        self.assertEqual(started, ['supervisor', 'views'])                         # the convert worker waits for the supervisor's first tick
+        self.assertTrue(any(e.startswith('convert: waiting for the supervisor') for e in result['events']), result['events'])
+        self.assertTrue(services.read_hold(self.root))                              # no supervisor ran: conversions are held (I.1)
+        self.assertEqual(self.running('convert'), [])
+        self.assertEqual(services.status(self.root)['services']['convert']['state'], 'waiting')
+        self.wait_for(lambda: services.supervisor_tick(self.root), what='the supervisor tick')
+        events = self.tick()['events']
+        self.assertTrue(any(e.startswith('convert: started') for e in events), events)
         for name in ('supervisor', 'views', 'convert'):
             self.wait_for(lambda n=name: self.running(n), what=f'{name} to run')
             self.assertEqual(len(self.running(name)), 1)
@@ -549,7 +667,9 @@ class ServicesTest(TempRoot):
         self.assertEqual(args, ['run', '--parallel', '8'])
         convert_args = json.loads((self.root / '.codex_jobs/_app/fake_convert_queue.args').read_text())
         self.assertIn('--no-tripo', convert_args)
-        self.assertEqual(self.tick()['events'], [])                                   # second pass: nothing to do
+        self.wait_for(lambda: services.read_hold(self.root) is None or self.tick() and services.read_hold(self.root) is None,
+                      what='the hold to be released after the supervisor ticked')
+        self.assertEqual(self.tick()['events'], [])                                   # next pass: nothing to do
         for name in ('supervisor', 'views', 'convert'):
             self.assertEqual(len(self.running(name)), 1)
             self.assertEqual(services.status(self.root)['services'][name]['state'], 'running')
@@ -593,6 +713,7 @@ class ServicesTest(TempRoot):
             shutil.rmtree(other, ignore_errors=True)
 
     def test_duplicate_instances_are_an_error_and_nothing_is_touched(self):
+        settings.save(self.root, VIEWS_ONLY)
         first, second = self.spawn('views'), self.spawn('views')
         self.wait_for(lambda: len(self.running('views')) == 2)
         result = self.tick()
@@ -654,6 +775,7 @@ class ServicesTest(TempRoot):
         self.assertFalse(pause.exists())
 
     def test_stop_views_by_pid_after_rechecking_the_process(self):
+        settings.save(self.root, VIEWS_ONLY)
         popen = self.spawn('views')
         self.tick()
         inst = self.running('views')[0]
@@ -674,24 +796,34 @@ class ServicesTest(TempRoot):
         self.assertEqual(self.tick(services={'supervisor': False, 'views': True, 'convert': False})['events'], [])
         self.assertEqual(self.running('views'), [])
 
+    def stop_file(self, worker=1):
+        path = self.root / f'.codex_jobs/_batch/convert_worker{worker}.stop'
+        return json.loads(path.read_text(encoding='utf-8')) if path.exists() else None
+
     def test_convert_stop_is_graceful_while_a_conversion_runs(self):
+        """I.2: the stop names the worker process; the worker acknowledges (.stopping), finishes its job and exits. Never killed."""
+        settings.save(self.root, CONVERT_ONLY)
         worker, job = self.spawn('convert'), self.spawn('convert_job')
         self.tick()
         self.assertEqual(services.status(self.root, deep=True)['convert_jobs'][0]['pid'], job.pid)
         with self.assertRaisesRegex(services.ServiceError, 'convert_job.py is running'):
             services.stop(self.root, 'convert', force=True)
-        self.assertFalse((self.root / '.codex_jobs/_batch/convert_worker.stop').exists() and self.rec('convert').get('stop_requested'))
-        self.ctl('convert_queue', {'ignore_stop': True})                              # the worker does not look at the stop file yet
-        result = services.stop(self.root, 'convert')
+        self.assertIsNone(self.stop_file())
+        self.ctl('convert_queue', {'busy': True})                                    # it acknowledges, then finishes the job in flight
+        result = services.stop(self.root, 'convert', wait=1.0, request=7)
         self.assertTrue(result['pending'])
-        self.assertIn('after the conversion in flight', result['message'])
-        self.assertTrue((self.root / '.codex_jobs/_batch/convert_worker.stop').exists())
+        self.assertIn('acknowledged', result['message'])
+        stop = self.stop_file()
+        self.assertEqual((stop['pid'], stop['request']), (worker.pid, 7))
+        self.assertAlmostEqual(stop['create_time'], psutil.Process(worker.pid).create_time(), delta=1.5)
+        self.assertTrue((self.root / '.codex_jobs/_batch/convert_worker1.stopping').exists())
         self.assertEqual(result['status']['state'], 'stopping')
         self.assertTrue(result['status']['stop_pending'])
-        time.sleep(0.5)
-        self.assertEqual(len(self.running('convert')), 1)                             # NOT killed by PID while convert_job.py runs
+        for _ in range(3):
+            self.tick()                                                                # re-evaluated, never killed on a timeout
+        self.assertEqual(len(self.running('convert')), 1)
         self.assertEqual(len(self.running('convert_job')), 1)
-        self.ctl('convert_queue', {})                                                  # the conversion ended; the worker reaches its loop top
+        self.ctl('convert_queue', {})                                                  # the job (finish + offload) is done: it exits
         self.wait_for(lambda: not self.running('convert'), what='the worker to exit through its stop file')
         worker.wait(10)
         events = self.tick(now=time.time())['events']
@@ -699,42 +831,108 @@ class ServicesTest(TempRoot):
         self.assertTrue(self.rec('convert')['user_stopped'])
         self.assertEqual(self.tick()['events'], [])
         self.assertEqual(self.running('convert'), [])
-        self.assertFalse((self.root / '.codex_jobs/_batch/convert_worker.stop').exists())
+        self.assertIsNone(self.stop_file())
+        self.assertFalse((self.root / '.codex_jobs/_batch/convert_worker.stop').exists())   # the old shared marker is never written
 
-    def test_convert_stop_without_a_conversion_uses_the_stop_file_then_the_pid(self):
+    def test_a_convert_stop_never_kills_on_timeout(self):
+        """Review F6: a timeout is no proof of an old worker; a worker that has not acknowledged keeps running and the stop stays pending."""
+        settings.save(self.root, CONVERT_ONLY)
         worker = self.spawn('convert')
-        self.tick()
-        result = services.stop(self.root, 'convert', wait=10)                        # a new worker: reads the stop file
-        self.assertFalse(result['pending'])
-        self.assertIn('convert worker stopped', result['message'])
-        worker.wait(10)
-        self.assertFalse((self.root / '.codex_jobs/_batch/convert_worker.stop').exists())
-        old = self.spawn('convert')                                                    # an adopted old worker that never reads the file
-        self.ctl('convert_queue', {'ignore_stop': True})
+        self.ctl('convert_queue', {'ignore_stop': True})                              # (a busy worker that has not reached its loop top yet)
         self.tick()
         result = services.stop(self.root, 'convert', wait=0.6)
-        self.assertFalse(result['pending'])
-        self.assertIn('by PID', result['message'])
+        self.assertTrue(result['pending'])
+        self.assertIn('acknowledge', result['message'])
+        for _ in range(3):
+            self.tick(now=time.time() + 3600)
+        self.assertEqual([i['pid'] for i in self.running('convert')], [worker.pid])
+        self.assertEqual(services.status(self.root)['services']['convert']['state'], 'stopping')
+        self.ctl('convert_queue', {})
+        self.wait_for(lambda: not self.running('convert'), what='the worker to honour the stop')
+        self.assertIn('convert: stopped', self.tick()['events'])
+
+    def test_a_stop_for_worker_1_is_never_taken_by_worker_2(self):
+        settings.save(self.root, CONVERT_ONLY)
+        w1 = self.spawn('convert')
+        w2 = subprocess.Popen([sys.executable, 'tools/convert_queue.py', '--sets-file', 'x', '--worker', '2'], cwd=str(self.root),
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.popens.append(w2)
+        self.ctl('convert_queue', {'busy': True})
+        self.tick()
+        self.assertEqual([i['pid'] for i in self.running('convert')], [w1.pid])        # worker 2 is the user's own
+        result = services.stop(self.root, 'convert', wait=1.0)
+        self.assertTrue(result['pending'])
+        self.assertEqual(self.stop_file()['pid'], w1.pid)
+        self.assertIsNone(self.stop_file(2))
+        self.ctl('convert_queue', {})
+        self.wait_for(lambda: not self.running('convert'), what='worker 1 to exit')
+        time.sleep(0.5)
+        self.assertIsNone(w2.poll())                                                   # worker 2 keeps running
+
+    def test_a_legacy_worker_is_stopped_only_while_it_sleeps(self):
+        """I.2 legacy rule: no stop support -> stopped through its verified handle only when no convert_job.py runs and its last event since it
+        started is PAUSED / IDLE / LOW DISK after its last CONVERT."""
+        settings.save(self.root, CONVERT_ONLY)
+        events_log = self.root / '.codex_jobs/_batch/convert_events.log'
+        old = self.spawn('convert')
+        self.ctl('convert_queue', {'ignore_stop': True})                               # it never reads a stop file
+        script = self.root / 'tools/convert_queue.py'
+        os.utime(script, (time.time() + 600, time.time() + 600))                       # it runs code older than the current file
+        self.assertTrue(services.legacy_worker(self.root, self.running('convert')[0]))
+        self.tick()
+
+        def event(text):
+            with open(events_log, 'a', encoding='utf-8') as handle:
+                handle.write(f'{datetime.now():%m-%d %H:%M:%S} {text}\n')
+        event('CONVERT s--abc123')
+        result = services.stop(self.root, 'convert', wait=0.5)
+        self.assertTrue(result['pending'])
+        self.assertIn('sleeps', result['message'])
+        event('[w2] PAUSED (PAUSE file); not starting conversions')                   # another worker's line does not count
+        self.tick()
+        self.assertEqual(len(self.running('convert')), 1)
+        job = self.spawn('convert_job')
+        event('PAUSED (PAUSE file); not starting conversions')
+        self.tick()
+        self.assertEqual(len(self.running('convert')), 1)                             # a convert_job.py runs: not touched
+        self.assertIn('convert_job.py', services.status(self.root)['services']['convert']['message'])
+        job.kill()
+        job.wait(10)
+        self.wait_for(lambda: not self.running('convert_job'))
+        events = self.tick()['events']
+        self.assertTrue(any('asleep' in e for e in events), events)
         old.wait(10)
         self.assertEqual(self.running('convert'), [])
-        self.assertFalse((self.root / '.codex_jobs/_batch/convert_worker.stop').exists())
+        self.assertTrue(self.rec('convert')['user_stopped'])
 
     def test_convert_restart_waits_for_the_conversion_then_restarts(self):
+        settings.save(self.root, CONVERT_ONLY)
         self.spawn('convert')
         job = self.spawn('convert_job')
+        self.ctl('convert_queue', {'busy': True})
         self.tick()
-        result = services.restart(self.root, 'convert')
+        result = services.restart(self.root, 'convert', wait=0.5)
         self.assertTrue(result['pending'])
+        self.ctl('convert_queue', {})
         self.wait_for(lambda: not self.running('convert'), what='worker exit')
         self.tick()
         self.wait_for(lambda: self.running('convert'), what='restart by the next tick')
         self.assertFalse(self.rec('convert')['user_stopped'])
         self.assertIn(job.pid, [i['pid'] for i in self.running('convert_job')])
 
+    def test_a_stale_per_worker_stop_file_is_removed(self):
+        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
+        dead.wait(10)
+        path = self.root / '.codex_jobs/_batch/convert_worker1.stop'
+        path.write_text(json.dumps({'pid': dead.pid, 'create_time': 1.0, 'request': 1, 'time': 'x'}), encoding='utf-8')
+        (self.root / '.codex_jobs/_batch/convert_worker1.stopping').write_text(json.dumps({'pid': dead.pid}), encoding='utf-8')
+        self.tick(services={'supervisor': False, 'views': False, 'convert': False})
+        self.assertFalse(path.exists())
+        self.assertFalse((self.root / '.codex_jobs/_batch/convert_worker1.stopping').exists())
+
     def test_crash_restart_backoff_then_hold(self):
-        self.tick()
-        self.wait_for(lambda: self.running('views'))
-        for name in ('supervisor', 'convert'):
+        self.settle()
+        for name in ('supervisor', 'views', 'convert'):
             self.wait_for(lambda n=name: self.running(n))
         t0 = time.time()
         self.kill('views')
@@ -788,7 +986,7 @@ class ServicesTest(TempRoot):
         self.assertEqual((self.rec('views')['fails'], self.rec('views')['error']), (0, None))
 
     def test_the_convert_worker_idle_exit_restarts_only_when_work_appears(self):
-        self.tick()
+        self.settle()
         self.wait_for(lambda: self.running('convert'))
         self.ctl('convert_queue', {'exit_after': 0.0, 'code': 0, 'idle_exit': True})
         self.wait_for(lambda: not self.running('convert'), what='idle exit')

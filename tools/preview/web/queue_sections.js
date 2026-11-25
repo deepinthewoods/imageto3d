@@ -9,6 +9,7 @@ import { api } from './api.js';
 import { confirmDialog } from './confirm.js';
 import { toast } from './toast.js';
 import { ago, badge, bytesText, button, duration, h, pretty, storage } from './util.js';
+import { noteServices } from './status.js';
 
 const SERVICE_ORDER = ['supervisor', 'views', 'convert'];
 const SERVICE_TONE = { running: 'ok', idle: 'info', stopping: 'warn', stopped: '', crashed: 'error', held: 'error', duplicate: 'error' };
@@ -22,6 +23,11 @@ const MODE_BUTTONS = [
 const DISK_WARN = 30 * 1024 ** 3;
 const DISK_ERROR = 10 * 1024 ** 3;
 const SERVICE_OFF_TEXT = 'service management is off';
+const UNMANAGED_TEXT = 'Service management is off - the server was started without --manage-services';
+const LOST_MS = 20000;           // a service request that is neither pending nor in the events after this long: outcome not recorded
+const CHECK_MS = 330000;         // a Tripo balance check runs up to ~300 s
+const REQ_VERB = { start: 'start', stop: 'stop', restart: 'restart' };
+const REQ_TONE = { requested: 'info', pending: 'warn', done: 'ok', failed: 'error', lost: 'warn' };
 
 const asList = value => (Array.isArray(value) ? value : value == null || value === '' ? [] : [value]);
 const text = value => (typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value));
@@ -85,7 +91,8 @@ const keyedButton = (fk, label, onclick, cls = '', title = '', disabled = false)
 export function createSections({ reload }) {
   const busy = new Set();
   let data = null;
-  const memo = { serviceOff: null, tripoNote: null, tripoTone: '' };
+  const memo = { serviceOff: null, check: null, checkNote: null };
+  const requests = [];     // service requests this page sent: {id, name, action, sent, status: requested|pending|done|failed|lost, text}
   const logOpen = new Set();
   const list = [];
 
@@ -109,6 +116,17 @@ export function createSections({ reload }) {
   }
 
   // ---- mode and pause ---------------------------------------------------------------------------------------------------
+  /** The conversion hold (.codex_jobs/_batch/CONVERT_HOLD, DESIGN_PHASE4.md I.1): `convert_hold: {since, reason}` of queue.mode or queue.services. */
+  const convertHold = d => {
+    const hold = d?.mode?.convert_hold ?? d?.services?.convert_hold;
+    return hold ? (typeof hold === 'object' ? hold : { reason: text(hold) }) : null;
+  };
+  const convertHoldNote = hold => {
+    const n = note(`Conversions are held (CONVERT_HOLD)${hold.since ? ` since ${hold.since}` : ''}${hold.reason ? `: ${hold.reason}` : ''}. The convert worker starts no job and `
+      + 'every paid step waits until the supervisor has completed a tick after its (re)start.', 'warn');
+    n.dataset.row = 'convert-hold';
+    return n;
+  };
   async function setMode(button1) {
     if (button1.key === 'run') {
       const ok = await confirmDialog({
@@ -126,7 +144,7 @@ export function createSections({ reload }) {
 
   const modeSection = makeSection('mode', 'Mode and pause', {
     hidden: d => !d?.mode,
-    sig: d => ({ mode: d.mode.mode, pause: d.mode.pause, run: d.mode.supervisor_running, warning: d.mode.warning, away: d.mode.away }),
+    sig: d => ({ mode: d.mode.mode, pause: d.mode.pause, run: d.mode.supervisor_running, warning: d.mode.warning, away: d.mode.away, hold: convertHold(d) }),
     build(d) {
       const snap = d.mode;
       const current = snap.mode?.mode;
@@ -140,6 +158,7 @@ export function createSections({ reload }) {
         return node;
       });
       const pause = snap.pause;
+      const hold = convertHold(d);
       const nodes = [
         h('div', { class: 'q-mode-row' }, ...buttons),
         h('div', { class: 'q-line' },
@@ -150,11 +169,12 @@ export function createSections({ reload }) {
             : badge('not paused', 'ok')),
         h('div', { class: 'q-line' }, h('span', { class: 'q-idle' })),
         snap.supervisor_running === false ? note(snap.warning || 'supervisor not running: the mode has no effect on conversions', 'bad') : null,
+        hold ? convertHoldNote(hold) : null,
       ];
       pause && nodes[1].lastChild.classList.add('q-pause-chip');
       return {
         nodes,
-        extra: pause ? badge('paused', 'warn') : null,
+        extra: [pause ? badge('paused', 'warn') : null, hold ? badge('conversions held', 'warn') : null].filter(Boolean),
         live(next) {
           const s = next.mode;
           const idle = nodes[2].firstChild;
@@ -168,11 +188,63 @@ export function createSections({ reload }) {
   });
 
   // ---- services ----------------------------------------------------------------------------------------------------------
+  const names = map => [...SERVICE_ORDER.filter(n => map[n]), ...Object.keys(map).filter(n => !SERVICE_ORDER.includes(n))];
+  // The server only ACCEPTS a service request ({ok, pending: true, request}); the manager thread carries it out later (a convert stop waits
+  // for the current job). The outcome is the `queue.services.events` entry with the same `request` id; until then the id is in
+  // `queue.services.pending`. Requests sent from this page are tracked; pending ones of other tabs / earlier page loads are listed too.
+  function trackRequest(id, name, action) {
+    requests.push({ id, name, action, sent: Date.now(), status: 'requested', text: '' });
+    while (requests.length > 8) { const at = requests.findIndex(r => r.final); requests.splice(at < 0 ? 0 : at, 1); }
+  }
+
+  function reconcileRequests(d) {
+    const svc = asMap(d?.services);
+    const pending = asList(svc.pending);
+    const events = asList(svc.events);
+    for (const r of requests) {
+      if (r.final) continue;
+      const id = String(r.id);
+      const mine = events.filter(e => e && e.request != null && String(e.request) === id);
+      const last = mine[mine.length - 1];
+      const outcome = [...mine].reverse().find(e => e.ok === false || (e.ok === true && !e.pending));
+      const entry = pending.find(p => String(p?.id) === id);
+      let status;
+      let detail = '';
+      if (outcome) { status = outcome.ok === false ? 'failed' : 'done'; detail = text(outcome.text); }
+      else if (entry) { status = 'pending'; detail = last ? text(last.text) : entry.running ? 'running' : 'waiting in the queue'; }
+      else if (Date.now() - r.sent > LOST_MS) { status = 'lost'; detail = last ? text(last.text) : ''; }
+      else if (last?.pending) { status = 'pending'; detail = text(last.text); }
+      else status = 'requested';
+      r.status = status;
+      r.text = detail;
+      if (['done', 'failed', 'lost'].includes(status)) {
+        r.final = true;
+        toast(status === 'done' ? `${r.name}: ${r.action} done${detail ? ` - ${detail}` : ''}`
+          : status === 'failed' ? `${r.name}: ${r.action} failed${detail ? `: ${detail}` : ''}`
+            : `${r.name}: ${r.action} finished, but no outcome was recorded`, { ms: status === 'failed' ? 8000 : 4000 });
+      }
+    }
+  }
+
+  /** Requests to show for a service: this page's own, plus the server's pending ones this page did not send. */
+  function requestsFor(d, name) {
+    const mine = requests.filter(r => r.name === name);
+    const known = new Set(requests.map(r => String(r.id)));
+    const foreign = asList(d?.services?.pending).filter(p => p && p.name === name && !known.has(String(p.id)))
+      .map(p => ({ id: p.id, name, action: p.action, status: 'pending', text: p.running ? 'running' : 'waiting in the queue', foreign: true }));
+    return [...mine, ...foreign];
+  }
+
   async function serviceAction(name, action) {
     await run(`svc:${name}`, `${pretty(action)} ${name}`, async () => {
       try {
         const result = await api.queuePost({ op: 'service', name, action });
-        toast(result?.message || `${name}: ${action} done`, { ms: 4000 });
+        if (result?.pending || result?.request != null) {
+          if (result.request != null) trackRequest(result.request, name, action);
+          toast(`${name}: ${action} requested...`, { ms: 3000 });
+        } else {
+          toast(`${name}: ${action} - ${result?.message || 'accepted by the server'}`, { ms: 4000 });
+        }
       } catch (error) {
         if (error.conflict && (/service management|management is off/i.test(error.message) || /off|disabled/i.test(error.code || ''))) {
           memo.serviceOff = error.message || SERVICE_OFF_TEXT;       // the server does not manage services: show that instead of the buttons
@@ -202,18 +274,28 @@ export function createSections({ reload }) {
     if (ok) serviceAction(svc.name, action);
   }
 
+  function requestLine(r) {
+    const words = { requested: 'requested...', pending: `requested, still pending${r.text ? `: ${r.text}` : ''}`, done: `done${r.text ? `: ${r.text}` : ''}`,
+      failed: `failed${r.text ? `: ${r.text}` : ''}`, lost: 'finished, but no outcome was recorded' };
+    return h('div', { class: `svc-req tone-${REQ_TONE[r.status]}`, dataset: { request: r.id, status: r.status } },
+      h('span', { text: `${REQ_VERB[r.action] || r.action}: ${words[r.status]}` }),
+      r.final ? button('dismiss', () => { requests.splice(requests.indexOf(r), 1); redraw(); }, '', 'Hide this result') : null);
+  }
+
   function serviceRow(svc) {
     const name = svc.name;
     const working = busy.has(`svc:${name}`);
     const off = !!memo.serviceOff;
     const running = svc.state === 'running';
     const inFlight = name === 'convert' && asList(svc.convert_jobs).length > 0;
+    const reqs = svc.requests || [];
+    const waiting = !!svc.stop_pending || reqs.some(r => !r.final);       // a request of this service is not finished: no second one
     const buttons = off ? [] : [
       ['stopped', 'crashed', 'held', 'idle'].includes(svc.state)
         ? keyedButton(`svc:${name}:start`, svc.state === 'crashed' ? 'Start now' : 'Start', () => serviceAction(name, 'start'), 'primary', `Start ${name}`, working) : null,
       running ? keyedButton(`svc:${name}:stop`, inFlight ? 'Stop after job' : 'Stop', () => askService(svc, 'stop'), 'danger',
-        inFlight ? 'The worker exits after the conversion in flight' : `Stop ${name}`, working || !!svc.stop_pending) : null,
-      running ? keyedButton(`svc:${name}:restart`, 'Restart', () => askService(svc, 'restart'), '', `Stop and start ${name} again`, working || !!svc.stop_pending) : null,
+        inFlight ? 'The worker exits after the conversion in flight' : `Stop ${name}`, working || waiting) : null,
+      running ? keyedButton(`svc:${name}:restart`, 'Restart', () => askService(svc, 'restart'), '', `Stop and start ${name} again`, working || waiting) : null,
     ];
     const uptime = h('span', { class: 'svc-uptime' });
     const message = svc.message || svc.error;
@@ -240,6 +322,9 @@ export function createSections({ reload }) {
       svc.enabled === false ? badge('off in settings', 'warn') : null,
       h('span', { class: 'queue-actions svc-actions' }, working ? h('span', { class: 'q-dim', text: 'working...' }) : null, ...buttons),
       message ? h('div', { class: `svc-message${['crashed', 'held', 'duplicate'].includes(svc.state) ? ' bad' : ''}`, text: message }) : null,
+      svc.stop_pending && !reqs.some(r => !r.final && r.action !== 'start') ? h('div', { class: 'svc-req tone-warn', dataset: { pending: 'stop' },
+        text: name === 'convert' ? 'stop requested; waiting for the current job' : 'stop requested; waiting' }) : null,
+      ...reqs.map(requestLine),
       svc.duplicates?.length ? h('div', { class: 'svc-message bad', text: `Two instances: pids ${svc.duplicates.map(d => d.pid).join(', ')}. Stop the extra one by hand; the app never does it.` }) : null,
       log);
     return {
@@ -259,58 +344,117 @@ export function createSections({ reload }) {
     };
   }
 
+  /** absent (an older server) | unmanaged (managed === false: no --manage-services) | scanning (no scan has finished yet) | ok */
+  function servicesMode(d) {
+    const raw = d?.services;
+    if (!raw || typeof raw !== 'object') return 'absent';
+    if (raw.managed === false) return 'unmanaged';
+    if (raw.scanned === false || (raw.managed === true && !raw.last_tick)) return 'scanning';
+    return 'ok';
+  }
+
   const servicesSection = makeSection('services', 'Services', {
     sig: d => {
+      const mode = servicesMode(d);
       const map = serviceMap(d);
-      if (!map) return { off: true, memo: memo.serviceOff };
+      if (mode !== 'ok' || !map) return { mode, memo: memo.serviceOff };
       return {
+        mode,
         memo: memo.serviceOff,
+        errors: [d.services.errors, d.services.manager_errors],
+        requests: names(map).flatMap(n => requestsFor(d, n)).map(r => [r.id, r.name, r.action, r.status, r.text, !!r.final]),
         services: Object.fromEntries(Object.entries(map).map(([name, s]) => [name, [s.state, s.enabled, s.pid, s.adopted, s.stop_pending, s.message, s.error, s.duplicates, s.convert_jobs,
           s.restart_in != null, !!(s.logs?.out || s.logs?.err || s.logs?.events), s.logs?.out_file, s.logs?.err_file]])),
       };
     },
     build(d) {
+      const mode = servicesMode(d);
       const map = serviceMap(d);
-      if (!map) return { nodes: [note(memo.serviceOff || SERVICE_OFF_TEXT, 'bad')], extra: badge('off', 'warn') };
-      const names = [...SERVICE_ORDER.filter(n => map[n]), ...Object.keys(map).filter(n => !SERVICE_ORDER.includes(n))];
-      const rows = names.map(n => serviceRow({ name: n, ...map[n] }));
-      const problems = asList(d.services?.errors);
+      const flag = (text1, tone, state) => { const n = note(text1, tone); n.dataset.state = state; return n; };
+      if (mode === 'absent' || !map) return { nodes: [flag(memo.serviceOff || SERVICE_OFF_TEXT, 'bad', 'off')], extra: badge('off', 'warn') };
+      if (mode === 'unmanaged') return { nodes: [flag(UNMANAGED_TEXT, 'warn', 'unmanaged')], extra: badge('not managed', 'warn') };
+      if (mode === 'scanning') return { nodes: [flag('Scanning for the running services... (the first scan takes a few seconds)', 'warn', 'scanning')], extra: badge('scanning...', 'warn') };
+      const ordered = names(map);
+      const rows = ordered.map(n => serviceRow({ name: n, ...map[n], requests: requestsFor(d, n) }));
+      const problems = [...asList(d.services?.errors), ...asList(d.services?.manager_errors)];
+      const scan = h('div', { class: 'q-dim', dataset: { row: 'scan' } });
       const nodes = [
         memo.serviceOff ? note(memo.serviceOff, 'bad') : null,
-        ...problems.map(p => note(p, 'bad')),
+        ...problems.map(p => note(text(p), 'bad')),
         h('div', { class: 'svc-list' }, ...rows.map(r => r.row)),
+        scan,
       ];
-      const bad = names.filter(n => ['crashed', 'held', 'duplicate'].includes(map[n].state)).length;
-      return { nodes, extra: bad ? badge(`${bad} problem${bad === 1 ? '' : 's'}`, 'error') : badge('ok', 'ok'), live: next => rows.forEach(r => r.live(next)) };
+      const bad = ordered.filter(n => ['crashed', 'held', 'duplicate'].includes(map[n].state)).length;
+      return {
+        nodes, extra: bad || problems.length ? badge(`${bad || problems.length} problem${(bad || problems.length) === 1 ? '' : 's'}`, 'error') : badge('ok', 'ok'),
+        live(next) {
+          rows.forEach(r => r.live(next));
+          const tick = next.services?.last_tick;
+          scan.textContent = tick ? `Last scan ${ago(tick)}${next.services.interval ? ` (every ${next.services.interval} s)` : ''}` : '';
+        },
+      };
     },
   });
 
   // ---- credits and disk --------------------------------------------------------------------------------------------------
+  // check_tripo starts the balance check on a worker thread ({ok: true, status: 'running', pending: true}); the result arrives up to ~300 s later as
+  // `credits.check.last` ({status: ok | busy | error, credits | message}) while `credits.check.running` is true. {ok: false, status: 'busy'} = refused at once.
+  const checkKey = c => JSON.stringify([c?.started, c?.finished, c?.last?.status, c?.last?.checked_at, c?.last?.credits, c?.last?.message]);
+  const BUSY_TEXT = 'busy: a conversion uses the Tripo browser';
+  function checkResult(last) {
+    if (!last) return null;
+    if (last.status === 'ok') return { tone: '', text: `Balance check: ${last.credits} credits${last.checked_at ? ` (${ago(last.checked_at)})` : ''}`, title: '' };
+    if (last.status === 'busy') return { tone: 'warn', text: `Balance check ${BUSY_TEXT}`, title: last.message || '' };
+    return { tone: 'bad', text: `Balance check failed: ${last.message || 'no message'}`, title: '' };
+  }
+
   async function checkTripo() {
+    const before = checkKey(data?.credits?.check);
+    memo.checkNote = null;
     await run('check_tripo', 'Check balance', async () => {
       const result = await api.queuePost({ op: 'check_tripo' });
-      const status = result?.status;
-      if (status === 'ok') {
-        memo.tripoNote = `Balance check: ${result.credits} credits`;
-        memo.tripoTone = '';
-      } else {
-        memo.tripoNote = `Balance check ${status === 'busy' ? 'not run' : 'failed'}: ${result?.message || status || 'no answer'}`;
-        memo.tripoTone = status === 'busy' ? 'warn' : 'bad';
+      if (result?.status === 'running' || (result?.ok && result?.pending)) {
+        memo.check = { before, sent: Date.now(), seen: false };
+        toast('Balance check started - checking...', { ms: 3000 });
+        return;
       }
-      toast(memo.tripoNote, { ms: 5000 });
+      const shown = result?.status === 'ok' ? checkResult({ status: 'ok', credits: result.credits, checked_at: result.checked_at })
+        : result?.status === 'busy' ? { tone: 'warn', text: `Balance check not run - ${BUSY_TEXT}`, title: result.message || '' }
+          : { tone: 'bad', text: `Balance check failed: ${result?.message || result?.status || 'no answer'}`, title: '' };
+      memo.checkNote = { ...shown, key: before };
+      toast(shown.text, { ms: 5000 });
     });
+  }
+
+  /** Follow a started check through `credits.check`: it ends when it stops running and a new result (or time) shows up. */
+  function reconcileCheck(d) {
+    const c = d?.credits?.check;
+    if (!memo.check || !c) return;
+    if (c.running) memo.check.seen = true;
+    if (c.running) return;
+    const age = Date.now() - memo.check.sent;
+    const changed = checkKey(c) !== memo.check.before;
+    if (changed || memo.check.seen) {
+      const shown = checkResult(c.last);
+      memo.check = null;
+      if (shown) toast(shown.text, { ms: 5000 });
+    } else if (age > LOST_MS) {
+      memo.check = null;
+      toast('Balance check: no result was recorded', { ms: 4000 });
+    }
   }
 
   const creditsSection = makeSection('credits', 'Credits and disk', {
     hidden: d => !d?.credits && d?.disk == null,
-    sig: d => ({ credits: d.credits, disk: d.disk, note: memo.tripoNote }),
+    sig: d => ({ credits: d.credits, disk: d.disk, check: !!memo.check, note: memo.checkNote }),
     build(d) {
       const tripo = d.credits?.tripo;
       const hyper = d.credits?.hyper3d;
       const disk = typeof d.disk === 'object' && d.disk ? (d.disk.free ?? d.disk.free_bytes) : d.disk;
       const total = typeof d.disk === 'object' && d.disk ? (d.disk.total ?? d.disk.total_bytes) : null;
       const diskTone = disk == null ? '' : disk < DISK_ERROR ? 'error' : disk < DISK_WARN ? 'warn' : 'ok';
-      const checking = busy.has('check_tripo');
+      const check = d.credits?.check;
+      const checking = busy.has('check_tripo') || !!memo.check || !!check?.running;
       const nodes = [];
       if (tripo) {
         nodes.push(h('div', { class: 'q-line', dataset: { row: 'tripo' } },
@@ -321,7 +465,21 @@ export function createSections({ reload }) {
           keyedButton('credits:check', checking ? 'Checking...' : 'Check balance', checkTripo, '',
             'Runs studio.mjs balance (only while no conversion uses the Tripo browser profile)', checking)));
       }
-      if (memo.tripoNote) nodes.push(note(memo.tripoNote, memo.tripoTone));
+      if (checking) {
+        const n = note(`Checking the Tripo balance...${check?.started ? ` (started ${ago(check.started)})` : ''} it can take a few minutes`, 'warn');
+        n.dataset.row = 'check';
+        n.dataset.state = 'running';
+        nodes.push(n);
+      } else {
+        const shown = memo.checkNote && memo.checkNote.key === checkKey(check) ? memo.checkNote : checkResult(check?.last);
+        if (shown) {
+          const n = note(shown.text, shown.tone);
+          n.dataset.row = 'check';
+          n.dataset.state = shown === memo.checkNote ? 'refused' : check.last.status;
+          if (shown.title) n.title = shown.title;
+          nodes.push(n);
+        }
+      }
       if (hyper) {
         nodes.push(h('div', { class: 'q-line', dataset: { row: 'hyper3d' } },
           h('b', { text: 'Hyper3D' }),
@@ -441,6 +599,27 @@ export function createSections({ reload }) {
   });
 
   // ---- holds -------------------------------------------------------------------------------------------------------------
+  /** The reviewed images of a colour-drift hold: [{path, sha256}] from the hold record (`images`); accept_drift is bound to these hashes. */
+  const driftImages = hold => asList(hold.images ?? hold.drift_images)
+    .filter(i => i && typeof i.path === 'string' && typeof i.sha256 === 'string' && i.sha256).map(i => ({ path: i.path, sha256: i.sha256 }));
+
+  async function acceptDrift(hold) {
+    const images = driftImages(hold);
+    if (!images.length) return;
+    const list = h('ul', { class: 'q-drift-images' }, ...images.map(i => h('li', null, h('span', { text: i.path }), h('span', { class: 'q-dim', text: ` sha256 ${i.sha256.slice(0, 12)}...` }))));
+    const ok = await confirmDialog({
+      title: 'Accept this colour drift?', confirm: 'Accept drift', danger: true, content: list,
+      lines: [...asList(hold.reasons).map(text),
+        `Accepting tells the supervisor these ${images.length} image${images.length === 1 ? '' : 's'} may go on with their current colours. The decision is bound to the files' hashes: an image that changes later needs a new decision.`],
+    });
+    if (!ok) return;
+    await run(`drift:${hold.key}`, 'Accept drift', async () => {
+      const result = await api.queuePost({ op: 'accept_drift', key: hold.key, images });
+      const n = asList(result?.accepted).length || images.length;
+      toast(`Accepted the colour drift of ${n} image${n === 1 ? '' : 's'} (${hold.key})`, { ms: 5000 });
+    });
+  }
+
   const holdsSection = makeSection('holds', 'Holds', {
     hidden: d => !Array.isArray(d?.holds),
     sig: d => d.holds,
@@ -448,10 +627,20 @@ export function createSections({ reload }) {
       const holds = d.holds;
       const nodes = holds.length ? holds.map(hold => {
         const set = setOf(hold.set);
-        return h('div', { class: 'q-item held', dataset: { hold: hold.key || set } },
+        let accept = null;
+        if (hold.drift) {
+          const images = driftImages(hold);
+          const working = busy.has(`drift:${hold.key}`);
+          accept = h('span', { class: 'queue-actions' },
+            keyedButton(`drift:${hold.key}`, working ? 'Accepting...' : 'Accept', () => acceptDrift(hold), 'primary',
+              images.length ? 'Accept the colour drift of the listed images (a confirmation lists them)' : 'no image hashes in this hold', working || !images.length),
+            images.length ? null : h('span', { class: 'q-dim', text: 'no image hashes in this hold' }));
+        }
+        return h('div', { class: 'q-item held', dataset: { hold: hold.key || set, drift: hold.drift ? 'true' : 'false' } },
           set ? h('a', { class: 'q-set', href: `#approved/${encodeURIComponent(`set:${set}`)}`, text: pretty(set), title: 'Open this set in the Approved tab' }) : h('span', { class: 'q-what', text: pretty(hold.key) }),
           h('div', { class: 'q-reasons' }, ...asList(hold.reasons).map(r => h('div', { text: text(r) }))),
-          hold.key && set ? h('span', { class: 'q-dim', text: hold.key }) : null);
+          hold.key && set ? h('span', { class: 'q-dim', text: hold.key }) : null,
+          accept);
       }) : [h('div', { class: 'q-line' }, h('span', { class: 'q-dim', text: 'The supervisor holds nothing.' }))];
       return { nodes, extra: holds.length ? badge(`${holds.length}`, 'warn') : null };
     },
@@ -492,6 +681,20 @@ export function createSections({ reload }) {
       ...NUMBERS.map(([key, label, hint, min, max]) => add(key, label, h('input', { type: 'number', min, max, step: 1, inputMode: 'numeric' }), hint, 'num')),
       add('tripo', 'Tripo', h('select', null, h('option', { value: 'off', text: 'off (no credits this month)' }), h('option', { value: 'auto', text: 'auto (Tripo first, Hyper3D when it runs out)' })), 'off passes --no-tripo to the convert worker', 'select'),
     ];
+    // allowed_hosts: a list editor (one text input per host, Add / remove); the control element carries its value through `.listValue` / `.setList`
+    const hostList = h('div', { class: 'q-list-edit', role: 'group', 'aria-label': 'Allowed hosts' });
+    const hostRows = h('div', { class: 'q-list-rows' });
+    const hostItem = (value = '') => {
+      const input = h('input', { type: 'text', value, placeholder: 'host name or address, e.g. my-pc.local', autocomplete: 'off', spellcheck: false });
+      input.setAttribute('aria-label', 'Allowed host');
+      const row = h('div', { class: 'q-list-row' }, input,
+        button('Remove', () => { row.remove(); hostList.dispatchEvent(new Event('input', { bubbles: true })); }, '', 'Remove this host'));
+      return row;
+    };
+    hostList.listValue = () => [...hostRows.querySelectorAll('input')].map(i => i.value.trim()).filter(Boolean);
+    hostList.setList = values => { hostRows.replaceChildren(...asList(values).map(v => hostItem(String(v)))); };
+    hostList.append(hostRows, button('Add host', () => { const row = hostItem(); hostRows.append(row); row.querySelector('input').focus(); hostList.dispatchEvent(new Event('input', { bubbles: true })); }, '', 'Add a host name'));
+    rows.push(add('allowed_hosts', 'Allowed hosts', hostList, 'Host names the server answers to besides localhost. A new host works at once; removing one needs a server restart.', 'list'));
     const checks = SERVICES.map(([name, label]) => {
       const input = h('input', { type: 'checkbox' });
       const row = add(`services.${name}`, '', input, '', 'check');
@@ -506,13 +709,16 @@ export function createSections({ reload }) {
     const serverValue = key => (key.startsWith('services.') ? server?.services?.[key.slice(9)] : server?.[key]);
     const inputValue = key => {
       const f = fields[key];
-      return f.kind === 'check' ? f.input.checked : f.kind === 'num' ? f.input.value.trim() : f.input.value;
+      return f.kind === 'check' ? f.input.checked : f.kind === 'num' ? f.input.value.trim() : f.kind === 'list' ? f.input.listValue() : f.input.value;
     };
-    const differs = key => (fields[key].kind === 'num' ? inputValue(key) !== String(serverValue(key) ?? '') : inputValue(key) !== serverValue(key));
+    const differs = key => (fields[key].kind === 'num' ? inputValue(key) !== String(serverValue(key) ?? '')
+      : fields[key].kind === 'list' ? JSON.stringify(inputValue(key)) !== JSON.stringify(asList(serverValue(key)).map(String))
+        : inputValue(key) !== serverValue(key));
     function show(key) {
       const f = fields[key];
       const value = serverValue(key);
       if (f.kind === 'check') f.input.checked = !!value;
+      else if (f.kind === 'list') { if (differs(key)) f.input.setList(value); }
       else f.input.value = value == null ? '' : String(value);
     }
     function changed() {
@@ -598,6 +804,15 @@ export function createSections({ reload }) {
   return {
     node,
     /** Feed the latest GET /api/v2/queue response. */
-    update(next) { data = next; redraw(); },
+    update(next) {
+      data = next;
+      if (servicesMode(next) === 'ok' && next.services.managed === true) memo.serviceOff = null;     // management is on after all
+      reconcileRequests(next);
+      reconcileCheck(next);
+      noteServices(servicesMode(next) === 'absent' ? null : { managed: next.services.managed !== false, scanned: servicesMode(next) !== 'scanning' });
+      redraw();
+    },
+    /** The Queue tab is closed: the header chip goes back to what the state says. */
+    dispose() { noteServices(null); },
   };
 }

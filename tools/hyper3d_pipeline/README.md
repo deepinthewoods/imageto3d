@@ -45,19 +45,35 @@ Flow (resumable by the server's stage, intents flushed before every click, never
    - In both cases the record is renamed to `studio_submission.not_submitted_<time>.json` (status `not_submitted`), so a re-run submits again.
    - `export_glb` also tolerates Firefox renaming a download while it is being listed; that crashed a collect on 2026-10-27.
 
-### Browser lock (2026-11-25)
+### Browser lock (2026-11-25; moved to the profile launch after review_v2_phase4)
 
 The Hyper3D Firefox profile admits one browser, and several processes now use it (outfit `convert_job.py`, the monster
-wrappers in `characters/monsters/aaa/tools/hyper3d_{single,twoview,multiview}.py`, the preview app's monster lane).
-`SeleniumRodin.__enter__` therefore takes the cross-process OS lock `<imageto3d root>/.codex_jobs/_batch/browser_hyper3d.lock`
-(`BrowserLock`: `msvcrt.locking` on Windows, `fcntl.flock` elsewhere, the helpers of `tools/tripo_pipeline/claim_lock.py`)
-BEFORE the profile check and launch, and releases it in `__exit__` (and when the start fails). The kernel frees it if the
-holder dies; the file is never deleted and holds the holder's pid for the waiter's message. A busy lock is polled for
-`$HYPER3D_LOCK_WAIT` seconds (default 600, 0 = fail at once), then `Stop('Hyper3D profile busy (another conversion holds the
-browser)')`, exit code 3, the same as any deliberate stop. Wrappers that subclass `SeleniumRodin` inherit it. If `submit`
-stops there it sets its record aside as `not_submitted` (nothing was generated), so a re-run submits again; `collect` just
-stops and resumes later. `$HYPER3D_BROWSER_LOCK` points the lock at another file (tests). Tests:
-`test_browser_lock.py` (two real processes) and `test_monster_wrappers.py`.
+wrappers in `characters/monsters/aaa/tools/hyper3d_{single,twoview,multiview}.py`, the preview app's monster lane, the manual
+`native_browser.py` / `workflow.py` runners). The cross-process OS lock `<imageto3d root>/.codex_jobs/_batch/browser_hyper3d.lock`
+(`browser_lock.BrowserLock`, re-exported by `rodin_backend`: `msvcrt.locking` on Windows, `fcntl.flock` elsewhere, the helpers
+of `tools/tripo_pipeline/claim_lock.py`) is taken in the functions that actually open the profile, through
+`browser_lock.open_profile(check, launch)`: `SeleniumRodin._start` (the monster wrappers inherit it), `native_browser.run`
+(login, inspect, prepare) and the hyper3d `workflow.py main`; the old debug scripts (`batch.py`, `heads_session.py`,
+`interactive_session.py`, `explore.py`, `probe.py`) hold it for their whole run. It is taken BEFORE the profile check and the
+launch and released after Firefox quits (and when the start fails). It is **re-entrant within one process** (a module-level
+depth counter), and the process that opens the profile holds it. **A parent never holds it while it waits on a child** that
+opens the profile (the preview app's monster lane starts the wrapper as a child and lets the child take it): the child would
+wait for the parent. The kernel frees it if the holder dies; the file is never deleted and holds the holder's pid for the
+waiter's message. A busy lock is polled for `$HYPER3D_LOCK_WAIT` seconds (default 600, 0 = fail at once), then
+`Stop('Hyper3D profile busy (another conversion holds the browser)')`, exit code 3, the same as any deliberate stop. If
+`submit` stops there it sets its record aside as `not_submitted` (nothing was generated), so a re-run submits again; `collect`
+just stops and resumes later. `$HYPER3D_BROWSER_LOCK` points the lock at another file (tests).
+
+### Output (paid-record) lock (2026-11-25, review_v2_phase4 finding 1)
+
+Every command on an output folder (`submit`, `collect`, `preview`, `inspect`, `bind`, also through the monster wrappers) holds
+`<out_dir>/.record.lock` (`browser_lock.output_lock`, an OS byte lock) for its whole run and reads `studio_submission.json`
+only after it has the lock; the record is created exclusively (complete temp file hard-linked into place). A second command
+on the same output stops at once with `STOPPED: another process is handling this output` (exit 3) without reading or writing
+anything, so two collectors can never both confirm the geometry and an inspection can never write back over a newer intent.
+The lock is re-entrant within one thread only (two threads of one process exclude each other). Tests: `test_browser_lock.py`
+(two real collector processes against one output: exactly one paid click; a concurrent inspector; the re-read after the lock;
+every profile entry point with fake selenium modules) and `test_monster_wrappers.py`.
 
 Config `allow_mixed_sizes` (only the monster multi-view wrapper sets it) lets `validate_views` accept images of different
 pixel sizes; the plan and record then carry `input_resolutions`. Hyper3D's acceptance of mixed sizes is unverified.

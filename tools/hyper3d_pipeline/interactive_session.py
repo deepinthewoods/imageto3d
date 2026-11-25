@@ -13,6 +13,9 @@ from selenium.webdriver.firefox.options import Options
 from selenium.webdriver.firefox.service import Service
 from native_browser import PROFILE, BINARY, GECKODRIVER, check_profile, WORKSPACE
 
+from browser_lock import BrowserLock
+# Hyper3D browser lock (browser_lock.py), taken before the profile check and held for the life of this process
+PROFILE_LOCK=BrowserLock().acquire()
 check_profile(PROFILE)
 options=Options()
 options.binary_location=BINARY

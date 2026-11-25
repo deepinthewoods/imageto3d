@@ -191,5 +191,111 @@ class LaunchTests(Base):
         self.assertTrue((job / 'cwd.txt').read_text().strip().endswith('/monsters/aaa'))
 
 
+class SingleInstanceAndReservationTests(Base):
+    """DESIGN_PHASE4 I.5 / review_v2_phase4 finding 10: one runner, and a launch is reserved in the status BEFORE the spawn
+    and reconciled at the next start (both launcher roots)."""
+
+    run_once = LaunchTests.run_once
+
+    def reserved(self, name='m-left', job='m-left-a01'):
+        view_batch.save(self.batch / 'status' / f'{name}.json', {
+            'state': 'launching', 'attempts': 0, 'job': job, 'started': '2026-11-25T10:00:00',
+            'jobs': [{'job': job, 'started': '2026-11-25T10:00:00'}]})
+
+    def test_a_second_runner_exits_while_the_first_holds_the_lock(self):
+        handle = view_batch.acquire_instance_lock()
+        self.assertIsNotNone(handle)
+        try:
+            self.task()
+            calls = []
+            with mock.patch.object(view_batch.subprocess, 'Popen', lambda cmd, **kw: calls.append(cmd) or mock.Mock()):
+                self.assertEqual(view_batch.run(mock.Mock(parallel=4, exit_when_idle=False)), 1)
+            self.assertEqual(calls, [])                                          # nothing launched, no status written
+            self.assertFalse((self.batch / 'status' / 'm-left.json').exists())
+        finally:
+            handle.close()
+        again = view_batch.acquire_instance_lock()                               # released with its holder
+        self.assertIsNotNone(again)
+        again.close()
+
+    def test_the_lock_is_held_by_another_process_too(self):
+        import subprocess
+        code = ('import sys; sys.path.insert(0, r"%s"); import view_batch; from pathlib import Path; '
+                'view_batch.BATCH = Path(r"%s"); h = view_batch.acquire_instance_lock(); print(h is not None, flush=True); '
+                'sys.stdin.readline()' % (Path(view_batch.__file__).resolve().parent, self.batch))
+        child = subprocess.Popen([sys.executable, '-c', code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+        try:
+            self.assertEqual(child.stdout.readline().strip(), 'True')
+            self.assertIsNone(view_batch.acquire_instance_lock())
+        finally:
+            child.communicate('\n', timeout=30)
+        handle = view_batch.acquire_instance_lock()
+        self.assertIsNotNone(handle)
+        handle.close()
+
+    def test_the_status_says_launching_while_the_job_is_spawned(self):
+        self.task(launcher='monsters')
+        seen = []
+        self.run_once(popen=lambda cmd, **kw: seen.append(self.status()) or mock.Mock())
+        (during,) = seen
+        self.assertEqual((during['state'], during['job'], during['jobs'][-1]['job']), ('launching', 'm-left-a01', 'm-left-a01'))
+        after = self.status()
+        self.assertEqual(after['state'], 'running')
+        self.assertNotIn('job', after)
+        self.assertEqual([j['job'] for j in after['jobs']], ['m-left-a01'])
+
+    def test_a_stop_between_spawn_and_status_never_launches_a_second_job(self):
+        """The reviewer's sequence: the runner spawned the job and died before recording it; the restarted runner must adopt
+        that job, not allocate the next attempt for the same outputs."""
+        self.task(launcher='monsters')
+        self.reserved()
+        (self.monsters / '.codex_jobs' / 'm-left-a01').mkdir(parents=True)     # the spawned launcher created its job folder
+        calls = []
+        with mock.patch.object(view_batch, 'job_alive', lambda job, status, root=None: True):
+            self.run_once(popen=lambda cmd, **kw: calls.append(cmd) or mock.Mock())
+        self.assertEqual(calls, [])                                             # no second job
+        status = self.status()
+        self.assertEqual((status['state'], [j['job'] for j in status['jobs']]), ('running', ['m-left-a01']))
+        self.assertNotIn('job', status)
+
+    def test_a_reservation_whose_launcher_still_runs_is_adopted(self):
+        self.task()
+        self.reserved()
+        calls = []
+        with mock.patch.object(view_batch, 'launcher_alive', lambda job: job == 'm-left-a01'), \
+                mock.patch.object(view_batch, 'job_alive', lambda job, status, root=None: True):
+            self.run_once(popen=lambda cmd, **kw: calls.append(cmd) or mock.Mock())
+        self.assertEqual((calls, self.status()['state']), ([], 'running'))
+
+    def test_a_reservation_that_never_launched_goes_back_to_pending_and_runs_once(self):
+        self.task()
+        self.reserved()
+        calls = []
+        with mock.patch.object(view_batch, 'launcher_alive', lambda job: False):
+            self.run_once(popen=lambda cmd, **kw: calls.append(cmd) or mock.Mock())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][len(view_batch.SHELL) + 1], 'm-left-a01')    # the reserved number is reused, not skipped
+        status = self.status()
+        self.assertEqual((status['state'], [j['job'] for j in status['jobs']]), ('running', ['m-left-a01']))
+
+    def test_a_reservation_is_judged_in_the_monster_root_not_this_project(self):
+        self.task(launcher='monsters')
+        self.reserved()
+        (self.root / '.codex_jobs' / 'm-left-a01').mkdir(parents=True)          # same name in the wrong project: ignored
+        with mock.patch.object(view_batch, 'launcher_alive', lambda job: False):
+            view_batch.reconcile_launching()
+        self.assertEqual((self.status()['state'], self.status()['jobs']), ('pending', []))
+
+    def test_a_failed_spawn_drops_the_reservation(self):
+        self.task()
+
+        def boom(cmd, **kw):
+            raise OSError('no bash')
+        self.run_once(popen=boom)
+        status = self.status()
+        self.assertEqual((status['state'], status['jobs']), ('pending', []))
+        self.assertNotIn('job', status)
+
+
 if __name__ == '__main__':
     unittest.main()

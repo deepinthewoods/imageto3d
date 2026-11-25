@@ -19,8 +19,11 @@ Cost safety (fail closed):
 
 The browser part (SeleniumRodin) drives the native Firefox profile of this folder (see README.md) and
 is UNVERIFIED against a signed-in session; everything else is offline-tested with a fake session.
-SeleniumRodin.__enter__ first takes the cross-process browser lock `.codex_jobs/_batch/browser_hyper3d.lock` (BrowserLock;
-waits up to $HYPER3D_LOCK_WAIT seconds, default 600, then Stop 'Hyper3D profile busy'); the monster wrappers inherit it.
+Locks (browser_lock.py): SeleniumRodin._start opens the profile through browser_lock.open_profile, which takes the
+cross-process browser lock `.codex_jobs/_batch/browser_hyper3d.lock` before the profile check and the launch (re-entrant within a
+process; waits up to $HYPER3D_LOCK_WAIT seconds, default 600, then Stop 'Hyper3D profile busy'); the monster wrappers inherit it.
+Every command (submit / collect / preview / inspect / bind) holds `<out_dir>/.record.lock` for its whole run and reads the record
+only after taking it; a second command on the same output stops at once with 'another process is handling this output'.
 """
 import argparse
 import contextlib
@@ -59,93 +62,10 @@ COST_KINDS = ('geometry', 'material_generate', 'material_confirm')
 STAGES_TO_ACT = {'geometry_preview', 'material_ready', 'material_preview', 'export_ready'}
 
 
-class Stop(Exception):
-    """A fail-closed stop: nothing wrong happened, a guard or a missing permission halted the run."""
-
-
-# --------------------------------------------------------------------------- browser lock
-
-# The Hyper3D Firefox profile admits ONE browser, and the outfit conversion (convert_job.py -> this file), the monster
-# wrappers (monsters/aaa/tools/hyper3d_*.py subclass SeleniumRodin) and the preview app's monster lane all start separate
-# processes. SeleniumRodin.__enter__ therefore takes this cross-process OS byte lock (the kernel frees it if the holder
-# dies; the lock file itself is never deleted) before it looks at or launches the profile. It is always the imageto3d
-# root's file, whoever the caller is.
-LOCK_FILE = HERE.parents[1] / '.codex_jobs' / '_batch' / 'browser_hyper3d.lock'
-LOCK_FILE_ENV = 'HYPER3D_BROWSER_LOCK'       # test hook: a different lock file
-LOCK_WAIT_ENV = 'HYPER3D_LOCK_WAIT'          # seconds to wait for a busy browser (0 = fail at once)
-LOCK_WAIT_S = 600
-LOCK_POLL_S = 1.0
-LOCK_BUSY = 'Hyper3D profile busy (another conversion holds the browser)'
-
-
-def lock_wait_seconds():
-    try:
-        return max(0.0, float(os.environ[LOCK_WAIT_ENV]))
-    except (KeyError, ValueError):
-        return float(LOCK_WAIT_S)
-
-
-class BrowserLock:
-    """Exclusive cross-process lock on the Hyper3D browser profile. `acquire` polls for `wait` seconds (default
-    $HYPER3D_LOCK_WAIT or 600) and then raises Stop(LOCK_BUSY); `release` is idempotent. The holder's pid is written at
-    the start of the file for the waiter's message (informational only: the OS lock is the authority)."""
-
-    def __init__(self, path=None, wait=None):
-        self.path = Path(path or os.environ.get(LOCK_FILE_ENV) or LOCK_FILE)
-        self.wait = lock_wait_seconds() if wait is None else float(wait)
-        self.handle = None
-
-    def _holder(self):
-        try:
-            return self.path.read_text(errors='replace').strip().splitlines()[0][:80]
-        except (OSError, IndexError):
-            return None
-
-    def acquire(self):
-        if self.handle:
-            return self
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        handle = os.fdopen(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o666), 'r+b')
-        try:
-            deadline = time.monotonic() + self.wait
-            announced = False
-            while not claim_lock.try_lock(handle):
-                if time.monotonic() >= deadline:
-                    holder = self._holder()
-                    raise Stop(LOCK_BUSY + (f'; held by {holder}' if holder else '') + f'; waited {self.wait:g} s')
-                if not announced:
-                    print(f'{LOCK_BUSY}; waiting up to {self.wait:g} s ({self.path})', file=sys.stderr, flush=True)
-                    announced = True
-                time.sleep(min(LOCK_POLL_S, max(0.05, deadline - time.monotonic())))
-            handle.seek(0)
-            handle.truncate()
-            handle.write(f'pid {os.getpid()} since {now()}\n'.encode())
-            handle.flush()
-            self.handle = handle
-            return self
-        except BaseException:
-            handle.close()
-            raise
-
-    def release(self):
-        handle, self.handle = self.handle, None
-        if handle is None:
-            return
-        try:
-            handle.seek(0)
-            handle.truncate()
-            handle.flush()
-            claim_lock.release_lock(handle)
-        except OSError:
-            pass
-        finally:
-            handle.close()
-
-    def __enter__(self):
-        return self.acquire()
-
-    def __exit__(self, *exc):
-        self.release()
+# Stop, the browser lock and the per-output record lock live in browser_lock.py (no selenium import), so native_browser.py
+# and workflow.py take the same browser lock when they open the profile.
+from browser_lock import (BrowserLock, LOCK_BUSY, LOCK_FILE, LOCK_FILE_ENV, LOCK_POLL_S, LOCK_WAIT_ENV,  # noqa: E402,F401
+                          LOCK_WAIT_S, OUTPUT_BUSY, RECORD_LOCK, Stop, lock_wait_seconds, open_profile, output_lock)
 
 
 BALANCE_WAIT_S = 60   # the header balance loads late (0, then the real one); Generate with 0 shown = "Insufficient Balance"
@@ -228,18 +148,32 @@ def sha256_file(path):
 # --------------------------------------------------------------------------- record (intent guard)
 
 class Record:
-    """studio_submission.json with write-before-click intents; mirrors job_state.Job semantics."""
+    """studio_submission.json with write-before-click intents; mirrors job_state.Job semantics. The commands below create,
+    read and write it only while they hold the output's `.record.lock` (browser_lock.output_lock)."""
 
     def __init__(self, path):
         self.path = Path(path)
         self.data = json.loads(self.path.read_text())
 
+    def reload(self):
+        self.data = json.loads(self.path.read_text())
+        return self
+
     @classmethod
     def create(cls, path, data):
+        """Exclusive creation: the complete record is written to a temp file and hard-linked into place, which fails when a
+        record already exists (never overwritten, never seen half-written)."""
         path = Path(path)
         if path.exists():
             raise Stop(f'Submission record already exists; collect or inspect instead: {path}')
-        atomic_json(path, data)
+        temp = path.with_name(f'{path.name}.{os.getpid()}.new')
+        atomic_json(temp, data)
+        try:
+            os.link(temp, path)
+        except FileExistsError:
+            raise Stop(f'Submission record already exists; collect or inspect instead: {path}') from None
+        finally:
+            temp.unlink(missing_ok=True)
         return cls(path)
 
     def save(self, event, **changes):
@@ -250,12 +184,17 @@ class Record:
             stream.write(json.dumps({'at': now(), 'event': event, **changes}, default=str) + '\n')
 
     def bind(self, url):
+        """Bind the model URL under the output lock (taken here when the caller does not hold it yet; the record is then
+        re-read first, so a bind run on its own never writes back a stale copy)."""
         ident = model_id(url)
         if not ident:
             raise ValueError('Expected a Hyper3D model URL ending in a UUID')
-        if self.data.get('model_id') not in (None, ident):
-            raise ValueError('This record is already bound to a different model')
-        self.save('model_linked', model_id=ident, model_url=f'{BASE}/{ident}', project_id=ident)
+        with output_lock(self.path.parent) as outermost:
+            if outermost:
+                self.reload()
+            if self.data.get('model_id') not in (None, ident):
+                raise ValueError('This record is already bound to a different model')
+            self.save('model_linked', model_id=ident, model_url=f'{BASE}/{ident}', project_id=ident)
 
     def intent(self, action):
         if self.data.get('pending_action'):
@@ -398,11 +337,17 @@ def _record_data(plan, config, views_dir, out_dir):
 
 
 def submit(views_dir, out_dir, *, config=None, session_factory=None, dry_run=False):
-    """Upload the views and start the FREE preview; leaves status 'submitted' with the model URL."""
+    """Upload the views and start the FREE preview; leaves status 'submitted' with the model URL. Holds the output lock
+    for the whole command (a second command on this output stops before the record is created or read)."""
     config = config or load_config()
     out_dir = Path(out_dir)
     plan = validate_views(views_dir, config)
     out_dir.mkdir(parents=True, exist_ok=True)
+    with output_lock(out_dir):
+        return _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run)
+
+
+def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
     record = Record.create(out_dir / RECORD, _record_data(plan, config, views_dir, out_dir))
     session_factory = session_factory or (lambda: SeleniumRodin(config, out_dir))
     with contextlib.ExitStack() as stack:
@@ -471,9 +416,16 @@ def _step(record, session, config, kind, expected, allow_paid, accept_preview=Fa
 
 def collect(out_dir, *, allow_paid=False, accept_preview=False, expected_costs=None,
             config=None, session_factory=None):
-    """Resume by server stage: confirm raw geometry, De-light material, export GLB, record exports.GLB."""
+    """Resume by server stage: confirm raw geometry, De-light material, export GLB, record exports.GLB. Holds the output
+    lock for the whole command and reads the record only after taking it (two collectors can never both act on one
+    record: the second stops with OUTPUT_BUSY before it reads or writes anything)."""
     config = config or load_config()
     out_dir = Path(out_dir)
+    with output_lock(out_dir):
+        return _collect_locked(out_dir, allow_paid, accept_preview, expected_costs, config, session_factory)
+
+
+def _collect_locked(out_dir, allow_paid, accept_preview, expected_costs, config, session_factory):
     record = Record(out_dir / RECORD)
     data = record.data
     if data.get('backend') != 'hyper3d':
@@ -550,9 +502,14 @@ def _finish(record, export):
 
 def preview(out_dir, *, config=None, session_factory=None):
     """Read-only: wait for the free geometry preview, screenshot it, dump the Confirm popover and its displayed
-    cost. Picks the configured mesh option (a selection, not a purchase) but NEVER clicks Confirm."""
+    cost. Picks the configured mesh option (a selection, not a purchase) but NEVER clicks Confirm. Holds the output lock."""
     config = config or load_config()
     out_dir = Path(out_dir)
+    with output_lock(out_dir):
+        return _preview_locked(out_dir, config, session_factory)
+
+
+def _preview_locked(out_dir, config, session_factory):
     record = Record(out_dir / RECORD)
     if record.data.get('backend') != 'hyper3d' or not record.data.get('model_url'):
         raise Stop('record is not a submitted hyper3d model')
@@ -578,9 +535,15 @@ def preview(out_dir, *, config=None, session_factory=None):
 
 
 def inspect_only(out_dir, *, config=None, session_factory=None):
-    """Read-only: reopen the model, record the server stage and a screenshot."""
+    """Read-only: reopen the model, record the server stage and a screenshot. Holds the output lock (an inspection
+    never writes back over a newer intent of a collect)."""
     config = config or load_config()
     out_dir = Path(out_dir)
+    with output_lock(out_dir):
+        return _inspect_locked(out_dir, config, session_factory)
+
+
+def _inspect_locked(out_dir, config, session_factory):
     record = Record(out_dir / RECORD)
     if not record.data.get('model_url'):
         return record.data
@@ -591,6 +554,15 @@ def inspect_only(out_dir, *, config=None, session_factory=None):
         session.screenshot('resume_inspected')
         record.save('resume_inspected', last_observation={'stage': stage})
     return record.data
+
+
+def bind(out_dir, url):
+    """`bind` command: attach a model URL to a submission interrupted before it was captured (under the output lock)."""
+    out_dir = Path(out_dir)
+    with output_lock(out_dir):
+        record = Record(out_dir / RECORD)
+        record.bind(url)
+        return record.data
 
 
 # --------------------------------------------------------------------------- browser (UNVERIFIED UI)
@@ -609,25 +581,21 @@ class SeleniumRodin:
     lock = None
 
     def __enter__(self):
-        # One browser on the profile across processes: the lock comes before anything looks at or launches it, and a
-        # failed start releases it again (__exit__ is not called when __enter__ raises).
-        self.lock = BrowserLock().acquire()
         try:
             return self._start()
-        except BaseException:
-            self.lock.release()
+        except BaseException:   # __exit__ is not called when __enter__ raises: quit a started browser, free the lock
+            self.__exit__(None, None, None)
             raise
 
     def _start(self):
+        """Open the profile through browser_lock.open_profile: the browser lock (re-entrant within this process) is taken
+        before the profile check and the Firefox launch and kept until __exit__. Subclasses (the monster wrappers) inherit
+        this; they never take the lock themselves."""
         import workflow as wf
         from native_browser import PROFILE, BINARY, check_profile, firefox_service, firefox_extra_args
         from selenium import webdriver
         from selenium.webdriver.firefox.options import Options
         self.wf = wf
-        try:
-            check_profile(PROFILE)
-        except ValueError as exc:
-            raise Stop(f'Firefox profile is open elsewhere: {exc}')
         self.downloads.mkdir(parents=True, exist_ok=True)
         options = Options()
         options.page_load_strategy = 'eager'
@@ -646,15 +614,20 @@ class SeleniumRodin:
         from hidden_display import hidden_display
         display = hidden_display()
         env = {**os.environ, 'DISPLAY': display} if display else None
-        self.driver = webdriver.Firefox(service=firefox_service(env=env), options=options)
+        try:
+            self.driver, self.lock = open_profile(lambda: check_profile(PROFILE),
+                                                  lambda: webdriver.Firefox(service=firefox_service(env=env), options=options))
+        except ValueError as exc:
+            raise Stop(f'Firefox profile is open elsewhere: {exc}')
         self.driver.set_window_size(1500, 1000)
         self.driver.set_page_load_timeout(45)
         return self
 
     def __exit__(self, *exc):
+        driver, self.driver = self.driver, None
         try:
-            if self.driver:
-                self.driver.quit()
+            if driver:
+                driver.quit()
         finally:
             if self.lock:
                 self.lock.release()
@@ -1133,9 +1106,7 @@ def main(argv=None):
         elif args.command == 'inspect':
             result = inspect_only(args.out_dir)
         else:
-            record = Record(Path(args.out_dir) / RECORD)
-            record.bind(args.url)
-            result = record.data
+            result = bind(args.out_dir, args.url)
     except Stop as exc:
         print(f'STOPPED: {exc}', file=sys.stderr)
         raise SystemExit(3)

@@ -2067,5 +2067,143 @@ class RecheckTests(Phase3Case):
         self.assertEqual((data['totals']['queued'], data['totals']['running']), (1001, 1))
 
 
+# ============================================================================================ phase 4 review (findings 11 and 12)
+
+class Phase4ReviewTests(Phase3Case):
+    logs = RecheckTests.logs
+    running_row = RecheckTests.running_row
+
+    # ------------------------------------------------------------------------------------------------------------------ F11
+    def test_f11_a_source_replaced_while_waiting_for_the_publish_locks_is_a_409(self):
+        """The reviewer replaced the pinned LOD at lock acquisition and got 200 + an active ready.json. The digest and the input fingerprints
+        are validated again at commit, under the locks: 409 stale, no manifest, no decision."""
+        self.approve_and_build()
+        args, rev = self.aligned_args()
+        lod = self.root / 'models/s/j1/human_male/outfit/reduced/lod_error_0p2.glb'
+        real = builds.lb()._publish_lock
+        replaced = []
+
+        @contextlib.contextmanager
+        def racing(out_root, wait):
+            with real(out_root, wait):
+                if not replaced:
+                    replaced.append(True)
+                    lod.write_bytes(b'another mesh written while the approval waited')
+                yield
+        with mock.patch.object(builds.lb(), '_publish_lock', side_effect=racing):
+            status, body = self.act('set:s', 'approve', rev=rev, args=args)
+        self.assertTrue(replaced)
+        self.assertEqual((status, body['code']), (409, 'stale'), body)
+        self.assertIn('while approving', body['error'])
+        self.assertFalse((self.root / 'models/s/ready.json').exists())
+        self.assertIsNone(self.item()['decisions']['aligned_approval'])
+
+    def test_f11_a_changed_input_fingerprint_at_commit_is_a_409(self):
+        self.approve_and_build()
+        args, rev = self.aligned_args()
+        real_fp = builds.lb().fingerprint_module
+        calls = []
+
+        def drifting(module, lod):
+            calls.append(module)
+            value = real_fp(module, lod)
+            return value if len(calls) <= 2 else value + '-changed'        # the checks before the locks pass, the commit check sees new inputs
+        with mock.patch.object(builds.lb(), 'fingerprint_module', side_effect=drifting):
+            status, body = self.act('set:s', 'approve', rev=rev, args=args)
+        self.assertEqual((status, body['code']), (409, 'stale'), body)
+        self.assertTrue(any('inputs changed while approving' in c for c in body['changes']), body['changes'])
+        self.assertFalse((self.root / 'models/s/ready.json').exists())
+
+    # ------------------------------------------------------------------------------------------------------------------ F12
+    def test_f12_a_replaced_database_with_other_rows_still_merges_the_live_attempt(self):
+        """R5 remainder: the replacement database already holds an unrelated row AND a queued copy of the running key before reconcile. The
+        live attempt is merged by its identity, never started a second time."""
+        self.sets_ready()
+        self.assertEqual(self.approve('s', 0)[0], 200)
+        q = taskqueue.for_root(self.root)
+        for task in q.tasks(lane='bare'):
+            q.cancel(task['id'])
+        self.build_bare(*RACES)
+        self.control(default='ok', **{'human_male/outfit': 'sleep:4'})
+        orch = self.orch()
+        self.started.append(orch)
+        self.idle_value = 5.0
+        orch.tick()
+        live = q.tasks(state=('starting', 'running'))[0]
+        for _ in range(100):
+            if orch._claim(live):
+                break
+            time.sleep(0.05)
+        for suffix in ('', '-wal', '-shm'):
+            f = q.path.with_name(q.path.name + suffix)
+            if f.exists():
+                f.rename(f.with_name(f.name + '.aside'))
+        q._ready = False
+        q.enqueue('layers', 'an-unrelated-row', 's', 'dwarf_male/outfit', {})                     # the reviewer's extra row
+        q.enqueue('layers', live['key'], live['set_name'], live['unit'], live['args'], approval_gen=live['approval_gen'])   # a queued copy
+        out = orch.reconcile()
+        self.assertEqual(out['adopted'], 1, out)
+        row = q.by_key(live['key'])
+        self.assertEqual((row['state'], row['token']), ('running', live['token']))
+        self.drive(orch, self.settled)
+        self.assertEqual(self.runs('human_male/outfit', live['args']['module_dir']), 1)          # never a second build
+
+    @unittest.skipIf(psutil is None, 'needs psutil')
+    def test_f12_a_failure_receipt_with_a_live_builder_keeps_the_slot(self):
+        """R6 remainder: a token-matching failure receipt (written before the builder exited, e.g. after a log I/O error) never frees the slot
+        while the recorded builder lives."""
+        builder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(lambda: (builder.kill(), builder.wait()))
+        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
+        dead.wait()
+        q = taskqueue.for_root(self.root)
+        task = self.running_row('receipt', dead.pid, 'tok-r', builder=builder)
+        orchestrator.result_path(q.get(task)).write_text(json.dumps(
+            {'token': 'tok-r', 'attempt': 1, 'exit': -1, 'last_json': None, 'finished': time.time(), 'start_error': 'OSError: no space left',
+             'builder_pid': builder.pid, 'builder_create': orchestrator.create_time(builder.pid), 'builder_exited': None}))
+        waiting = q.enqueue('layers', 'next', 's', 'dwarf_male/outfit', {'race': 'dwarf_male', 'module_dir': str(self.module('j9', race='dwarf_male')),
+                                                                         'lod': '0p2'})
+        self.control(default='ok')
+        orch = self.orch(raw=True)
+        self.started.append(orch)
+        self.idle_value = 5.0                                                          # one worker
+        orch.tick()
+        self.assertEqual(q.get(task)['state'], 'orphan')
+        self.assertEqual(q.get(waiting)['state'], 'queued')                            # the slot stays taken
+        orch.tick()
+        self.assertEqual(q.get(task)['state'], 'orphan')
+        # an older wrapper's receipt without the builder fields: the claim's builder decides
+        row = q.get(task)
+        self.assertTrue(orch._receipt_builder_alive(row, {'token': 'tok-r', 'exit': -1, 'start_error': 'x'}, time.time()))
+        self.assertFalse(orch._receipt_builder_alive(row, {'token': 'tok-r', 'exit': 0}, time.time()))
+        builder.kill()
+        builder.wait(10)
+        orch.tick()
+        self.assertNotIn(q.get(task)['state'], taskqueue.ACTIVE)                       # settled once the builder is gone
+
+    def test_f12_the_wrapper_writes_its_receipt_only_after_the_builder_exited(self):
+        base = Path(self.temp.name) / 'rt12'
+        base.mkdir()
+        code = 'import json,time\nfor i in range(50): print("line", i, flush=True)\ntime.sleep(0.5)\nprint(json.dumps({"status": "ok"}), flush=True)'
+        spec = {'id': 3, 'attempt': 1, 'token': 'tok-io', 'argv': [sys.executable, '-c', code], 'log': str(base / 'io.log'),
+                'result': str(base / 'io.result.json'), 'claim': str(base / 'io.claim.json'), 'task': {'key': 'k'}}
+        real = run_task._json_object
+        failed = []
+
+        def flaky(line):
+            if not failed:
+                failed.append(True)
+                raise OSError('the log disk went away')
+            return real(line)
+        with mock.patch.object(run_task, '_json_object', side_effect=flaky):
+            result = run_task.run(spec)
+        self.assertIn('log disk went away', result['log_error'])
+        self.assertEqual((result['exit'], result['builder_exited'], result['last_json']), (0, True, {'status': 'ok'}))
+        self.assertFalse(orchestrator.pid_alive(result['builder_pid']) and
+                         orchestrator.create_time(result['builder_pid']) == result['builder_create'])
+        claim = json.loads((base / 'io.claim.json').read_text())
+        self.assertEqual(claim['builder_pid'], result['builder_pid'])
+
+
 if __name__ == '__main__':
     unittest.main()

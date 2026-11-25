@@ -129,8 +129,18 @@ events(id INTEGER PRIMARY KEY, time REAL, task_id INTEGER, kind TEXT, detail TEX
   "Choose views" until **Use enabled views** (verb `convert`) freezes the list into `views.json` (`frozen_at`, the hashes) and
   queues the conversion. An "unattended" tick at approval skips the wait.
 - **Conversion lane** (one at a time; it shares the browser profile with the outfit convert worker):
-  - It takes the cross-process lock `.codex_jobs/_batch/browser_hyper3d.lock`. Phase 5 adds the same lock to `rodin_backend`'s
-    session start, so the outfit worker and the monster lane never use the profile at once.
+  - The profile is guarded by the cross-process lock `.codex_jobs/_batch/browser_hyper3d.lock`
+    (`tools/hyper3d_pipeline/browser_lock.py`, DESIGN_PHASE4 I.4). The process that OPENS the profile takes it: every
+    function that launches Firefox on it (`rodin_backend.SeleniumRodin._start`, which the monster wrappers inherit,
+    `native_browser.py`, the hyper3d `workflow.py`) goes through `browser_lock.open_profile`, so the outfit worker and the
+    monster lane never use the profile at once. The lock is re-entrant only within one process.
+  - **The lane never holds the browser lock itself, and never while it waits on its child**: the wrapper subprocess it starts
+    takes it when it opens the browser (a parent holding it would make that child wait `$HYPER3D_LOCK_WAIT`, default 600 s,
+    and then stop with "Hyper3D profile busy"). To avoid starting a child that will only wait, the lane may probe the lock
+    (acquire with `wait=0`, then release at once) before it spawns the child; contention then shows as "browser busy".
+  - Each output folder also has `.record.lock` (held by the wrapper for its whole submit / collect / preview / inspect / bind
+    command); a second command on the same output stops with "another process is handling this output" (exit 3, a
+    retryable stop, nothing written).
   - It is gated like conversions (PAUSE scope `conversions`, idle rule).
   - Backend: Tripo is off this month (settings). Hyper3D runs `hyper3d_single.py` for one enabled view and an N-view generalisation
     of `hyper3d_twoview.py` for 2-4 views (upload order = enabled order; no direction labels).

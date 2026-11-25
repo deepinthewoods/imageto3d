@@ -7,6 +7,8 @@
   window:
       python -X utf8 -u tools/preview/v2/server.py --port 8765 --manage-services
   stdout / stderr go to .codex_jobs\_batch\preview_v2_win.out.log / .err.log (the previous run's files are kept as *.prev.log).
+  Every run first checks the port: when something already listens on it (normally the v2 server of an earlier trigger, which outlives the
+  short-lived launcher this task tracks), it only appends a line to .codex_jobs\_batch\preview_v2_logon.log: no log rotation, no second server.
   The task never stops the pipeline services: the server only ADOPTS the supervisor / view runner / convert worker it finds, and a server
   restart (or this task's removal) leaves them running.
 
@@ -62,11 +64,16 @@ function Quote([string]$text) { return "'" + $text.Replace("'", "''") + "'" }   
 $logs = Join-Path $Repo '.codex_jobs\_batch'
 $out = Join-Path $logs 'preview_v2_win.out.log'
 $err = Join-Path $logs 'preview_v2_win.err.log'
+$note = Join-Path $logs 'preview_v2_logon.log'
 $serverArgs = "'-X','utf8','-u','tools/preview/v2/server.py','--port','$Port','--manage-services'"
 # The task's own process is a short-lived hidden PowerShell that rotates the logs and starts python hidden and detached from the task.
+# It FIRST checks the port (review F17): when anything already listens on it (normally the v2 server of an earlier trigger, which outlives
+# this launcher), it only notes that in preview_v2_logon.log and exits: no log rotation, no second server.
 $launch = @(
     "Set-Location -LiteralPath $(Quote $Repo)",
     "New-Item -ItemType Directory -Force -Path $(Quote $logs) | Out-Null",
+    "`$busy = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction SilentlyContinue)",
+    "if (`$busy.Count -gt 0) { Add-Content -LiteralPath $(Quote $note) -Value ((Get-Date -Format s) + ' port $Port already has a listener (pid ' + `$busy[0].OwningProcess + '); nothing rotated or started'); exit 0 }",
     "foreach (`$f in @($(Quote $out), $(Quote $err))) { if (Test-Path -LiteralPath `$f) { Move-Item -LiteralPath `$f -Destination (`$f -replace '\.log$', '.prev.log') -Force } }",
     "Start-Process -FilePath $(Quote $Python) -ArgumentList $serverArgs -WorkingDirectory $(Quote $Repo) -WindowStyle Hidden -RedirectStandardOutput $(Quote $out) -RedirectStandardError $(Quote $err)"
 ) -join '; '

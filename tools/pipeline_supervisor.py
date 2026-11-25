@@ -16,10 +16,18 @@ writes .codex_jobs/_batch/PAUSE (json: since, reason, scope): convert_queue.py t
 only when the scope lists "views" (a manual `mode pause`, and a user-active pause since the 2026-10-29 user rule;
 `mode pause-conversions` keeps view generation running; `mode views-run` (user, 2026-11-14) follows the user for
 conversions only, so views generate at any time and conversions run while the user is away), and
-convert_job.py submits no new module. "Finish, then freeze": every descendant of a running convert_job.py that is blender,
-or a python running a script under tools/tripo_pipeline/ (other than convert_job.py), is SIGSTOPped (re-checked each tick);
-network steps (codex image jobs, Hyper3D/rodin_backend, firefox, geckodriver, node studio.mjs, Xvfb) are never frozen.
-Frozen pids (with start times) are in paused_pids.json. Resuming (or exiting, or SIGTERM) removes PAUSE and SIGCONTs them.
+convert_job.py starts no paid step. "Finish, then freeze": every descendant of a running convert_job.py OF THIS CHECKOUT
+(its script path, resolved against the process's working directory, is <root>/tools/tripo_pipeline/convert_job.py) that is
+blender, or a python running a script under tools/tripo_pipeline/ (other than convert_job.py), is SIGSTOPped (re-checked each
+tick); network steps (codex image jobs, Hyper3D/rodin_backend, firefox, geckodriver, node studio.mjs, Xvfb) are never frozen.
+Frozen pids (with start times) are in paused_pids.json. Resuming (or exiting, or SIGTERM) removes PAUSE and SIGCONTs exactly
+the processes recorded there whose pid AND start time still match (nothing else, review_v2_phase4 finding 7).
+
+Every completed screen tick writes .codex_jobs/_batch/supervisor_tick.json {pid, create_time, time (epoch s), at (ISO), mode,
+paused}: the preview app removes its CONVERT_HOLD only after a tick of the current supervisor that is newer than the hold
+(DESIGN_PHASE4 I.1). On shutdown the supervisor first waits for a running advance pass (a gate's workflow.py claim child runs
+under this process's claim lock) and only then releases PAUSE, its single-instance lock and exits; a pass that is not inside a
+claim is waited for at most ADVANCE_JOIN_TIMEOUT seconds (finding 9).
 
 Auto-advance (every 3 min), only for sets matching a pattern in .codex_jobs/_batch/advance.json
 ({"sets": [{"pattern": "ragged_outfit_*", "extra_file": "...", "views_priority": 2}]}):
@@ -75,6 +83,8 @@ except ImportError:
     psutil = None
 
 SCREEN_TICK, ADVANCE_TICK = 30, 180
+ADVANCE_JOIN_TIMEOUT = 1200   # seconds shutdown waits for an advance pass outside a claim (a claim is always waited for)
+TICK_FILE_NAME = 'supervisor_tick.json'
 CLAIMED_STAGES = ('processing_views', 'multiview_ready', 'processing', 'completed')
 # What a user-active pause stops (user, 2026-10-26: "we can generate the multi-views when the screen is on"); the image
 # jobs run remotely and their local checks cost a few CPU-seconds per view. A manual `mode pause` stops both.
@@ -172,6 +182,14 @@ def parse_idle(text):
     return None if not found else int(found.group(1)) / 1000
 
 
+def own_create_time():
+    """This process's creation time as psutil reports it (None without psutil)."""
+    try:
+        return psutil.Process(os.getpid()).create_time() if psutil else None
+    except Exception:   # noqa: BLE001
+        return None
+
+
 def process_table():
     """Rows {pid, ppid, comm, cmdline, stopped, start} of every process (psutil if installed, else /proc)."""
     rows = []
@@ -227,13 +245,56 @@ def script_of(row):
     return next((a for a in row['cmdline'][1:6 if IS_WIN else 4] if a.endswith('.py')), '')
 
 
-def heavy_processes(rows):
+def row_cwd(row):
+    """Working directory of a table row's process: row['cwd'] when the row carries one, else asked from the OS for the SAME
+    process (start time checked; a reused pid gives None); None when it cannot be read."""
+    if 'cwd' in row:
+        return row['cwd']
+    try:
+        if psutil:
+            proc = psutil.Process(row['pid'])
+            if abs(proc.create_time() - row['start']) >= 1:
+                return None
+            return proc.cwd()
+        if IS_WIN:
+            return None
+        fields = Path(f'/proc/{row["pid"]}/stat').read_text().rpartition(')')[2].split()
+        if int(fields[19]) != row['start']:
+            return None
+        return os.readlink(f'/proc/{row["pid"]}/cwd')
+    except Exception:   # noqa: BLE001  gone, access denied, no such pid
+        return None
+
+
+def norm_path(path):
+    return os.path.normcase(os.path.realpath(str(path)))
+
+
+def script_path(row):
+    """The resolved script path of a python row (relative paths against its working directory), None when unknown."""
+    script = script_of(row)
+    if not script:
+        return None
+    path = Path(script)
+    if not path.is_absolute():
+        cwd = row_cwd(row)
+        if not cwd:
+            return None
+        path = Path(cwd) / path
+    return norm_path(path)
+
+
+def heavy_processes(rows, root=None):
     """Local CPU-heavy steps to freeze: descendants of a running convert_job.py that are blender or a python running a
-    tools/tripo_pipeline/ script other than convert_job.py. Never hyper3d/node/firefox/geckodriver/Xvfb/codex."""
+    tools/tripo_pipeline/ script other than convert_job.py. Never hyper3d/node/firefox/geckodriver/Xvfb/codex. With `root`
+    only convert_job.py processes of THAT checkout count (their resolved script path is <root>/tools/tripo_pipeline/
+    convert_job.py; an unknown path does not count), so another checkout's conversion is never frozen."""
     children = {}
     for row in rows:
         children.setdefault(row['ppid'], []).append(row)
-    roots = [r for r in rows if r['comm'].startswith('python') and Path(script_of(r)).name == 'convert_job.py']
+    target = None if root is None else norm_path(Path(root) / 'tools' / 'tripo_pipeline' / 'convert_job.py')
+    roots = [r for r in rows if r['comm'].startswith('python') and Path(script_of(r)).name == 'convert_job.py'
+             and (target is None or script_path(r) == target)]
     found, seen, stack = [], set(), [r['pid'] for r in roots]
     while stack:
         for child in children.get(stack.pop(), []):
@@ -282,6 +343,8 @@ class Supervisor:
         self.mode_file, self.pids_file = self.batch / 'supervisor_mode.json', self.batch / 'paused_pids.json'
         self.state_file, self.advance_file = self.batch / 'supervisor_state.json', self.batch / 'advance.json'
         self.lock_file, self.stop_file = self.batch / 'supervisor.lock', self.batch / STOP_FILE_NAME
+        self.tick_file = self.batch / TICK_FILE_NAME
+        self.claim_active = None   # set whose claim lock this process holds (whole claim: moves, claim child, add-views)
         self.paused, self.stop, self.last_error, self.screen_failed = self.pause_file.exists(), False, {}, False
         self.claim_held = None   # set whose claim lock this process holds while its claim child runs
         self.write_lock, self.sizes, self.cache = threading.Lock(), {}, {}
@@ -385,7 +448,7 @@ class Supervisor:
         rows = process_table() if rows is None else rows
         kept = [r for r in self.recorded() if any(same_process(row, r) for row in rows)]
         new = []
-        for row in heavy_processes(rows):
+        for row in heavy_processes(rows, self.root):
             # Windows suspends are counted and psutil does not always report a suspended process as stopped, so a
             # process already on record is never suspended a second time (2026-11-16: body_fit.py was frozen three
             # times, resumed twice and stayed suspended for six hours)
@@ -402,11 +465,11 @@ class Supervisor:
         return new
 
     def resume(self, rows=None):
-        """SIGCONT every recorded pid (same start time) and any stopped heavy descendant; returns the pids resumed."""
+        """SIGCONT exactly the processes recorded in paused_pids.json whose pid and start time still match (identities this
+        supervisor suspended); a stopped process it did not record is never touched. Returns the pids resumed."""
         rows = process_table() if rows is None else rows
         records = self.recorded()
         targets = {row['pid'] for row in rows if any(same_process(row, r) for r in records)}
-        targets |= {row['pid'] for row in heavy_processes(rows) if row['stopped']}
         for pid in sorted(targets):
             try:
                 self.send(pid, SIGCONT)
@@ -448,6 +511,15 @@ class Supervisor:
                 resumed = self.resume()
                 self.emit(f'RESUME ({reason}): PAUSE removed' + (f', continued {len(resumed)} process(es)' if resumed else ''))
         self.paused = paused
+        return True
+
+    def write_tick(self):
+        """supervisor_tick.json after a completed screen tick (the preview app's CONVERT_HOLD release waits for one)."""
+        if self.dry_run:
+            return
+        atomic_write(self.tick_file, {'pid': os.getpid(), 'create_time': own_create_time(), 'time': time.time(),
+                                      'at': datetime.now().isoformat(timespec='seconds'), 'mode': self.mode(),
+                                      'paused': bool(self.paused)})
 
     def resume_stale(self):
         resumed = self.resume()
@@ -467,6 +539,8 @@ class Supervisor:
         if not approved.is_dir():
             return
         for folder in sorted(approved.iterdir()):
+            if self.stop:   # shutting down: start no new claim
+                return
             if not folder.is_dir() or folder.name.startswith('.') or not re.fullmatch(r'[a-z0-9][a-z0-9_]*', folder.name):
                 continue
             if (folder / '.tripo-job.json').exists():
@@ -640,6 +714,8 @@ class Supervisor:
 
     def gate_fronts(self, groups):
         for (kind, set_id), names in sorted(groups.items()):
+            if self.stop:   # shutting down: start no new claim
+                return
             if kind != 'fronts' or not (self.root / 'concepts' / set_id).is_dir():
                 continue
             # a done front whose race moved on (not in concepts/ any more, in a claimed job) is history; a new front in
@@ -699,11 +775,11 @@ class Supervisor:
         (lock busy) stays in concepts/ and is tried again on the next pass."""
         try:
             with claim_lock(self.root, set_id, wait=CLAIM_LOCK_WAIT):
-                self.claim_held = set_id
+                self.claim_held = self.claim_active = set_id
                 try:
                     self.claim_locked(set_id, entry, races, key)
                 finally:
-                    self.claim_held = None
+                    self.claim_held = self.claim_active = None
         except ClaimBusy:
             self.emit(f'HOLD {set_id}: claim lock busy (the preview app is changing this set); trying again next pass')
 
@@ -770,6 +846,8 @@ class Supervisor:
 
     def retry_views(self):
         for key, record in list(self.state['sets'].items()):
+            if self.stop:
+                return
             entry = self.advance_entry(key)
             if entry and record.get('path') and not record.get('views_added') and not self.dry_run:
                 self.add_views(key, entry)
@@ -849,6 +927,8 @@ class Supervisor:
         if not stage.is_dir():
             return
         for job in sorted(p for p in stage.iterdir() if p.is_dir()):
+            if self.stop:
+                return
             set_id = job.name.split('--')[0]
             if not self.advance_entry(set_id) or (read_json(job / '.tripo-job.json', {}) or {}).get('state') != 'generating_other_views':
                 continue
@@ -888,9 +968,11 @@ class Supervisor:
         if not (read_json(self.advance_file, {}) or {}).get('sets'):
             return
         groups = self.task_index()
-        self.guard('retry-views', self.retry_views)
-        self.guard('gate1', self.gate_fronts, groups)
-        self.guard('gate2', self.gate_views, groups)
+        for name, func in (('retry-views', self.retry_views), ('gate1', lambda: self.gate_fronts(groups)),
+                           ('gate2', lambda: self.gate_views(groups))):
+            if self.stop:   # shutting down: the remaining gates wait for the next start
+                return
+            self.guard(name, func)
 
     # loop
     def acquire(self):
@@ -917,6 +999,28 @@ class Supervisor:
             self.thread = threading.Thread(target=self.guard, args=('advance', self.advance), daemon=True)
             self.thread.start()
 
+    def drain_advance(self, timeout=ADVANCE_JOIN_TIMEOUT, poll=30):
+        """Shutdown: wait for a running advance pass before PAUSE and the single-instance lock are released (finding 9). A
+        pass inside a claim (moves, the workflow.py claim child that relies on this process's claim lock, add-views) is
+        always waited for; anything else at most `timeout` seconds. Returns True when no pass runs any more."""
+        thread = self.thread
+        if thread is None or not thread.is_alive():
+            return True
+        self.emit(f'STOPPING: waiting for the running advance pass to finish'
+                  f'{" (claim of " + self.claim_active + " in progress)" if self.claim_active else ""}')
+        started = time.monotonic()
+        while thread.is_alive():
+            thread.join(poll)
+            if not thread.is_alive():
+                break
+            if self.claim_active:
+                continue   # never exit (and free the claim lock) while a claim runs
+            if time.monotonic() - started >= timeout:
+                self.emit(f'STOPPING: the advance pass is still running after {timeout} s outside any claim; exiting without it')
+                return False
+        self.emit(f'STOPPING: advance pass finished after {time.monotonic() - started:.0f} s')
+        return True
+
     def run(self):
         handle = self.acquire()
         if handle is None:
@@ -931,12 +1035,15 @@ class Supervisor:
         last_advance = 0
         try:
             while not self.stop:
-                self.guard('screen', self.tick_screen)
+                if self.guard('screen', self.tick_screen):
+                    self.guard('tick-file', self.write_tick)
                 if time.time() - last_advance >= ADVANCE_TICK:
                     last_advance = time.time()
                     self.advance_async()
                 self.sleep(SCREEN_TICK)
         finally:
+            self.stop = True
+            self.guard('drain', self.drain_advance)   # a claim child must never outlive our claim lock
             self.guard('exit', self.release_all)
             self.stop_file.unlink(missing_ok=True)
             self.emit('STOP')
@@ -947,7 +1054,7 @@ class Supervisor:
         paused, reason = self.desired_pause()
         self.emit(f'mode {self.mode()}: would be {"PAUSED" if paused else "running"} ({reason}); PAUSE file '
                   f'{"present" if self.pause_file.exists() else "absent"}')
-        for row in heavy_processes(process_table()):
+        for row in heavy_processes(process_table(), self.root):
             self.emit(f'heavy step {row["pid"]}:{row["comm"]} {" ".join(row["cmdline"][:3])[:100]} '
                       f'(stopped={row["stopped"]}; {"would freeze" if paused else "left running"})')
         self.guard('advance', self.advance)

@@ -1,4 +1,8 @@
-"""Manual sign-in in normal Firefox, followed by read-only Selenium monitoring."""
+"""Manual sign-in in normal Firefox, followed by read-only Selenium monitoring.
+
+Every launch on the workflow profile (login, inspect, prepare) holds the Hyper3D browser lock
+(browser_lock.py, `.codex_jobs/_batch/browser_hyper3d.lock`) from before the profile check until Firefox is closed, so it
+cannot race a conversion or a monster wrapper between that check and the browser start."""
 import argparse
 from datetime import datetime, timezone
 import glob
@@ -12,6 +16,7 @@ import sys
 import time
 
 from browser import collect_images, save_snapshot, WORKSPACE, LOGIN
+from browser_lock import BrowserLock, Stop as BrowserBusy, open_profile
 from platform_compat import WINDOWS
 
 # HYPER3D_PROFILE points parallel conversion workers at their own clone of the signed-in profile
@@ -138,17 +143,19 @@ def observe(driver, slot, image):
 
 def run(args):
     profile = Path(args.profile).expanduser().resolve()
-    check_profile(profile)
     if args.command == "login":
         if not WINDOWS and not os.environ.get("DISPLAY"):
             raise ValueError("No desktop display found. Set DISPLAY to your local desktop display.")
         if not FIREFOX:
             raise ValueError("Firefox not found. Install it or set HYPER3D_FIREFOX to firefox.exe.")
-        print("Opening normal Firefox for manual Hyper3D/Google sign-in. No automation is attached.", flush=True)
-        print("After Hyper3D is signed in, close this Firefox window before inspect or prepare.", flush=True)
-        if WINDOWS:   # no exec(): it would not wait for the window to close
-            sys.exit(subprocess.call([FIREFOX, "-no-remote", "-profile", str(profile), LOGIN]))
-        os.execv(FIREFOX, [FIREFOX, "--no-remote", "--profile", str(profile), LOGIN])
+        with BrowserLock():   # held until the sign-in window closes (Linux: until exec, see below)
+            check_profile(profile)
+            print("Opening normal Firefox for manual Hyper3D/Google sign-in. No automation is attached.", flush=True)
+            print("After Hyper3D is signed in, close this Firefox window before inspect or prepare.", flush=True)
+            if WINDOWS:   # no exec(): it would not wait for the window to close
+                sys.exit(subprocess.call([FIREFOX, "-no-remote", "-profile", str(profile), LOGIN]))
+            # Linux: the lock's descriptor is close-on-exec, so the lock ends here; the profile's own lock covers the window
+            os.execv(FIREFOX, [FIREFOX, "--no-remote", "--profile", str(profile), LOGIN])
 
     from selenium import webdriver
     from selenium.webdriver.firefox.options import Options
@@ -164,9 +171,10 @@ def run(args):
     if args.headless and "-headless" not in firefox_extra_args():
         options.add_argument("-headless")
     # Use the profile in place so its site session persists. Never copy the user's main profile.
-    driver = webdriver.Firefox(service=firefox_service(), options=options)
-    driver.set_page_load_timeout(45)
+    driver, lock = open_profile(lambda: check_profile(profile),
+                                lambda: webdriver.Firefox(service=firefox_service(), options=options))
     try:
+        driver.set_page_load_timeout(45)
         auth_nav = visit(driver, LOGIN)
         form = any(p.is_displayed() for p in driver.find_elements(By.CSS_SELECTOR, 'input[type="password"]'))
         auth = {"state": "signed_out" if form else "unknown_or_signed_in",
@@ -213,7 +221,10 @@ def run(args):
                 break
             time.sleep(args.interval)
     finally:
-        driver.quit()
+        try:
+            driver.quit()
+        finally:
+            lock.release()
 
 
 def main():
@@ -235,7 +246,7 @@ def main():
         parser.error("offset/cycles must be nonnegative; interval must be at least one second")
     try:
         run(args)
-    except ValueError as exc:
+    except (ValueError, BrowserBusy) as exc:
         parser.error(str(exc))
     except KeyboardInterrupt:
         print("Stopped; the workflow profile and logs were preserved.")

@@ -132,9 +132,12 @@ def test_parse_screen():
     assert ps.parse_screen('') is None
 
 
-def table():
+def table(root=None):
+    """A fake process table; with `root` every row's working directory is that checkout (the supervisor only freezes the
+    descendants of a convert_job.py whose resolved script path is under its own root)."""
     def row(pid, ppid, comm, *cmd, stopped=False):
-        return {'pid': pid, 'ppid': ppid, 'comm': comm, 'cmdline': list(cmd), 'stopped': stopped, 'start': 1000.0 + pid}
+        return {'pid': pid, 'ppid': ppid, 'comm': comm, 'cmdline': list(cmd), 'stopped': stopped, 'start': 1000.0 + pid,
+                **({'cwd': str(root)} if root is not None else {})}
     return [
         row(1, 0, 'systemd'),
         row(100, 1, 'python3', 'python3', 'tools/convert_queue.py', '--worker', '1'),
@@ -160,7 +163,7 @@ def test_heavy_selection():
 
 
 def test_heavy_ignores_already_stopped_in_freeze(root, monkeypatch):
-    rows = table()
+    rows = table(root)
     rows[3]['stopped'] = True
     sent = []
     sup = make_sup(root)
@@ -171,7 +174,7 @@ def test_heavy_ignores_already_stopped_in_freeze(root, monkeypatch):
 
 
 def test_pause_resume_transitions(root, monkeypatch):
-    rows, sent = table(), []
+    rows, sent = table(root), []
     sup = make_sup(root)
     monkeypatch.setattr(ps, 'process_table', lambda: rows)
 
@@ -282,7 +285,7 @@ def test_mode_override(root, monkeypatch):
 
 
 def test_release_all_on_exit(root, monkeypatch):
-    rows, sent = table(), []
+    rows, sent = table(root), []
     monkeypatch.setattr(ps, 'process_table', lambda: rows)
     sup = make_sup(root)
     monkeypatch.setattr(sup, 'send', lambda pid, sig: sent.append((pid, sig)))
@@ -716,7 +719,7 @@ def test_windows_freeze_and_resume_use_psutil_suspend_resume(root, monkeypatch):
     FakePsutil.log, FakePsutil.missing = [], set()
     monkeypatch.setattr(ps, 'IS_WIN', True)
     monkeypatch.setattr(ps, 'psutil', FakePsutil)
-    rows = table()
+    rows = table(root)
     sup = make_sup(root)
     frozen = sup.freeze(rows)
     assert sorted(r['pid'] for r in frozen) == [111, 112, 118, 120]
@@ -734,9 +737,9 @@ def test_windows_freeze_never_suspends_a_recorded_process_twice(root, monkeypatc
     monkeypatch.setattr(ps, 'IS_WIN', True)
     monkeypatch.setattr(ps, 'psutil', FakePsutil)
     sup = make_sup(root)
-    sup.freeze(table())
+    sup.freeze(table(root))
     FakePsutil.log.clear()
-    assert sup.freeze(table()) == []   # psutil still reports them as running; the record says they are frozen
+    assert sup.freeze(table(root)) == []   # psutil still reports them as running; the record says they are frozen
     assert not [p for a, p in FakePsutil.log if a == 'suspend']
     assert sorted(r['pid'] for r in json.loads(sup.pids_file.read_text())) == [111, 112, 118, 120]
 
@@ -745,7 +748,7 @@ def test_windows_freeze_skips_a_process_that_vanished(root, monkeypatch):
     FakePsutil.log, FakePsutil.missing = [], {111}
     monkeypatch.setattr(ps, 'IS_WIN', True)
     monkeypatch.setattr(ps, 'psutil', FakePsutil)
-    frozen = make_sup(root).freeze(table())
+    frozen = make_sup(root).freeze(table(root))
     assert sorted(r['pid'] for r in frozen) == [112, 118, 120]   # psutil.Error became OSError and was skipped
 
 
@@ -846,7 +849,7 @@ def test_stop_file_ends_the_loop_through_the_normal_exit_path(root, monkeypatch)
 @windows_only
 def test_startup_resumes_processes_left_suspended_by_a_killed_instance(root, monkeypatch):
     import threading
-    rows = table()
+    rows = table(root)
     monkeypatch.setattr(ps, 'process_table', lambda: rows)
     monkeypatch.setattr(ps.Supervisor, 'user_away', lambda self: True)
     sent = []
@@ -877,3 +880,162 @@ def test_dry_run_does_not_write_auto_accepted_drift(root):
     sup.run_cmd.drift = {'front_three_quarter.png'}
     sup.advance()
     assert (root / '.codex_jobs' / '_batch' / 'advance.json').read_bytes() == before
+
+
+# ---------------------------------------------------------------- review_v2_phase4 findings 7, 9 and the I.1 tick file
+def other_checkout_rows(root, other):
+    """This checkout's conversion (pids 1xx) beside another checkout's (pids 5xx, a stopped Blender among them)."""
+    def row(pid, ppid, comm, *cmd, stopped=False, cwd=None):
+        return {'pid': pid, 'ppid': ppid, 'comm': comm, 'cmdline': list(cmd), 'stopped': stopped, 'start': 1000.0 + pid,
+                **({'cwd': str(cwd)} if cwd else {})}
+    script = str(root / 'tools' / 'tripo_pipeline' / 'convert_job.py')
+    other_script = str(other / 'tools' / 'tripo_pipeline' / 'convert_job.py')
+    return [
+        row(110, 1, 'python3', 'python3', script, 'job--1'),                                         # absolute, ours
+        row(111, 110, 'blender', 'blender', '-b'),
+        row(510, 1, 'python3', 'python3', other_script, 'job--2'),                                   # absolute, other
+        row(511, 510, 'blender', 'blender', '-b', stopped=True),
+        row(520, 1, 'python3', 'python3', 'tools/tripo_pipeline/convert_job.py', 'j', cwd=other),    # relative, other cwd
+        row(521, 520, 'blender', 'blender', '-b'),
+        row(530, 1, 'python3', 'python3', 'tools/tripo_pipeline/convert_job.py', 'j', cwd=root),     # relative, our cwd
+        row(531, 530, 'python3', 'python3', 'tools/tripo_pipeline/reduce_model.py'),
+        row(540, 1, 'python3', 'python3', 'tools/tripo_pipeline/convert_job.py', 'j'),               # relative, cwd unknown
+        row(541, 540, 'blender', 'blender', '-b'),
+    ]
+
+
+def test_heavy_processes_only_match_this_checkouts_convert_job(root, tmp_path_factory, monkeypatch):
+    other = tmp_path_factory.mktemp('other_checkout')
+    monkeypatch.setattr(ps, 'psutil', None)          # a row without cwd cannot be resolved: it must not count
+    monkeypatch.setattr(ps, 'IS_WIN', True)
+    rows = other_checkout_rows(root, other)
+    assert sorted(r['pid'] for r in ps.heavy_processes(rows, root)) == [111, 531]
+    assert sorted(r['pid'] for r in ps.heavy_processes(rows)) == [111, 511, 521, 531, 541]   # no root: the old behaviour
+
+
+def test_freeze_and_resume_never_touch_another_checkouts_processes(root, tmp_path_factory, monkeypatch):
+    other = tmp_path_factory.mktemp('other_checkout')
+    monkeypatch.setattr(ps, 'psutil', None)
+    monkeypatch.setattr(ps, 'IS_WIN', True)
+    rows, sent = other_checkout_rows(root, other), []
+    sup = make_sup(root)
+    monkeypatch.setattr(sup, 'send', lambda pid, sig: sent.append((pid, sig)))
+    assert sorted(r['pid'] for r in sup.freeze(rows)) == [111, 531]
+    assert sorted(p for p, s in sent if s == ps.SIGSTOP) == [111, 531]
+    for row in rows:
+        row['stopped'] = row['stopped'] or row['pid'] in (111, 531)
+    rows.append({'pid': 532, 'ppid': 530, 'comm': 'blender', 'cmdline': ['blender'], 'stopped': True, 'start': 1532.0})
+    sent.clear()
+    assert sup.resume(rows) == [111, 531]            # only the recorded identities: not 511 (other checkout), not 532 (unrecorded)
+    assert sorted(p for p, s in sent if s == ps.SIGCONT) == [111, 531]
+
+
+def test_resume_at_start_continues_only_recorded_identities(root, monkeypatch):
+    rows = table(root)
+    for row in rows:
+        row['stopped'] = row['pid'] in (111, 112, 118, 120)
+    sent = []
+    sup = make_sup(root)
+    monkeypatch.setattr(sup, 'send', lambda pid, sig: sent.append((pid, sig)))
+    ps.atomic_write(sup.pids_file, [{'pid': 111, 'start': 1111.0, 'comm': 'blender'},
+                                    {'pid': 112, 'start': 5.0, 'comm': 'python3'}])   # 112: pid reused since
+    assert sup.resume(rows) == [111]
+    assert sent == [(111, ps.SIGCONT)]
+
+
+def test_a_completed_tick_writes_the_tick_file(root, monkeypatch):
+    monkeypatch.setattr(ps, 'process_table', lambda: [])
+    sup = make_sup(root)
+    sup.run_cmd.screen = '(false,)\n'
+    before = ps.time.time()
+    assert sup.tick_screen() is True
+    sup.write_tick()
+    tick = json.loads(sup.tick_file.read_text())
+    assert tick['pid'] == ps.os.getpid() and tick['paused'] is True and tick['mode'] == 'auto'
+    assert before <= tick['time'] <= ps.time.time() and tick['at']
+    if ps.psutil:
+        assert abs(tick['create_time'] - ps.psutil.Process(ps.os.getpid()).create_time()) < 1
+    dry = ps.Supervisor(root, dry_run=True)
+    sup.tick_file.unlink()
+    dry.write_tick()
+    assert not sup.tick_file.exists()
+
+
+def test_run_writes_the_tick_file_only_after_a_completed_tick(root, monkeypatch):
+    import threading
+    monkeypatch.setattr(ps, 'process_table', lambda: [])
+    monkeypatch.setattr(ps.Supervisor, 'user_away', lambda self: True)
+    sup = make_sup(root)
+    monkeypatch.setattr(sup, 'advance_async', lambda: None)
+    timer = threading.Timer(1.5, lambda: setattr(sup, 'stop', True))
+    timer.start()
+    assert sup.run() == 0
+    timer.join()
+    assert json.loads(sup.tick_file.read_text())['pid'] == ps.os.getpid()
+    broken = make_sup(root)
+    sup.tick_file.unlink()
+    monkeypatch.setattr(broken, 'tick_screen', lambda: 1 / 0)          # a failed tick writes no tick file
+    monkeypatch.setattr(broken, 'advance_async', lambda: None)
+    timer = threading.Timer(1.5, lambda: setattr(broken, 'stop', True))
+    timer.start()
+    assert broken.run() == 0
+    timer.join()
+    assert not sup.tick_file.exists()
+
+
+def test_shutdown_waits_for_a_running_claim_child_before_releasing(root, monkeypatch):
+    """Finding 9: a stop during gate 1's `workflow.py claim` (a child relying on this process's claim lock) must not release
+    the claim lock, PAUSE or the single-instance lock until the claim returned."""
+    from claim_lock import ClaimBusy, claim_lock
+    monkeypatch.setattr(ps, 'process_table', lambda: [])
+    monkeypatch.setattr(ps.Supervisor, 'user_away', lambda self: False)   # user active: PAUSE is written
+    sup = gate1_ready(root)
+    fake, seen = sup.run_cmd, {}
+
+    def slow_claim(command, timeout=900):
+        if ' claim ' in ' '.join(str(c) for c in command):
+            sup.stop = True                     # the stop request arrives while the claim child runs
+            ps.time.sleep(2.5)
+            seen['instance_running'] = ps.Supervisor(root).instance()[0]
+            seen['pause_present'] = sup.pause_file.exists()
+            try:
+                with claim_lock(root, SET, wait=0):
+                    seen['claim_lock'] = 'free'
+            except ClaimBusy:
+                seen['claim_lock'] = 'held'
+        return fake(command, timeout)
+    sup.run_cmd = slow_claim
+    assert sup.run() == 0
+    assert seen == {'instance_running': True, 'pause_present': True, 'claim_lock': 'held'}
+    assert (root / 'processing_views' / f'{SET}--abc123def456').is_dir()   # the claim completed
+    lines = events(root)
+    stop = next(i for i, l in enumerate(lines) if l.endswith('SUPERVISOR STOP'))
+    assert any('STOPPING: waiting for the running advance pass' in l for l in lines[:stop])
+    assert any('STOPPING: advance pass finished' in l for l in lines[:stop])
+    assert not sup.pause_file.exists()
+    assert ps.Supervisor(root).instance()[0] is False
+    with claim_lock(root, SET, wait=0):
+        pass
+
+
+def test_drain_gives_up_on_a_pass_outside_a_claim_after_the_timeout(root):
+    import threading
+    sup = make_sup(root)
+    release = threading.Event()
+    sup.thread = threading.Thread(target=release.wait, args=(30,), daemon=True)
+    sup.thread.start()
+    try:
+        assert sup.drain_advance(timeout=0.3, poll=0.1) is False
+        sup.claim_active = 'some_set'                     # inside a claim the timeout does not apply
+        threading.Timer(0.6, release.set).start()
+        assert sup.drain_advance(timeout=0.1, poll=0.1) is True
+    finally:
+        release.set()
+    assert any('outside any claim' in l for l in events(root))
+
+
+def test_a_stop_ends_the_advance_pass_before_the_next_gate(root):
+    sup = gate1_ready(root)
+    sup.stop = True
+    sup.advance()
+    assert not sup.run_cmd.of('claim')

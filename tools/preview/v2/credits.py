@@ -2,13 +2,18 @@
 
     snapshot(root)            {"tripo": tripo_state(root), "hyper3d": hyper3d_state(root)}   cheap; safe to call on every poll
     tripo_state(root)         the setting (`off` = "off (no credits this month)") plus the cached balance of the last check
-    check_tripo(root, run=)   the "Check balance" button: `node tools/tripo_pipeline/studio.mjs balance`, ONLY when no convert_job.py /
-                              studio.mjs of this checkout runs (they use the same browser profile); otherwise {"status": "busy"}
+    check_tripo(root, run=)   the "Check balance" button: `node tools/tripo_pipeline/studio.mjs balance` while holding the Tripo browser lock
+                              `.codex_jobs/_batch/browser_tripo.lock` (DESIGN_PHASE4.md I.3; taken without waiting: held by anyone = "busy"),
+                              and only when no convert_job.py / studio.mjs of this checkout runs (legacy callers without the lock)
     hyper3d_state(root)       newest `balances` entry of any `studio_submission.json` (models/**, monsters pipeline/**/hyper3d/)
 
 The Hyper3D scan is cheap: it lists the candidate files (a depth-limited directory walk, ~0.1 s for 1000 modules) and reads only files whose
 mtime is newer than the previous scan; the first scan reads files newest first and stops once a file is older than the best balance found
 (a file's mtime cannot be earlier than the balances inside it). Nothing here ever submits or pays anything.
+
+Every write of credits.json is a read-merge-write of ONE key under the cross-process lock `.codex_jobs/_app/credits.lock` (`update_cache`), so a
+balance check and a Hyper3D scan never overwrite each other's newly recorded value (phase 4 review F8). A balance check counts only with exit 0
+and a numeric `credits`; anything else is an error that keeps the last good balance.
 """
 from __future__ import annotations
 
@@ -16,6 +21,8 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+from contextlib import contextmanager
+import math
 import subprocess
 import sys
 import threading
@@ -53,6 +60,58 @@ def write_cache(root, data: dict) -> None:
     guard.write_atomic(cache_path(root), (json.dumps(data, indent=2) + '\n').encode('utf-8'))
 
 
+def cache_lock_path(root) -> Path:
+    return Path(root) / guard.APP / 'credits.lock'
+
+
+def update_cache(root, key: str, merge) -> dict:
+    """Read credits.json, replace ONLY `key` with `merge(current value of the key)` and write it back, all under the credits lock (F8). Returns
+    the new value of the key."""
+    with guard.os_lock(cache_lock_path(root)):
+        cache = read_cache(root)
+        value = merge(cache.get(key) if isinstance(cache.get(key), dict) else None)
+        cache[key] = value
+        write_cache(root, cache)
+    return value
+
+
+def browser_lock_path(root) -> Path:
+    return Path(root) / '.codex_jobs' / '_batch' / 'browser_tripo.lock'
+
+
+class BrowserBusy(Exception):
+    """Another process holds the Tripo browser lock."""
+
+
+@contextmanager
+def tripo_browser(root):
+    """Hold `.codex_jobs/_batch/browser_tripo.lock` (DESIGN_PHASE4.md I.3: the cross-process byte lock, claim_lock style, every python caller of
+    studio.mjs takes around each call) without waiting: BrowserBusy when anybody holds it."""
+    path = browser_lock_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle = open(path, 'a+b')
+    try:
+        if not guard.try_lock(handle):
+            raise BrowserBusy('the Tripo browser profile is in use (browser_tripo.lock is held)')
+        try:
+            yield
+        finally:
+            guard.release_lock(handle)
+    finally:
+        handle.close()
+
+
+def tripo_browser_busy(root) -> bool:
+    """A quick probe of the Tripo browser lock (taken and released at once)."""
+    try:
+        with tripo_browser(root):
+            return False
+    except BrowserBusy:
+        return True
+    except OSError:
+        return False
+
+
 def now_iso(now: float | None = None) -> str:
     return datetime.fromtimestamp(time.time() if now is None else now, tz=timezone.utc).isoformat(timespec='seconds')
 
@@ -72,39 +131,59 @@ def _run_balance(root) -> tuple[int, str, str]:
     return run.returncode, run.stdout or '', run.stderr or ''
 
 
+def _numeric(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def parse_balance(code: int, out: str):
+    """The balance of a `studio.mjs balance` run: only exit 0 with a numeric `credits` on the last stdout line counts (F4 / F8); else None."""
+    if code != 0:
+        return None
+    try:
+        credits = json.loads(out.strip().splitlines()[-1])['credits']
+    except (IndexError, ValueError, KeyError, TypeError):
+        return None
+    return credits if _numeric(credits) else None
+
+
 def check_tripo(root, run=None, now: float | None = None) -> dict:
     """Run the Tripo balance check once. `run(root) -> (returncode, stdout, stderr)` is injectable (tests never start node).
-    {"status": "ok", "credits"} | {"status": "busy", "message"} (a conversion or another check uses the browser profile) | {"status": "error", "message"}."""
+    {"status": "ok", "credits"} | {"status": "busy", "message"} (the browser lock is held, or a conversion / another check uses the profile)
+    | {"status": "error", "message"} (the last good balance stays in the cache)."""
     if not _CHECK.acquire(blocking=False):
         return {'status': 'busy', 'message': 'a balance check is already running'}
     try:
-        users = services.convert_job_running(root) or services.studio_running(root)
-        if users:
-            what = 'convert_job.py' if services.convert_job_running(root) else 'studio.mjs'
-            return {'status': 'busy', 'message': f'{what} is running (pid {users[0]["pid"]}) and uses the Tripo browser profile; check again after it'}
         try:
-            code, out, err = (run or _run_balance)(root)
-        except (OSError, subprocess.SubprocessError) as error:
-            return _tripo_failed(root, now, f'{type(error).__name__}: {error}')
-        try:
-            credits = json.loads(out.strip().splitlines()[-1])['credits']
-        except (IndexError, ValueError, KeyError, TypeError):
+            with tripo_browser(root):
+                jobs = services.convert_job_running(root)
+                users = jobs or services.studio_running(root)
+                if users:
+                    what = 'convert_job.py' if jobs else 'studio.mjs'
+                    return {'status': 'busy', 'message': f'{what} is running (pid {users[0]["pid"]}) and uses the Tripo browser profile; check again after it'}
+                try:
+                    code, out, err = (run or _run_balance)(root)
+                except (OSError, subprocess.SubprocessError) as error:
+                    return _tripo_failed(root, now, f'{type(error).__name__}: {error}')
+        except BrowserBusy as exc:
+            return {'status': 'busy', 'message': f'{exc}; check again after the conversion'}
+        credits = parse_balance(code, out)
+        if credits is None:
             tail = ' | '.join((err or out).strip().splitlines()[-2:])
-            return _tripo_failed(root, now, f'balance check failed (exit {code}): {tail}'[:400])
-        cache = read_cache(root)
-        cache['tripo'] = {'credits': credits, 'checked_at': now_iso(now), 'ok': True, 'error': None}
-        write_cache(root, cache)
-        return {'status': 'ok', 'credits': credits, 'checked_at': cache['tripo']['checked_at']}
+            return _tripo_failed(root, now, f'balance check failed (exit {code}, no numeric balance): {tail}'[:400])
+        stamp = now_iso(now)
+        update_cache(root, 'tripo', lambda _old: {'credits': credits, 'checked_at': stamp, 'ok': True, 'error': None})
+        return {'status': 'ok', 'credits': credits, 'checked_at': stamp}
     finally:
         _CHECK.release()
 
 
 def _tripo_failed(root, now, message: str) -> dict:
-    cache = read_cache(root)
-    previous = cache.get('tripo') or {}
-    cache['tripo'] = {'credits': previous.get('credits'), 'checked_at': previous.get('checked_at'), 'ok': False, 'error': message,
-                      'failed_at': now_iso(now)}
-    write_cache(root, cache)
+    stamp = now_iso(now)
+
+    def merge(previous):
+        previous = previous or {}
+        return {'credits': previous.get('credits'), 'checked_at': previous.get('checked_at'), 'ok': False, 'error': message, 'failed_at': stamp}
+    update_cache(root, 'tripo', merge)
     return {'status': 'error', 'message': message}
 
 
@@ -192,8 +271,16 @@ def scan_hyper3d(root, extra_roots=None, persist: bool = True) -> dict | None:
                 best = {**found, 'source': str(path)}
                 changed = True
         if persist and (changed or top != high or 'hyper3d' not in cache):
-            cache['hyper3d'] = {'best': best, 'high_water': top, 'scanned_at': now_iso()}
-            write_cache(root, cache)
+            stamp, found = now_iso(), best
+
+            def merge(current):
+                # another writer may have recorded a newer balance meanwhile: keep the newest best and the highest high-water mark
+                current = current or {}
+                other = current.get('best') if isinstance(current.get('best'), dict) else None
+                keep = other if other is not None and (found is None or float(other.get('ts') or 0) > float(found.get('ts') or 0)) else found
+                mark = max(float(current.get('high_water') or 0.0), float(top or 0.0))
+                return {'best': keep, 'high_water': mark, 'scanned_at': stamp}
+            best = update_cache(root, 'hyper3d', merge)['best']
         return best
 
 

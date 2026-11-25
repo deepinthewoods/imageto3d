@@ -36,7 +36,8 @@ VIEWS = ('front', 'front_three_quarter', 'back', 'back_three_quarter')
 REFRESH_S = 5.0                   # a full rescan of the task folders at least this often, whatever the directory mtimes say
 LOG_TAIL_BYTES = 1500
 EVENTS_TAIL = 20
-CONVERT_MAX_TRIES = 3             # = tools/convert_queue.py MAX_TRIES: a job with this many .fails is no longer taken (a test compares them)
+CONVERT_MAX_TRIES = convert_list.MAX_TRIES    # = tools/convert_queue.py MAX_TRIES: a job with this many .fails is no longer taken (a test compares)
+MONSTERS_ENV = 'IMAGETO3D_MONSTERS'          # = tools/view_batch.py MONSTERS_ENV: the monster pipeline root of `"launcher": "monsters"` tasks
 _LOCK = threading.Lock()
 _INDEX: dict[str, dict] = {}
 _FILES: dict[tuple, tuple] = {}   # (kind, path) -> (signature, parsed) for small json files read often
@@ -190,11 +191,36 @@ def task_index(root) -> dict:
         return view
 
 
+def _task_raw(root, name: str) -> dict:
+    raw = _cached_json('task', batch(root) / 'tasks' / f'{name}.json')
+    return raw if isinstance(raw, dict) else {}
+
+
+def _output_paths(root, name: str) -> list[PurePosixPath]:
+    outputs = _task_raw(root, name).get('outputs')
+    return [PurePosixPath(str(o).replace('\\', '/')) for o in outputs if isinstance(o, str)] if isinstance(outputs, list) else []
+
+
 def task_outputs(root, name: str) -> list[str]:
     """The view names (file stems) a task writes, from its `outputs` (Linux or Windows paths alike); cached by the file's (mtime, size)."""
-    raw = _cached_json('task', batch(root) / 'tasks' / f'{name}.json')
-    outputs = raw.get('outputs') if isinstance(raw, dict) and isinstance(raw.get('outputs'), list) else []
-    return [PurePosixPath(str(o).replace('\\', '/')).stem for o in outputs if isinstance(o, str)]
+    return [p.stem for p in _output_paths(root, name)]
+
+
+def task_output_jobs(root, name: str) -> set[str]:
+    """The job folders a views task writes into: `<...>/<job>/<race>/<module>/<view>.png` of its outputs (phase 4 review F19)."""
+    return {p.parts[-4] for p in _output_paths(root, name) if len(p.parts) >= 4 and '--' in p.parts[-4]}
+
+
+def monsters_root(root) -> Path:
+    """`characters/monsters/aaa` beside the project (`$IMAGETO3D_MONSTERS` overrides), as tools/view_batch.py monsters_root."""
+    override = os.environ.get(MONSTERS_ENV)
+    return Path(override) if override else Path(root).parent / 'monsters' / 'aaa'
+
+
+def launcher_root(root, name: str) -> Path:
+    """The project whose `.codex_jobs/<job>/` holds a task's Codex jobs (tools/view_batch.py launcher_root): the monster pipeline for
+    `"launcher": "monsters"`, this project otherwise."""
+    return monsters_root(root) if _task_raw(root, name).get('launcher') == 'monsters' else Path(root)
 
 
 def state_of(index: dict, name: str) -> dict:
@@ -286,8 +312,16 @@ class Facts:
             names = own or names
         return max(names, key=lambda n: (self.index['tasks'][n]['mtime'], n))
 
-    def view_task(self, set_name: str, race: str, module: str, prefix: str | None) -> str | None:
-        return self._newest(self.views.get((set_name, race, module), []), prefix)
+    def view_task(self, set_name: str, race: str, module: str, prefix: str | None, job_name: str | None = None) -> str | None:
+        """The newest views task of the unit. With `job_name`, only a task whose outputs are in THAT job folder counts (review F19: another job of
+        the set never lends its views), or a task without outputs of the same job prefix."""
+        names = self.views.get((set_name, race, module), [])
+        if job_name is None:
+            return self._newest(names, prefix)
+        own = [n for n in names if job_name in task_output_jobs(self.root, n)]
+        if own:
+            return self._newest(own, None)
+        return self._newest([n for n in names if not _output_paths(self.root, n) and self.index['tasks'][n]['prefix'] == prefix], None)
 
     def fronts_task(self, set_name: str, race: str) -> str | None:
         return self._newest(self.fronts.get((set_name, race), []), None)
@@ -352,7 +386,7 @@ def unit_progress(root, set_name: str, unit: dict, job: dict | None, facts: Fact
             if st['state'] == 'failed' and not out['error']:
                 out['error'] = f'fronts task failed: {name}'
     elif job is not None and job['stage'] == 'processing_views' and status not in ('reduced', 'pin_missing'):
-        name = facts.view_task(set_name, race, module, prefix)
+        name = facts.view_task(set_name, race, module, prefix, job['name'])
         state, outputs = None, set()
         if name:
             st = state_of(facts.index, name)
@@ -438,11 +472,14 @@ def views_section(root, now: float | None = None, limit: int = 200) -> dict:
         kind = index['tasks'][name]['kind']
         by_kind.setdefault(kind, {})
         by_kind[kind][st['state']] = by_kind[kind].get(st['state'], 0) + 1
-        if st['state'] == 'running':
-            running.append({'name': name, 'job': st['job'], 'started': st['started'], 'elapsed': iso_age(st['started'], now)})
+        if st['state'] in ('running', 'launching'):            # launching = the runner's launch reservation (DESIGN_PHASE4.md I.5)
+            running.append({'name': name, 'job': st['job'], 'started': st['started'], 'elapsed': iso_age(st['started'], now),
+                            'launching': st['state'] == 'launching'})
         elif st['state'] == 'failed':
             job = st['job']
-            tail = tail_text(Path(root) / '.codex_jobs' / job / 'log.txt') if isinstance(job, str) and job and '/' not in job and '\\' not in job else ''
+            # the job's log lives under the project that launched it (a monster-launcher task: the monster root; review F19)
+            tail = (tail_text(launcher_root(root, name) / '.codex_jobs' / job / 'log.txt')
+                    if isinstance(job, str) and job and '/' not in job and '\\' not in job and job not in ('.', '..') else '')
             failed.append({'name': name, 'attempts': st['attempts'], 'job': job, 'exit': st['exit'], 'log_tail': tail})
     return {'counts': counts, 'by_kind': by_kind, 'running': running[:limit], 'failed': failed[:limit], 'total': len(index['tasks'])}
 
@@ -485,15 +522,79 @@ def conversions_section(root) -> dict:
             'excludes': [p for p in convert_list.patterns(root) if p.startswith('!')]}
 
 
+DRIFT = ' colour DRIFT'
+_SHA: dict[str, tuple] = {}
+
+
+def drift_images(reasons: list[str]) -> dict[str, set]:
+    """{image file name: {race | None}} of the supervisor's colour-drift hold reasons (`<image> colour DRIFT (...)`, optionally prefixed with
+    `<race>: `; pipeline_supervisor.colour_problems / front_reasons / the view gate)."""
+    out: dict[str, set] = {}
+    for reason in reasons:
+        if DRIFT not in reason:
+            continue
+        head = reason.split(DRIFT, 1)[0]
+        race, _sep, name = head.rpartition(': ')
+        out.setdefault(name.strip(), set()).add(race.strip().split(': ')[-1] or None)
+    return out
+
+
+def hold_scope(root, key: str) -> list[Path]:
+    """The folders a hold's images live in: the job folder for a job hold, `concepts/<set>/` for a set (gate 1) hold."""
+    if '--' in key:
+        return [Path(root) / stage / key for stage in ('processing_views', 'multiview_ready', 'processing')]
+    return [Path(root) / 'concepts' / key.split('#', 1)[0]]
+
+
+def _sha256(path: Path) -> str | None:
+    """sha256 of a file, cached by (mtime, size)."""
+    import hashlib
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    sig = (st.st_mtime_ns, st.st_size)
+    hit = _SHA.get(str(path))
+    if hit and hit[0] == sig:
+        return hit[1]
+    try:
+        digest = hashlib.sha256(Path(path).read_bytes()).hexdigest()
+    except OSError:
+        return None
+    _SHA[str(path)] = (sig, digest)
+    return digest
+
+
+def drift_hold_images(root, key: str, reasons: list[str]) -> list[dict]:
+    """[{path (relative, POSIX), sha256 (current bytes), race}] of the images a colour-drift hold names, found inside the hold's scope
+    (`<scope>/<race>/<module>/<image>` for a job, `<scope>/<race>/<image>` for a set). The op accept_drift accepts exactly these pairs."""
+    out = []
+    for name, races in sorted(drift_images(reasons).items()):
+        for base in hold_scope(root, key):
+            if not base.is_dir():
+                continue
+            pattern = ('*/*/' if '--' in key else '*/') + name
+            for path in sorted(base.glob(pattern)):
+                race = path.relative_to(base).parts[0]
+                if not path.is_file() or not any(r is None or r == race for r in races):
+                    continue
+                digest = _sha256(path)
+                if digest:
+                    out.append({'path': path.relative_to(root).as_posix(), 'sha256': digest, 'race': race})
+    return out
+
+
 def holds_section(root, set_of=None) -> list[dict]:
-    """`holds` of GET /api/v2/queue: [{key, reasons, set, job, gnome, drift}] from supervisor_state.json."""
+    """`holds` of GET /api/v2/queue: [{key, reasons, set, job, gnome, drift, images}] from supervisor_state.json; `images` = the drifted images
+    with their current sha256 (drift holds only, else [])."""
     out = []
     for key, value in sorted(read_holds(root).items()):
         job = key if '--' in key else None
         base = key.split('--')[0].split('#', 1)[0]
         reasons = [str(r) for r in value.get('reasons') or []]
+        drift = any('colour DRIFT' in r for r in reasons)
         out.append({'key': key, 'reasons': reasons, 'set': set_of(base) if set_of else base, 'job': job, 'gnome': key.endswith('#gnome'),
-                    'drift': any('colour DRIFT' in r for r in reasons)})
+                    'drift': drift, 'images': drift_hold_images(root, key, reasons) if drift else []})
     return out
 
 
@@ -509,16 +610,20 @@ def problems(statuses: dict | None) -> list[str] | None:
             out.append(f'{name}: {state}' + (f' ({st.get("message")})' if st.get('message') else ''))
         elif state == 'stopped' and st.get('enabled') and st.get('message') != 'stopped on request':
             out.append(f'{name}: not running')
+        elif state == 'waiting' and st.get('enabled') and 'waiting for the supervisor' not in str(st.get('message')):
+            out.append(f'{name}: not started ({st.get("message")})')       # an unverified look-alike, a held instance lock, unreadable settings
     return out
 
 
-def status_summary(root, services_problems: list[str] | None, queue_health) -> dict:
+def status_summary(root, services_problems: list[str] | None, queue_health, scanned: bool | None = None) -> dict:
     """`state.status` (DESIGN_PHASE4.md H.1, the shape the phase 4 client reads): {mode: {mode, label, since}, paused: false | {reason, since,
     scope}, services: null (no --manage-services) | {ok, problems: [text]}, queue_health}, plus the flat copies `pause_reason` and
     `services_problems` (the first H wording). Two small file reads."""
     import modes
     mode = modes.read_mode(root)
     pause = modes.read_pause(root)
-    services_ = None if services_problems is None else {'ok': not services_problems, 'problems': list(services_problems)}
+    # `managed` / `scanned` (false until the first services tick): the header can say "services scanning..." on every tab
+    services_ = None if services_problems is None else {'ok': not services_problems, 'problems': list(services_problems), 'managed': True,
+                                                        'scanned': bool(scanned)}
     return {'mode': mode, 'paused': pause if pause is not None else False, 'services': services_, 'queue_health': queue_health,
             'pause_reason': (pause or {}).get('reason'), 'services_problems': services_problems}

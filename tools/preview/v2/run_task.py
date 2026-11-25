@@ -65,9 +65,24 @@ def create_time(pid: int) -> float | None:
         return None
 
 
+def _drain(proc, result: dict) -> None:
+    """Read the builder's stdout to its end without the log (after a log write failed): the builder never blocks on a full pipe, and a verdict
+    printed after the failure is still seen."""
+    try:
+        for raw in proc.stdout:
+            found = _json_object(raw.decode('utf-8', 'replace'))
+            if found is not None:
+                result['last_json'] = found
+    except (OSError, ValueError):
+        pass
+
+
 def run(spec: dict) -> dict:
-    """Run the command of `spec`; returns the result record (main() writes it to spec['result'])."""
-    result: dict = {'token': spec.get('token'), 'attempt': spec.get('attempt'), 'exit': -1, 'last_json': None, 'finished': None}
+    """Run the command of `spec`; returns the result record (main() writes it to spec['result']). Once the builder started, the result is only
+    produced after the builder EXITED (phase 4 review F12): `builder_pid` / `builder_create` name it and `builder_exited` is true only after its
+    wait() returned, so the orchestrator never frees a worker slot while the builder still runs."""
+    result: dict = {'token': spec.get('token'), 'attempt': spec.get('attempt'), 'exit': -1, 'last_json': None, 'finished': None,
+                    'builder_pid': None, 'builder_create': None, 'builder_exited': None}
     log_path = Path(spec['log'])
     err_path = Path(spec.get('err') or str(log_path)[:-4] + '.err.log')
     claim_path = Path(spec['claim']) if spec.get('claim') else None
@@ -75,6 +90,7 @@ def run(spec: dict) -> dict:
              'wrapper_pid': os.getpid(), 'wrapper_create': create_time(os.getpid()), 'builder_pid': None, 'builder_create': None,
              'log': str(log_path), 'err': str(err_path), 'result': spec.get('result'), 'argv': [str(a) for a in spec.get('argv') or []],
              'claimed': time.time()}
+    proc = None
     try:
         if claim_path is not None:
             _write_atomic(claim_path, claim)                    # the first thing: this attempt is alive
@@ -89,26 +105,45 @@ def run(spec: dict) -> dict:
             # this wrapper has no console (it is started detached): without CREATE_NO_WINDOW Windows would open one per console child
             proc = subprocess.Popen([str(a) for a in spec['argv']], stdout=subprocess.PIPE, stderr=err, stdin=subprocess.DEVNULL,
                                     cwd=spec.get('cwd') or None, env=env, creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+            result.update(builder_pid=proc.pid, builder_create=create_time(proc.pid))
             if claim_path is not None:
-                try:
-                    _write_atomic(claim_path, claim | {'builder_pid': proc.pid, 'builder_create': create_time(proc.pid)})
-                except OSError:
-                    pass
-            for raw in proc.stdout:
-                log.write(raw)
-                log.flush()
-                found = _json_object(raw.decode('utf-8', 'replace'))
-                if found is not None:
-                    result['last_json'] = found
+                for attempt in range(5):                        # the builder identity must reach the claim (Kill & retry, slot keeping)
+                    try:
+                        _write_atomic(claim_path, claim | {'builder_pid': proc.pid, 'builder_create': result['builder_create']})
+                        break
+                    except OSError as exc:
+                        if attempt == 4:
+                            result['claim_error'] = f'{type(exc).__name__}: {exc}'
+                        time.sleep(0.2 * (attempt + 1))
+            try:
+                for raw in proc.stdout:
+                    log.write(raw)
+                    log.flush()
+                    found = _json_object(raw.decode('utf-8', 'replace'))
+                    if found is not None:
+                        result['last_json'] = found
+            except Exception as exc:  # noqa: BLE001  (a log write failed: keep the builder running to its end, never orphan it)
+                result['log_error'] = f'{type(exc).__name__}: {exc}'
+                _drain(proc, result)
             proc.stdout.close()
             result['exit'] = proc.wait()
+            result['builder_exited'] = True
     except BaseException as exc:  # noqa: BLE001  (the result file is written on every path)
         result['start_error'] = f'{type(exc).__name__}: {exc}'
+        if proc is not None and not result.get('builder_exited'):
+            try:                                                # the builder started: the result waits for its exit
+                _drain(proc, result)
+                result['exit'] = proc.wait()
+                result['builder_exited'] = True
+            except BaseException:  # noqa: BLE001
+                pass
         try:
             with open(log_path, 'ab') as log:
                 log.write(f'wrapper error: {result["start_error"]}\n'.encode('utf-8', 'replace'))
         except OSError:
             pass
+    if proc is None:
+        result['builder_exited'] = True                         # no builder was ever started
     result['finished'] = time.time()
     return result
 

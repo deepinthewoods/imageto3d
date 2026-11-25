@@ -9,10 +9,13 @@ import json, re, sys, time
 from pathlib import Path
 from probe import FORBIDDEN, DOM_JS
 from native_browser import PROFILE, BINARY, GECKODRIVER, check_profile
+from browser_lock import BrowserLock
 BAD = re.compile(FORBIDDEN.pattern + r'|export|free preview|subscribe|trial|buy|share|submit|fork|bake', re.I)
 
 def main():
     out = Path(sys.argv[1]); steps = json.loads(Path(sys.argv[2]).read_text()); out.mkdir(parents=True, exist_ok=True)
+    # Hyper3D browser lock (browser_lock.py), taken before the profile check and held for the life of this process
+    profile_lock = BrowserLock().acquire()  # noqa: F841
     check_profile(PROFILE)
     from selenium import webdriver
     from selenium.webdriver.common.by import By

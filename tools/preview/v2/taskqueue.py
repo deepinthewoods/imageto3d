@@ -458,6 +458,38 @@ class TaskQueue:
             return cursor.lastrowid
         return self._tx(work)
 
+    def adopt_attempt(self, lane: str, key: str, set_name: str | None, unit: str | None, args: dict, attempt: int, token: str, log: str | None,
+                      pid: int | None, create_time: float | None, started: float | None, max_attempts: int = 3,
+                      approval_gen: str | None = None) -> tuple[str, int | None]:
+        """Merge a SURVIVING attempt (its claim / token process is alive) into the database by attempt identity (phase 4 review F12), whatever
+        else the database holds: ('inserted', id) a new running row; ('known', id) the row already carries this token; ('merged', id) the row
+        of the key was queued / failed / cancelled / done and now IS this running attempt (it is never started a second time); ('conflict', id)
+        the row of the key runs ANOTHER live attempt (left alone)."""
+        if lane not in LANES:
+            raise ValueError(f'unknown lane {lane!r}')
+        now = time.time()
+
+        def work(conn):
+            row = conn.execute('SELECT id, state, token FROM tasks WHERE key=?', (key,)).fetchone()
+            if row is None:
+                cursor = conn.execute('INSERT INTO tasks(lane,key,set_name,unit,args,state,priority,attempts,max_attempts,pid,pid_create,started,log,'
+                                      'created,updated,not_before,token,approval_gen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)',
+                                      (lane, key, set_name, unit, json.dumps(args or {}), 'running', 5, attempt, max_attempts, pid, create_time,
+                                       started or now, log, now, now, token, approval_gen))
+                self._event(conn, cursor.lastrowid, 'adopt_claim', token)
+                return 'inserted', cursor.lastrowid
+            if row['token'] == token:
+                return 'known', row['id']
+            if row['state'] in ACTIVE:
+                return 'conflict', row['id']
+            conn.execute('UPDATE tasks SET state=?, token=?, pid=?, pid_create=?, builder_pid=NULL, builder_create=NULL, kill_requested=0, '
+                         'cancel_gen=NULL, started=?, finished=NULL, log=?, attempts=?, updated=?, error=NULL, result=NULL, not_before=0, '
+                         'approval_gen=COALESCE(?, approval_gen) WHERE id=?',
+                         ('running', token, pid, create_time, started or now, log, attempt, now, approval_gen, row['id']))
+            self._event(conn, row['id'], 'adopt_claim', f'{token} (merged into the {row["state"]} row)')
+            return 'merged', row['id']
+        return self._tx(work)
+
     # ---------------------------------------------------------------------------------------------------------- reads
     def get(self, task_id: int) -> dict | None:
         return self._run('SELECT * FROM tasks WHERE id=?', (task_id,), write=False, one=True)
