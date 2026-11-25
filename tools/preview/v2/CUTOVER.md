@@ -3,8 +3,8 @@
 DESIGN_PHASE4.md sections G and I, as commands. The old site (`python -u tools/preview/serve.py`, port 8765; Tailscale serve already forwards
 to 8765) is replaced by v2 (`python -X utf8 -u tools/preview/v2/server.py --port 8765 --manage-services`). Service management is OFF unless
 the server is started with `--manage-services`: only the cut-over server gets the flag (a dev / test server on 8766 never adopts, starts,
-stops or signals a service). The prototype on :8790 is `experiments/shell_slots_20261122/serve.py`: it is not part of the cut-over; leave it
-running.
+stops or signals a service). The prototype on :8790 is `experiments/shell_slots_20261122/serve.py`: it is not part of steps 1-8; leave it
+running until step 9, which removes its files.
 
 The pipeline services (supervisor, view runner, convert worker) are never killed by the cut-over. v2 adopts them; the steps below restart the
 supervisor and the view runner on purpose and drain the old convert worker, each through the paid-safety interlock of DESIGN_PHASE4.md I:
@@ -134,7 +134,7 @@ stays pending ("stopping" in the Queue tab); it is never killed on a timeout. Wi
 PAUSED, so this normally completes at the next tick. On Restart the manager starts the new worker after the old one is gone; the new worker
 honours CONVERT_HOLD, PAUSE and its own stop file (it acknowledges with `convert_worker1.stopping`, finishes its job, then exits).
 
-## 7. Rollback (any time; the services keep running)
+## 7. Rollback (any time before step 9; the services keep running)
 
 ```powershell
 $listen = @(Get-NetTCPConnection -State Listen -LocalPort 8765 | Select-Object -ExpandProperty OwningProcess -Unique)
@@ -166,4 +166,32 @@ decides:
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\preview\v2\install_logon_task.ps1 -WhatIf     # show only
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\preview\v2\install_logon_task.ps1             # register
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\preview\v2\install_logon_task.ps1 -Uninstall  # remove
+```
+
+## 9. Merge the phase 6 branch (last step, after the new site is verified)
+
+Only once steps 1-6 are done and the user has used v2 on :8765 and agrees. Branch `pipeline-v2-phase6` (based on `82e6de1`) removes the old
+site's UI (`tools/preview/app.js`, `index.html`, `style.css`, `fitsym.js`, `monsters.js`, `test_fitsym.mjs`, `preview.sh` and the HTTP handler of
+`serve.py`, which becomes a library whose `main()` prints how to start v2 and exits 2), the prototype's code and pages in
+`experiments/shell_slots_20261122/` (its `out/` data and README stay), and updates AGENTS.md / CLAUDE.md / the READMEs for v2.
+
+1. The old site is no longer running (step 1). The prototype on :8790 loses its server file and pages with the merge: if the user agrees, stop
+   exactly its listener first, the same way as step 1 (one pid, command line `experiments/shell_slots_20261122/serve.py`, checked twice).
+   v2 itself does not need a restart: it imports `serve.py` only at start, and the functions it uses are unchanged.
+2. From the repo root, with `git status` clean:
+   ```powershell
+   git merge --no-ff pipeline-v2-phase6
+   python -X utf8 -m unittest tools/preview/test_serve.py tools/preview/test_monsters.py
+   python -X utf8 tools/preview/serve.py        # prints "retired ... tools/preview/v2/server.py --manage-services" and exits 2
+   ```
+3. v2 keeps running: the branch changes only docstrings in `v2/actions.py`, `v2/decisions.py` and `v2/server.py`. The services are not touched.
+
+**Rollback after this step** means restoring the old files and starting the old site:
+```powershell
+git checkout 82e6de1 -- tools/preview experiments/shell_slots_20261122
+```
+then the start command of step 7. Careful: that path list also resets `tools/preview/v2/` and `tools/preview/web/` to `82e6de1`; if v2 fixes
+were committed after `82e6de1`, restore only the removed files instead:
+```powershell
+git checkout 82e6de1 -- tools/preview/serve.py tools/preview/test_serve.py tools/preview/app.js tools/preview/index.html tools/preview/style.css tools/preview/fitsym.js tools/preview/monsters.js tools/preview/test_fitsym.mjs tools/preview/preview.sh experiments/shell_slots_20261122
 ```
