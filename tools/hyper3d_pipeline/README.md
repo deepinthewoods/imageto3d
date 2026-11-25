@@ -7,7 +7,10 @@ works but is not used by the new backend. Sample inputs mentioned there lived in
 
 ## Hyper3D as an alternative to Tripo (high-poly, no Smart Low-poly)
 
-Tripo stays the default. Select Hyper3D per run:
+Tripo stays the default. Since 2026-11-25 the convert worker that the preview app manages (`tools/convert_queue.py`, see
+`AGENTS.md`) picks Hyper3D by itself: for every module when the app's `tripo` setting is `off` (`--no-tripo`), else for the
+modules the readable Tripo balance does not cover (an unreadable balance holds the job; it never falls back to Hyper3D). Monster
+variants convert through the app's `monster_convert` lane (`hyper3d_single.py` / `hyper3d_multiview.py`). By hand, select Hyper3D per run:
 
 ```bash
 python3 tools/tripo_pipeline/convert_job.py <set>--<job-id> --backend hyper3d [--dry-run] [--allow-paid --accept-preview]

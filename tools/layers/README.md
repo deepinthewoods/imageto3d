@@ -1,5 +1,10 @@
 # tools/layers - the layer builder (pipeline v2, phase 2)
 
+**Status (2026-11-25, phase 6):** this is the only layer builder. The prototype in `experiments/shell_slots_20261122/` was retired: its code, its
+Mix page server (:8790) and its viewer pages were removed (commit `82e6de1` has them); only its README and its local `out/` data (the parity reference)
+remain. Builds run through the preview app: **Approve** in its 3D tab queues `build_module` for every unit at the approved LOD (and `build_bare` per
+race), its Aligned tab shows the result with the Amount sliders, and its Mix tab tries any built layers on.
+
 Builds the **swappable layers** of a generated module: per slot one GLB with the garment and its own skin cut on the game body's ring loops, with
 the morph target `fill` (the Amount slider). Moved here from `experiments/shell_slots_20261122/` (commit `a626d23` / tag `pre-pipeline-v2` has the
 original) with the geometry code unchanged; see `PIPELINE_V2_PLAN.md` section 6 and `tools/preview/v2/DESIGN.md`.
@@ -150,7 +155,8 @@ dynamic uses were `globals()` in the removed variant switch and `getattr` copyin
 `geodiv.py` (`process_module`, `run_outfit`, `run_armour`, symmetry / spike / sliver code, variants), the plane-cut / zipper / stitch code of
 `shell_slots.py`, the pieces driver of `pieces.py` (only `fill_layer_guard`, switched off by `LAYER_GUARD = False`, remains), the batch drivers
 (`main`, pools, `write_index`, `LOD_OVERRIDE`) and `process_all.py` (only `jobs()` discovery left, used by `checks/`). `imprint.py`, `seal.py`,
-`watertight.py`, `zipper.py`, `design_symmetry.py`, `render.py`, `serve.py`, `build_variants.py` stayed in the experiment folder.
+`watertight.py`, `zipper.py`, `design_symmetry.py`, `render.py`, `serve.py`, `build_variants.py` stayed in the experiment folder until phase 6 removed
+them (2026-11-25).
 Constants and thresholds of the live code are untouched. One change in behaviour: `geodiv.relabel_off_body_skin` broke a tie between garment roles by
 the set order of role strings, which depends on `PYTHONHASHSEED` (1-4 faces of a layer changed role between runs; the geometry never did). A tie now
 goes (`geodiv.pick_role`) to the earlier role of `primary, secondary, tertiary, accent, joint`, then, for custom roles with no canonical place, to the
@@ -159,7 +165,7 @@ lexically smaller name, so a build is reproducible (tested under six hash seeds,
 ## Parity with the prototype
 
 Method (`tools/layers/build.py parity`, strict, see CLI): build the module with the LOD the reference JSON records (`load.source_lod`), then per slot
-compare the new GLB with `experiments/shell_slots_20261122/out/layers/<race>/<slot>__<set>.glb`. Results of the 2026-11-25 phase-2 review fixes (GPU,
+compare the new GLB with `experiments/shell_slots_20261122/out/layers/<race>/<slot>__<set>.glb` (the prototype's kept output, not tracked: on this PC only). Results of the 2026-11-25 phase-2 review fixes (GPU,
 scratch output; eight modules + two bare races): every compared slot has the same faces in the same winding, identical colours, identical notes and
 0.0 mm vertex difference at both morph weights; the only role differences are the tie-break (dwarf_female Terrapin plank: 2 faces).
 
