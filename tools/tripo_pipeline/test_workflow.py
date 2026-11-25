@@ -361,6 +361,26 @@ class PromoteTest(unittest.TestCase):
         self.assertTrue((self.root / 'approved/blue_robe/human_male/outfit_front.png').is_file())
         self.assertEqual(workflow.claim(self.root, 'blue_robe')['modules'], [{'race_gender': 'human_male', 'module': 'outfit'}])
 
+    def test_promotion_id_is_in_the_folder_before_it_appears(self):
+        """The preview app's promotion id is written into the STAGING folder: the set is never visible in approved/ without it."""
+        self.add('12', 'blue_robe', ['outfit'])
+        seen = []
+        real_rename = workflow.os.rename
+
+        def watch(src, dst):
+            if Path(dst).name == 'blue_robe':
+                seen.append(sorted(p.name for p in Path(src).iterdir()))
+            return real_rename(src, dst)
+        with mock.patch.object(workflow.os, 'rename', side_effect=watch):
+            result = workflow.promote(self.root, self.batch, '12', set_id='blue_robe', approve=True, promotion_id='a' * 32)
+        self.assertEqual(seen, [['.preview-promotion.json', 'human_male']])
+        self.assertEqual(result['promotion_id'], 'a' * 32)
+        mark = json.loads((self.root / 'approved/blue_robe/.preview-promotion.json').read_text())
+        self.assertEqual(mark['promotion_id'], 'a' * 32)
+        with self.assertRaisesRegex(ValueError, 'Bad promotion id'):
+            workflow.promote(self.root, self.batch, '12', set_id='other', approve=True, promotion_id='../x')
+        self.assertFalse((self.root / 'approved/other').exists())
+
     def test_incomplete_missing_record_and_bad_inputs_fail_closed(self):
         self.add('01', 'half', ['body_armor'])
         with self.assertRaisesRegex(ValueError, 'both armor modules or one outfit'):

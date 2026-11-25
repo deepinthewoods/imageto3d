@@ -13,7 +13,7 @@ write surface, so a request can never reach the old site's `model:` / `approvedm
 """
 from __future__ import annotations
 
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 import json
 from pathlib import Path
 import re
@@ -55,6 +55,9 @@ FLAT_TYPES = ('legacy', 'archlegacy', 'trashlegacy')
 WITHDRAWN = guard.APP / 'withdrawn'
 PROMOTION_MARK = '.preview-promotion.json'       # written into approved/<set>/ by a legacy approve; travels with the folder into its job when claimed
 JOB_STAGES = ('processing_views', 'multiview_ready', 'processing', 'failed', 'completed', serve.HELD)
+PUBLISH_WAIT = 30.0          # seconds the Aligned approval waits for a builder's publish lock (the builder holds it only to commit / adopt)
+MANUAL_CHECK = ('manual check needed: this entry was recorded before promotions carried an id, so there is no proof that approved/{set} is the '
+                'folder it promoted; check approved/{set} by hand (move it back or claim it), then remove the entry')
 
 
 def _undo(verb: str | None, item_id: str | None, args: dict | None = None, rev: int | None = None) -> dict | None:
@@ -236,20 +239,23 @@ def claimed_promotion(root: Path, set_name: str, promotion_id: str) -> str | Non
     return None
 
 
-def withdraw_approved(root: Path, set_name: str, promotion_id: str | None = None, strict: bool = False) -> tuple[str, Path | None]:
+def withdraw_approved(root: Path, set_name: str, promotion_id: str | None) -> tuple[str, Path | None]:
     """Take `approved/<set>` out of approved/ if nobody claimed it (moved to .codex_jobs/_app/withdrawn/, never deleted).
     Returns ('withdrawn', where it went), or ('absent', None) when the set is not in approved/ and nothing else holds it; a claim, or a copy that already
-    moved on to another review stage, is a ValueError and changes nothing. `promotion_id` (phase 1 review #3): the folder must carry that promotion
-    (a later promotion of the same name is never withdrawn by an old Undo); `strict` refuses a folder without any promotion mark too."""
+    moved on to another review stage, is a ValueError and changes nothing. POSITIVE EVIDENCE is required (phase 3 re-check R7): the folder must carry
+    the promotion mark `promotion_id`; a folder without a mark or with another one is never withdrawn, and without a `promotion_id` (an entry recorded
+    before promotions carried an id) nothing is withdrawn at all ("manual check needed")."""
     src = serve.direct(root, 'approved', set_name)
+    if not promotion_id:
+        raise ValueError(MANUAL_CHECK.format(set=set_name))
     with _locked_claim(root, set_name):
         if src.exists():
             if _claimed(src):
                 raise ValueError(f'{set_name} has already been claimed; it cannot be withdrawn')
-            if promotion_id is not None:
-                found = promotion_of(src)
-                if found != promotion_id and (found is not None or strict):
-                    raise ValueError(f'approved/{set_name} is a later promotion of that name, not the one this entry made; it was not withdrawn')
+            found = promotion_of(src)
+            if found != promotion_id:
+                raise ValueError(f'approved/{set_name} is not the promotion this entry made ({"another promotion" if found else "it has no promotion mark"}); '
+                                 'it was not withdrawn')
             dst = serve.unique(root / WITHDRAWN / set_name)
             dst.parent.mkdir(parents=True, exist_ok=True)
             src.rename(dst)
@@ -296,10 +302,10 @@ def _write_sidecar(root: Path, rec: dict) -> None:
 
 
 def _rollback_flat(root: Path, rec: dict) -> None:
-    """Undo an interrupted flat move: withdraw the promoted set (legacy approve), put the files back, remove the sidecar."""
+    """Undo an interrupted flat move: withdraw the promoted set (legacy approve; only the folder carrying THIS promotion's mark, re-check R7), put
+    the files back, remove the sidecar."""
     approved = rec.get('approved_set')
     if approved and (rec.get('promoted') or (root / 'approved' / approved).exists()):
-        # the pre-check guaranteed the set did not exist before this approve; a mark of ANOTHER promotion still refuses
         withdraw_approved(root, approved, rec.get('promotion_id'))
     _back_pairs(root, rec.get('files') or [])
     sidecar = rec.get('sidecar')
@@ -371,15 +377,17 @@ def legacy_approve(root: Path, kind: str, parts: list[str]) -> dict:
     promotion_id = uuid.uuid4().hex
 
     def promote(rec: dict) -> dict:
+        # the promotion id goes INTO the staging folder before workflow.py renames it into approved/ (re-check R7): a claim can never take the
+        # promotion before it carries its mark, and nothing here writes into approved/ afterwards
         command = [sys.executable, str(root / 'tools' / 'tripo_pipeline' / 'workflow.py'),
-                   '--root', str(root), 'promote', str(batch), key.split('_', 1)[0], '--approve']
+                   '--root', str(root), 'promote', str(batch), key.split('_', 1)[0], '--approve', '--promotion-id', promotion_id]
         run = subprocess.run(command, capture_output=True, text=True, check=False)
         if run.returncode:
             raise ValueError(run.stderr.strip() or run.stdout.strip() or 'Promote failed')
         promoted = json.loads(run.stdout)
         result['promoted'] = promoted | ({'path': str(promoted['path']).replace('\\', '/')} if 'path' in promoted else {})
-        mark = serve.direct(root, 'approved', promoted['set']) / PROMOTION_MARK
-        guard.write_atomic(mark, json.dumps({'promotion_id': promotion_id, 'created': guard.now(), 'source': f'{origin_dir}/{batch.name}/{key}'}).encode())
+        if promoted.get('promotion_id') != promotion_id:
+            raise ValueError('workflow.py promote did not record the promotion id (an older workflow.py?); the promotion is not trusted')
         sidecar = rec['sidecar']
         sidecar['content'] = sidecar['content'] | {'approved_set': promoted['set'], 'promotion_id': promotion_id}
         return {'approved_set': promoted['set'], 'sidecar': sidecar, 'promoted': True}
@@ -446,7 +454,7 @@ def restore_legacy(root: Path, parts: list[str]) -> dict:
         try:
             if isinstance(origin.get('approved_set'), str):
                 promotion = origin.get('promotion_id') if isinstance(origin.get('promotion_id'), str) else None
-                withdrawn, kept = withdraw_approved(root, serve.safe_name(origin['approved_set']), promotion, strict=promotion is not None)
+                withdrawn, kept = withdraw_approved(root, serve.safe_name(origin['approved_set']), promotion)
             # the origin sidecar stays in the trash folder as an audit record; no files are deleted
             flat_move(root, 'restore', files, dst)
         except Exception as exc:
@@ -470,7 +478,8 @@ def resolve_intent(root: Path, intent_id: str, verb: str) -> dict:
         raise guard.Busy('That change is still running')
     rec = guard.read_intent(root, intent_id)
     kind = rec.get('kind')
-    with serve.LOCK, (decisions.set_lock(root, rec['set']) if isinstance(rec.get('set'), str) and NAME.fullmatch(rec['set']) else nullcontext()):
+    owner = guard.intent_set(rec)                   # also a pre-fix intent without `set` (from its decision path, re-check R12)
+    with serve.LOCK, (decisions.set_lock(root, owner) if owner and NAME.fullmatch(owner) else nullcontext()):
         if kind == 'files_tx':
             rec = guard.read_intent(root, intent_id)            # (re-read under the set lock)
             if rec.get('conflict'):
@@ -499,7 +508,8 @@ def recover_transactions(root: Path) -> list[str]:
     for rec in guard.list_intents(root):
         if rec.get('kind') != 'files_tx' or rec.get('conflict'):
             continue
-        set_name = rec.get('set') if isinstance(rec.get('set'), str) and NAME.fullmatch(rec.get('set') or '') else None
+        set_name = guard.intent_set(rec)                       # (pre-fix intents: inferred from the decision path, re-check R12)
+        set_name = set_name if set_name and NAME.fullmatch(set_name) else None
         try:
             with decisions.set_lock(root, set_name) if set_name else nullcontext():
                 try:
@@ -609,54 +619,63 @@ def _layer_args(root: Path, unit: dict, lod: str, glb_sha256: str) -> dict:
 
 
 def _ensure(queue: taskqueue.TaskQueue, lane: str, key: str, key_with_fp, current, retry_failed: bool, set_name: str | None, unit: str,
-            args: dict, priority: int) -> str:
+            args: dict, priority: int, gen: str | None = None, explicit: bool = False) -> str:
     """Make sure a task for `key` is on its way and return what happened: `queued`, `retried`, `running`, `current` (a done task whose build
-    is still current and valid), or `failed` (left as it is). A done task whose build is NOT current (code or inputs changed, or the build is
-    gone) gets a NEW key (`key_with_fp()`): the fingerprint changed, so the work is new. When that fingerprint key is itself done and its
-    publication is still missing or invalid, the row gets a fresh attempt (phase 3 review F11: every done key is revalidated, never assumed)."""
+    is still current and valid), `failed` (left as it is), `cancelled` (the user cancelled it for this approval: left as it is) or `waiting`.
+    A done task whose build is NOT current (code or inputs changed, or the build is gone) gets a NEW key (`key_with_fp()`): the fingerprint changed,
+    so the work is new. When that fingerprint key is itself done and its publication is still missing or invalid, the row gets a fresh attempt
+    (phase 3 review F11: every done key is revalidated, never assumed).
+    `gen` = the approval generation the work is for (layers; None for bare): a queued row is re-tagged with it, a failed row of an OLDER generation
+    is retried (its failure belongs to the old approval, re-check R11). `explicit` = an Approve / Rebuild / Retry (a user action): only then is a
+    row the user cancelled for this generation queued again (re-check R8); reconcile never resurrects it."""
     task = queue.by_key(key)
     if task is None:
-        queue.enqueue(lane, key, set_name, unit, args, priority)
+        queue.enqueue(lane, key, set_name, unit, args, priority, approval_gen=gen)
         return 'queued'
     state = task['state']
+    same_gen = gen is None or task.get('approval_gen') == gen
     if state == 'queued':
+        if not same_gen:
+            queue.enqueue(lane, key, set_name, unit, args, priority, approval_gen=gen)        # (re-tags the waiting row)
         return 'waiting'                                       # already queued (nothing new)
-    if state == 'running':
-        return state
-    if state == 'starting':
+    if state in taskqueue.ACTIVE:
         return 'running'
     if state == 'cancelled':
-        queue.enqueue(lane, key, set_name, unit, args, priority)
+        if task.get('cancel_gen') and not explicit and (gen is None or task['cancel_gen'] == gen):
+            return 'cancelled'
+        queue.enqueue(lane, key, set_name, unit, args, priority, approval_gen=gen)
         return 'queued'
     if state == 'failed':
-        if retry_failed:
-            queue.retry(task['id'])
+        if retry_failed or not same_gen:
+            queue.retry(task['id'], approval_gen=gen)
             return 'retried'
         return 'failed'
     if current():
         return 'current'
     if key_with_fp is None:
-        queue.reset_done(task['id'], 'the published build is missing or invalid: built again')
+        queue.reset_done(task['id'], 'the published build is missing or invalid: built again', approval_gen=gen)
         return 'queued'
     fp_key = key_with_fp()
     if fp_key == key:
-        queue.reset_done(task['id'], 'the published build is missing or invalid: built again')
+        queue.reset_done(task['id'], 'the published build is missing or invalid: built again', approval_gen=gen)
         return 'queued'
-    return _ensure(queue, lane, fp_key, None, current, retry_failed, set_name, unit, args, priority)
+    return _ensure(queue, lane, fp_key, None, current, retry_failed, set_name, unit, args, priority, gen, explicit)
 
 
-def _bare_current(race: str) -> bool:
-    ptr = builds.bare_pointer(race)
+def _bare_current(root: Path, race: str) -> bool:
+    ptr = builds.bare_pointer(root, race)
     return bool(ptr) and ptr.get('fingerprint') == builds.fingerprint_bare(race)
 
 
-def _ensure_bare(root: Path, race: str, retry_failed: bool) -> str:
+def _ensure_bare(root: Path, race: str, retry_failed: bool, explicit: bool = False) -> str:
     return _ensure(taskqueue.for_root(root), 'bare', builds.bare_key(race), lambda: builds.bare_key(race, builds.fingerprint_bare(race)),
-                   lambda: _bare_current(race), retry_failed, None, race, {'race': race}, 3)
+                   lambda: _bare_current(root, race), retry_failed, None, race, {'race': race}, 3, None, explicit)
 
 
-def _ensure_layers(root: Path, set_name: str, unit: dict, approved: dict, retry_failed: bool) -> str:
-    key, lod, job, sha = _unit_key(unit), approved['lod'], approved['job'], approved['glb_sha256']
+def _ensure_layers(root: Path, set_name: str, unit: dict, approved: dict, retry_failed: bool, gen: str | None, explicit: bool = False) -> str:
+    key, lod, job, sha = _unit_key(unit), approved['lod'], approved['job'], approved.get('glb_sha256')
+    if not isinstance(sha, str) or not sha:
+        return builds.NEEDS_REVIEW                             # an older pin without the source digest is never built (re-check R10)
     module = builds.module_dir(root, unit['model_set'], unit['job'], unit['race'], unit['module'])
 
     def current() -> bool:
@@ -664,12 +683,24 @@ def _ensure_layers(root: Path, set_name: str, unit: dict, approved: dict, retry_
         return bool(ptr) and ptr.get('fingerprint') == builds.fingerprint_module(module, lod)
     return _ensure(taskqueue.for_root(root), 'layers', builds.layer_key(set_name, key, lod, job, sha),
                    lambda: builds.layer_key(set_name, key, lod, job, sha, builds.fingerprint_module(module, lod)), current, retry_failed,
-                   set_name, key, _layer_args(root, unit, lod, sha), 5)
+                   set_name, key, _layer_args(root, unit, lod, sha), 5, gen, explicit)
+
+
+def task_gen(root: Path, task: dict) -> str | None:
+    """The generation of the 3D approval a layers task's set has NOW (None: no approval / unreadable / a bare task)."""
+    set_name = task.get('set_name')
+    if task.get('lane') != 'layers' or not isinstance(set_name, str) or not NAME.fullmatch(set_name):
+        return None
+    try:
+        return decisions.approval_gen(decisions.load(root, set_name)['lod_approval'])
+    except guard.Conflict:
+        return None
 
 
 def task_approved(root: Path, task: dict, derived: dict | None = None) -> bool:
-    """A task may (still) run: a layers task only while its set has an active 3D approval of exactly that unit (job, LOD, source digest); a bare
-    task while some approved set needs its race (phase 3 review F6). Unreadable decisions count as not approved."""
+    """A task may (still) run: a layers task only while its set has an active 3D approval of exactly that unit (job, LOD, source digest, and the
+    approval generation the row was queued for, when it carries one: re-check R11); a bare task while some approved set needs its race (phase 3
+    review F6). Unreadable decisions count as not approved."""
     args = task.get('args') if isinstance(task.get('args'), dict) else {}
     if task.get('lane') == 'bare':
         race = args.get('race') or task.get('unit')
@@ -685,8 +716,9 @@ def task_approved(root: Path, task: dict, derived: dict | None = None) -> bool:
     entry = ((dec['lod_approval'] or {}).get('units') or {}).get(task.get('unit'))
     if not isinstance(entry, dict) or task.get('unit') in (dec['dropped'] or {}):
         return False
-    return entry.get('job') == args.get('job') and entry.get('lod') == args.get('lod') and \
-        (not args.get('glb_sha256') or entry.get('glb_sha256') == args.get('glb_sha256'))
+    gen = decisions.approval_gen(dec['lod_approval'])
+    return entry.get('job') == args.get('job') and entry.get('lod') == args.get('lod') and bool(entry.get('glb_sha256')) and \
+        entry.get('glb_sha256') == args.get('glb_sha256') and task.get('approval_gen') in (None, gen)
 
 
 def ensure_set_tasks(root: Path, info: dict, retry_failed: bool = False) -> dict[str, str]:
@@ -695,19 +727,21 @@ def ensure_set_tasks(root: Path, info: dict, retry_failed: bool = False) -> dict
     A failed unit is only retried when `retry_failed` (a deterministic failure must not loop); a published one (even stale) is left alone; a unit
     whose pinned source changed is never queued (it needs Back to 3D)."""
     approved = (info['decisions']['lod_approval'] or {}).get('units') or {}
+    gen = decisions.approval_gen(info['decisions']['lod_approval'])
     actions: dict[str, str] = {}
     for race in sorted({u['race'] for u in _live_units(info)}):
-        if not builds.bare_pointer(race):
-            actions[f'bare:{race}'] = _ensure_bare(root, race, retry_failed)
+        if not builds.bare_pointer(root, race):
+            actions[f'bare:{race}'] = _ensure_bare(root, race, retry_failed, explicit=retry_failed)
     for unit in _live_units(info):
         key = _unit_key(unit)
         rec = info['builds'].get(key)
         if unit['status'] != 'reduced' or not isinstance(approved.get(key), dict) or rec is None:
             continue
-        if rec['status'] in builds.BUILT + (builds.SOURCE_CHANGED, 'queued', 'building') or (rec['status'] == 'failed' and not retry_failed):
+        if rec['status'] in builds.BUILT + (builds.SOURCE_CHANGED, builds.NEEDS_REVIEW, 'queued', 'building') or \
+                (rec['status'] in ('failed', builds.CANCELLED) and not retry_failed):
             continue
-        actions[key] = _ensure_layers(root, info['name'], unit, approved[key], retry_failed)
-    return {k: v for k, v in actions.items() if v != 'waiting'}        # only what this call changed
+        actions[key] = _ensure_layers(root, info['name'], unit, approved[key], retry_failed, gen, explicit=retry_failed)
+    return {k: v for k, v in actions.items() if v not in ('waiting', 'cancelled')}        # only what this call changed
 
 
 def _units_arg(args: dict) -> tuple[dict[str, dict], dict[str, str]]:
@@ -763,8 +797,10 @@ def approve_3d(root: Path, set_name: str, rev: object, args: dict) -> dict:
         now = {_unit_key(u): {'job': u['job'], 'lod': u['lod']} for u in live}
         diffs = _diff('unit', {k: {'job': v['job'], 'lod': v['lod']} for k, v in shown.items()}, now, lambda v: f'job {v["job"]} lod {v["lod"]}')
         saved = {_unit_key(u) for u in live if u['lod_saved']}
+        # args.lods must name EXACTLY the never-saved units (re-check R15): a saved one, an unknown one or a missing one is a change
         diffs += [f'unit {k}: its LOD was saved meanwhile' for k in sorted(set(unsaved) & saved)]
         diffs += [f'unit {k}: shown as saved, but it has no saved LOD' for k in sorted(set(now) - saved - set(unsaved)) if k in shown]
+        diffs += [f'unit {k}: in args.lods but not a unit of the set' for k in sorted(set(unsaved) - set(now))]
         if diffs:
             raise guard.Changed('the set changed since it was displayed (' + '; '.join(diffs[:6]) + '); review it again', changes=diffs)
         approved: dict[str, dict] = {}
@@ -835,14 +871,21 @@ def approve_aligned(root: Path, set_name: str, rev: object, args: dict) -> dict:
             raise catalog.NotFound(f'Unknown set {set_name}')
         _check_writable(info, rev)
         if info['stage'] not in ('aligned', 'completed'):          # completed: approving again (new amounts) rewrites aligned_approval and ready.json
-            raise ValueError(f'{set_name} is in {info["stage"]}; only an aligned or completed set can be approved here')
+            # an Aligned payload is always answered with the Aligned conflicts (re-check R15): the client reloads on a 409, never on a 400
+            moved = [k for k, rec in info['builds'].items() if rec['status'] in (builds.SOURCE_CHANGED, builds.NEEDS_REVIEW)]
+            if moved:
+                raise guard.StaleBuild(f'the approved LOD file of {", ".join(moved)} changed since the 3D approval; send the set back to 3D',
+                                       changes=[f'{k}: {info["builds"][k]["status"].replace("_", " ")}' for k in moved])
+            raise guard.Changed(f'{set_name} is in {info["stage"]} now, not in Aligned; review it again',
+                                changes=[f'stage: aligned displayed, {info["stage"]} now'])
         live = _live_units(info)
         pins = [_unit_key(u) for u in live if u['status'] == 'pin_missing']
         if pins:
             raise ValueError(f'the approved conversion of {", ".join(pins)} is missing; send the set back to 3D')
         races = sorted({u['race'] for u in live}, key=catalog.race_rank)
         now_builds = {_unit_key(u): (info['builds'].get(_unit_key(u)) or {}).get('build_id') for u in live}
-        bare_ptrs = {race: builds.bare_pointer(race) for race in races}
+        snaps = info.get('bare_snaps') or {}
+        bare_ptrs = {race: (snaps[race] if race in snaps else builds.bare_snapshot(root, race))[0] for race in races}
         now_bare = {race: ptr['build_id'] if ptr else None for race, ptr in bare_ptrs.items()}
         diffs = _diff('build', shown_builds, now_builds, str) + _diff('bare', shown_bare, now_bare, str)
         if diffs:
@@ -861,44 +904,69 @@ def approve_aligned(root: Path, set_name: str, rev: object, args: dict) -> dict:
             raise ValueError('the bare layers are not built for: ' + ', '.join(no_bare))
         approved = info['decisions']['lod_approval']['units']
         stale = []
-        units, ready_units = {}, {race: {} for race in races}
+        modules = {}
         for unit in live:
             key = _unit_key(unit)
             rec = info['builds'][key]
             module = builds.module_dir(root, unit['model_set'], unit['job'], unit['race'], unit['module'])
-            ptr = builds.pointer_at(module, rec['lod'])
-            if not ptr or ptr['build_id'] != rec['build_id']:
-                raise guard.Changed(f'{key}: the published build changed while approving; review it again', changes=[f'build {key} changed'])
+            modules[key] = (unit, module, rec['lod'])
             try:
-                if builds.lb().fingerprint_module(module, rec['lod']) != ptr.get('fingerprint'):
+                if builds.lb().fingerprint_module(module, rec['lod']) != (builds.module_snapshot(module, rec['lod'])[0] or {}).get('fingerprint'):
                     stale.append(f'{key} (code or inputs changed since the build)')
                 if builds.file_sha256(builds.source_glb(module, rec['lod'])) != approved[key].get('glb_sha256'):
                     stale.append(f'{key} (the approved LOD file changed)')
             except OSError as exc:
                 stale.append(f'{key} ({exc})')
-            out_root, folder = module / 'layers', module / 'layers' / ptr['build_id']
-            slots = {}
-            for slot in sorted(ptr['slots']):
-                glb = builds.contained(out_root / ptr['slots'][slot]['glb'], folder)
-                slots[slot] = {'glb': builds.rel_path(root, glb), 'sha256': builds.file_sha256(glb)}
-            units[key] = {'job': approved[key]['job'], 'lod': rec['lod'], 'build_id': rec['build_id']}
-            ready_units[unit['race']][unit['module']] = units[key] | {'slots': slots}
-        bare_dirs = {}
         for race in races:
             if builds.lb().fingerprint_bare(race) != bare_ptrs[race].get('fingerprint'):
                 stale.append(f'bare {race} (code or game body changed since the build)')
-            out_root = builds.bare_root() / race
-            folder = builds.contained(out_root / bare_ptrs[race]['build_id'], out_root)
-            bare_dirs[race] = builds.rel_path(root, folder)
         stale = [f'{key} (marked stale by the stale scan)' for key, rec in info['builds'].items() if rec['status'] == 'stale' and
                  not any(s.startswith(key + ' ') for s in stale)] + stale
         if stale:
             raise guard.StaleBuild('stale layers cannot be approved: ' + ', '.join(stale[:8]) + '; rebuild them (or send the set back to 3D)', changes=stale)
-        stamp, approval_id = guard.now(), uuid.uuid4().hex
-        aligned = {'time': stamp, 'approval_id': approval_id, 'units': units, 'amount': given, 'bare': {r: now_bare[r] for r in races}}
-        ready = {'schema': 1, 'set': set_name, 'kind': info['kind'], 'approved_at': stamp, 'approval_id': approval_id,
-                 'races': {race: {'amount': given[race], 'units': ready_units[race]} for race in races}, 'bare': bare_dirs}
-        data = decisions.approve_aligned(root, set_name, rev, aligned, given, decisions.models_dir(root, set_name) / decisions.READY, ready)
+        # Re-check R2 / R3: hold the builder's publish lock of EVERY output root the manifest names (module layers folders and bare race folders, in
+        # sorted path order; the builder never takes a set lock), re-read every pointer uncached (full validation, slot bytes rehashed against the
+        # recorded digests), compare with what the client displayed and write the decision + ready.json before any builder can publish again.
+        roots = sorted({str(module / 'layers') for _u, module, _l in modules.values()} | {str(builds.bare_root(root) / race) for race in races})
+        with ExitStack() as stack:
+            for out_root in roots:
+                Path(out_root).mkdir(parents=True, exist_ok=True)
+                try:
+                    stack.enter_context(builds.lb()._publish_lock(Path(out_root), PUBLISH_WAIT))
+                except TimeoutError:
+                    raise guard.Busy('a layer build of this set is being published right now; try again in a moment') from None
+            changes, units, ready_units, bare_dirs = [], {}, {race: {} for race in races}, {}
+            for key, (unit, module, lod) in modules.items():
+                ptr, problem = builds.module_snapshot(module, lod, fresh=True)
+                if not ptr or ptr['build_id'] != shown_builds.get(key):
+                    changes.append(f'build {key}: {shown_builds.get(key)} displayed, {ptr["build_id"] if ptr else "none (" + str(problem) + ")"} now')
+                    continue
+                out_root, folder = module / 'layers', module / 'layers' / ptr['build_id']
+                slots = {}
+                for slot in sorted(ptr['slots']):
+                    glb = builds.contained(out_root / ptr['slots'][slot]['glb'], folder)
+                    slots[slot] = {'glb': builds.rel_path(root, glb), 'sha256': ptr['slots'][slot]['sha256']}     # (verified just now)
+                units[key] = {'job': approved[key]['job'], 'lod': lod, 'build_id': ptr['build_id']}
+                ready_units[unit['race']][unit['module']] = units[key] | {'slots': slots}
+            for race in races:
+                ptr, problem = builds.bare_snapshot(root, race, fresh=True)
+                if not ptr or ptr['build_id'] != shown_bare.get(race):
+                    changes.append(f'bare {race}: {shown_bare.get(race)} displayed, {ptr["build_id"] if ptr else "none (" + str(problem) + ")"} now')
+                    continue
+                if ptr.get('fingerprint') != bare_ptrs[race].get('fingerprint'):
+                    changes.append(f'bare {race}: republished while approving')
+                    continue
+                out_root = builds.bare_root(root) / race
+                bare_dirs[race] = builds.rel_path(root, builds.contained(out_root / ptr['build_id'], out_root))
+            if changes:
+                raise guard.Changed('the layers changed while approving (' + '; '.join(changes[:6]) + '); review them again', changes=changes)
+            stamp, approval_id = guard.now(), uuid.uuid4().hex
+            ready = {'schema': 1, 'set': set_name, 'kind': info['kind'], 'approved_at': stamp, 'approval_id': approval_id,
+                     'races': {race: {'amount': given[race], 'units': ready_units[race]} for race in races}, 'bare': bare_dirs}
+            raw = decisions.ready_bytes(ready)
+            aligned = {'time': stamp, 'approval_id': approval_id, 'units': units, 'amount': given, 'bare': {r: now_bare[r] for r in races},
+                       'ready_sha256': decisions.ready_digest(raw)}
+            data = decisions.approve_aligned(root, set_name, rev, aligned, given, decisions.models_dir(root, set_name) / decisions.READY, raw)
     return {'ok': True, 'undo': _undo('unapprove', f'set:{set_name}', {'to': 'aligned'}, data['rev']), 'rev': data['rev'], 'approval_id': approval_id}
 
 
@@ -919,18 +987,19 @@ def rebuild_set(root: Path, set_name: str, rev: object, args: dict) -> dict:
         if not info['locked']:
             raise ValueError(f'{set_name} is not approved in 3D: nothing to rebuild')
         approved = info['decisions']['lod_approval']['units']
+        gen = decisions.approval_gen(info['decisions']['lod_approval'])
         picked = [u for u in _live_units(info) if u['status'] == 'reduced' and isinstance(approved.get(_unit_key(u)), dict)
                   and race_filter in (None, u['race']) and module_filter in (None, u['module'])]
         if not picked:
             raise ValueError('no approved unit matches')
         actions: dict[str, str] = {}
         for race in sorted({u['race'] for u in picked}):
-            actions[f'bare:{race}'] = _ensure_bare(root, race, True)
+            actions[f'bare:{race}'] = _ensure_bare(root, race, True, explicit=True)
         for unit in picked:
             if unit.get('source_changed'):
                 actions[_unit_key(unit)] = builds.SOURCE_CHANGED
                 continue
-            actions[_unit_key(unit)] = _ensure_layers(root, set_name, unit, approved[_unit_key(unit)], True)
+            actions[_unit_key(unit)] = _ensure_layers(root, set_name, unit, approved[_unit_key(unit)], True, gen, explicit=True)
     queued = sum(1 for v in actions.values() if v in ('queued', 'retried'))
     return {'ok': True, 'undo': None, 'queued': queued, 'actions': actions}
 
@@ -975,7 +1044,14 @@ def set_action(root: Path, verb: str, set_name: str, rev: object, args: dict) ->
             prior = data.pop('_undropped', {}) or {}
             undo = lambda new: _undo('drop_race', f'set:{set_name}', {'race': race, 'meta': {'time': prior.get('time'), 'reason': prior.get('reason', '')}}, new)  # noqa: E731
     elif verb == 'approve':
-        result = approve_3d(root, set_name, rev, args) if info['stage'] in ('3d', 'approved') else approve_aligned(root, set_name, rev, args)
+        # route by the PAYLOAD first (re-check R15): an Aligned approval (args.builds / args.bare) always gets the Aligned checks, a 3D one
+        # (args.units) the 3D checks, whatever the stage became since the client drew it; each answers a changed stage with a 409
+        if 'builds' in args or 'bare' in args:
+            result = approve_aligned(root, set_name, rev, args)
+        elif 'units' in args or info['stage'] in ('3d', 'approved'):
+            result = approve_3d(root, set_name, rev, args)
+        else:
+            result = approve_aligned(root, set_name, rev, args)
         return _finish_set(root, verb, set_name, result)
     elif verb == 'rebuild':
         return _finish_set(root, verb, set_name, rebuild_set(root, set_name, rev, args))
@@ -1036,13 +1112,13 @@ def rebuild_stale(root: Path) -> dict:
     """POST /api/v2/queue {op: "rebuild_stale"}: for every set in 3d / aligned / completed with a 3D approval, queue the rebuild of every stale
     published layer build (a new fingerprint key) and of the stale bare builds of its races (DESIGN_PHASE3.md E4). Returns {queued, sets}."""
     derived = catalog.derive_all(root)
-    stale_bare = set(builds.stale_state(root)['bare'])
     queued, sets = 0, []
     for name, info in sorted(derived['sets'].items()):
         if not info['locked'] or info['stage'] not in ('3d', 'aligned', 'completed') or info['decisions_error'] or info.get('recovering'):
             continue
         units = [u for u in _live_units(info) if (info['builds'].get(_unit_key(u)) or {}).get('status') == 'stale']
-        races = sorted({u['race'] for u in _live_units(info)} & stale_bare)
+        # a stale bare build counts on its own (re-check R14): the stale scan's entry must still name the published bare build
+        races = sorted(race for race, rec in (info.get('bare_builds') or {}).items() if rec['status'] == 'stale')
         if not units and not races:
             continue
         with decisions.set_lock(root, name):
@@ -1050,11 +1126,12 @@ def rebuild_stale(root: Path) -> dict:
             if not fresh or not fresh['locked']:
                 continue
             approved = fresh['decisions']['lod_approval']['units']
-            got = [_ensure_bare(root, race, True) for race in races]
+            gen = decisions.approval_gen(fresh['decisions']['lod_approval'])
+            got = [_ensure_bare(root, race, True, explicit=True) for race in races]
             for unit in _live_units(fresh):
                 key = _unit_key(unit)
                 if (fresh['builds'].get(key) or {}).get('status') == 'stale' and isinstance(approved.get(key), dict):
-                    got.append(_ensure_layers(root, name, unit, approved[key], True))
+                    got.append(_ensure_layers(root, name, unit, approved[key], True, gen, explicit=True))
         n = sum(1 for g in got if g in ('queued', 'retried'))
         if n:
             queued += n
@@ -1080,22 +1157,30 @@ def queue_op(root: Path, data: object) -> dict:
     if task is None:
         raise catalog.NotFound(f'Unknown task {task_id}')
     op = data['op']
+    gen = task_gen(root, task)
     if op == 'retry':
-        if task['state'] in ('failed', 'cancelled') and not task_approved(root, task):
+        if task['state'] in ('failed', 'cancelled') and (not task_approved(root, task) or
+                                                        (task['lane'] == 'layers' and task.get('approval_gen') not in (None, gen))):
             raise ValueError(f'task {task_id} belongs to an approval that was withdrawn or changed; approve the set again instead')
-        done = queue.retry(task_id)
+        done = queue.retry(task_id, approval_gen=gen if task['lane'] == 'layers' else None)
     elif op == 'cancel':
-        done = queue.cancel(task_id, 'manual')
+        # a MANUAL cancel holds for the current approval generation: reconcile never queues it again (re-check R8)
+        done = queue.cancel(task_id, 'manual', manual_gen=(gen or 'manual') if task['lane'] == 'layers' else 'manual')
     else:
         import time
-        if not builds.is_stalled(task, time.time(), builds.stall_minutes(root)):
-            raise ValueError(f'task {task_id} is not stalled; Kill & retry is only for a build whose output stopped')
-        done = queue.request_kill(task_id)
+        token = data.get('token')
+        if not isinstance(token, str) or not token:
+            raise ValueError('token is required: the attempt (queue row `token`) the client saw; Kill & retry acts on that attempt only')
+        if task.get('token') != token:
+            raise guard.Changed(f'task {task_id} runs another attempt now; reload the queue', changes=[f'task {task_id}: attempt changed'])
+        if task['state'] != 'orphan' and not builds.is_stalled(task, time.time(), builds.stall_minutes(root)):
+            raise ValueError(f'task {task_id} is not stalled; Kill & retry is only for a build whose output stopped (or an orphaned builder)')
+        done = queue.request_kill(task_id, token)
     if not done:
         state = queue.get(task_id)['state']
         raise ValueError(f'task {task_id} is {state}; ' + {'retry': 'only a failed or cancelled task can be retried',
                                                           'cancel': 'only a queued task can be cancelled',
-                                                          'kill_retry': 'only a starting or running task can be killed'}[op])
+                                                          'kill_retry': 'only a starting, running or orphaned task can be killed'}[op])
     catalog.invalidate()
     row = queue.get(task_id)
     return {'ok': True, 'id': task_id, 'state': row['state'], 'kill_requested': bool(row.get('kill_requested'))}

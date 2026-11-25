@@ -11,6 +11,9 @@
 // id of every unit, the bare build id of every race, the amounts) and a 409 (changed / stale / rev) reloads, lists what changed and
 // stays on the set. Sliders belong to the race and set they were drawn for (disabled synchronously when the race changes).
 // The item is polled while ANY build or rebuild task of the set is queued / running / stalled.
+// Approve (phase 3 re-check R1): the click captures the composition generation (bumped on every compose / item replacement / race change)
+// and the exact displayed ids; after the pending Amount saves it ABORTS (no POST, "the view changed - check it and approve again", a fresh
+// gesture needed) when the generation or an id changed or the composition is not fully loaded.
 //
 // Keyboard (same rules as the other modals): the shortcuts only fire when no control has focus; after a slider / select / checkbox
 // changed, focus goes back to the dialog so Space and the arrows keep working.
@@ -132,6 +135,7 @@ async function showComposite(modal, host, { readOnly }) {
   let notice = [];                                  // what changed when the server refused an approve
   let rebuilt = [];                                 // published build ids that changed under the viewer
   let approving = false;
+  let generation = 0;                               // bumped on every compose / item replacement / race change: what Approve was clicked on
 
   // ---- layout ---------------------------------------------------------------------------------------------
   const wrap = h('div', { class: 'viewer-wrap' });
@@ -327,7 +331,7 @@ async function showComposite(modal, host, { readOnly }) {
   }
 
   /** Why Approve is not possible right now, or null: decisions, stage, every unit of every race built, and the composition on screen complete. */
-  function approveBlock() {
+  function approveBlock({ ignoreApproving = false } = {}) {
     if (!item) return 'Loading...';
     if (item.error) return `Decisions unreadable: ${item.error}`;
     if ((item.stage ?? card.stage) !== 'aligned') return 'The set is not in Aligned';
@@ -335,7 +339,7 @@ async function showComposite(modal, host, { readOnly }) {
     if (unbuilt.length) return `Every layer build must be published first: ${unbuilt.map(([key, b]) => `${key} (${b?.status || 'none'})`).join(', ')}`;
     const noBare = raceList().filter(r => !bareBuildId(r));
     if (noBare.length) return `No bare layers for ${noBare.map(pretty).join(', ')}: build them first`;
-    if (approving) return 'Approving...';
+    if (approving && !ignoreApproving) return 'Approving...';
     if (!composition.ok) return composition.reason;
     return null;
   }
@@ -384,6 +388,9 @@ async function showComposite(modal, host, { readOnly }) {
       else if (bareState.status === 'failed' || bareState.task?.state === 'failed') nodes.push(h('div', { class: 'warn error', text: `${text}: rebuild failed${bareState.error ? ' - ' + bareState.error : ''}` }));
       else nodes.push(h('div', { class: 'layer-row', text }));
     }
+    for (const r of raceList().filter(r => r !== race && bareInfo(r)?.status === 'stale')) {
+      nodes.push(h('div', { class: 'warn', text: `Bare layers of ${pretty(r)}: stale: built with older layer code. Select that race and use Rebuild, or Rebuild stale in the Queue tab.` }));
+    }
     if (item?.not_converted?.length) nodes.push(h('div', { class: 'layer-row', text: 'Not converted: ' + item.not_converted.map(n => pretty(n.race)).join(', ') }));
     notes.replaceChildren(h('h3', { text: 'Layers' }), ...nodes);
   }
@@ -417,6 +424,7 @@ async function showComposite(modal, host, { readOnly }) {
 
   async function render({ relative = false, first = false } = {}) {
     const mine = ++renderSeq;
+    generation++;
     composition = { ok: false, loading: true, reason: 'Loading layers...' };
     failures = [];
     drawControls();
@@ -447,6 +455,7 @@ async function showComposite(modal, host, { readOnly }) {
   async function selectRace(next) {
     if (!next || next === race) return;
     race = next;
+    generation++;
     // synchronously, before any await: the sliders on screen belong to the old race and must not save into the new one
     sliderEpoch++;
     for (const input of amountBox.querySelectorAll('input')) input.disabled = true;
@@ -479,6 +488,7 @@ async function showComposite(modal, host, { readOnly }) {
       if (!host.isCurrent()) return;
       noteRebuilt(item, fresh);
       item = fresh;
+      generation++;
       for (const key of Object.keys(amounts)) delete amounts[key];   // the saved values are the truth again
       if (!raceList().includes(race)) race = raceList().includes(carry.race) ? carry.race : raceList()[0] ?? null;
       await render();
@@ -566,11 +576,23 @@ async function showComposite(modal, host, { readOnly }) {
     if (!host.isCurrent()) return;
     const lines = describeChanges(sent, seenIds());
     const server = [].concat(error.body?.changes ?? []).map(c => (typeof c === 'string' ? c : c?.message || JSON.stringify(c)));
-    const why = error.code === 'stale' ? 'Not approved: some layers are stale (built with older layer code). Rebuild them first.'
+    const stage = item?.stage ?? card.stage;
+    const moved = stage !== 'aligned';
+    const why = moved ? `Not approved: the set is now in ${stage === '3d' ? '3D' : pretty(stage)}, not Aligned (it was moved elsewhere). Nothing was approved here.`
+      : error.code === 'stale' ? 'Not approved: some layers are stale (built with older layer code). Rebuild them first.'
       : lines.length || server.length ? 'Not approved: the layers changed since you looked at them. Review them and approve again.'
         : 'Not approved: the set changed (revision) since you looked at it. Review it and approve again.';
     rebuilt = [];                                          // the refusal lists the changes itself
-    notice = [why, ...(lines.length ? lines : server)];
+    notice = [why, ...(moved ? [] : lines.length ? lines : server)];
+    drawNotes();
+    updateApprove();
+  }
+
+  /** The composition or the ids changed between the click and the moment Approve would send: nothing is posted, a fresh gesture is needed. */
+  function viewChanged(block) {
+    rebuilt = [];
+    notice = ['Not approved: the view changed - check it and approve again.', ...(block ? [`(${block})`] : [])];
+    toast('The view changed - check it and approve again', { ms: 3000 });
     drawNotes();
     updateApprove();
   }
@@ -579,15 +601,20 @@ async function showComposite(modal, host, { readOnly }) {
     if (readOnly || approving) return;
     const early = approveBlock();
     if (early) { toast(early); return; }
+    // what the reviewer looked at when the gesture happened: the composition generation and the exact build ids (units and bare)
+    const clicked = { generation, ids: JSON.stringify(seenIds()) };
     approving = true;
     updateApprove();
     try {
       await writes.catch(() => {});                       // saved Amounts first, so the rev is the newest
       if (!host.isCurrent()) return;
-      const sent = seenIds();                             // exactly the ids on screen: the server refuses when they differ
+      // after the wait: the same composition, fully loaded, with the same ids - otherwise abort and ask for a fresh gesture
+      const sent = seenIds();
+      const block = approveBlock({ ignoreApproving: true });
+      if (generation !== clicked.generation || JSON.stringify(sent) !== clicked.ids || block) { viewChanged(block); return; }
       notice = [];
       let refused = null;
-      const result = await host.actThenAdvance(card, 'approve', {
+      const result = await host.actThenAdvance(card, 'approve', {   // no await between the check above and the request
         rev: item.rev,
         args: { amount: amountMap(), builds: sent.builds, bare: sent.bare },
         onError: error => { refused = error; },

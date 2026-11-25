@@ -19,6 +19,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import sys
 import threading
 import time
@@ -327,9 +328,26 @@ def sha256_or_none(data: bytes | None) -> str | None:
     return None if data is None else hashlib.sha256(data).hexdigest()
 
 
+SET_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_-]*$')          # (serve.NAME)
+SET_FILES = re.compile(r'^models/([A-Za-z0-9][A-Za-z0-9_-]*)/(pipeline_v2\.json|ready\.json(\.(revoked|quarantine)-[^/]*)?)$')
+
+
+def intent_set(rec: dict) -> str | None:
+    """The set an intent belongs to: its `set` field, else (an intent written before intents named their set, phase 3 re-check R12) the set whose
+    decision file / manifest (`models/<set>/pipeline_v2.json`, `models/<set>/ready.json...`) it recorded. None when neither says."""
+    named = rec.get('set')
+    if isinstance(named, str) and SET_NAME.match(named):
+        return named
+    for entry in rec.get('files') or []:
+        match = SET_FILES.match(str(entry.get('path') or '')) if isinstance(entry, dict) else None
+        if match:
+            return match.group(1)
+    return None
+
+
 def set_intents(root: Path, set_name: str) -> list[dict]:
-    """Unresolved intents (not running in this process right now) that belong to `set_name`."""
-    return [rec for rec in list_intents(root) if rec.get('set') == set_name]
+    """Unresolved intents (not running in this process right now) that belong to `set_name` (`intent_set`: also pre-fix intents without `set`)."""
+    return [rec for rec in list_intents(root) if intent_set(rec) == set_name]
 
 
 def check_recovering(root: Path, set_name: str) -> None:

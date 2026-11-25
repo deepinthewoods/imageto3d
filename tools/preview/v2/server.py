@@ -55,7 +55,6 @@ PLACEHOLDER = ('<!doctype html><html><head><meta charset="utf-8"><title>Preview 
 META = re.compile(r'<meta\s+name="v2-token"[^>]*>', re.I)
 BAD_PATH_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')       # drive letters / alternate streams / wildcards: none belongs in a served path
 POST_PATHS = ('/api/v2/action', '/api/v2/lod', '/api/v2/thumbnail', '/api/v2/amount', '/api/v2/queue')
-BARE_PREFIX = 'tools/preview/cache/layers/'      # the bare layers live in the repo's cache, also when the project root is a copy
 
 
 def queue_health(root: Path) -> dict | None:
@@ -152,14 +151,9 @@ def _symmap(file: Path) -> bool:
 
 
 def files_lookup(root: Path, path: str) -> tuple[Path | None, int]:
-    """serve.py's `/files/` rule: image/GLB suffixes (and the fit lab symmetry maps) inside the project root. The bare layer cache
-    (`tools/preview/cache/layers/`) of the REAL repo is served too when the root is another folder (a test fixture)."""
-    tail = path.removeprefix('/files/')
-    found = lookup(root, tail, FILE_SUFFIXES, _symmap)
-    clean = clean_relative(tail)
-    if found[0] is None and found[1] == 404 and clean and clean.startswith(BARE_PREFIX) and Path(root).resolve() != builds.REPO.resolve():
-        return lookup(builds.REPO, tail, FILE_SUFFIXES)
-    return found
+    """serve.py's `/files/` rule: image/GLB suffixes (and the fit lab symmetry maps) inside the project root. The bare layers are part of the
+    project root too (`<root>/tools/preview/cache/layers/`, phase 3 re-check R13): nothing is ever served from another root."""
+    return lookup(root, path.removeprefix('/files/'), FILE_SUFFIXES, _symmap)
 
 
 def mfiles_lookup(root: Path, path: str) -> tuple[Path | None, int]:

@@ -30,7 +30,15 @@ SOURCE DIGEST: `--expect-source-sha256` (the sha256 of reduced/lod_error_<lod>.g
 again under the publish lock; a mismatch is a failure 'source changed' (not retryable: the approval no longer describes this file).
 
 POINTER REPAIR: a pointer whose content is not exactly the build.json of the valid build it names (cleared slot map, a copied pointer) is never
-trusted: the build is re-adopted from its own build.json under the publish lock (status 'current'), before anything is built.
+trusted: the build is re-adopted from its own build.json under the publish lock (status 'current'), before anything is built. The generation the
+damaged pointer names is tried first (when it validates), then the newest valid '-r<n>' generation down to the base id (phase 3 re-check R9).
+
+SLOT DIGESTS (phase 3 re-check R3): every slot entry of build.json (and so of the pointer) records the GLB's `size` and `sha256`, computed at
+publication; `validate_build` (default `digests=True`) requires them and checks the bytes. A build whose bytes changed (a truncated slot) or that
+has no digests (built before they were recorded) is invalid: never 'current', never adopted; the next build gets a fresh '-r<n>' id.
+
+ADOPTION RECHECK (phase 3 re-check R9): every adoption path (current reuse, pointer repair, adopting an identical winner after a build, adopting
+after a failed build) runs under the publish lock and rechecks the expected source digest and the fingerprint first (`_inputs_problem`).
 
 One build per process is the production use (the layer lane starts a fresh process per task); repeated in-process calls are safe too (the
 game-body caches are dropped when the body cache files change). The CLI prints the result dict as JSON on its LAST stdout line on every path
@@ -432,11 +440,29 @@ def _required_problems(kind, required):
     return out
 
 
-def validate_build(build_dir, fp=None, expect_id=None, expect=None, name=None):
+def slot_digest_problem(glb, entry):
+    """None when the slot GLB `glb` has exactly the size and sha256 its build.json entry records (phase 3 re-check R3), else why not."""
+    size, digest = entry.get('size'), entry.get('sha256')
+    if not isinstance(size, int) or isinstance(size, bool) or not isinstance(digest, str) or not SHA256_RE.fullmatch(digest):
+        return 'no recorded size / sha256 (built before slot digests were recorded)'
+    try:
+        actual = Path(glb).stat().st_size
+        if actual != size:
+            return f'size {actual} != recorded {size}'
+        if _sha256(glb) != digest:
+            return 'sha256 differs from the recorded one'
+    except OSError as error:
+        return f'unreadable ({error})'
+    return None
+
+
+def validate_build(build_dir, fp=None, expect_id=None, expect=None, name=None, digests=True):
     """Problems ([str], empty = valid) of a build folder: build.json present and ok (matching `fp` / `expect_id` when given, and every key of `expect`,
     e.g. {'kind', 'race', 'module', 'lod'}), the required slots are EXACTLY required_slots(kind, race) and the slot map has no other slot, every
     slot entry names its own file in this folder, every required slot has its GLB (parsed whole, morph target 'fill' for module layers, faces) and
-    its JSON. `name` = the build id the folder is published under (default: the folder's name; an attempt folder is checked before its rename)."""
+    its JSON. `name` = the build id the folder is published under (default: the folder's name; an attempt folder is checked before its rename).
+    `digests` (default on): every slot entry must record the GLB's `size` and `sha256` and the file must still have exactly those bytes (a build
+    from before the digests were recorded is not valid any more: it is rebuilt under a fresh '-r<n>' id)."""
     build_dir = Path(build_dir)
     name = name or build_dir.name
     rec = _read_json(build_dir / 'build.json')
@@ -484,6 +510,11 @@ def validate_build(build_dir, fp=None, expect_id=None, expect=None, name=None):
         if not g.is_file() or not j.is_file() or not isinstance(_read_json(j), dict):
             problems.append(f'slot {k}: glb/json missing or unreadable')
             continue
+        if digests:
+            bad_digest = slot_digest_problem(g, entry)
+            if bad_digest:
+                problems.append(f'slot {k}: glb {bad_digest}')
+                continue
         bad, info = check_glb(g, need_morph=kind != 'bare')
         if bad:
             problems.append(f'slot {k}: glb {"; ".join(bad)}')
@@ -624,8 +655,14 @@ def _fail_early(out_root, module_path, lod, message, tag, write=True):
     return fail
 
 
-def _record(res, build_id, job, seconds, gpu_used):
-    slots = {k: {'glb': f'{build_id}/{k}.glb', 'json': f'{build_id}/{k}.json', 'faces': st['faces']} for k, st in sorted(res['slots'].items())}
+def _record(res, build_id, job, seconds, gpu_used, folder):
+    """The build record (build.json = the pointer). Every slot carries the `size` and `sha256` of its GLB in `folder` (the attempt, before its
+    rename): the publication is bound to those exact bytes (phase 3 re-check R3)."""
+    slots = {}
+    for k, st in sorted(res['slots'].items()):
+        glb = Path(folder) / f'{k}.glb'
+        slots[k] = {'glb': f'{build_id}/{k}.glb', 'json': f'{build_id}/{k}.json', 'faces': st['faces'], 'size': glb.stat().st_size,
+                    'sha256': _sha256(glb)}
     warnings = [f'{k}: {w}' for k, st in sorted(res['slots'].items()) for w in st.get('warnings', [])]
     wc = {k: st['wall_crossings_left'] for k, st in sorted(res['slots'].items()) if st.get('wall_crossings_left') is not None}
     flat = [x for v in wc.values() for x in v]
@@ -668,12 +705,43 @@ def _free_id(out_root, base):
     return f'{base}-r{n}'
 
 
-def _adopt(out_root, job):
-    """A VALID published build with this job's fingerprint ('<base>' or a recovery '<base>-r<n>' folder): point the pointer at it (when it does not
-    already) and return its record as status 'current'; None when there is none. Called under the publish lock."""
+def _inputs_problem(out_root, job, seconds=None):
+    """Under the publish lock, before ANY adoption or publication (phase 3 re-check R9): the pinned source GLB is still the one asked for and the
+    fingerprint is still the job's. Returns the failure record, or None when both hold."""
+    if job.source_ok is not None and not job.source_ok():
+        return _failure(out_root, job, SOURCE_CHANGED, seconds=seconds, gpu=_gpu_used(job.gpu), retryable=False)
+    try:
+        same = job.fp_fn() == job.fp
+    except OSError:
+        same = False
+    if not same:
+        return _failure(out_root, job, 'inputs changed during build (retry)', seconds=seconds, gpu=_gpu_used(job.gpu), retryable=True)
+    return None
+
+
+def _generations(out_root, job):
+    """The candidate folders of this fingerprint: the generation the pointer names first (when it is one of them), then the newest recovery
+    generation down to the base id (a repair never rewinds to an older generation while a newer valid one exists; re-check R9)."""
     out_root = Path(out_root)
-    names = [job.base_id] + sorted((p.name for p in out_root.glob(f'{job.base_id}-r*') if p.is_dir()), key=lambda n: int(n.rsplit('-r', 1)[1]) if n.rsplit('-r', 1)[1].isdigit() else 0)
-    for name in names:
+
+    def gen(n):
+        tail = n.rsplit('-r', 1)[1] if n != job.base_id else ''
+        return int(tail) if tail.isdigit() else 0
+    names = sorted([job.base_id] + [p.name for p in out_root.glob(f'{job.base_id}-r*') if p.is_dir()], key=gen, reverse=True)
+    rec = _read_json(_pointer(out_root, job.tag))
+    named = rec.get('build_id') if isinstance(rec, dict) else None
+    if isinstance(named, str) and named in names:
+        names.remove(named)
+        names.insert(0, named)
+    return names
+
+
+def _adopt(out_root, job):
+    """A VALID published build with this job's fingerprint ('<base>' or a recovery '<base>-r<n>' folder; the one the pointer names first): point the
+    pointer at it (when it does not already) and return its record as status 'current'; None when there is none. Called under the publish lock,
+    after `_inputs_problem`."""
+    out_root = Path(out_root)
+    for name in _generations(out_root, job):
         d = out_root / name
         if not d.is_dir() or d.is_symlink() or validate_build(d, fp=job.fp, expect_id=name, expect=job.expect()):
             continue
@@ -686,7 +754,8 @@ def _adopt(out_root, job):
 
 
 def _current(out_root, job):
-    """The cheap path: the pointer names a build with this fingerprint that validates AND is exactly that build's build.json."""
+    """The cheap path: the pointer names a build with this fingerprint that validates AND is exactly that build's build.json. Called under the publish
+    lock, after `_inputs_problem`."""
     rec = _read_json(_pointer(out_root, job.tag))
     if not (isinstance(rec, dict) and rec.get('status') == 'ok' and rec.get('fingerprint') == job.fp and isinstance(rec.get('build_id'), str)
             and BUILD_ID_RE.fullmatch(rec['build_id'])):
@@ -702,19 +771,17 @@ def _commit(out_root, job, attempt, res, seconds):
     out_root = Path(out_root)
     with _publish_lock(out_root):
         _clean_abandoned(out_root, keep=attempt)
-        if job.source_ok is not None and not job.source_ok():
+        failed = _inputs_problem(out_root, job, seconds)
+        if failed is not None:
             shutil.rmtree(attempt, ignore_errors=True)
-            return _failure(out_root, job, SOURCE_CHANGED, seconds=seconds, gpu=_gpu_used(job.gpu), retryable=False)
-        if job.fp_fn() != job.fp:
-            shutil.rmtree(attempt, ignore_errors=True)
-            return _failure(out_root, job, 'inputs changed during build (retry)', seconds=seconds, gpu=_gpu_used(job.gpu), retryable=True)
+            return failed
         if not job.force:
             got = _adopt(out_root, job)
             if got is not None:
                 shutil.rmtree(attempt, ignore_errors=True)
                 return got
         build_id = _free_id(out_root, job.base_id)
-        rec = _record(res, build_id, job, seconds, _gpu_used(job.gpu))
+        rec = _record(res, build_id, job, seconds, _gpu_used(job.gpu), attempt)
         _write_json_atomic(attempt / 'build.json', rec)
         problems = validate_build(attempt, fp=job.fp, expect_id=build_id, expect=job.expect(), name=build_id)
         if problems:
@@ -737,7 +804,7 @@ def _fail_build(out_root, job, attempt, error, t0):
         with _publish_lock(out_root, 60.0):
             if job.fp_fn() != job.fp:
                 fail['superseded'] = True                           # a newer worker owns the pointer and the failure file
-            elif not job.force and (got := _adopt(out_root, job)) is not None:
+            elif not job.force and _inputs_problem(out_root, job) is None and (got := _adopt(out_root, job)) is not None:
                 return got
             else:
                 _write_json_atomic(Path(out_root) / 'last_failure.json', {k: v for k, v in fail.items() if k != 'out_root'})
@@ -752,11 +819,11 @@ def _publish(out_root, job):
     try:
         out_root.mkdir(parents=True, exist_ok=True)
         if not job.force:
-            got = _current(out_root, job)
-            if got is not None:
-                return got
-            with _publish_lock(out_root):                         # a valid build of this fingerprint whose pointer is lost or damaged: repair it
-                got = _adopt(out_root, job)
+            with _publish_lock(out_root):                         # reuse / pointer repair, with the inputs rechecked under the lock (R9)
+                failed = _inputs_problem(out_root, job)
+                got = None if failed is not None else (_current(out_root, job) or _adopt(out_root, job))
+            if failed is not None:
+                return failed
             if got is not None:
                 return got
         attempt = out_root / f'.attempt-{job.tag}-{job.fp[:12]}-{os.getpid()}'
@@ -994,7 +1061,7 @@ def parity(ref_dir, ref_set, new_dir, lod=None, tie_max=12):
     rec = _read_json(new_dir / 'build.json')
     if not isinstance(rec, dict):
         return _parity_fail(f'build.json missing or unreadable in {new_dir}')
-    problems = [f'build: {p}' for p in validate_build(new_dir)]
+    problems = [f'build: {p}' for p in validate_build(new_dir, digests=False)]      # (parity compares the bytes that are there)
     kind = rec.get('kind')
     new_slots = sorted(p.stem for p in new_dir.glob('*.glb'))
     ref_slots = sorted(k for k in SLOT_ALLOWED.get(kind, ()) if (ref_dir / f'{k}__{ref_set}.glb').is_file())

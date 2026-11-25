@@ -19,6 +19,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 
 import numpy as np
@@ -261,6 +262,8 @@ def claim(root: Path, set_name: str, base_views: Path | None = None) -> dict:
     a second claim of the same set waits up to a minute for the first."""
     if not clean_name(set_name):
         raise ValueError('Set name must be a single safe folder name')
+    if os.environ.get('IMAGETO3D_CLAIM_LOCK_HELD') == set_name:   # the supervisor (gate 1) holds this set's lock from before its folder moves
+        return _claim_locked(root, set_name, base_views)
     with claim_lock(root, set_name, wait=60.0):
         return _claim_locked(root, set_name, base_views)
 
@@ -329,8 +332,11 @@ def _claim_locked(root: Path, set_name: str, base_views: Path | None = None) -> 
 BATCH_FILE = re.compile(r'^(?P<nn>\d+)_(?P<slug>[a-z0-9][a-z0-9_-]*)__(?P<module>body_armor|right_gauntlet_boot|outfit)\.png$')
 
 
+PROMOTION_MARK = '.preview-promotion.json'     # the preview app's promotion id (tools/preview/v2/actions.py PROMOTION_MARK)
+
+
 def promote(root: Path, batch: Path, number: str, set_id: str | None = None, race: str | None = None,
-            approve: bool = False) -> dict:
+            approve: bool = False, promotion_id: str | None = None) -> dict:
     """Copy one concept from a flat batch folder into the per-set layout (never overwrites).
 
     A batch (`concepts/<batch_id>/`) is flat: `<NN>_<slug>__<module>.png` per module plus `<NN>_<slug>.json`
@@ -339,7 +345,11 @@ def promote(root: Path, batch: Path, number: str, set_id: str | None = None, rac
     `promoted_from`), or, with `approve`, goes straight into `approved/<set_id>/<race>/` when the user said so.
     `set_id` defaults to `<batch_id>_<NN>_<slug>`; `race` to the json's `race_gender`. Fails closed: ambiguous or
     incomplete sets, a missing/incorrect record, wrong image size/alpha, an existing destination.
+    `promotion_id` (the preview app's legacy approve): written as `.preview-promotion.json` into the STAGING folder, so
+    the set is never visible in approved/ (where a claim could take it) without the mark that identifies it.
     """
+    if promotion_id is not None and not re.fullmatch(r'[0-9a-f]{32}', promotion_id):
+        raise ValueError(f'Bad promotion id: {promotion_id!r}')
     batch = batch.resolve()
     if not batch.is_dir() or batch.is_symlink():
         raise ValueError(f'Not a batch folder: {batch}')
@@ -387,12 +397,15 @@ def promote(root: Path, batch: Path, number: str, set_id: str | None = None, rac
                 **meta, 'module': module,
                 'promoted_from': {'batch': batch.name, 'number': nn, 'slug': slug, 'file': path.name,
                                   'sha256': hashes[module], 'record': record_path.name}})
+        if promotion_id is not None:
+            write_json(temp / PROMOTION_MARK, {'promotion_id': promotion_id, 'created': time.strftime('%Y-%m-%dT%H:%M:%S%z'),
+                                               'source': f'{batch.name}/{nn}_{slug}'})
         os.rename(temp, target)
     finally:
         if temp.exists():
             shutil.rmtree(temp)
     return {'set': set_id, 'path': str(target), 'race_gender': race, 'modules': sorted(files),
-            'stage': 'approved' if approve else 'concepts'}
+            'stage': 'approved' if approve else 'concepts', **({'promotion_id': promotion_id} if promotion_id else {})}
 
 
 def ready(root: Path, job_name: str) -> dict:
@@ -450,6 +463,7 @@ def main(argv: list[str] | None = None) -> int:
     move.add_argument('--set', dest='set_id', help='set id (default <batch>_<NN>_<slug>)')
     move.add_argument('--race', help='race_gender (default: race_gender in the concept json)')
     move.add_argument('--approve', action='store_true', help='put it straight into approved/ (only when the user said so)')
+    move.add_argument('--promotion-id', help="the preview app's promotion id: written into the set folder before it appears")
     publish = sub.add_parser('ready', help='Validate all four views and move to multiview_ready/')
     publish.add_argument('job_name')
     args = parser.parse_args(argv)
@@ -457,7 +471,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == 'status': result = stage_status(root)
         elif args.command == 'check': result = validate_set(root, args.folder.resolve(), complete=args.complete)
-        elif args.command == 'promote': result = promote(root, args.batch_dir, args.number, args.set_id, args.race, args.approve)
+        elif args.command == 'promote': result = promote(root, args.batch_dir, args.number, args.set_id, args.race, args.approve,
+                                                         args.promotion_id)
         elif args.command == 'claim': result = claim(root, args.set_name, args.base_views.resolve() if args.base_views else None)
         else: result = ready(root, args.job_name)
         print(json.dumps(result, indent=2, sort_keys=True))

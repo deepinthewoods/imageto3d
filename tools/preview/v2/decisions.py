@@ -12,11 +12,13 @@ Nothing here moves folders or calls the pipeline tools.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import re
 import sys
 import threading
+import uuid
 
 HERE = Path(__file__).resolve().parent
 for _p in (HERE.parent, HERE):
@@ -33,6 +35,7 @@ HISTORY_LIMIT = 500
 LOD_LEVELS = serve.LOD_LEVELS            # ('0p4', '0p2', '0p1')
 READY = 'ready.json'
 UNIT_KEY = re.compile(r'^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$')
+SHA256 = re.compile(r'^[0-9a-f]{64}$')
 now = guard.now
 
 
@@ -83,6 +86,8 @@ def _units_problem(where: str, units: object, fields: dict) -> str | None:
                 return f'{where}.units.{key}.lod {value!r} is not a LOD'
             if not isinstance(value, str) or not value:
                 return f'{where}.units.{key}.{field} is missing or not text'
+            if field == 'glb_sha256' and not SHA256.match(value):
+                return f'{where}.units.{key}.glb_sha256 is not a sha256'
     return None
 
 
@@ -117,6 +122,8 @@ def validate(raw: object) -> str | None:
         frozen = lod.get('required_races')
         if frozen is not None and (not isinstance(frozen, list) or not all(isinstance(r, str) for r in frozen)):
             return 'lod_approval.required_races is not a list of races'
+        if lod.get('approval_id') is not None and not isinstance(lod['approval_id'], str):
+            return 'lod_approval.approval_id is not text'
     aligned = raw.get('aligned_approval')
     if aligned is not None:
         problem = _units_problem('aligned_approval', aligned.get('units'), {'job': True, 'lod': True, 'build_id': True})
@@ -131,6 +138,8 @@ def validate(raw: object) -> str | None:
             return 'aligned_approval.bare is not a {race: build id} map'
         if aligned.get('approval_id') is not None and not isinstance(aligned['approval_id'], str):
             return 'aligned_approval.approval_id is not text'
+        if aligned.get('ready_sha256') is not None and not (isinstance(aligned['ready_sha256'], str) and SHA256.match(aligned['ready_sha256'])):
+            return 'aligned_approval.ready_sha256 is not a sha256'
     return None
 
 
@@ -142,6 +151,14 @@ def normalise(set_name: str, raw: object) -> dict:
             if key in raw and key not in ('schema', 'set'):
                 data[key] = raw[key]
     return data
+
+
+def approval_gen(lod_approval: dict | None) -> str | None:
+    """The generation of a 3D approval (re-check R8 / R11): its `approval_id` (written since the re-check), else its `time` (older approvals)."""
+    if not isinstance(lod_approval, dict):
+        return None
+    value = lod_approval.get('approval_id') or lod_approval.get('time')
+    return str(value) if value else None
 
 
 def path_of(root: Path, set_name: str) -> Path:
@@ -254,25 +271,34 @@ def undrop_race(root: Path, set_name: str, race: str, rev: object) -> dict:
     return data | {'_undropped': removed}
 
 
-def revoked_name(folder: Path) -> Path:
-    """A free `ready.json.revoked-<time>[-n]` path in `folder` (revoked manifests are never deleted)."""
-    stamp = now().replace(':', '').replace('+0000', '')
-    revoked = folder / f'{READY}.revoked-{stamp}'
+def revoked_name(folder: Path, kind: str = 'revoked') -> Path:
+    """A free `ready.json.<kind>-<time>[-n]` path in `folder` (`revoked` / `quarantine`; such manifests are never deleted)."""
+    stamp = now().replace(':', '').replace('+0000', '').replace('+00:00', '')
+    revoked = folder / f'{READY}.{kind}-{stamp}'
     n = 2
     while revoked.exists():
-        revoked = folder / f'{READY}.revoked-{stamp}-{n}'
+        revoked = folder / f'{READY}.{kind}-{stamp}-{n}'
         n += 1
     return revoked
 
 
-def revoke_plan(root: Path, set_name: str) -> tuple[list[tuple[Path, bytes | None]], Path | None]:
+def revoke_plan(root: Path, set_name: str, kind: str = 'revoked') -> tuple[list[tuple[Path, bytes | None]], Path | None]:
     """The transaction steps that revoke `models/<set>/ready.json` (renamed = its bytes written to a revoked name, then deleted)."""
     ready = models_dir(root, set_name) / READY
     old = guard.read_bytes_or_none(ready)
     if old is None:
         return [], None
-    revoked = revoked_name(ready.parent)
+    revoked = revoked_name(ready.parent, kind)
     return [(revoked, old), (ready, None)], revoked
+
+
+def ready_bytes(ready: dict) -> bytes:
+    """The exact bytes of a ready.json (the Aligned approval stores their sha256 as `ready_sha256`, re-check R4)."""
+    return json.dumps(ready, indent=1).encode('utf-8')
+
+
+def ready_digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
 
 
 def send_back(root: Path, set_name: str, rev: object, target: str) -> dict:
@@ -299,12 +325,14 @@ def send_back(root: Path, set_name: str, rev: object, target: str) -> dict:
         return data | {'_revoked': revoked.name if revoked else None}
 
 
-def revoke_ready(root: Path, set_name: str, reason: str) -> str | None:
-    """Revoke ready.json alone (the orchestrator, when the approval it certifies no longer holds). Call under the set lock."""
-    steps, revoked = revoke_plan(root, set_name)
+def revoke_ready(root: Path, set_name: str, reason: str, kind: str = 'revoked') -> str | None:
+    """Revoke ready.json alone (the orchestrator, when the approval it certifies no longer holds): renamed to `ready.json.revoked-<time>`, or with
+    `kind='quarantine'` to `ready.json.quarantine-<time>` (a manifest that cannot be verified any more: unreadable decisions, bytes that are not
+    the approved ones; re-check R4). The bytes are kept. Call under the set lock."""
+    steps, revoked = revoke_plan(root, set_name, kind)
     if not steps:
         return None
-    guard.apply_transaction(root, f'revoke ready {set_name}: {reason}'[:200], steps, set_name)
+    guard.apply_transaction(root, f'{"quarantine" if kind == "quarantine" else "revoke"} ready {set_name}: {reason}'[:200], steps, set_name)
     return revoked.name
 
 
@@ -373,6 +401,9 @@ def approve_3d(root: Path, set_name: str, rev: object, writes: list[tuple[str, s
         if data['lod_approval']:
             raise AlreadyApproved(f'{set_name} is already approved in 3D; send it back first')
         plan: list[tuple[Path, bytes | None]] = []
+        for key, entry in units.items():
+            if not isinstance(entry.get('glb_sha256'), str) or not SHA256.match(entry['glb_sha256']):
+                raise ValueError(f'{key}: a 3D approval pins the source digest (glb_sha256) of every unit')
         for model_set, job, race, module, lod in writes:
             if lod not in LOD_LEVELS:
                 raise ValueError(f'Invalid LOD {lod!r}')
@@ -380,16 +411,19 @@ def approve_3d(root: Path, set_name: str, rev: object, writes: list[tuple[str, s
             if folder.is_symlink() or not (folder / 'reduced' / f'lod_error_{lod}.glb').is_file():
                 raise ValueError(f'{race}/{module} has no {lod} model')
             plan.append((folder / serve.LOD_CHOICE, json.dumps(lod_record(lod), indent=1).encode('utf-8')))
-        data['lod_approval'] = {'time': now(), 'units': units, 'required_races': list(required_races)}
+        data['lod_approval'] = {'time': now(), 'approval_id': uuid.uuid4().hex, 'units': units, 'required_races': list(required_races)}
         data = bumped(data, 'approve_3d', {'units': {k: v['lod'] for k, v in units.items()}, 'picked': len(writes)})
         plan.append((path_of(root, set_name), dump(data)))
         guard.apply_transaction(root, f'approve_3d {set_name}', plan, set_name)
         return data
 
 
-def approve_aligned(root: Path, set_name: str, rev: object, aligned: dict, amount: dict, ready_path: Path, ready: dict) -> dict:
-    """The Aligned approval, ONE transaction: pipeline_v2.json (`aligned_approval` with its `approval_id`, `amount` merged per race, rev bumped),
-    `ready.json` (the same `approval_id`) and, when an older ready.json exists, its revoked copy."""
+def approve_aligned(root: Path, set_name: str, rev: object, aligned: dict, amount: dict, ready_path: Path, ready: bytes) -> dict:
+    """The Aligned approval, ONE transaction: pipeline_v2.json (`aligned_approval` with its `approval_id` and `ready_sha256` = the sha256 of `ready`,
+    `amount` merged per race, rev bumped), `ready.json` (exactly the bytes `ready`, carrying the same `approval_id`) and, when an older ready.json
+    exists, its revoked copy."""
+    if aligned.get('ready_sha256') != ready_digest(ready):
+        raise ValueError('aligned_approval.ready_sha256 is not the digest of the ready.json written with it')
     with set_lock(root, set_name):
         guard.check_recovering(root, set_name)
         data = load(root, set_name)
@@ -404,8 +438,7 @@ def approve_aligned(root: Path, set_name: str, rev: object, aligned: dict, amoun
         data = bumped(data, 'approve_aligned', {'units': {k: v['build_id'] for k, v in aligned['units'].items()}, 'approval_id': aligned.get('approval_id')})
         steps, _revoked = revoke_plan(root, set_name)
         steps = [s for s in steps if s[0] != ready_path]                     # the old manifest is kept as a revoked copy, then replaced
-        guard.apply_transaction(root, f'approve_aligned {set_name}', steps + [(path_of(root, set_name), dump(data)),
-                                                                               (ready_path, json.dumps(ready, indent=1).encode('utf-8'))], set_name)
+        guard.apply_transaction(root, f'approve_aligned {set_name}', steps + [(path_of(root, set_name), dump(data)), (ready_path, ready)], set_name)
         return data
 
 

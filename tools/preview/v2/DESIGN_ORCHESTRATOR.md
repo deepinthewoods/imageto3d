@@ -59,10 +59,11 @@ v2 does **not** rewrite them. The server becomes their **process manager**, give
 ### Queue store `.codex_jobs/_app/queue.sqlite3` (`v2/taskqueue.py`, stdlib sqlite3, WAL)
 ```sql
 tasks(id INTEGER PRIMARY KEY, lane TEXT, key TEXT UNIQUE, set_name TEXT, unit TEXT, args TEXT /*json*/,
-      state TEXT /*queued|starting|running|done|failed|cancelled*/, priority INTEGER, attempts INTEGER, max_attempts INTEGER,
+      state TEXT /*queued|starting|running|orphan|done|failed|cancelled*/, priority INTEGER, attempts INTEGER, max_attempts INTEGER,
       pid INTEGER, pid_create REAL, started REAL, finished REAL, log TEXT, result TEXT /*json*/, error TEXT,
       created REAL, updated REAL, not_before REAL /*retry backoff, added in phase 3*/,
-      token TEXT, builder_pid INTEGER, builder_create REAL, kill_requested INTEGER /*phase 3 review: attempts, Kill & retry*/)
+      token TEXT, builder_pid INTEGER, builder_create REAL, kill_requested INTEGER /*phase 3 review: attempts, Kill & retry*/,
+      approval_gen TEXT, cancel_gen TEXT /*phase 3 re-check: approval generation, persistent manual cancel; DESIGN_PHASE3.md G*/)
 events(id INTEGER PRIMARY KEY, time REAL, task_id INTEGER, kind TEXT, detail TEXT)
 ```
 - `key` = `<lane>:<set>:<race>/<module>:<lod>:<job>`. Enqueueing an existing key that is done or running is a no-op. A failed one

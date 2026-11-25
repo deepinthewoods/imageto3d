@@ -17,6 +17,15 @@ uuid token and attempt-specific paths `logs/<id>-a<n>.log / .err.log / .result.j
 time. After a crash a `starting` attempt with a claim (or, without one, a process whose command line carries the token) is adopted as running;
 only then is it declared lost. Results are accepted only with the attempt's token, and a row is finished only while it still carries it.
 
+A WORKER SLOT is held until both the wrapper and its builder are confirmed gone (re-check R6): a dead wrapper whose builder still runs makes the
+row `orphan` (it keeps its slot and is shown with Kill); Kill & retry needs the attempt token the client saw, kills each process only after its
+identity was verified, and requeues only once both are gone (a refused or failed kill leaves the row and its slot, with the reason as error).
+Whenever the queue database is missing, empty or repaired, the surviving attempts (claim files, and live processes carrying a task file's token
+on their command line) are adopted BEFORE reconcile allocates any work (re-check R5). Reconcile isolates each set (a failure is logged and the
+pass goes on, R10) and QUARANTINES an active ready.json that can no longer be verified (unreadable decisions, bytes or approval id that are not
+the approval's: renamed `ready.json.quarantine-<time>`, bytes kept, event `quarantine`, R4). Bare builds are written to and read from
+`<root>/tools/preview/cache/layers/<race>/` (`--out` is always passed, R13).
+
 Heartbeat (review F10): the attempt's two logs growing. An active attempt whose logs have not grown for `build_stall_minutes` (settings.json,
 default 30) is shown as stalled in the queue, with Kill & retry. Pool limit: `layer_workers_present` (default 1) while the user is at the PC,
 `layer_workers_away` (default 4) when away (idle >= 300 s: presence.json when fresh, else GetLastInputInfo); 0 while the supervisor mode is
@@ -63,6 +72,7 @@ INTERVAL = 3.0
 STALE_INTERVAL = 600.0
 BACKOFF = 60.0
 CREATE_TIME_TOLERANCE = 2.0
+KILL_WAIT = 10.0                      # seconds Kill & retry waits for a killed process to be gone
 ADOPT_CAP_S = 6 * 3600.0              # without psutil a pid cannot be proven to be the task's process: trust it for this long at most
 DEFAULTS = {'layer_workers_present': 1, 'layer_workers_away': 4, 'build_stall_minutes': 30}
 MINIMUM = {'layer_workers_present': 0, 'layer_workers_away': 0, 'build_stall_minutes': 1}
@@ -235,6 +245,21 @@ def same_process(task: dict, now: float) -> bool:
     return identity_ok(task.get('pid'), task.get('pid_create'), task.get('started'), now)
 
 
+def token_processes() -> dict[str, tuple[int, float | None]]:
+    """{token: (pid, create time)} of every live process whose command line carries `--token <token>` (the wrappers; one process scan)."""
+    out: dict[str, tuple[int, float | None]] = {}
+    if psutil is None:
+        return out
+    for proc in psutil.process_iter(['pid', 'cmdline', 'create_time']):
+        try:
+            line = proc.info.get('cmdline') or []
+            if '--token' in line and line.index('--token') + 1 < len(line):
+                out[str(line[line.index('--token') + 1])] = (proc.info['pid'], proc.info.get('create_time'))
+        except (psutil.Error, TypeError, ValueError):
+            continue
+    return out
+
+
 def find_token_process(token: str | None) -> tuple[int, float | None] | None:
     """(pid, create time) of a live process whose command line carries `token` (a wrapper started just before a crash), else None."""
     if psutil is None or not token:
@@ -331,6 +356,7 @@ class Orchestrator:
         self.notes: list[str] = []
         self.active = False
         self.faults: dict = {}                         # tests: {'claimed' | 'spawned': fn(task)} called at those points of a start
+        self._claims_scanned: object = 'never'          # the database identity whose emptiness was last answered by a claim scan (R5)
         self._procs: list[subprocess.Popen] = []       # the wrappers this instance started (polled, so none is left un-reaped)
 
     # ------------------------------------------------------------------------------------------------------- lifecycle
@@ -382,9 +408,9 @@ class Orchestrator:
         `starting` one has a claim / a process with its token) or lost."""
         now = time.time()
         summary = {'adopted': 0, 'finished': 0, 'lost': 0}
-        for task in self.queue.tasks(state=taskqueue.ACTIVE):
+        for task in self.queue.tasks(state=taskqueue.ACTIVE, limit=100000):
             outcome = self._check_active(task, now)
-            if outcome in ('alive', 'adopted'):
+            if outcome in ('alive', 'adopted', 'orphaned'):
                 summary['adopted'] += 1
                 self.notes.append(f'adopted task {task["id"]} attempt {task["attempts"]}')
             elif outcome in ('finished', 'killed'):
@@ -400,8 +426,8 @@ class Orchestrator:
         """One reconcile pass: finish, reconcile, start. Returns {"finished", "started", "limit", "running"}."""
         now = time.time() if now is None else now
         finished = 0
-        for task in self.queue.tasks(state=taskqueue.ACTIVE):
-            finished += self._check_active(task, now) in ('finished', 'lost', 'killed')
+        for task in self.queue.tasks(state=taskqueue.ACTIVE, limit=100000):
+            finished += self._check_active(task, now) in ('finished', 'lost', 'killed', 'orphaned', 'kill_failed')
         if self.reconcile_queue:
             try:
                 self.reconcile()
@@ -431,15 +457,22 @@ class Orchestrator:
             return None
         return value
 
+    def _builder_alive(self, task: dict, claim: dict | None, now: float) -> bool:
+        """The attempt's builder (from the claim, else the row) is still the live recorded process."""
+        claim = claim or {}
+        pid = claim.get('builder_pid') or task.get('builder_pid')
+        created = claim.get('builder_create') if claim.get('builder_pid') else task.get('builder_create')
+        return bool(pid) and identity_ok(pid, created, task.get('started'), now)
+
     def _check_active(self, task: dict, now: float) -> str:
-        """Settle one starting / running attempt: 'finished', 'lost', 'killed', 'adopted' (starting -> running) or 'alive'."""
+        """Settle one starting / running / orphan attempt: 'finished', 'lost', 'killed', 'kill_failed', 'adopted' (starting -> running),
+        'orphaned' (running -> orphan: the wrapper died, its builder lives; the slot stays taken) or 'alive'."""
         result = self._read_result(task)
         if result is not None:
             self._finish(task, result)
             return 'finished'
         if task.get('kill_requested'):
-            self._kill(task)
-            return 'killed'
+            return self._kill(task)
         claim = self._claim(task)
         if task['state'] == 'starting':
             if claim and identity_ok(claim.get('wrapper_pid'), claim.get('wrapper_create'), task.get('started'), now):
@@ -447,6 +480,8 @@ class Orchestrator:
             else:
                 found = find_token_process(task.get('token'))
                 if found is None:
+                    if self._builder_alive(task, claim, now) and self.queue.mark_orphan(task['id'], task.get('token')):
+                        return 'orphaned'                      # the wrapper is gone, its builder is not (R6)
                     self._lost(task)
                     return 'lost'
                 pid, created = found
@@ -457,12 +492,17 @@ class Orchestrator:
             return 'alive'
         if claim and claim.get('builder_pid') and claim['builder_pid'] != task.get('builder_pid'):
             self.queue.set_builder(task['id'], task.get('token'), claim['builder_pid'], claim.get('builder_create'))
-        if same_process(task, now):
+        if task['state'] != 'orphan' and same_process(task, now):
             return 'alive'
         result = self._read_result(task)                       # the wrapper may have written it just before it exited
         if result is not None:
             self._finish(task, result)
             return 'finished'
+        if self._builder_alive(task, claim, now):              # re-check R6: the slot is held until the builder is gone too
+            if task['state'] != 'orphan' and self.queue.mark_orphan(task['id'], task.get('token')):
+                self.notes.append(f'task {task["id"]}: its wrapper died while the builder still runs (orphan; the worker slot stays taken)')
+                return 'orphaned'
+            return 'alive'
         self._lost(task)
         return 'lost'
 
@@ -476,11 +516,11 @@ class Orchestrator:
             return 'the builder verdict names no build'
         args = task.get('args') or {}
         if task['lane'] == 'bare':
-            ptr = builds.bare_pointer(str(args.get('race') or task.get('unit')))
+            ptr = builds.bare_pointer(self.root, str(args.get('race') or task.get('unit')), fresh=True)
         else:
             if not args.get('module_dir') or args.get('lod') not in decisions.LOD_LEVELS:
                 return 'the task names no module / LOD'
-            ptr = builds.pointer_at(Path(args['module_dir']), args['lod'])
+            ptr = builds.pointer_at(Path(args['module_dir']), args['lod'], fresh=True)
         if not ptr or ptr.get('build_id') != build_id:
             return f'the builder reported {build_id} but it is not the valid publication'
         return None
@@ -517,62 +557,128 @@ class Orchestrator:
         norm = [os.path.normcase(a) for a in line]
         return all(os.path.normcase(str(m)) in norm for m in must_contain)
 
-    def _kill(self, task: dict) -> None:
-        """Kill & retry: the builder first, then the wrapper, each by PID after its command line and create time were checked; then a fresh
-        attempt (attempts reset: a manual retry) while the approval holds, else failed."""
+    def _terminate(self, pid: int | None, created: float | None, marks: list[str]) -> str:
+        """Stop one recorded process: 'gone' (not running, or its pid now belongs to another process), 'killed' (verified, killed and confirmed
+        gone), 'unverified' (alive but its identity / command line could not be verified: not touched) or 'survived' (killed, still alive)."""
+        if not pid or not pid_alive(pid):
+            return 'gone'
+        actual = create_time(pid)
+        if created is not None and actual is not None and abs(actual - created) > CREATE_TIME_TOLERANCE:
+            return 'gone'                                       # the pid was reused: the recorded process is gone
+        if not self._verified(pid, created, marks):
+            deadline = time.monotonic() + 3.0                   # (a process that is exiting right now cannot be inspected: wait for it)
+            while time.monotonic() < deadline and pid_alive(pid):
+                time.sleep(0.1)
+            if not pid_alive(pid):
+                return 'gone'
+            if not self._verified(pid, created, marks):
+                return 'unverified'
+        try:
+            proc = psutil.Process(pid)
+            proc.kill()
+            proc.wait(KILL_WAIT)
+        except psutil.NoSuchProcess:
+            return 'killed'
+        except psutil.Error:
+            pass
+        if not pid_alive(pid):
+            return 'killed'
+        later = create_time(pid)
+        return 'killed' if later is not None and created is not None and abs(later - created) > CREATE_TIME_TOLERANCE else 'survived'
+
+    def _kill(self, task: dict) -> str:
+        """Kill & retry: the builder first, then the wrapper, each by PID after its command line and create time were checked. Only when BOTH are
+        confirmed gone is a fresh attempt queued (attempts reset: a manual retry; failed instead when the approval was withdrawn): 'killed'. A
+        process that could not be verified or did not die leaves the row as it is, slot included, with the reason as its error ('kill_failed')."""
         claim = self._claim(task) or {}
-        killed = []
+        killed, problems = [], []
         argv = [a for a in (claim.get('argv') or [])[1:]]
         for role, pid, created, marks in (('builder', claim.get('builder_pid') or task.get('builder_pid'),
                                            claim.get('builder_create') if claim.get('builder_pid') else task.get('builder_create'), argv),
                                           ('wrapper', task.get('pid'), task.get('pid_create'), [task.get('token')] if task.get('token') else [str(RUN_TASK)])):
-            if self._verified(pid, created, marks):
-                try:
-                    psutil.Process(pid).kill()
-                    killed.append(f'{role} {pid}')
-                except psutil.Error:
-                    pass
+            outcome = self._terminate(pid, created, marks)
+            if outcome == 'killed':
+                killed.append(f'{role} {pid}')
+            elif outcome != 'gone':
+                problems.append(f'{role} {pid} {"could not be verified (not touched)" if outcome == "unverified" else "is still running after the kill"}')
+        if problems:
+            detail = 'Kill & retry could not stop the attempt: ' + '; '.join(problems) + ' (the worker slot stays taken)'
+            self.queue.kill_failed(task['id'], task.get('token'), detail)
+            self.notes.append(f'task {task["id"]}: {detail}')
+            return 'kill_failed'
         detail = 'killed by the user (Kill & retry)' + (f': {", ".join(killed)}' if killed else ': no matching process was running')
         if self._approved(task):
             self.queue.requeue(task['id'], task.get('token'), detail, 0.0, reset=True)
         else:
             self.queue.finish(task['id'], task.get('token'), False, None, detail + '; the approval was withdrawn, not retried')
         self.notes.append(f'task {task["id"]}: {detail}')
+        return 'killed'
 
     # ---------------------------------------------------------------------------------------------------------- reconcile
+    def _db_identity(self) -> tuple | None:
+        try:
+            st = os.stat(self.queue.path)
+        except OSError:
+            return None
+        return (st.st_ino, st.st_ctime_ns)
+
     def reconcile(self) -> dict:
-        """Make the queue agree with the decisions (the queue is a derived cache, review F7 / F9). Idempotent."""
-        out = {'repaired': None, 'recovered': [], 'queued': {}, 'cancelled': 0, 'revoked': []}
+        """Make the queue agree with the decisions (the queue is a derived cache, review F7 / F9). Idempotent. A missing, empty or repaired
+        database first adopts the surviving attempts (re-check R5); each set is reconciled on its own (a failure is logged, R10)."""
+        out = {'repaired': None, 'adopted': 0, 'recovered': [], 'queued': {}, 'cancelled': 0, 'revoked': [], 'quarantined': [], 'errors': []}
         health = self.queue.check()
         if health.get('corrupt'):
             out['repaired'] = self.repair_queue()
+        else:
+            ident = self._db_identity()
+            if ident != self._claims_scanned and self.queue.count() == 0:
+                out['adopted'] = self.adopt_claims()
+                if out['adopted']:
+                    note = f'the queue database was missing or empty: {out["adopted"]} running build(s) re-adopted from their claims'
+                    self.notes.append(note)
+                    self.queue.event('adopt', note)
+                self._claims_scanned = self._db_identity() if out['adopted'] else ident
         out['recovered'] = actions.recover_transactions(self.root)
         derived = catalog.derive_all(self.root)
         for name, info in sorted(derived['sets'].items()):
-            if info['decisions_error'] or info.get('recovering'):
-                continue
-            if info['locked'] and info['stage'] in ('3d', 'aligned', 'completed') and self._needs_work(info):
-                with decisions.set_lock(self.root, name):
-                    catalog.invalidate()
-                    fresh = catalog.derive_one(self.root, name)
-                    if fresh and fresh['locked'] and not fresh['decisions_error']:
-                        done = actions.ensure_set_tasks(self.root, fresh)
-                        if any(v in ('queued', 'retried') for v in done.values()):
-                            out['queued'][name] = done
-            if info.get('ready') is not None and info['stage'] != 'completed':
-                revoked = self._revoke(name)
-                if revoked:
-                    out['revoked'].append(revoked)
+            try:
+                self._reconcile_set(name, info, out)
+            except Exception as exc:  # noqa: BLE001  (one bad set never stops the others, re-check R10)
+                text = f'reconcile {name}: {type(exc).__name__}: {exc}'
+                out['errors'].append(text)
+                self.errors = (self.errors + [text])[-20:]
         out['cancelled'] = self._cancel_withdrawn(derived)
-        if out['queued'] or out['cancelled'] or out['revoked'] or out['recovered'] or out['repaired']:
+        if out['queued'] or out['cancelled'] or out['revoked'] or out['quarantined'] or out['recovered'] or out['repaired'] or out['adopted']:
             catalog.invalidate()
         return out
 
-    @staticmethod
-    def _needs_work(info: dict) -> bool:
-        if any(rec['status'] == 'none' for rec in info['builds'].values()):
+    def _reconcile_set(self, name: str, info: dict, out: dict) -> None:
+        if info.get('recovering'):
+            return
+        if info['decisions_error']:
+            if info.get('ready') is not None:                   # an active manifest nobody can verify any more (R4)
+                moved = self._revoke(name, quarantine_reason='the set decision file is unreadable')
+                if moved:
+                    out['quarantined'].append(moved)
+            return
+        if info['locked'] and info['stage'] in ('3d', 'aligned', 'completed') and self._needs_work(info):
+            with decisions.set_lock(self.root, name):
+                catalog.invalidate()
+                fresh = catalog.derive_one(self.root, name)
+                if fresh and fresh['locked'] and not fresh['decisions_error']:
+                    done = actions.ensure_set_tasks(self.root, fresh)
+                    if any(v in ('queued', 'retried') for v in done.values()):
+                        out['queued'][name] = done
+        if info.get('ready') is not None and info['stage'] != 'completed':
+            moved = self._revoke(name)
+            if moved:
+                out['quarantined' if '.quarantine-' in moved else 'revoked'].append(moved)
+
+    def _needs_work(self, info: dict) -> bool:
+        if any(rec['status'] in ('none', builds.DAMAGED) for rec in info['builds'].values()):
             return True
-        return any(not builds.bare_pointer(race) for race in info['races'])
+        return any(not builds.bare_pointer(self.root, race) and (info.get('bare_builds') or {}).get(race, {}).get('status') != builds.CANCELLED
+                   for race in info['races'])
 
     def _cancel_withdrawn(self, derived: dict) -> int:
         """Cancel queued tasks whose approval is gone or changed (and queued bare tasks no approved set needs)."""
@@ -594,64 +700,110 @@ class Orchestrator:
         if not info or info['decisions_error']:
             return False
         entry = ((info['decisions']['lod_approval'] or {}).get('units') or {}).get(task.get('unit'))
+        gen = decisions.approval_gen(info['decisions']['lod_approval'])
         return isinstance(entry, dict) and entry.get('job') == args.get('job') and entry.get('lod') == args.get('lod') and \
-            (not args.get('glb_sha256') or entry.get('glb_sha256') == args.get('glb_sha256'))
+            bool(entry.get('glb_sha256')) and entry.get('glb_sha256') == args.get('glb_sha256') and task.get('approval_gen') in (None, gen)
 
-    def _revoke(self, name: str) -> str | None:
-        """Revoke models/<set>/ready.json when (rechecked under the set lock) its approval no longer holds: renamed, never deleted, event logged."""
+    UNVERIFIABLE = ('ready.json is missing or belongs to another approval', 'ready.json is not the manifest this approval wrote')
+
+    def _revoke(self, name: str, quarantine_reason: str | None = None) -> str | None:
+        """Take models/<set>/ready.json out of service when (rechecked under the set lock) its approval no longer holds: REVOKED (renamed
+        `ready.json.revoked-<time>`) when the approval is simply gone or its builds changed; QUARANTINED (`ready.json.quarantine-<time>`, re-check
+        R4) when it cannot be verified: the decisions are unreadable, or the approval exists but the manifest's bytes / approval id are not the
+        ones it wrote. Never deleted; queue event `revoke` / `quarantine` and an actions.jsonl entry."""
         with decisions.set_lock(self.root, name):
             catalog.invalidate()
             fresh = catalog.derive_one(self.root, name)
-            if not fresh or fresh.get('ready') is None or fresh['stage'] == 'completed' or fresh.get('recovering'):
+            if not fresh or fresh.get('ready') is None or fresh.get('recovering'):
                 return None
-            reason = '; '.join(fresh.get('not_completed') or [f'the set is in {fresh["stage"]}'])[:300]
-            revoked = decisions.revoke_ready(self.root, name, reason)
-        if revoked:
-            self.queue.event('revoke', f'{name}: {revoked}: {reason}')
-            serve.log_action(self.root, 'revoke_ready', f'models/{name}/ready.json', f'models/{name}/{revoked}', reason[:200])
-            self.notes.append(f'revoked {name}/ready.json: {reason}')
-        return revoked
+            if fresh['decisions_error']:
+                kind, reason = 'quarantine', quarantine_reason or f'the set decision file is unreadable: {fresh["decisions_error"]}'
+            elif fresh['stage'] == 'completed':
+                return None
+            else:
+                problems = fresh.get('not_completed') or [f'the set is in {fresh["stage"]}']
+                unverifiable = bool(fresh['decisions']['aligned_approval']) and any(p.startswith(self.UNVERIFIABLE) for p in problems)
+                kind, reason = ('quarantine' if unverifiable else 'revoked'), '; '.join(problems)
+            reason = reason[:300]
+            moved = decisions.revoke_ready(self.root, name, reason, kind)
+        if moved:
+            event = 'quarantine' if kind == 'quarantine' else 'revoke'
+            self.queue.event(event, f'{name}: {moved}: {reason}')
+            serve.log_action(self.root, f'{event}_ready', f'models/{name}/ready.json', f'models/{name}/{moved}', reason[:200])
+            self.notes.append(f'{"quarantined" if kind == "quarantine" else "revoked"} {name}/ready.json: {reason}')
+        return moved
 
     def repair_queue(self) -> dict:
-        """The database is damaged: keep it as `.corrupt-<time>`, start a fresh one, re-adopt every SURVIVING wrapper from its claim file (so
-        nothing is started twice); the rest of the work is queued again from the decisions by reconcile."""
+        """The database is damaged: keep it as `.corrupt-<time>`, start a fresh one, re-adopt every SURVIVING attempt (adopt_claims, so nothing is
+        started twice); the rest of the work is queued again from the decisions by reconcile."""
         kept = self.queue.repair()
-        adopted = 0
-        now = time.time()
-        for claim_file in sorted(self.logs.glob('*.claim.json')) if self.logs.is_dir() else []:
-            claim = _json_file(claim_file)
-            task = (claim or {}).get('task') if isinstance((claim or {}).get('task'), dict) else None
-            if not claim or not task or not claim.get('token') or _json_file(Path(str(claim_file)[:-len('.claim.json')] + '.result.json')):
-                continue
-            if not identity_ok(claim.get('wrapper_pid'), claim.get('wrapper_create'), claim.get('claimed'), now):
-                continue
-            try:
-                new_id = self.queue.insert_running(task.get('lane'), task.get('key'), task.get('set'), task.get('unit'), task.get('args') or {},
-                                                   int(claim.get('attempt') or 1), claim['token'], claim.get('log'), claim.get('wrapper_pid'),
-                                                   claim.get('wrapper_create'), claim.get('claimed'), int(task.get('max_attempts') or 3))
-            except (taskqueue.QueueError, ValueError, TypeError):
-                continue
-            if new_id is not None:
-                adopted += 1
-                if claim.get('builder_pid'):
-                    self.queue.set_builder(new_id, claim['token'], claim['builder_pid'], claim.get('builder_create'))
+        adopted = self.adopt_claims()
+        self._claims_scanned = self._db_identity()
         note = f'queue database was damaged: kept as {kept.name if kept else "-"}, rebuilt; {adopted} running build(s) re-adopted from their claims'
         self.notes.append(note)
         self.queue.event('repair', note)
         return {'kept': str(kept) if kept else None, 'adopted': adopted}
 
+    def adopt_claims(self) -> int:
+        """Re-insert every attempt that is still alive into a lost / empty / rebuilt queue (re-check R5): each attempt's task file without a
+        result; alive = its claim's wrapper is the recorded live process, or (no usable claim yet) a live process carries its token on the command
+        line. A claim whose wrapper died while its builder still runs is adopted as `orphan` (its slot stays taken, R6). Returns how many."""
+        if not self.logs.is_dir():
+            return 0
+        now, adopted, tokens = time.time(), 0, None
+        for spec_file in sorted(self.logs.glob('*.task.json')):
+            base = str(spec_file)[:-len('.task.json')]
+            if Path(base + '.result.json').exists():
+                continue
+            claim = _json_file(Path(base + '.claim.json'))
+            spec = _json_file(spec_file) or {}
+            source = claim if claim and claim.get('token') and isinstance(claim.get('task'), dict) else None
+            orphan = False
+            if source is not None and identity_ok(source.get('wrapper_pid'), source.get('wrapper_create'), source.get('claimed'), now):
+                pid, created, started = source['wrapper_pid'], source.get('wrapper_create'), source.get('claimed')
+            elif source is not None and source.get('builder_pid') and \
+                    identity_ok(source['builder_pid'], source.get('builder_create'), source.get('claimed'), now):
+                pid, created, started, orphan = source.get('wrapper_pid'), source.get('wrapper_create'), source.get('claimed'), True
+            else:
+                if not spec.get('token') or not isinstance(spec.get('task'), dict):
+                    continue
+                tokens = token_processes() if tokens is None else tokens
+                found = tokens.get(spec['token'])
+                if not found:
+                    continue
+                source = spec | {'log': spec.get('log')}
+                (pid, created), started = found, spec_file.stat().st_mtime
+            task = source['task']
+            try:
+                new_id = self.queue.insert_running(task.get('lane'), task.get('key'), task.get('set'), task.get('unit'), task.get('args') or {},
+                                                   int(source.get('attempt') or 1), source['token'], source.get('log'), pid, created, started,
+                                                   int(task.get('max_attempts') or 3), approval_gen=task.get('approval_gen'))
+            except (taskqueue.QueueError, ValueError, TypeError):
+                continue
+            if new_id is None:
+                continue
+            adopted += 1
+            if source.get('builder_pid'):
+                self.queue.set_builder(new_id, source['token'], source['builder_pid'], source.get('builder_create'))
+            if orphan:
+                self.queue.mark_orphan(new_id, source['token'])
+        return adopted
+
     # ------------------------------------------------------------------------------------------------------------ starting
     def default_argv(self, task: dict) -> list[str]:
+        """The builder command. The output folder is ALWAYS explicit (re-check R13): bare builds go to `<root>/tools/preview/cache/layers/<race>`
+        of THIS project root (never the builder's default, the real repository's cache), module builds to `<module_dir>/layers`."""
         args = task.get('args') or {}
         if task['lane'] == 'bare':
-            return [sys.executable, str(BUILD_PY), 'bare', str(args['race'])]
-        argv = [sys.executable, str(BUILD_PY), 'module', str(args['module_dir']), '--lod', str(args['lod'])]
+            race = str(args['race'])
+            return [sys.executable, str(BUILD_PY), 'bare', race, '--out', str(builds.bare_root(self.root) / race)]
+        argv = [sys.executable, str(BUILD_PY), 'module', str(args['module_dir']), '--lod', str(args['lod']), '--out', str(Path(args['module_dir']) / 'layers')]
         if isinstance(args.get('glb_sha256'), str):
             argv += ['--expect-source-sha256', args['glb_sha256']]
         return argv
 
     def _bare_current(self, race: str) -> bool:
-        ptr = builds.bare_pointer(race)
+        ptr = builds.bare_pointer(self.root, race)
         if not ptr:
             return False
         try:
@@ -703,7 +855,7 @@ class Orchestrator:
             spec = {'id': task['id'], 'attempt': attempt, 'token': token, 'argv': self.argv_for(task), 'env': TASK_ENV, 'log': str(paths['log']),
                     'err': str(paths['err']), 'result': str(paths['result']), 'claim': str(paths['claim']), 'cwd': str(REPO),
                     'task': {'key': task['key'], 'lane': task['lane'], 'set': task.get('set_name'), 'unit': task.get('unit'),
-                             'args': task.get('args') or {}, 'max_attempts': task.get('max_attempts')}}
+                             'args': task.get('args') or {}, 'max_attempts': task.get('max_attempts'), 'approval_gen': task.get('approval_gen')}}
             paths['spec'].write_text(json.dumps(spec), encoding='utf-8')
             kwargs = {'creationflags': DETACHED} if os.name == 'nt' else {'start_new_session': True}
             proc = subprocess.Popen([sys.executable, str(RUN_TASK), str(paths['spec']), '--token', token], stdin=subprocess.DEVNULL,
@@ -745,6 +897,7 @@ def scan_stale(root: Path) -> dict:
     for name, info in derived['sets'].items():
         if info['stage'] not in ('3d', 'aligned', 'completed') or not info['locked']:
             continue
+        races |= set(info['races'])                       # every live race's bare build, also of a set none of whose units is built yet (R14)
         for unit in info['units']:
             key = f'{unit["race"]}/{unit["module"]}'
             rec = (info.get('builds') or {}).get(key)
@@ -762,7 +915,7 @@ def scan_stale(root: Path) -> dict:
             if ptr.get('fingerprint') != current:
                 units[f'{name}/{key}'] = {'build_id': ptr['build_id'], 'lod': rec['lod'], 'fingerprint': ptr.get('fingerprint'), 'current': current}
     for race in sorted(races):
-        ptr = builds.bare_pointer(race)
+        ptr = builds.bare_pointer(root, race)
         if ptr:
             try:
                 current = builds.fingerprint_bare(race)
@@ -805,22 +958,27 @@ def task_view(task: dict, now: float, stall_minutes: int = DEFAULTS['build_stall
             'elapsed': round((finished or now) - started, 1) if started else None, 'error': task.get('error'),
             'log_tail': log_tail(task) if shows_log else '', 'err_tail': log_tail(task, 400, 'err') if task['state'] in ('running', 'failed') else '',
             'key': task['key'], 'stalled': stalled(task, now, stall_minutes), 'last_output': last_output(task) if task['state'] in taskqueue.ACTIVE else None,
-            'kill_requested': bool(task.get('kill_requested'))}
+            'kill_requested': bool(task.get('kill_requested')), 'orphan': task['state'] == 'orphan',
+            'token': task.get('token') if task['state'] in taskqueue.ACTIVE else None}
 
 
 def queue_state(root: Path, active: bool, now: float | None = None) -> dict:
-    """GET /api/v2/queue: active and queued tasks plus failed / done / cancelled ones of the last 24 h, newest first. `totals` (per state) and
-    `workers.running` are SQL counts over the whole table, independent of the page; `page` says how much of each group is shown (review F16)."""
+    """GET /api/v2/queue. The rows come in three groups (re-check R16): EVERY active attempt (starting / running / stalled / orphan) first, never
+    truncated, newest first; then queued tasks (newest first, at most OPEN_PAGE); then failed / done / cancelled ones of the last 24 h (newest first,
+    at most RECENT_PAGE). `totals` (per state) and `workers.running` are SQL counts over the whole table, independent of the page; `page` says how
+    much of each group is shown (review F16)."""
     now = time.time() if now is None else now
     queue = taskqueue.for_root(root)
     since = now - 86400
     finished_states = ('failed', 'done', 'cancelled')
-    open_rows = queue.tasks(state=taskqueue.OPEN, limit=OPEN_PAGE)
+    active_rows = queue.tasks(state=taskqueue.ACTIVE, limit=1_000_000)
+    queued_rows = queue.tasks(state='queued', limit=OPEN_PAGE)
+    open_rows = active_rows + queued_rows
     recent = queue.tasks(state=finished_states, since=since, limit=RECENT_PAGE)
     totals = queue.totals()
     open_total = sum(totals.get(s, 0) for s in taskqueue.OPEN)
     recent_total = queue.count(finished_states, since)
-    tasks = sorted(open_rows + recent, key=lambda t: -t['id'])
+    tasks = sorted(active_rows, key=lambda t: -t['id']) + sorted(queued_rows, key=lambda t: -t['id']) + sorted(recent, key=lambda t: -t['id'])
     pool = pool_status(root)
     stall = read_settings(root)['build_stall_minutes']
     views = [task_view(t, now, stall) for t in tasks]
@@ -830,5 +988,7 @@ def queue_state(root: Path, active: bool, now: float | None = None) -> dict:
             'totals': totals, 'stalled': sum(v['stalled'] for v in views), 'stall_minutes': stall,
             'page': {'open_limit': OPEN_PAGE, 'open_total': open_total, 'open_shown': len(open_rows), 'recent_limit': RECENT_PAGE,
                      'recent_total': recent_total, 'recent_shown': len(recent), 'recent_since': since,
+                     'active_total': sum(totals.get(s, 0) for s in taskqueue.ACTIVE), 'active_shown': len(active_rows),
+                     'queued_total': totals.get('queued', 0), 'queued_shown': len(queued_rows),
                      'truncated': open_total > len(open_rows) or recent_total > len(recent)},
             'queue_health': queue.health_view()}

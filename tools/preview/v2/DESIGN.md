@@ -78,8 +78,9 @@ tools/layers/      the production layer builder (phase 2): build.py (API + CLI),
   4. no `aligned_approval`, or it no longer holds -> **aligned**
   5. else -> **completed**. The Aligned approval holds (phase 3 review F3, DESIGN_PHASE3.md F.3) only when its units are exactly the live units (frozen
      required races) and the 3D-approved units, every one with its approved build id still published, every approved bare build still published,
-     and `models/<S>/ready.json` carries the approval's `approval_id`. 3D-approved units show the FROZEN LOD of `lod_approval`; a unit whose pinned
-     source GLB changed is `source_changed` (not built; Back to 3D).
+     and `models/<S>/ready.json` carries the approval's `approval_id` AND has exactly the bytes whose sha256 the approval stored (`ready_sha256`,
+     DESIGN_PHASE3.md G.4). 3D-approved units show the FROZEN LOD of `lod_approval`; a unit whose pinned source GLB changed is `source_changed`, one
+     pinned without a digest (an older approval) `needs_review` (neither is built; Back to 3D; DESIGN_PHASE3.md G.10).
 - **Default LOD** shown (not saved, `lod_saved: false`) when a module has no `chosen_lod.json`: `0p2` (124 of the 132 existing picks).
 - **Monster variant** (`monsters.cards`): `reduced` LODs and not approved -> **3d**; approved (`chosen_lod.json approved`) ->
   **completed**; otherwise -> **approved** (in progress). Monster concepts: phase 5.
@@ -89,11 +90,13 @@ tools/layers/      the production layer builder (phase 2): build.py (API + CLI),
 ```json
 {"schema": 1, "set": "S", "rev": 7,
  "dropped": {"gnome_female": {"time": "...", "reason": "..."}},
- "lod_approval": {"time": "...", "units": {"human_male/body_armor": {"job": "a28c0e5ad46d", "lod": "0p2", "glb_sha256": "..."}},
+ "lod_approval": {"time": "...", "approval_id": "<uuid hex: the approval generation>",
+                  "units": {"human_male/body_armor": {"job": "a28c0e5ad46d", "lod": "0p2", "glb_sha256": "<64 hex>"}},
                   "required_races": ["human_male", "..."]},
  "amount": {"human_male": {"body": 100, "limbs": 100}, "elf_female": {"outfit": 80}},
  "aligned_approval": {"time": "...", "approval_id": "<uuid hex>", "units": {"human_male/body_armor": {"job": "...", "lod": "0p2", "build_id": "..."}},
-                      "bare": {"human_male": "bare-..."}, "amount": {"human_male": {"body": 100, "limbs": 100}}},
+                      "bare": {"human_male": "bare-..."}, "amount": {"human_male": {"body": 100, "limbs": 100}},
+                      "ready_sha256": "<sha256 of the exact ready.json bytes>"},
  "history": [{"time": "...", "action": "approve_3d", "detail": {}}]}
 ```
 - `amount` groups: outfit sets `{"outfit": n}`; armour sets `{"body": n, "limbs": n}` (body = torso layer, limbs = gloves and

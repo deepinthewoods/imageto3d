@@ -17,6 +17,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 import uuid
@@ -33,14 +34,14 @@ import orchestrator  # noqa: E402
 import run_task  # noqa: E402
 import server  # noqa: E402
 import taskqueue  # noqa: E402
-from test_v2 import RACES, V2Case  # noqa: E402
+from test_v2 import RACES, V2Case, write_slot  # noqa: E402
 
 try:
     import psutil
 except ImportError:      # pragma: no cover
     psutil = None
 
-FAKE = '''import hashlib, importlib.util, json, os, pathlib, sys, time
+FAKE = '''import hashlib, importlib.util, json, os, pathlib, struct, sys, time
 args = sys.argv[1:]
 ctl = pathlib.Path(args[args.index('--ctl') + 1])
 cfg = json.loads(ctl.read_text()) if ctl.exists() else {}
@@ -48,19 +49,35 @@ spec = importlib.util.spec_from_file_location('layers_build', args[args.index('-
 lb = importlib.util.module_from_spec(spec)
 sys.modules['layers_build'] = lb
 spec.loader.exec_module(lb)
+
+
+def layer_glb(tag, morph):
+    pos = struct.pack('<9f', 0, 0, 0, 1, 0, 0, 0, 1, 0)
+    blob = pos + (pos if morph else b'')
+    views = [{'buffer': 0, 'byteOffset': 0, 'byteLength': 36}] + ([{'buffer': 0, 'byteOffset': 36, 'byteLength': 36}] if morph else [])
+    accs = [{'bufferView': i, 'componentType': 5126, 'count': 3, 'type': 'VEC3'} for i in range(len(views))]
+    prim = {'attributes': {'POSITION': 0}} | ({'targets': [{'POSITION': 1}]} if morph else {})
+    mesh = {'primitives': [prim]} | ({'extras': {'targetNames': ['fill']}} if morph else {})
+    js = json.dumps({'asset': {'version': '2.0', 'generator': tag}, 'meshes': [mesh], 'accessors': accs, 'bufferViews': views,
+                     'buffers': [{'byteLength': len(blob)}]}).encode()
+    js += b' ' * (-len(js) % 4)
+    body = struct.pack('<II', len(js), 0x4E4F534A) + js + struct.pack('<II', len(blob), 0x004E4942) + blob
+    return struct.pack('<4sII', b'glTF', 2, 12 + len(body)) + body
+
+
 if args[0] == 'bare':
     race = args[1]
-    target, out = f'bare:{race}', pathlib.Path(args[args.index('--bare-root') + 1]) / race
+    target, out = f'bare:{race}', pathlib.Path(args[args.index('--out') + 1])          # (the dispatcher always passes --out)
     fp, tag, lod = lb.fingerprint_bare(race), 'bare', None
-    slots = ['head', 'torso', 'lower_arm.l', 'lower_arm.r', 'lower_leg.l', 'lower_leg.r']
+    slots = lb.required_slots('bare', race)
     kind, ident = 'bare', 'bare:' + race
 else:
     module = pathlib.Path(args[1]).resolve()
     lod = args[args.index('--lod') + 1]
     race, kind = module.parts[-2], module.name
-    target, out = f'{race}/{kind}', module / 'layers'
+    target, out = f'{race}/{kind}', pathlib.Path(args[args.index('--out') + 1])
     fp, tag = lb.fingerprint_module(module, lod), lod
-    slots = {'outfit': ['outfit'], 'body_armor': ['torso'], 'right_gauntlet_boot': ['lower_arm.l', 'lower_arm.r', 'lower_leg.l', 'lower_leg.r']}[kind]
+    slots = lb.required_slots(kind, race)
     ident = lb._rel(module)
 runs_file = ctl.parent / ('runs-' + hashlib.sha1((target + str(args[1])).encode()).hexdigest()[:10])
 runs = int(runs_file.read_text()) + 1 if runs_file.exists() else 1
@@ -107,11 +124,14 @@ if ptr_file.exists() and json.loads(ptr_file.read_text()).get('build_id') == bui
     print(json.dumps({'status': 'current', 'build_id': build_id}), flush=True)
     sys.exit(0)
 (out / build_id).mkdir(parents=True, exist_ok=True)
+entries = {}
 for slot in slots:
-    (out / build_id / (slot + '.glb')).write_bytes(b'glb-' + slot.encode() + build_id.encode())
+    data = layer_glb(build_id + '/' + slot, kind != 'bare')
+    (out / build_id / (slot + '.glb')).write_bytes(data)
     (out / build_id / (slot + '.json')).write_text('{}')
+    entries[slot] = {'glb': f'{build_id}/{slot}.glb', 'json': f'{build_id}/{slot}.json', 'faces': 1, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
 record = {'build_id': build_id, 'fingerprint': fp, 'lod': lod, 'status': 'ok', 'kind': kind, 'race': race, 'warnings': [], 'metrics': {'wall_crossings_left': 0},
-          'module': ident, 'required': slots, 'slots': {s: {'glb': f'{build_id}/{s}.glb', 'json': f'{build_id}/{s}.json', 'faces': 10} for s in slots}}
+          'module': ident, 'required': slots, 'slots': entries}
 (out / build_id / 'build.json').write_text(json.dumps(record))
 ptr_file.write_text(json.dumps(record))
 print(json.dumps({'status': 'ok', 'build_id': build_id}), flush=True)
@@ -126,9 +146,10 @@ class Phase3Case(V2Case):
         self.fake = base / 'fake_build.py'
         self.fake.write_text(FAKE)
         self.ctl = base / 'ctl.json'
-        self.bare_dir = self.root / 'tools' / 'preview' / 'cache' / 'layers'
+        self.bare_dir = self.root / 'tools' / 'preview' / 'cache' / 'layers'           # the fixture root's own bare cache (re-check R13)
         self.old_bare = builds.lb().BARE_ROOT
-        builds.lb().BARE_ROOT = self.bare_dir
+        self.production_bare = base / 'production_bare_cache'                         # stands in for the builder's default: must stay untouched
+        builds.lb().BARE_ROOT = self.production_bare
         self.old_backoff = orchestrator.BACKOFF
         orchestrator.BACKOFF = 0.0
         self.idle_value = 5.0           # present
@@ -173,17 +194,15 @@ class Phase3Case(V2Case):
                 pass
 
     # ------------------------------------------------------------------------------------------------------------ helpers
-    def build_bare(self, *races):
-        """Publish current bare builds (pointer == build.json + stub GLBs) of races, with the real bare fingerprint."""
+    def build_bare(self, *races, suffix=''):
+        """Publish current bare builds (pointer == build.json + valid GLBs with recorded digests) of races, with the real bare fingerprint."""
         for race in races:
             out = self.bare_dir / race
             fp = builds.fingerprint_bare(race)
-            build_id = f'bare-{fp[:12]}'
+            build_id = f'bare-{fp[:12]}{suffix}'
             (out / build_id).mkdir(parents=True, exist_ok=True)
-            for slot in BARE_SLOTS:
-                (out / build_id / f'{slot}.glb').write_bytes(b'bare-' + slot.encode())
             record = {'build_id': build_id, 'fingerprint': fp, 'status': 'ok', 'kind': 'bare', 'race': race, 'module': f'bare:{race}', 'lod': None,
-                      'required': BARE_SLOTS, 'slots': {s: {'glb': f'{build_id}/{s}.glb', 'faces': 5} for s in BARE_SLOTS}}
+                      'required': BARE_SLOTS, 'slots': {s: write_slot(out / build_id, build_id, s, morph=False) for s in BARE_SLOTS}}
             (out / build_id / 'build.json').write_text(json.dumps(record))
             (out / 'current_bare.json').write_text(json.dumps(record))
 
@@ -198,13 +217,10 @@ class Phase3Case(V2Case):
         return path
 
     def fake_argv(self, task):
-        args = task.get('args') or {}
-        if task['lane'] == 'bare':
-            return [sys.executable, str(self.fake), 'bare', args['race'], '--ctl', str(self.ctl), '--build-py', str(builds.BUILD_PY), '--bare-root', str(self.bare_dir)]
-        argv = [sys.executable, str(self.fake), 'module', args['module_dir'], '--lod', args['lod'], '--ctl', str(self.ctl), '--build-py', str(builds.BUILD_PY)]
-        if args.get('glb_sha256'):
-            argv += ['--expect-source-sha256', args['glb_sha256']]
-        return argv
+        """The REAL dispatcher command (Orchestrator.default_argv on this root: --out included) with the fake builder in place of build.py."""
+        argv = orchestrator.Orchestrator.default_argv(types.SimpleNamespace(root=self.root), task)
+        self.assertEqual(argv[1], str(orchestrator.BUILD_PY))
+        return [argv[0], str(self.fake)] + argv[2:] + ['--ctl', str(self.ctl), '--build-py', str(builds.BUILD_PY)]
 
     def control(self, **modes):
         self.ctl.write_text(json.dumps(modes))
@@ -388,10 +404,11 @@ class QueueTests(Phase3Case):
             q.enqueue('layers', f'newer-{i}', 's', 'u', {})
         with mock.patch.object(orchestrator, 'OPEN_PAGE', 10):
             data = orchestrator.queue_state(self.root, False)
-        self.assertNotIn(old, [t['id'] for t in data['tasks']])              # the old running row is beyond the page ...
-        self.assertEqual(data['workers']['running'], 1)                       # ... but still counted
+        self.assertEqual(data['tasks'][0]['id'], old)                         # re-check R16: every active attempt first, never cut off by the page
+        self.assertEqual(data['workers']['running'], 1)
         self.assertEqual((data['totals']['queued'], data['totals']['running']), (30, 1))
-        self.assertEqual((data['page']['open_total'], data['page']['open_shown'], data['page']['open_limit'], data['page']['truncated']), (31, 10, 10, True))
+        self.assertEqual((data['page']['open_total'], data['page']['open_shown'], data['page']['open_limit'], data['page']['truncated']), (31, 11, 10, True))
+        self.assertEqual((data['page']['active_total'], data['page']['active_shown'], data['page']['queued_total'], data['page']['queued_shown']), (1, 1, 30, 10))
 
     def test_a_damaged_database_never_breaks_the_site_and_is_rebuilt(self):
         """F9: corrupt queue -> state / item / queue still answer with queue_health; the orchestrator keeps the file, re-adopts the surviving
@@ -788,7 +805,7 @@ class PoolTests(Phase3Case):
         orch.tick()
         row = q.get(row['id'])
         self.assertEqual(row['builder_pid'], claim['builder_pid'])
-        self.assertEqual(self.post('/api/v2/queue', {'op': 'kill_retry', 'id': row['id']})[0], 400)          # not stalled yet
+        self.assertEqual(self.post('/api/v2/queue', {'op': 'kill_retry', 'id': row['id'], 'token': row['token']})[0], 400)          # not stalled yet
         for _ in range(200):                                                # the builder has printed its first line (then stays silent)
             if 'fake build' in Path(row['log']).read_text(errors='replace'):
                 break
@@ -802,7 +819,11 @@ class PoolTests(Phase3Case):
         self.assertEqual((row_view['state'], row_view['stalled']), ('stalled', True))
         unit_task = self.item()['builds'][row['unit']]['task']
         self.assertEqual(unit_task['state'], 'stalled')
-        status, body = self.post('/api/v2/queue', {'op': 'kill_retry', 'id': row['id']})
+        self.assertEqual(row_view['token'], row['token'])                     # the attempt the client sees
+        self.assertEqual(self.post('/api/v2/queue', {'op': 'kill_retry', 'id': row['id']})[0], 400)                         # R6: token required
+        status, body = self.post('/api/v2/queue', {'op': 'kill_retry', 'id': row['id'], 'token': 'another-attempt'})
+        self.assertEqual((status, body['code']), (409, 'changed'))
+        status, body = self.post('/api/v2/queue', {'op': 'kill_retry', 'id': row['id'], 'token': row['token']})
         self.assertEqual((status, body['kill_requested']), (200, True), body)
         builder, wrapper = psutil.Process(claim['builder_pid']), psutil.Process(row['pid'])
         self.control(default='ok')
@@ -1051,11 +1072,11 @@ class ApprovalTests(Phase3Case):
                     self.assertTrue(rec['glb'].startswith(f'models/a/j1/{race}/{module}/layers/{entry["build_id"]}/'))
         self.assertEqual(sorted(ready['bare']), sorted(RACES))
         for race, rel in ready['bare'].items():
-            self.assertEqual(Path(rel).name, builds.bare_pointer(race)['build_id'])
+            self.assertEqual(Path(rel).name, builds.bare_pointer(self.root, race)['build_id'])
             self.assertFalse(Path(rel).is_absolute())
         data = json.loads((self.root / 'models/a/pipeline_v2.json').read_text())
         self.assertEqual(data['aligned_approval']['approval_id'], body['approval_id'])
-        self.assertEqual(data['aligned_approval']['bare'], {r: builds.bare_pointer(r)['build_id'] for r in RACES})
+        self.assertEqual(data['aligned_approval']['bare'], {r: builds.bare_pointer(self.root, r)['build_id'] for r in RACES})
         self.assertEqual(data['aligned_approval']['units']['human_male/body_armor']['build_id'], item['builds']['human_male/body_armor']['build_id'])
         self.assertEqual(data['amount']['human_male'], {'body': 60, 'limbs': 30})
         self.assertEqual([c['id'] for c in self.get('/api/v2/state')[1]['tabs']['completed']], ['set:a'])
@@ -1120,7 +1141,8 @@ class ApprovalTests(Phase3Case):
         self.assertIn('source changed 1', [b['text'] for b in item['card']['badges']])
         args = {'builds': {k: v['build_id'] for k, v in item['builds'].items()}, 'bare': {r: v['build_id'] for r, v in item['bare_builds'].items()},
                 'amount': {r: {'outfit': 100} for r in RACES}}
-        self.assertEqual(self.act('set:s', 'approve', rev=item['rev'], args=args)[0], 400)          # (the set is not in aligned any more)
+        status, body = self.act('set:s', 'approve', rev=item['rev'], args=args)          # (the set is not in aligned any more: R15, a 409 the client reloads on)
+        self.assertEqual((status, body['code']), (409, 'stale'), body)
         # a rebuild never builds it; a queued task for it fails 'source changed' at dispatch
         status, body = self.act('set:s', 'rebuild', rev=item['rev'], args={})
         self.assertEqual(body['actions']['human_male/outfit'], 'source_changed')
@@ -1142,10 +1164,10 @@ class ApprovalTests(Phase3Case):
         self.assertEqual(self.item()['stage'], 'completed')
         # ready.json replaced by another approval's manifest: not Completed
         ready = self.root / 'models/s/ready.json'
-        saved = ready.read_text()
-        ready.write_text(json.dumps(json.loads(saved) | {'approval_id': 'another'}))
+        saved = ready.read_bytes()
+        ready.write_bytes(json.dumps(json.loads(saved) | {'approval_id': 'another'}).encode())
         self.assertEqual(self.item()['stage'], 'aligned')
-        ready.write_text(saved)
+        ready.write_bytes(saved)
         self.assertEqual(self.item()['stage'], 'completed')
         # the bare build of a race is republished: not Completed, and reconcile revokes the manifest
         bare_ptr = self.bare_dir / 'dwarf_male' / 'current_bare.json'
@@ -1329,7 +1351,7 @@ class RebuildTests(Phase3Case):
         pointer.unlink()
         (self.bare_dir / 'dwarf_male' / 'current_bare.json').unlink()
         self.drive(orch, lambda: self.item()['stage'] == 'aligned' and self.settled())
-        self.assertTrue(builds.bare_pointer('dwarf_male'))
+        self.assertTrue(builds.bare_pointer(self.root, 'dwarf_male'))
 
     def test_stale_scan_marks_old_builds_and_rebuild_gets_a_new_key(self):
         self.sets_ready()
@@ -1449,7 +1471,7 @@ class EndpointTests(Phase3Case):
             conn.execute('UPDATE tasks SET updated=? WHERE id=?', (time.time() - 90000, old))        # finished more than 24 h ago
         status, data = self.get('/api/v2/queue')
         self.assertEqual(status, 200)
-        self.assertEqual([t['id'] for t in data['tasks']], [d, c, b, a])
+        self.assertEqual([t['id'] for t in data['tasks']], [c, b, d, a])                   # (R16: active, then queued, then recent; newest first in each)
         failed = data['tasks'][3]
         self.assertEqual((failed['state'], failed['error'], failed['set'], failed['unit'], failed['lane'], failed['attempts']), ('failed', 'boom happened', 's', 'human_male/outfit', 'layers', 1))
         self.assertTrue(failed['log_tail'].rstrip().endswith('the last line'))
@@ -1566,6 +1588,483 @@ class ServerWiringTests(Phase3Case):
         self.assertEqual(item['stage'], 'aligned', {k: v['status'] for k, v in item['builds'].items()})
         self.assertTrue(self.get('/api/v2/queue')[1]['workers']['orchestrator'])
         self.assertEqual(self.approve_aligned()[1]['stage'], 'completed')
+
+
+# =========================================================================================================== phase 3 re-check (R2-R16)
+
+class RecheckTests(Phase3Case):
+    """Regression tests of the phase 3 re-check findings (the reviewer's scenarios; .codex_jobs/review_v2_phase3_recheck_20261125/result.md)."""
+
+    def logs(self):
+        logs = self.root / '.codex_jobs' / '_app' / 'logs'
+        logs.mkdir(parents=True, exist_ok=True)
+        return logs
+
+    def second_bare(self, race='human_male'):
+        """A second valid generation (`-r1`) of a race's bare build; the pointer stays on the first. Returns (pointer file, bytes A, bytes B)."""
+        ptr = self.bare_dir / race / 'current_bare.json'
+        first = ptr.read_bytes()
+        self.build_bare(race, suffix='-r1')
+        second = ptr.read_bytes()
+        ptr.write_bytes(first)
+        return ptr, first, second
+
+    # ------------------------------------------------------------------------------------------------------------------ R2
+    def test_r2_one_pointer_snapshot_per_item(self):
+        """The bare pointer switches between two reads of one item request: the URLs and the bare build id still come from ONE read."""
+        orch, _ = self.approve_and_build()
+        ptr, first, second = self.second_bare()
+        first_id = json.loads(first)['build_id']
+        real = builds.read_json
+        switched = []
+
+        def racing(path):
+            value = real(path)
+            if Path(path) == ptr and not switched:
+                switched.append(True)
+                ptr.write_bytes(second)                                             # republished right after the first read
+            return value
+        with mock.patch.object(builds, 'read_json', side_effect=racing):
+            item = self.item()
+        self.assertTrue(switched)
+        self.assertEqual(item['bare_builds']['human_male']['build_id'], first_id)
+        self.assertTrue(all(f'/{first_id}/' in url for url in item['bare']['human_male'].values()), item['bare']['human_male'])
+
+    def test_r2_a_bare_republish_during_the_aligned_approval_is_a_409(self):
+        """The bare pointer switches after the displayed ids were compared (during the fingerprint checks): the final comparison under the
+        builder's publish locks sees it; 409 changed and no ready.json. While the decision is written the publish lock is held."""
+        orch, _ = self.approve_and_build()
+        args, rev = self.aligned_args()
+        ptr, first, second = self.second_bare()
+        real_fp = builds.lb().fingerprint_bare
+
+        def racing(race):
+            if race == 'human_male':
+                ptr.write_bytes(second)
+            return real_fp(race)
+        with mock.patch.object(builds.lb(), 'fingerprint_bare', side_effect=racing):
+            status, body = self.act('set:s', 'approve', rev=rev, args=args)
+        self.assertEqual((status, body['code']), (409, 'changed'), body)
+        self.assertTrue(any(c.startswith('bare human_male') for c in body['changes']), body['changes'])
+        self.assertFalse((self.root / 'models/s/ready.json').exists())
+        self.assertIsNone(self.item()['decisions']['aligned_approval'])
+        # with the displayed ids current: the builder's publish lock of every involved output root is held while the decision is written
+        args, rev = self.aligned_args()
+        real_write = actions.decisions.approve_aligned
+        held = []
+
+        def probe(*a, **k):
+            def other():
+                for out_root in (self.bare_dir / 'human_male', self.root / 'models/s/j1/dwarf_male/outfit/layers'):
+                    try:
+                        with builds.lb()._publish_lock(out_root, 0.3):
+                            held.append(False)
+                    except TimeoutError:
+                        held.append(True)
+            thread = threading.Thread(target=other)
+            thread.start()
+            thread.join()
+            return real_write(*a, **k)
+        with mock.patch.object(actions.decisions, 'approve_aligned', side_effect=probe):
+            status, body = self.act('set:s', 'approve', rev=rev, args=args)
+        self.assertEqual((status, body.get('stage')), (200, 'completed'), body)
+        self.assertEqual(held, [True, True])
+
+    # ------------------------------------------------------------------------------------------------------------------ R3
+    def test_r3_a_zero_byte_slot_is_never_published_or_certified(self):
+        orch, body = self.completed_set()
+        args, rev = self.aligned_args()
+        item = self.item()
+        build_id = item['builds']['human_male/outfit']['build_id']
+        ptr = json.loads((self.root / 'models/s/j1/human_male/outfit/layers/current_0p2.json').read_text())
+        self.assertTrue(all(len(e['sha256']) == 64 and e['size'] > 0 for e in ptr['slots'].values()))        # the builder's digests
+        (self.root / f'models/s/j1/human_male/outfit/layers/{build_id}/outfit.glb').write_bytes(b'')
+        item = self.item()
+        rec = item['builds']['human_male/outfit']
+        self.assertEqual(rec['status'], 'damaged')
+        self.assertIn('not valid', rec['error'])
+        self.assertNotEqual(item['stage'], 'completed')
+        self.assertIn('damaged build 1', [b['text'] for b in item['card']['badges']])
+        status, answer = self.act('set:s', 'approve', rev=rev, args=args)                # the displayed (old) composition: refused
+        self.assertEqual(status, 409, answer)
+        out = orch.reconcile()
+        self.assertEqual(len(out['revoked']), 1)
+        self.assertFalse((self.root / 'models/s/ready.json').exists())
+        self.assertIn('human_male/outfit', out['queued'].get('s', {}))                   # the damaged build is built again
+        # a zero-byte BARE slot: the bare build is damaged as well
+        bare = builds.bare_pointer(self.root, 'dwarf_male')
+        (self.bare_dir / 'dwarf_male' / bare['build_id'] / 'head.glb').write_bytes(b'')
+        self.assertEqual(self.item()['bare_builds']['dwarf_male']['status'], 'damaged')
+        self.assertIsNone(builds.bare_pointer(self.root, 'dwarf_male'))
+
+    # ------------------------------------------------------------------------------------------------------------------ R4
+    def test_r4_a_replaced_ready_json_is_not_completed_and_is_quarantined(self):
+        orch, body = self.completed_set()
+        ready = self.root / 'models/s/ready.json'
+        data = json.loads((self.root / 'models/s/pipeline_v2.json').read_text())
+        self.assertEqual(data['aligned_approval']['ready_sha256'], hashlib.sha256(ready.read_bytes()).hexdigest())
+        replaced = json.dumps({'approval_id': body['approval_id']}).encode()          # the reviewer's manifest: only the approval id
+        ready.write_bytes(replaced)
+        item = self.item()
+        self.assertEqual(item['stage'], 'aligned')
+        self.assertTrue(any('ready_sha256' in p for p in item['not_completed']), item['not_completed'])
+        out = orch.reconcile()
+        self.assertEqual((len(out['quarantined']), out['revoked']), (1, []))
+        self.assertFalse(ready.exists())
+        kept = list(ready.parent.glob('ready.json.quarantine-*'))
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(kept[0].read_bytes(), replaced)                                  # the bytes are kept for recovery
+        self.assertTrue(any(e['kind'] == 'quarantine' for e in taskqueue.for_root(self.root).events()))
+
+    def test_r4_an_unreadable_decision_quarantines_the_active_manifest(self):
+        orch, body = self.completed_set()
+        ready = self.root / 'models/s/ready.json'
+        saved = ready.read_bytes()
+        (self.root / 'models/s/pipeline_v2.json').write_bytes(b'{"rev": 3, broken')
+        item = self.item()
+        self.assertTrue(item['error'])
+        self.assertNotEqual(item['stage'], 'completed')
+        out = orch.reconcile()
+        self.assertEqual(len(out['quarantined']), 1, out)
+        self.assertFalse(ready.exists())
+        self.assertEqual(next(ready.parent.glob('ready.json.quarantine-*')).read_bytes(), saved)
+
+    # ------------------------------------------------------------------------------------------------------------------ R5
+    def test_r5_a_missing_database_adopts_the_live_attempt_before_queueing_work(self):
+        self.sets_ready()
+        self.assertEqual(self.approve('s', 0)[0], 200)
+        q = taskqueue.for_root(self.root)
+        for task in q.tasks(lane='bare'):
+            q.cancel(task['id'])
+        self.build_bare(*RACES)
+        self.control(default='ok', **{'human_male/outfit': 'sleep:4'})
+        orch = self.orch()
+        self.started.append(orch)
+        self.idle_value = 5.0
+        orch.tick()
+        live = q.tasks(state=('starting', 'running'))[0]
+        for _ in range(100):
+            if orch._claim(live):
+                break
+            time.sleep(0.05)
+        for suffix in ('', '-wal', '-shm'):                                             # the database is moved aside (the reviewer's step)
+            f = q.path.with_name(q.path.name + suffix)
+            if f.exists():
+                f.rename(f.with_name(f.name + '.aside'))
+        q._ready = False
+        out = orch.reconcile()
+        self.assertEqual(out['adopted'], 1, out)
+        rows = {t['key']: t for t in q.tasks()}
+        self.assertEqual((rows[live['key']]['state'], rows[live['key']]['token']), ('running', live['token']))
+        self.assertEqual(rows[live['key']]['approval_gen'], live['approval_gen'])
+        self.assertEqual(orch.reconcile()['adopted'], 0)                                  # once per database
+        self.drive(orch, self.settled)
+        self.assertEqual(self.runs('human_male/outfit', live['args']['module_dir']), 1)  # never a second build
+        self.assertEqual(self.item()['stage'], 'aligned')
+
+    @unittest.skipIf(psutil is None, 'needs psutil')
+    def test_r5_an_attempt_without_a_claim_is_found_by_its_token(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', '--token', 'tok-spec'])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        logs = self.logs()
+        spec = {'id': 77, 'attempt': 1, 'token': 'tok-spec', 'log': str(logs / '77-a1.log'),
+                'task': {'key': 'k-spec', 'lane': 'layers', 'set': 's', 'unit': 'human_male/outfit', 'args': {}, 'max_attempts': 3, 'approval_gen': 'g1'}}
+        (logs / '77-a1.task.json').write_text(json.dumps(spec))
+        for _ in range(100):
+            if 'tok-spec' in orchestrator.token_processes():
+                break
+            time.sleep(0.05)
+        orch = self.orch(raw=True)
+        self.assertEqual(orch.adopt_claims(), 1)
+        row = taskqueue.for_root(self.root).by_key('k-spec')
+        self.assertEqual((row['state'], row['pid'], row['token'], row['approval_gen']), ('running', child.pid, 'tok-spec', 'g1'))
+
+    # ------------------------------------------------------------------------------------------------------------------ R6
+    def running_row(self, key, pid, token, created=None, builder=None):
+        q = taskqueue.for_root(self.root)
+        mod = self.module('j-' + key)
+        task = q.enqueue('layers', key, 's', 'human_male/outfit', {'race': 'human_male', 'module_dir': str(mod), 'lod': '0p2'})
+        log = self.logs() / f'{task}-a1.log'
+        q.claim(task, token, str(log))
+        q.mark_running(task, token, pid, created)
+        log.write_text('started\n')
+        if builder is not None:
+            (self.logs() / f'{task}-a1.claim.json').write_text(json.dumps(
+                {'token': token, 'attempt': 1, 'task': {'key': key}, 'wrapper_pid': pid, 'wrapper_create': created, 'builder_pid': builder.pid,
+                 'builder_create': orchestrator.create_time(builder.pid), 'argv': [sys.executable, '-c', 'import time; time.sleep(60)'],
+                 'claimed': time.time()}))
+        return task
+
+    @unittest.skipIf(psutil is None, 'needs psutil')
+    def test_r6_a_dead_wrapper_with_a_live_builder_keeps_its_slot(self):
+        builder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(lambda: (builder.kill(), builder.wait()))
+        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
+        dead.wait()
+        q = taskqueue.for_root(self.root)
+        task = self.running_row('orph', dead.pid, 'tok-o', builder=builder)
+        waiting = q.enqueue('layers', 'next', 's', 'dwarf_male/outfit', {'race': 'dwarf_male', 'module_dir': str(self.module('j9', race='dwarf_male')), 'lod': '0p2'})
+        self.control(default='ok')
+        orch = self.orch(raw=True)
+        self.started.append(orch)
+        self.idle_value = 5.0                                                          # one worker
+        orch.tick()
+        self.assertEqual(q.get(task)['state'], 'orphan')
+        self.assertEqual(q.get(waiting)['state'], 'queued')                             # the slot is still taken by the orphaned builder
+        self.assertEqual(q.count(taskqueue.ACTIVE), 1)
+        view = next(t for t in self.get('/api/v2/queue')[1]['tasks'] if t['id'] == task)
+        self.assertEqual((view['state'], view['orphan'], view['token']), ('orphan', True, 'tok-o'))
+        orch.tick()
+        self.assertEqual(q.get(task)['state'], 'orphan')                               # stays while the builder lives
+        status, body = self.post('/api/v2/queue', {'op': 'kill_retry', 'id': task, 'token': 'tok-o'})
+        self.assertEqual(status, 200, body)
+        mode = self.root / '.codex_jobs' / '_batch' / 'supervisor_mode.json'
+        mode.parent.mkdir(parents=True, exist_ok=True)
+        mode.write_text(json.dumps({'mode': 'pause'}))                                  # (nothing starts in this tick: the row stays visible)
+        orch.tick()
+        builder.wait(10)
+        self.assertEqual(q.get(task)['state'], 'queued')                               # requeued only after the builder was gone
+        self.assertIn('killed by the user', q.get(task)['error'])
+
+    @unittest.skipIf(psutil is None, 'needs psutil')
+    def test_r6_a_kill_that_cannot_be_verified_or_does_not_work_keeps_the_slot(self):
+        q = taskqueue.for_root(self.root)
+        stranger = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])          # its command line does not carry the token
+        self.addCleanup(lambda: (stranger.kill(), stranger.wait()))
+        task = self.running_row('unverified', stranger.pid, 'tok-u', orchestrator.create_time(stranger.pid))
+        self.assertTrue(q.request_kill(task, 'tok-u'))
+        self.assertFalse(q.request_kill(task, 'another-token'))
+        orch = self.orch(raw=True)
+        orch.tick()
+        row = q.get(task)
+        self.assertEqual((row['state'], row['kill_requested']), ('running', 0))
+        self.assertIn('could not be verified', row['error'])
+        self.assertTrue(stranger.poll() is None)                                       # not touched
+        # verified, but the kill does not take effect: still not requeued
+        stubborn = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', 'tok-s'])
+        self.addCleanup(lambda: (stubborn.kill(), stubborn.wait()))
+        other = self.running_row('survives', stubborn.pid, 'tok-s', orchestrator.create_time(stubborn.pid))
+        self.assertTrue(q.request_kill(other, 'tok-s'))
+        with mock.patch.object(orchestrator, 'KILL_WAIT', 0.2), mock.patch.object(psutil.Process, 'kill', lambda self: None):
+            orch.tick()
+        row = q.get(other)
+        self.assertEqual(row['state'], 'running')
+        self.assertIn('still running after the kill', row['error'])
+        self.assertEqual(q.count(taskqueue.ACTIVE), 2)
+
+    # ------------------------------------------------------------------------------------------------------------------ R8
+    def test_r8_a_manual_cancel_holds_for_the_approval_generation(self):
+        self.sets_ready()
+        self.assertEqual(self.approve('s', 0)[0], 200)
+        q = taskqueue.for_root(self.root)
+        task = next(t for t in q.tasks(lane='layers') if t['unit'] == 'human_male/outfit')
+        status, body = self.post('/api/v2/queue', {'op': 'cancel', 'id': task['id']})
+        self.assertEqual((status, body['state']), (200, 'cancelled'))
+        orch = self.orch()
+        for _ in range(2):
+            orch.reconcile()
+            self.assertEqual(q.get(task['id'])['state'], 'cancelled')                  # never resurrected by reconcile
+        self.assertEqual(self.item()['builds']['human_male/outfit']['status'], 'cancelled')
+        status, body = self.act('set:s', 'rebuild', rev=1, args={'race': 'human_male'})   # an explicit Rebuild queues it again
+        self.assertEqual((status, body['actions']['human_male/outfit']), (200, 'queued'), body)
+        self.assertEqual(q.get(task['id'])['state'], 'queued')
+        self.assertEqual(self.post('/api/v2/queue', {'op': 'cancel', 'id': task['id']})[0], 200)
+        self.assertEqual(self.act('set:s', 'unapprove', rev=1)[0], 200)                  # a NEW approval clears it as well
+        self.assertEqual(self.approve('s', 2)[0], 200)
+        self.assertEqual(q.get(task['id'])['state'], 'queued')
+        self.assertIsNone(q.get(task['id'])['cancel_gen'])
+
+    # ------------------------------------------------------------------------------------------------------------------ R10
+    def test_r10_a_digestless_pin_needs_review_and_reconcile_isolates_sets(self):
+        self.sets_ready('s')
+        self.assertEqual(self.approve('s', 0)[0], 200)
+        path = self.root / 'models/s/pipeline_v2.json'
+        data = json.loads(path.read_text())
+        del data['lod_approval']['units']['human_male/outfit']['glb_sha256']
+        path.write_text(json.dumps(data))
+        for t in taskqueue.for_root(self.root).tasks():
+            taskqueue.for_root(self.root).cancel(t['id'])
+        item = self.item()
+        self.assertIsNone(item['error'])                                                 # an older pin is readable ...
+        self.assertEqual(item['builds']['human_male/outfit']['status'], 'needs_review')   # ... and needs Back to 3D
+        self.assertTrue(next(u for u in item['units'] if u['race'] == 'human_male')['needs_review'])
+        self.assertIn('needs 3D review 1', [b['text'] for b in item['card']['badges']])
+        self.full_set('t', 'j1')
+        with mock.patch.object(taskqueue.TaskQueue, 'enqueue', side_effect=taskqueue.QueueError('disk I/O error')):
+            self.assertEqual(self.approve('t', 0)[0], 200)
+        orch = self.orch()
+        out = orch.reconcile()
+        self.assertEqual(out['errors'], [])
+        self.assertIn('t', out['queued'])
+        self.assertFalse(any(t['unit'] == 'human_male/outfit' and t['set_name'] == 's' and t['state'] == 'queued' for t in taskqueue.for_root(self.root).tasks()))
+        self.assertEqual(self.act('set:s', 'rebuild', rev=1, args={'race': 'human_male'})[1]['actions']['human_male/outfit'], 'needs_review')
+        # one set failing in reconcile never stops the others
+        real = actions.ensure_set_tasks
+
+        def broken(root, info, retry_failed=False):
+            if info['name'] == 's':
+                raise KeyError('glb_sha256')
+            return real(root, info, retry_failed)
+        for t in taskqueue.for_root(self.root).tasks(set_name='t'):
+            taskqueue.for_root(self.root).cancel(t['id'])
+        data['lod_approval']['units']['human_male/outfit']['glb_sha256'] = '0' * 64      # (s needs work again)
+        path.write_text(json.dumps(data))
+        catalog.invalidate()
+        with mock.patch.object(actions, 'ensure_set_tasks', side_effect=broken):
+            out = orch.reconcile()
+        self.assertTrue(any(e.startswith('reconcile s:') for e in out['errors']), out)
+        self.assertIn('t', out['queued'])
+        # a malformed digest is an unreadable decision file
+        data['lod_approval']['units']['human_male/outfit']['glb_sha256'] = 'xyz'
+        path.write_text(json.dumps(data))
+        self.assertIn('glb_sha256', self.item()['error'])
+
+    # ------------------------------------------------------------------------------------------------------------------ R11
+    def test_r11_an_old_attempt_never_shows_on_a_newer_approval(self):
+        self.sets_ready()
+        self.assertEqual(self.approve('s', 0)[0], 200)
+        q = taskqueue.for_root(self.root)
+        old = next(t for t in q.tasks(lane='layers') if t['unit'] == 'human_male/outfit')
+        self.assertTrue(q.claim(old['id'], 'tok-old', None))
+        self.assertTrue(q.mark_running(old['id'], 'tok-old', None, None))
+        self.assertEqual(self.act('set:s', 'unapprove', rev=1)[0], 200)
+        (self.root / 'models/s/j1/human_male/outfit/reduced/lod_error_0p2.glb').write_bytes(b'a new source')
+        self.assertEqual(self.approve('s', 2)[0], 200)
+        rec = self.item()['builds']['human_male/outfit']
+        self.assertEqual(rec['status'], 'queued')
+        self.assertNotEqual(rec['task']['id'], old['id'])
+        q.finish(old['id'], 'tok-old', False, None, 'no garment found for outfit')        # the OLD attempt fails
+        rec = self.item()['builds']['human_male/outfit']
+        self.assertEqual((rec['status'], rec['error']), ('queued', None))
+        self.assertEqual(self.orch().reconcile()['errors'], [])
+        # the same digest approved again: the old generation's failure is not shown and reconcile retries it for the new approval
+        new = q.get(rec['task']['id'])
+        self.assertEqual(self.act('set:s', 'unapprove', rev=3)[0], 200)
+        q.enqueue('layers', new['key'], 's', new['unit'], new['args'])                   # (it was cancelled by the unapprove)
+        self.settle(new['id'], ok=False, error='no garment found for outfit')
+        with mock.patch.object(taskqueue.TaskQueue, 'enqueue', side_effect=taskqueue.QueueError('x')), \
+                mock.patch.object(taskqueue.TaskQueue, 'retry', side_effect=taskqueue.QueueError('x')):
+            self.assertEqual(self.approve('s', 4)[0], 200)
+        self.assertEqual(self.item()['builds']['human_male/outfit']['status'], 'none')    # the old failure belongs to the old approval
+        self.orch().reconcile()
+        row = q.get(new['id'])
+        self.assertEqual((row['state'], row['approval_gen']), ('queued', self.item()['decisions']['lod_approval']['approval_id']))
+
+    # ------------------------------------------------------------------------------------------------------------------ R12
+    def test_r12_a_pre_fix_intent_keeps_its_set_read_only(self):
+        self.sets_ready()
+        self.assertEqual(self.lod('s', 0, race='human_male', module='outfit', lod='0p1')[0], 200)
+        path = self.root / 'models/s/pipeline_v2.json'
+        import base64
+        before = path.read_bytes()
+        intent = {'id': 'prefix0000000001', 'kind': 'files_tx', 'label': 'lod s (371a0c6 format)', 'created': '2026-11-20T00:00:00+00:00',
+                  'files': [{'path': 'models/s/pipeline_v2.json', 'before_b64': base64.b64encode(before).decode()}]}     # no `set`, no digests
+        folder = self.root / '.codex_jobs/_app/intents'
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / 'prefix0000000001.json').write_text(json.dumps(intent))
+        later = json.loads(before)
+        later['rev'] += 1
+        path.write_text(json.dumps(later))                                                # a later write landed meanwhile
+        self.assertEqual(guard.intent_set(intent), 's')
+        self.assertEqual(len(guard.set_intents(self.root, 's')), 1)
+        notes = actions.recover_transactions(self.root)
+        self.assertIn('conflict', notes[0])
+        self.assertEqual(json.loads(path.read_text())['rev'], later['rev'])               # nothing restored over the later decision
+        item = self.item()
+        self.assertTrue(item['recovering'])
+        status, body = self.lod('s', item['rev'], race='human_male', module='outfit', lod='0p4')
+        self.assertEqual((status, body['code']), (409, 'recovering'))
+        card = next(c for c in self.get('/api/v2/state')[1]['tabs']['trash'] if c['kind'] == 'recovery')
+        self.assertIn('set s read-only', [b['text'] for b in card['badges']])
+
+    # ------------------------------------------------------------------------------------------------------------------ R13
+    def test_r13_bare_builds_use_the_fixture_roots_own_cache(self):
+        orch = self.orch()
+        bare = orch.default_argv({'lane': 'bare', 'args': {'race': 'human_male'}})
+        self.assertEqual(bare[bare.index('--out') + 1], str(self.root / 'tools/preview/cache/layers/human_male'))
+        mod = self.root / 'models/s/j1/human_male/outfit'
+        module = orch.default_argv({'lane': 'layers', 'args': {'module_dir': str(mod), 'lod': '0p2', 'glb_sha256': 'a' * 64}})
+        self.assertEqual(module[module.index('--out') + 1], str(mod / 'layers'))
+        self.approve_and_build()
+        self.assertTrue(builds.bare_pointer(self.root, 'human_male'))
+        self.assertFalse(self.production_bare.exists())                                  # the builder's default cache was never written
+        self.assertTrue(str(builds.bare_root(self.root)).startswith(str(self.root)))
+        real = next(builds.REPO.glob('tools/preview/cache/layers/*/*/head.glb'), None)  # a bare GLB that exists ONLY in the real repository
+        if real is not None and self.root.resolve() != builds.REPO.resolve():
+            rel = real.relative_to(builds.REPO).as_posix()
+            if not (self.root / rel).exists():
+                self.assertEqual(self.raw('GET', '/files/' + rel)[0], 404)              # no fallback read from another root
+
+    # ------------------------------------------------------------------------------------------------------------------ R14
+    def test_r14_a_stale_bare_build_alone_is_on_the_card_and_rebuilt(self):
+        self.sets_ready()
+        self.assertEqual(self.approve('s', 0)[0], 200)
+        for race in RACES:
+            self.publish_current('s', 'j1', race, 'outfit')
+        self.build_bare(*RACES)
+        for task in taskqueue.for_root(self.root).tasks():
+            self.settle(task['id'])
+        out = self.bare_dir / 'human_male'
+        rec = json.loads((out / 'current_bare.json').read_text())
+        rec['fingerprint'] = '0ld' * 21 + 'x'
+        for f in (out / 'current_bare.json', out / rec['build_id'] / 'build.json'):
+            f.write_text(json.dumps(rec))
+        data = orchestrator.scan_stale(self.root)
+        self.assertEqual((data['units'], sorted(data['bare'])), ({}, ['human_male']))
+        item = self.item()
+        self.assertEqual(item['bare_builds']['human_male']['status'], 'stale')
+        self.assertIn('stale 1', [b['text'] for b in item['card']['badges']])
+        state = self.get('/api/v2/state')[1]
+        self.assertEqual(state['stale'], {'units': 0, 'bare': ['human_male'], 'sets': ['s']})
+        status, body = self.post('/api/v2/queue', {'op': 'rebuild_stale'})
+        self.assertEqual((status, body['queued'], body['sets']), (200, 1, ['s']), body)
+        self.assertTrue(any(t['lane'] == 'bare' and t['unit'] == 'human_male' and t['state'] == 'queued' for t in taskqueue.for_root(self.root).tasks()))
+
+    # ------------------------------------------------------------------------------------------------------------------ R15
+    def test_r15_lods_keys_must_be_exactly_the_unsaved_units(self):
+        self.sets_ready()
+        units, lods = self.shown('s')
+        status, body = self.approve('s', 0, units=units, lods=lods | {'elf_male/outfit': '0p2'})
+        self.assertEqual((status, body['code']), (409, 'changed'), body)
+        self.assertTrue(any('elf_male/outfit' in c for c in body['changes']))
+        self.assertFalse((self.root / 'models/s/pipeline_v2.json').exists())
+
+    def test_r15_an_aligned_payload_after_a_stage_change_is_a_409(self):
+        orch, _ = self.approve_and_build()
+        args, rev = self.aligned_args()
+        status, body = self.act('set:s', 'unapprove', rev=rev, args={'to': '3d'})
+        self.assertEqual(status, 200, body)
+        status, body = self.act('set:s', 'approve', rev=body['rev'], args=args)
+        self.assertEqual((status, body['code']), (409, 'changed'), body)
+        self.assertIn('stage', body['changes'][0])
+        # a 3D payload on a set that is already approved is the 3D conflict (409 approved), never the Aligned 400
+        units, lods = self.shown('s')
+        self.assertEqual(self.approve('s', body['item']['rev'], units=units, lods=lods)[0], 200)
+        self.assertEqual(self.approve('s', body['item']['rev'] + 1, units=units, lods={})[1]['code'], 'approved')
+
+    # ------------------------------------------------------------------------------------------------------------------ R16
+    def test_r16_an_old_stalled_task_is_listed_before_1000_newer_open_rows(self):
+        q = taskqueue.for_root(self.root)
+        old = q.enqueue('layers', 'old-stalled', 's', 'human_male/outfit', {})
+        log = self.logs() / f'{old}-a1.log'
+        log.write_text('silent\n')
+        q.claim(old, 'tok-st', str(log))
+        q.mark_running(old, 'tok-st', None, None)
+        past = time.time() - 4 * 3600
+        os.utime(log, (past, past))
+        with contextlib.closing(q._connect()) as conn:
+            conn.execute('UPDATE tasks SET started=? WHERE id=?', (past, old))
+            now = time.time()
+            conn.execute('BEGIN')
+            conn.executemany('INSERT INTO tasks(lane,key,set_name,unit,args,state,priority,attempts,max_attempts,created,updated,not_before) '
+                             'VALUES (?,?,?,?,?,?,?,?,?,?,?,0)', [('layers', f'newer-{i}', 's', 'u', '{}', 'queued', 5, 0, 3, now, now) for i in range(1001)])
+            conn.execute('COMMIT')
+        data = orchestrator.queue_state(self.root, False)
+        self.assertEqual((data['tasks'][0]['id'], data['tasks'][0]['state'], data['tasks'][0]['token']), (old, 'stalled', 'tok-st'))
+        self.assertEqual(data['stalled'], 1)
+        self.assertEqual((data['page']['queued_total'], data['page']['queued_shown'], data['page']['active_shown'], data['page']['truncated']),
+                         (1001, orchestrator.OPEN_PAGE, 1, True))
+        self.assertEqual((data['totals']['queued'], data['totals']['running']), (1001, 1))
 
 
 if __name__ == '__main__':

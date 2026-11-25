@@ -38,13 +38,43 @@ if command=='promote':
  files=list(batch.glob(number+'_*__*.png'))
  key=files[0].name.split('__')[0]
  target=root/'approved'/(batch.name+'_'+key)
- target.joinpath('human_male').mkdir(parents=True)
- for f in files: target.joinpath('human_male',f.name.split('__')[1].replace('.png','_front.png')).write_bytes(f.read_bytes())
- print(json.dumps({'set':target.name,'stage':'approved'}))
+ staging=root/'approved'/('.promote_'+key)
+ staging.joinpath('human_male').mkdir(parents=True)
+ for f in files: staging.joinpath('human_male',f.name.split('__')[1].replace('.png','_front.png')).write_bytes(f.read_bytes())
+ pid=args[args.index('--promotion-id')+1] if '--promotion-id' in args else None
+ if pid: staging.joinpath('.preview-promotion.json').write_text(json.dumps({'promotion_id':pid}))
+ staging.rename(target)
+ print(json.dumps({'set':target.name,'stage':'approved'}|({'promotion_id':pid} if pid else {})))
 '''
 RACES = ('human_male', 'dwarf_male')
 LAYER_SLOTS = {'outfit': ('outfit',), 'body_armor': ('torso',), 'right_gauntlet_boot': ('lower_arm.l', 'lower_arm.r', 'lower_leg.l', 'lower_leg.r')}
 PNG = b'\x89PNG\r\n\x1a\n' + b'0' * 16
+
+
+def layer_glb(tag: str = '', morph: bool = True) -> bytes:
+    """A minimal VALID layer GLB (one triangle, morph target 'fill' unless `morph` is False) that tools/layers/build.py's check_glb accepts;
+    `tag` goes into asset.generator so every slot / build has its own bytes. One face."""
+    import struct
+    pos = struct.pack('<9f', 0, 0, 0, 1, 0, 0, 0, 1, 0)
+    blob = pos + (pos if morph else b'')
+    views = [{'buffer': 0, 'byteOffset': 0, 'byteLength': 36}] + ([{'buffer': 0, 'byteOffset': 36, 'byteLength': 36}] if morph else [])
+    accs = [{'bufferView': i, 'componentType': 5126, 'count': 3, 'type': 'VEC3'} for i in range(len(views))]
+    prim = {'attributes': {'POSITION': 0}} | ({'targets': [{'POSITION': 1}]} if morph else {})
+    mesh = {'primitives': [prim]} | ({'extras': {'targetNames': ['fill']}} if morph else {})
+    js = json.dumps({'asset': {'version': '2.0', 'generator': tag}, 'meshes': [mesh], 'accessors': accs, 'bufferViews': views,
+                     'buffers': [{'byteLength': len(blob)}]}).encode()
+    js += b' ' * (-len(js) % 4)
+    body = struct.pack('<II', len(js), 0x4E4F534A) + js + struct.pack('<II', len(blob), 0x004E4942) + blob
+    return struct.pack('<4sII', b'glTF', 2, 12 + len(body)) + body
+
+
+def write_slot(folder: Path, build_id: str, slot: str, morph: bool = True) -> dict:
+    """Write `<slot>.glb` (valid) + `<slot>.json` into a build folder; returns its build.json slot entry with faces, size and sha256."""
+    import hashlib
+    data = layer_glb(f'{build_id}/{slot}', morph)
+    (folder / f'{slot}.glb').write_bytes(data)
+    (folder / f'{slot}.json').write_text('{}')
+    return {'glb': f'{build_id}/{slot}.glb', 'json': f'{build_id}/{slot}.json', 'faces': 1, 'size': len(data), 'sha256': hashlib.sha256(data).hexdigest()}
 
 
 class V2Case(unittest.TestCase):
@@ -163,6 +193,11 @@ class V2Case(unittest.TestCase):
             payload['jobs'] = jobs
         return self.post('/api/v2/lod', payload)
 
+    def sha(self, set_name, job, race, module='outfit', lod='0p2'):
+        """sha256 of a reduced LOD GLB (what a 3D approval pins as glb_sha256)."""
+        import hashlib
+        return hashlib.sha256((self.root / 'models' / set_name / job / race / module / 'reduced' / f'lod_error_{lod}.glb').read_bytes()).hexdigest()
+
     def unit(self, set_name, race='human_male', module='outfit'):
         _, item = self.get(f'/api/v2/item?id=set:{set_name}')
         return next(u for u in item['units'] if u['race'] == race and u['module'] == module), item
@@ -180,13 +215,11 @@ class V2Case(unittest.TestCase):
         build_id = f'{lod}-{fingerprint[:12]}'
         (out / build_id).mkdir(parents=True, exist_ok=True)
         slots = slots or LAYER_SLOTS[module]
-        for slot in slots:
-            (out / build_id / f'{slot}.glb').write_bytes(b'glb-' + slot.encode())
-            (out / build_id / f'{slot}.json').write_text('{}')
+        entries = {slot: write_slot(out / build_id, build_id, slot) for slot in slots}
         import builds as _builds
         record = {'build_id': build_id, 'fingerprint': fingerprint, 'lod': lod, 'status': 'ok', 'kind': module, 'race': race, 'set': ms,
                   'module': _builds.lb()._rel(out.parent), 'required': list(slots), 'warnings': [], 'metrics': {'wall_crossings_left': 0},
-                  'slots': {slot: {'glb': f'{build_id}/{slot}.glb', 'json': f'{build_id}/{slot}.json', 'faces': 10} for slot in slots}}
+                  'slots': entries}
         (out / build_id / 'build.json').write_text(json.dumps(record))
         (out / f'current_{lod}.json').write_text(json.dumps(record))
         return record
@@ -265,7 +298,7 @@ class StageTests(V2Case):
         self.assertEqual((status, result['rev']), (200, 1))
         self.assertTrue((self.root / 'models/s/new/human_male/outfit/chosen_lod.json').is_file())
         self.assertFalse((self.root / 'models/s/old/human_male/outfit/chosen_lod.json').exists())
-        pin = {'schema': 1, 'rev': 3, 'lod_approval': {'units': {'human_male/outfit': {'job': 'old', 'lod': '0p2'}}}}
+        pin = {'schema': 1, 'rev': 3, 'lod_approval': {'units': {'human_male/outfit': {'job': 'old', 'lod': '0p2', 'glb_sha256': self.sha('s', 'old', 'human_male')}}}}
         (self.root / 'models/s/pipeline_v2.json').write_text(json.dumps(pin))
         unit, item = self.unit('s')
         self.assertEqual((unit['job'], item['rev'], item['stage'], item['locked']), ('old', 3, '3d', True))   # approved, layer build not published yet
@@ -343,8 +376,8 @@ class StageTests(V2Case):
         self.full_set('s', 'old')
         self.job('s', 'new', 'completed', (('human_male', 'outfit'),), state='converted')
         self.reduce('s', 'new', 'human_male', 'outfit', mtime=4_000_000_000)
-        pin = {'schema': 1, 'rev': 4, 'lod_approval': {'units': {'human_male/outfit': {'job': 'gone', 'lod': '0p2'},
-                                                                   'dwarf_male/outfit': {'job': 'old', 'lod': '0p2'}}}}
+        pin = {'schema': 1, 'rev': 4, 'lod_approval': {'units': {'human_male/outfit': {'job': 'gone', 'lod': '0p2', 'glb_sha256': '0' * 64},
+                                                                   'dwarf_male/outfit': {'job': 'old', 'lod': '0p2', 'glb_sha256': self.sha('s', 'old', 'dwarf_male')}}}}
         (self.root / 'models/s/pipeline_v2.json').write_text(json.dumps(pin))
         self.assertEqual(self.unit('s')[1]['stage'], '3d')           # dwarf_male/outfit is approved but not built yet
         self.publish('s', 'old', 'dwarf_male', 'outfit')
@@ -1004,6 +1037,54 @@ class MoveSafetyTests(V2Case):
         untouched()
         self.assertEqual(guard.list_intents(self.root), [])
 
+    def test_a_claim_right_after_the_promotion_finds_the_mark_already_there(self):
+        """Re-check R7 (the reviewer's reproduction): a claim takes approved/<set> the moment promote published it. The promotion id is already in
+        the folder (written into promote's staging folder) and nothing recreates approved/<set> afterwards."""
+        self.legacy()
+        real_run = actions.subprocess.run
+        seen = []
+
+        def run_then_claim(command, *args, **kwargs):
+            out = real_run(command, *args, **kwargs)
+            if 'promote' in command and out.returncode == 0:
+                src = self.root / 'approved/batch_01_plate'
+                seen.append(sorted(p.name for p in src.iterdir()))
+                src.rename(self.root / 'processing_views/batch_01_plate--abc')            # the supervisor claims it at once
+            return out
+        with mock.patch.object(actions.subprocess, 'run', side_effect=run_then_claim):
+            status, body = self.act('legacy:batch:01_plate', 'approve')
+        self.assertEqual(status, 200, body)
+        self.assertEqual(seen, [['.preview-promotion.json', 'human_male']])
+        self.assertFalse((self.root / 'approved/batch_01_plate').exists())                 # never recreated with only the mark
+        mark = json.loads((self.root / 'processing_views/batch_01_plate--abc' / actions.PROMOTION_MARK).read_text())
+        sidecar = json.loads((self.root / 'trash/concepts/batch/01_plate.preview-origin.json').read_text())
+        self.assertEqual(mark['promotion_id'], sidecar['promotion_id'])
+        self.assertEqual(guard.list_intents(self.root), [])
+
+    def test_a_pre_fix_sidecar_or_intent_never_withdraws_anything(self):
+        """Re-check R7: withdrawal needs positive evidence. An Undo entry or an interrupted approve recorded before promotions carried an id
+        fails with "manual check needed" and moves nothing."""
+        self.legacy()
+        self.assertEqual(self.act('legacy:batch:01_plate', 'approve')[0], 200)
+        approved = self.root / 'approved/batch_01_plate'
+        sidecar_path = self.root / 'trash/concepts/batch/01_plate.preview-origin.json'
+        sidecar = json.loads(sidecar_path.read_text())
+        sidecar.pop('promotion_id')
+        sidecar_path.write_text(json.dumps(sidecar))
+        status, result = self.act('trashlegacy:batch:01_plate', 'restore')
+        self.assertEqual(status, 400)
+        self.assertIn('manual check needed', result['error'])
+        self.assertTrue((approved / actions.PROMOTION_MARK).is_file())                       # untouched
+        self.assertFalse((self.root / 'concepts/batch/01_plate__outfit.png').exists())
+        # an interrupted legacy approve of the old format (no promotion id): Roll back refuses too
+        intent = guard.new_intent(self.root, {'kind': 'flat_move', 'verb': 'approve', 'label': 'approve 01_plate', 'files': [],
+                                              'approved_set': 'batch_01_plate', 'promoted': True, 'sidecar': None})
+        guard.abandon_intent(intent)
+        status, result = self.act(f'intent:{intent}', 'rollback')
+        self.assertEqual(status, 400)
+        self.assertIn('manual check needed', result['error'])
+        self.assertTrue(approved.is_dir())
+
     def test_an_old_undo_never_withdraws_a_later_promotion_of_the_same_name(self):
         """Phase 1 review #3: the promotion id of the sidecar must match the mark in approved/<set>/."""
         self.legacy()
@@ -1018,7 +1099,7 @@ class MoveSafetyTests(V2Case):
         (approved / actions.PROMOTION_MARK).write_text(json.dumps({'promotion_id': 'a-later-one'}))
         status, result = self.act('trashlegacy:batch:01_plate', 'restore')
         self.assertEqual(status, 400)
-        self.assertIn('later promotion', result['error'])
+        self.assertIn('not the promotion this entry made', result['error'])
         self.assertTrue((approved / actions.PROMOTION_MARK).is_file())               # untouched
         (approved / actions.PROMOTION_MARK).unlink()                                 # a promotion without any mark is not withdrawn either
         self.assertEqual(self.act('trashlegacy:batch:01_plate', 'restore')[0], 400)

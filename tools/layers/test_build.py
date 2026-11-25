@@ -697,6 +697,76 @@ class RecoveryTest(Base):
         self.assertEqual(ok['status'], 'ok', ok.get('error'))
         self.assertEqual(build.build_module(self.mod, '0p2', self.out, gpu=False, expect_source_sha256=build._sha256(glb))['status'], 'current')
 
+    def test_slot_digests_are_recorded_and_a_zero_byte_slot_is_invalid(self):
+        """Re-check R3: build.json (= the pointer) records size + sha256 per slot GLB; a slot truncated to zero bytes (or a build without digests)
+        is invalid, never 'current', and the next build publishes a fresh -r1 generation."""
+        r = self.build()
+        for k, entry in r['slots'].items():
+            g = self.out / r['build_id'] / f'{k}.glb'
+            self.assertEqual((entry['size'], entry['sha256']), (g.stat().st_size, build._sha256(g)))
+        self.assertEqual(self.pointer(), json.loads((self.out / r['build_id'] / 'build.json').read_text(encoding='utf-8')))
+        (self.out / r['build_id'] / 'lower_arm.l.glb').write_bytes(b'')
+        self.assertTrue(any('lower_arm.l' in p and 'size 0' in p for p in build.validate_build(self.out / r['build_id'])))
+        r2 = self.build()
+        self.assertEqual((r2['status'], r2['build_id']), ('ok', r['build_id'] + '-r1'))
+        # a build from before the digests were recorded: invalid as well (rebuilt, never adopted)
+        d = self.out / r2['build_id']
+        rec = json.loads((d / 'build.json').read_text(encoding='utf-8'))
+        for entry in rec['slots'].values():
+            entry.pop('sha256')
+            entry.pop('size')
+        (d / 'build.json').write_text(json.dumps(rec), encoding='utf-8')
+        (self.out / 'current_0p2.json').write_text(json.dumps(rec), encoding='utf-8')
+        self.assertTrue(any('no recorded size / sha256' in p for p in build.validate_build(d)))
+        self.assertEqual(build.validate_build(d, digests=False), [])
+        self.assertEqual(self.build()['build_id'], r['build_id'] + '-r2')
+
+    def test_damaged_pointer_naming_a_valid_newer_generation_is_repaired_to_it(self):
+        """Re-check R9: the generation the damaged pointer names is tried first; a repair never rewinds to the older base id."""
+        r = self.build()
+        r2 = self.build(force=True)                                                          # a valid second generation of the same fingerprint
+        self.assertEqual(r2['build_id'], r['build_id'] + '-r1')
+        ptr = self.out / 'current_0p2.json'
+        good = json.loads(ptr.read_text(encoding='utf-8'))
+        self.assertEqual(good['build_id'], r2['build_id'])
+        ptr.write_text(json.dumps(dict(good, warnings=['damaged copy'])), encoding='utf-8')
+        calls = self.stub.calls
+        r3 = self.build()
+        self.assertEqual((r3['status'], r3['build_id'], self.stub.calls), ('current', r2['build_id'], calls))
+        self.assertEqual(json.loads(ptr.read_text(encoding='utf-8')), good)
+        # a pointer naming nothing usable: the NEWEST valid generation, not the oldest
+        ptr.write_text('{broken', encoding='utf-8')
+        self.assertEqual(self.build()['build_id'], r2['build_id'])
+
+    def test_a_source_change_during_pointer_repair_is_refused(self):
+        """Re-check R9 (the reviewer's reproduction): the source is checked, then changes before the fingerprint is taken; a published build of the
+        NEW source exists and the pointer is damaged. The repair rechecks the digest under the publish lock: 'source changed', nothing adopted."""
+        glb = self.mod / 'reduced' / 'lod_error_0p2.glb'
+        source_a = glb.read_bytes()
+        sha_a = build._sha256(glb)
+        self.assertEqual(self.build()['status'], 'ok')
+        glb.write_bytes(b'source B')
+        r_b = self.build()
+        self.assertEqual(r_b['status'], 'ok')
+        ptr = self.out / 'current_0p2.json'
+        ptr.write_text('{"damaged": true}', encoding='utf-8')
+        glb.write_bytes(source_a)
+        real_fp = build.fingerprint_module
+
+        def racing_fp(module_dir, lod):
+            glb.write_bytes(b'source B')                                                    # the source changes right after the first check
+            return real_fp(module_dir, lod)
+        build.fingerprint_module = racing_fp
+        try:
+            calls = self.stub.calls
+            res = build.build_module(self.mod, '0p2', self.out, gpu=False, expect_source_sha256=sha_a)
+        finally:
+            build.fingerprint_module = real_fp
+        self.assertEqual(res['status'], 'failed')
+        self.assertIn('source changed', res['error'])
+        self.assertEqual(self.stub.calls, calls)
+        self.assertEqual(ptr.read_text(encoding='utf-8'), '{"damaged": true}')                # nothing was adopted / repaired
+
     def test_glb_checker(self):
         good = self.tmp / 'g.glb'
         write_glb(good, 6)

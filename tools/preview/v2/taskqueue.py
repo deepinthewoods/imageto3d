@@ -7,7 +7,10 @@ Thread-safety: ONE module-level lock around every statement; a connection is ope
 and processes). Only the orchestrator thread starts and finishes tasks (`claim`, `mark_running`, `finish`, `requeue`); HTTP threads
 only `enqueue`, `retry`, `cancel` or `request_kill`. A read-only server (no writer lock) may read an existing database but never creates one.
 
-Task states: queued -> starting -> running -> done | failed; queued -> cancelled. A failed or cancelled task can be queued again.
+Task states: queued -> starting -> running -> done | failed; queued -> cancelled; running -> orphan (the wrapper died while its builder still runs:
+the worker slot stays taken until the builder is gone too, phase 3 re-check R6). A failed or cancelled task can be queued again.
+Columns of the re-check: `approval_gen` (the 3D approval generation the row was queued for, R11) and `cancel_gen` (set by a MANUAL cancel: the
+generation it was cancelled for; reconcile never resurrects such a row for that generation, R8; Retry / a new approval clears it).
 Every start is an ATTEMPT with its own uuid `token` (phase 3 review F5): `claim` commits it (queued -> starting, only from queued),
 the detached wrapper claims the token in its claim file, and `mark_running` / `finish` / `requeue` only act on the row while it still
 carries that token, so a late receipt of an older attempt, a cancel or a second dispatcher can never finish or restart it twice.
@@ -29,9 +32,9 @@ import time
 APP = Path('.codex_jobs') / '_app'
 DB_NAME = 'queue.sqlite3'
 LANES = ('bare', 'layers')
-STATES = ('queued', 'starting', 'running', 'done', 'failed', 'cancelled')
-OPEN = ('queued', 'starting', 'running')
-ACTIVE = ('starting', 'running')
+STATES = ('queued', 'starting', 'running', 'orphan', 'done', 'failed', 'cancelled')
+ACTIVE = ('starting', 'running', 'orphan')         # rows that hold a worker slot
+OPEN = ('queued',) + ACTIVE
 LOCK = threading.RLock()
 SCHEMA = '''
 CREATE TABLE IF NOT EXISTS tasks(
@@ -44,7 +47,8 @@ CREATE INDEX IF NOT EXISTS tasks_set ON tasks(set_name);
 CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, time REAL, task_id INTEGER, kind TEXT, detail TEXT);
 '''
 # columns added after the first phase 3 schema (added to an existing database by ALTER TABLE)
-EXTRA_COLUMNS = (('token', 'TEXT'), ('builder_pid', 'INTEGER'), ('builder_create', 'REAL'), ('kill_requested', 'INTEGER DEFAULT 0'))
+EXTRA_COLUMNS = (('token', 'TEXT'), ('builder_pid', 'INTEGER'), ('builder_create', 'REAL'), ('kill_requested', 'INTEGER DEFAULT 0'),
+                 ('approval_gen', 'TEXT'), ('cancel_gen', 'TEXT'))
 JSON_FIELDS = ('args', 'result')
 CORRUPT_TEXT = ('not a database', 'malformed', 'file is encrypted', 'disk image')
 
@@ -231,9 +235,10 @@ class TaskQueue:
 
     # --------------------------------------------------------------------------------------------------------- writes
     def enqueue(self, lane: str, key: str, set_name: str | None, unit: str | None, args: dict | None = None, priority: int = 5,
-                max_attempts: int = 3, retry: bool = False) -> int:
+                max_attempts: int = 3, retry: bool = False, approval_gen: str | None = None) -> int:
         """Queue a task and return its id. IDEMPOTENT per `key`: a queued, starting, running or done task with that key is returned unchanged;
-        a failed one too unless `retry=True`; a cancelled one is queued again (its approval came back)."""
+        a failed one too unless `retry=True`; a cancelled one is queued again (its approval came back). `approval_gen` is written into a new or
+        re-queued row (and into a still-queued one)."""
         if lane not in LANES:
             raise ValueError(f'unknown lane {lane!r}')
         now = time.time()
@@ -242,20 +247,22 @@ class TaskQueue:
             row = conn.execute('SELECT id, state FROM tasks WHERE key=?', (key,)).fetchone()
             if row is None:
                 cursor = conn.execute(
-                    'INSERT INTO tasks(lane,key,set_name,unit,args,state,priority,attempts,max_attempts,created,updated,not_before) '
-                    'VALUES (?,?,?,?,?,?,?,?,?,?,?,0)',
-                    (lane, key, set_name, unit, json.dumps(args or {}), 'queued', priority, 0, max_attempts, now, now))
+                    'INSERT INTO tasks(lane,key,set_name,unit,args,state,priority,attempts,max_attempts,created,updated,not_before,approval_gen) '
+                    'VALUES (?,?,?,?,?,?,?,?,?,?,?,0,?)',
+                    (lane, key, set_name, unit, json.dumps(args or {}), 'queued', priority, 0, max_attempts, now, now, approval_gen))
                 self._event(conn, cursor.lastrowid, 'enqueue', key)
                 return cursor.lastrowid
             if row['state'] == 'cancelled' or (row['state'] == 'failed' and retry):
                 self._requeue_sql(conn, row['id'], now, reset=True)
                 self._event(conn, row['id'], 'requeue', f'{row["state"]} -> queued')
+            if approval_gen is not None and (row['state'] in ('cancelled', 'queued') or (row['state'] == 'failed' and retry)):
+                conn.execute('UPDATE tasks SET approval_gen=? WHERE id=?', (approval_gen, row['id']))
             return row['id']
         return self._tx(work)
 
     @staticmethod
     def _requeue_sql(conn: sqlite3.Connection, task_id: int, now: float, reset: bool, not_before: float = 0.0, error: str | None = None) -> None:
-        conn.execute('UPDATE tasks SET state=?, pid=NULL, pid_create=NULL, builder_pid=NULL, builder_create=NULL, token=NULL, kill_requested=0, '
+        conn.execute('UPDATE tasks SET state=?, pid=NULL, pid_create=NULL, builder_pid=NULL, builder_create=NULL, token=NULL, kill_requested=0, cancel_gen=NULL, '
                      'started=NULL, finished=NULL, result=NULL, not_before=?, updated=?, '
                      'attempts=CASE WHEN ? THEN 0 ELSE attempts END, error=CASE WHEN ? THEN NULL ELSE ? END WHERE id=?',
                      ('queued', not_before, now, int(reset), int(reset), error, task_id))
@@ -282,11 +289,37 @@ class TaskQueue:
 
         def work(conn):
             cursor = conn.execute('UPDATE tasks SET state=?, pid=?, pid_create=?, updated=? WHERE id=? AND token IS ? AND state IN (?,?)',
-                                  ('running', pid, create_time, now, task_id, token, *ACTIVE))
+                                  ('running', pid, create_time, now, task_id, token, 'starting', 'running'))
             if cursor.rowcount != 1:
                 return False
             self._event(conn, task_id, 'start', f'pid {pid}')
             return True
+        return self._tx(work)
+
+    def mark_orphan(self, task_id: int, token: str | None) -> bool:
+        """Orchestrator only: the attempt's wrapper is gone but its builder still runs (re-check R6): running -> orphan; the slot stays taken."""
+        now = time.time()
+
+        def work(conn):
+            cursor = conn.execute('UPDATE tasks SET state=?, updated=? WHERE id=? AND token IS ? AND state IN (?,?)',
+                                  ('orphan', now, task_id, token, 'starting', 'running'))
+            if cursor.rowcount == 1:
+                self._event(conn, task_id, 'orphan', 'the wrapper died; its builder still runs')
+            return cursor.rowcount == 1
+        return self._tx(work)
+
+    def kill_failed(self, task_id: int, token: str | None, error: str) -> bool:
+        """Orchestrator only: Kill & retry could not verify / stop a process of the attempt: the row keeps its state AND its slot, the request is
+        cleared (the user may try again) and the reason is shown (re-check R6)."""
+        now = time.time()
+        placeholders = ','.join('?' * len(ACTIVE))
+
+        def work(conn):
+            cursor = conn.execute(f'UPDATE tasks SET kill_requested=0, error=?, updated=? WHERE id=? AND token IS ? AND state IN ({placeholders})',
+                                  (error, now, task_id, token, *ACTIVE))
+            if cursor.rowcount == 1:
+                self._event(conn, task_id, 'kill_failed', error)
+            return cursor.rowcount == 1
         return self._tx(work)
 
     def set_builder(self, task_id: int, token: str | None, pid: int | None, create_time: float | None) -> None:
@@ -297,7 +330,7 @@ class TaskQueue:
         now = time.time()
 
         def work(conn):
-            cursor = conn.execute('UPDATE tasks SET state=?, finished=?, result=?, error=?, updated=?, kill_requested=0 WHERE id=? AND token IS ? AND state IN (?,?)',
+            cursor = conn.execute('UPDATE tasks SET state=?, finished=?, result=?, error=?, updated=?, kill_requested=0 WHERE id=? AND token IS ? AND state IN (?,?,?)',
                                   ('done' if ok else 'failed', now, json.dumps(result) if result is not None else None, None if ok else (error or 'failed'),
                                    now, task_id, token, *ACTIVE))
             if cursor.rowcount != 1:
@@ -332,7 +365,7 @@ class TaskQueue:
             return True
         return self._tx(work)
 
-    def reset_done(self, task_id: int, reason: str) -> bool:
+    def reset_done(self, task_id: int, reason: str, approval_gen: str | None = None) -> bool:
         """A done task whose publication is missing or invalid gets a fresh attempt under the same key (review F11; attempts kept)."""
         now = time.time()
 
@@ -341,12 +374,15 @@ class TaskQueue:
             if row is None or row['state'] != 'done':
                 return False
             self._requeue_sql(conn, task_id, now, reset=False, error=reason)
+            if approval_gen is not None:
+                conn.execute('UPDATE tasks SET approval_gen=? WHERE id=?', (approval_gen, task_id))
             self._event(conn, task_id, 'repair', reason)
             return True
         return self._tx(work)
 
-    def retry(self, task_id: int) -> bool:
-        """A failed or cancelled task goes back to queued with a fresh attempts count (the Retry button). False when it is in another state."""
+    def retry(self, task_id: int, approval_gen: str | None = None) -> bool:
+        """A failed or cancelled task goes back to queued with a fresh attempts count (the Retry button; it clears a manual cancel). False when it
+        is in another state. `approval_gen` (when given) re-tags the row for that approval."""
         now = time.time()
 
         def work(conn):
@@ -356,12 +392,15 @@ class TaskQueue:
             if row['state'] not in ('failed', 'cancelled'):
                 return False
             self._requeue_sql(conn, task_id, now, reset=True)
+            if approval_gen is not None:
+                conn.execute('UPDATE tasks SET approval_gen=? WHERE id=?', (approval_gen, task_id))
             self._event(conn, task_id, 'retry', 'manual')
             return True
         return self._tx(work)
 
-    def cancel(self, task_id: int, detail: str = '') -> bool:
-        """A queued task is cancelled; a running one cannot be cancelled (Kill & retry stops it). False when not queued."""
+    def cancel(self, task_id: int, detail: str = '', manual_gen: str | None = None) -> bool:
+        """A queued task is cancelled; a running one cannot be cancelled (Kill & retry stops it). False when not queued. `manual_gen` (the Queue's
+        Cancel button): the approval generation the user cancelled it for, kept in `cancel_gen` so reconcile never puts it back (re-check R8)."""
         now = time.time()
 
         def work(conn):
@@ -370,7 +409,8 @@ class TaskQueue:
                 raise ValueError(f'unknown task {task_id}')
             if row['state'] != 'queued':
                 return False
-            conn.execute('UPDATE tasks SET state=?, finished=?, updated=? WHERE id=? AND state=?', ('cancelled', now, now, task_id, 'queued'))
+            conn.execute('UPDATE tasks SET state=?, finished=?, updated=?, cancel_gen=? WHERE id=? AND state=?',
+                         ('cancelled', now, now, manual_gen, task_id, 'queued'))
             self._event(conn, task_id, 'cancel', detail)
             return True
         return self._tx(work)
@@ -387,19 +427,22 @@ class TaskQueue:
             return len(ids)
         return self._tx(work)
 
-    def request_kill(self, task_id: int) -> bool:
-        """Kill & retry (HTTP): flag a starting / running task; the orchestrator kills its builder and wrapper and queues a fresh attempt."""
+    def request_kill(self, task_id: int, token: str) -> bool:
+        """Kill & retry (HTTP): flag the starting / running / orphan attempt `token` (the one the client saw, re-check R6); the orchestrator kills
+        its builder and wrapper and queues a fresh attempt only once both are confirmed gone."""
         now = time.time()
 
         def work(conn):
-            cursor = conn.execute('UPDATE tasks SET kill_requested=1, updated=? WHERE id=? AND state IN (?,?)', (now, task_id, *ACTIVE))
+            cursor = conn.execute('UPDATE tasks SET kill_requested=1, updated=? WHERE id=? AND token IS ? AND state IN (?,?,?)',
+                                  (now, task_id, token, *ACTIVE))
             if cursor.rowcount == 1:
                 self._event(conn, task_id, 'kill_requested', '')
             return cursor.rowcount == 1
         return self._tx(work)
 
     def insert_running(self, lane: str, key: str, set_name: str | None, unit: str | None, args: dict, attempt: int, token: str, log: str,
-                       pid: int | None, create_time: float | None, started: float | None, max_attempts: int = 3) -> int | None:
+                       pid: int | None, create_time: float | None, started: float | None, max_attempts: int = 3,
+                       approval_gen: str | None = None) -> int | None:
         """Reconstruction after a lost / repaired database: a surviving wrapper (its claim file) becomes a running row again. None when the key
         already exists."""
         now = time.time()
@@ -408,9 +451,9 @@ class TaskQueue:
             if conn.execute('SELECT id FROM tasks WHERE key=?', (key,)).fetchone() is not None:
                 return None
             cursor = conn.execute('INSERT INTO tasks(lane,key,set_name,unit,args,state,priority,attempts,max_attempts,pid,pid_create,started,log,'
-                                  'created,updated,not_before,token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)',
+                                  'created,updated,not_before,token,approval_gen) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)',
                                   (lane, key, set_name, unit, json.dumps(args or {}), 'running', 5, attempt, max_attempts, pid, create_time,
-                                   started or now, log, now, now, token))
+                                   started or now, log, now, now, token, approval_gen))
             self._event(conn, cursor.lastrowid, 'adopt_claim', token)
             return cursor.lastrowid
         return self._tx(work)
@@ -477,7 +520,7 @@ class TaskQueue:
 
     def open_tasks(self) -> list[dict]:
         """Every queued, starting or running task (the orchestrator's working set)."""
-        return self._run('SELECT * FROM tasks WHERE state IN (?,?,?) ORDER BY priority, id', OPEN, write=False, many=True)
+        return self._run('SELECT * FROM tasks WHERE state IN (?,?,?,?) ORDER BY priority, id', OPEN, write=False, many=True)
 
     def events(self, after_id: int = 0, limit: int = 500) -> list[dict]:
         return self._run('SELECT * FROM events WHERE id>? ORDER BY id LIMIT ?', (after_id, limit), write=False, many=True)

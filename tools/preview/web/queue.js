@@ -8,10 +8,15 @@ import { state, refresh, subscribe, queueHealthErrors } from './state.js';
 import { toast } from './toast.js';
 import { badge, button, h, pretty } from './util.js';
 
-const TONE = { running: 'info', queued: 'info', done: 'ok', failed: 'error', cancelled: 'warn', stalled: 'error' };
-const OP_TEXT = { retry: ['Retrying', 'Retry'], cancel: ['Cancelled', 'Cancel'], kill_retry: ['Killed and re-queued', 'Kill & retry'] };
+// Phase 3 re-check: the queue response carries `totals` (every state, whole table) and `page` (what was cut); the active tasks (starting /
+// running / stalled / orphan) are always shown first with their controls; an `orphan` (an adopted builder whose wrapper died) has Kill.
+// kill_retry carries the `token` of the attempt the user saw (the server refuses a kill of a newer attempt).
+const TONE = { running: 'info', starting: 'info', queued: 'info', done: 'ok', failed: 'error', cancelled: 'warn', stalled: 'error', orphan: 'error' };
+const OP_TEXT = { retry: ['Retrying', 'Retry'], cancel: ['Cancelled', 'Cancel'], kill_retry: ['Killed and re-queued', 'Kill & retry'], kill: ['Killed', 'Kill'] };
+const ACTIVE = ['running', 'starting', 'stalled', 'orphan'];
+const isActive = task => ACTIVE.includes(task.state);
 
-/** Sets whose card carries a "stale n" badge (the stale scan found their published builds out of date). */
+/** Sets whose card carries a "stale n" badge (the stale scan found their published builds, or their bare builds, out of date). */
 const staleSets = () => ['3d', 'aligned', 'completed'].flatMap(tab => state.tabs[tab] || [])
   .filter(card => (card.badges || []).some(b => /^stale\b/i.test(b.text || '')));
 const POLL_MS = 3000;
@@ -73,14 +78,15 @@ export function mountQueue(container) {
     await load();
   }
 
-  async function op(kind, task) {
+  /** `kind` is the op sent; `label` picks the texts (Kill of an orphan is the kill_retry op). */
+  async function op(kind, task, label = kind) {
     if (busy.has(task.id)) return;
     busy.add(task.id);
     try {
-      await api.queueOp(kind, task.id);
-      toast(`${OP_TEXT[kind][0]} task ${task.id}`, { ms: 2000 });
+      await api.queueOp(kind, task.id, kind === 'kill_retry' && task.token ? { token: task.token } : undefined);
+      toast(`${OP_TEXT[label][0]} task ${task.id}`, { ms: 2000 });
     } catch (error) {
-      if (!error.conflict) toast(`${OP_TEXT[kind][1]} failed: ${error.message}`);
+      if (!error.conflict) toast(`${OP_TEXT[label][1]} failed: ${error.message}`);
     } finally {
       busy.delete(task.id);
     }
@@ -89,14 +95,17 @@ export function mountQueue(container) {
 
   function row(task) {
     const failed = task.state === 'failed';
+    const attention = failed || task.state === 'stalled' || task.state === 'orphan';
     const log = task.log_tail || '';
     const errorText = task.error || '';
     const actions = h('span', { class: 'queue-actions' },
       failed || task.state === 'cancelled' ? button('Retry', () => op('retry', task), 'primary', 'Run this task again') : null,
       task.state === 'stalled' ? button('Kill & retry', () => op('kill_retry', task), 'danger', 'Stop the stuck build and queue it again') : null,
+      task.state === 'orphan' ? button('Kill', () => op('kill_retry', task, 'kill'), 'danger',
+        'The build is still running but its wrapper died: stop it (the work is queued again when the approval still stands)') : null,
       task.state === 'queued' ? button('Cancel', () => op('cancel', task), '', 'Remove it from the queue (a running build finishes on its own)') : null);
     const expanded = open.has(task.id);
-    return h('div', { class: 'queue-row' + (failed || task.state === 'stalled' ? ' failed' : ''), dataset: { id: task.id, state: task.state } },
+    return h('div', { class: 'queue-row' + (attention ? ' failed' : ''), dataset: { id: task.id, state: task.state } },
       h('span', { class: 'q-id', text: `#${task.id}` }),
       h('span', { class: 'q-lane', text: task.lane || '' }),
       h('span', { class: 'q-what' }, h('b', { text: task.set ? pretty(task.set) : '' }), task.unit ? ` ${pretty(task.unit)}` : ''),
@@ -108,15 +117,31 @@ export function mountQueue(container) {
         h('summary', { text: 'log' }), h('pre', { text: log })) : null);
   }
 
+  /** "Showing 25 of 1,040 open tasks and 50 of 3,000 recent tasks": the server cut the list (page.truncated). */
+  function pageText(page, shown) {
+    if (!page) return '';
+    const n = value => Number(value).toLocaleString('en-US');
+    const parts = [];
+    if (page.open_total != null && page.open_shown != null && page.open_shown < page.open_total) parts.push(`${n(page.open_shown)} of ${n(page.open_total)} open tasks`);
+    if (page.recent_total != null && page.recent_shown != null && page.recent_shown < page.recent_total) parts.push(`${n(page.recent_shown)} of ${n(page.recent_total)} recent tasks`);
+    if (!parts.length && page.truncated) parts.push(`${n(shown)} tasks`);
+    return parts.length ? `Showing ${parts.join(' and ')} - the rest is hidden (active tasks are always listed first).` : '';
+  }
+
   function draw(data) {
-    const tasks = data?.tasks || [];
+    // active tasks first (stable: the server's order within each group)
+    const tasks = [...(data?.tasks || [])].map((task, index) => [task, index])
+      .sort((a, b) => (isActive(b[0]) - isActive(a[0])) || a[1] - b[1]).map(([task]) => task);
     const workers = data?.workers;
     const counts = {};
     for (const t of tasks) counts[t.state] = (counts[t.state] || 0) + 1;
+    const totals = data?.totals && typeof data.totals === 'object' ? data.totals : counts;     // the whole table, not the returned rows
+    const cut = pageText(data?.page, tasks.length);
     summary.replaceChildren(
       h('strong', { text: 'Queue' }),
-      ...Object.entries(counts).map(([state, n]) => badge(`${state} ${n}`, TONE[state] || '')),
-      workers ? h('span', { class: 'q-workers', text: `workers ${workers.running ?? 0}/${workers.limit ?? '?'} · ${workers.present ? 'you are at the PC' : 'away'}` }) : null);
+      ...Object.entries(totals).filter(([, n]) => n).map(([state, n]) => badge(`${state} ${n}`, TONE[state] || '')),
+      workers ? h('span', { class: 'q-workers', text: `workers ${workers.running ?? 0}/${workers.limit ?? '?'} · ${workers.present ? 'you are at the PC' : 'away'}` }) : null,
+      cut ? h('span', { class: 'q-page', text: cut }) : null);
     table.replaceChildren(...(tasks.length ? tasks.map(row) : [h('div', { class: 'queue-empty', text: 'No tasks in the last 24 hours.' })]));
   }
 

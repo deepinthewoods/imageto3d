@@ -17,7 +17,8 @@ were labelled as skin, never reaches Aligned. The contract is checked twice: on 
 slot list of that kind on that race, legs taken from the race's game body cache (`tools/preview/cache/bases/<race>.npz`: faces of `leg_stretch.<s>` /
 `foot.<s>`, read with a stdlib .npy reader, since the v2 server imports build.py and has no numpy). A stored build whose `required` list or slot map is
 not exactly that list (both boots removed with their declaration, an extra foreign slot), whose slot path is not `<build_id>/<slot>.glb`, or whose
-`kind` / `race` / `module` / `lod` is not the module's own, is invalid. The v2 server applies the same rule to pointers (`v2/builds.py`).
+`kind` / `race` / `module` / `lod` is not the module's own, is invalid. The v2 server applies the same rule to pointers (`v2/builds.py`): it calls
+`validate_build` itself (phase 3 re-check R3), so a publication the builder would not reuse is never published for v2 either.
 
 ## API (`build.py`)
 
@@ -27,6 +28,7 @@ import build
 r = build.build_module('models/<set>/<job>/<race>/<module>', '0p2')            # out_root = <module>/layers, gpu=True
 r = build.build_module(module_dir, '0p2', out_root='D:/x/layers', gpu=False, force=True)
 b = build.build_bare('human_male')                                             # out_root = tools/preview/cache/layers/human_male
+# the v2 dispatcher ALWAYS passes the output folder (re-check R13): bare -> <project root>/tools/preview/cache/layers/<race>, module -> <module>/layers
 ```
 
 Each returns the build record (the content of the LOD's pointer file) with `status`:
@@ -85,7 +87,8 @@ garment roles (same provenance) is counted separately as `tie_break_faces` / `ti
 ```
 
 There is **no single `current.json`**: one pointer per LOD, so a 0p2 and a 0p4 build of one module never replace each other.
-Pointer / `build.json`: `build_id, fingerprint, lod, status:'ok', time, seconds, slots{slot:{glb, json, faces}} (paths relative to out_root), required[]
+Pointer / `build.json`: `build_id, fingerprint, lod, status:'ok', time, seconds, slots{slot:{glb, json, faces, size, sha256}} (paths relative to out_root;
+`size` / `sha256` of the slot GLB, computed at publication: phase 3 re-check R3), required[]
 (the slots the contract demanded), warnings[], metrics{wall_crossings_left (max over slots and both Amounts), wall_crossings_left_by_slot, boundary_edges,
 ring_vertices_merged, ring_vertices_inserted, skipped, mirrored_from_right}, gpu, module (repo-relative), race, set, kind, peak_rss_mb`.
 `ring_vertices_merged{slot: n}` is the number of the seam rings' own vertices that are no longer a vertex of the layer; `ring_vertices_inserted{slot: n}`
@@ -97,9 +100,17 @@ the other layer vertices lying on a ring line / inner ring (inserted by the snap
    of that folder is empty: `build.json` present, ok, same fingerprint and module identity, exactly `required_slots(kind, race)`, and for every required
    slot the JSON, and the GLB parsed whole (header, JSON
    chunk, BIN chunk length equals the file, buffer views and accessors inside the buffer, every primitive's POSITION and morph accessors, materials,
-   morph target `fill` for module layers, face count equal to `build.json`). The check is cheap (reads the files, no geometry).
+   morph target `fill` for module layers, face count equal to `build.json`) and **its bytes are the published ones**: every slot entry records `size` and
+   `sha256`, and the GLB must still have exactly those (re-check R3; `validate_build(digests=True)`, the default). A slot truncated to zero bytes, or a
+   build from before the digests were recorded, is invalid: never `current`, never adopted, the next build gets a fresh `-r<n>` id. The check reads and
+   hashes the files (no geometry). `parity` checks the structure only (`digests=False`): it compares the bytes that are there.
    A pointer that is lost or damaged (cleared slot map, a copied pointer) while a valid build of this fingerprint exists is **repaired** before
-   anything is built: under the publish lock the build is adopted and the pointer rewritten from its own `build.json` (result `current`).
+   anything is built: under the publish lock the build is adopted and the pointer rewritten from its own `build.json` (result `current`). The generation
+   the damaged pointer names is tried FIRST (when it validates), then the newest valid `-r<n>` down to the base id: a repair never rewinds to an older
+   generation (re-check R9).
+   **Every adoption path** (this reuse and repair, adopting a concurrent winner at commit, adopting after a failed build) runs under the publish lock and
+   first rechecks the expected source digest (`source changed`, not retryable) and the fingerprint (`inputs changed during build (retry)`), so a source
+   that changes between the first digest check and the fingerprint can never be answered with another source's build (re-check R9).
 2. Otherwise the layer code runs into `.attempt-*`, the result is checked (every required slot built), and the **commit** happens under the exclusive
    `<out_root>/.publish.lock`:
    - abandoned `.attempt-*` folders / stray `*.tmp-<pid>` files are removed (older than 1 h with no live owner pid, or older than 24 h);

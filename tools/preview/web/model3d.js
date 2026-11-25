@@ -425,6 +425,10 @@ export async function showModel3d(modal, host) {
     mine.node.querySelectorAll('button').forEach(b => { b.disabled = true; });
     let done = false;
     try {
+      // the table on screen (mine.shown) must be what the units are NOW, at the click and again after the pending saves: otherwise
+      // nothing is sent, the table is redrawn with the differences and a fresh confirm is required
+      const early = diffShown(mine.shown, shownUnits());
+      if (early.length) { renderConfirm(early); return; }
       await writes.catch(() => {});             // pending LOD saves first, so the rev is the newest
       if (confirm !== mine) return;
       const drift = diffShown(mine.shown, shownUnits());

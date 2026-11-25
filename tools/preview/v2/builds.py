@@ -7,8 +7,14 @@ could be shadowed by an unrelated installed package, and `tools/layers` would ot
 
 A pointer counts as PUBLISHED only when (phase 3 review F4): it is ok, names this exact module (repo-relative path equality, race, kind, LOD), its
 required list and slot map are EXACTLY `build.required_slots(kind, race)`, it is byte-for-byte the immutable `<build_id>/build.json` it names, the
-build folder is a real folder directly in the output root, and every slot path is `<build_id>/<slot>.glb`, resolves inside that folder and exists.
-A damaged pointer is not published; the builder repairs it from build.json under its publish lock (status `current`).
+build folder is a real folder directly in the output root, every slot path is `<build_id>/<slot>.glb`, resolves inside that folder and exists, AND
+the builder's own full validator passes (`build.validate_build`: every GLB parsed whole, faces, slot JSONs, and the per-slot `size` / `sha256` the
+builder recorded at publication; phase 3 re-check R3). The validation is cached by the (mtime, size, inode) of build.json and every slot file;
+certification (`verify_bytes`) rehashes the slot bytes uncached. A damaged pointer is not published (status `damaged` when a pointer exists); the
+builder repairs it from build.json under its publish lock (status `current`) or builds a fresh generation.
+
+Bare layers live under the PROJECT ROOT (`<root>/tools/preview/cache/layers/<race>/`, re-check R13): a fixture root never reads or writes the real
+repository's cache, and the dispatcher passes that folder to the builder as `--out`.
 """
 from __future__ import annotations
 
@@ -51,9 +57,12 @@ def lb():
         return _BUILD
 
 
-def bare_root() -> Path:
-    """tools/preview/cache/layers (the production cache of the bare layers); a test may replace `lb().BARE_ROOT`."""
-    return Path(lb().BARE_ROOT)
+BARE_REL = Path('tools') / 'preview' / 'cache' / 'layers'
+
+
+def bare_root(root: Path) -> Path:
+    """`<root>/tools/preview/cache/layers`: the bare layers of a project root (re-check R13; on the real root the builder's default BARE_ROOT)."""
+    return Path(root) / BARE_REL
 
 
 # ------------------------------------------------------------------------------------------------------------------ json cache
@@ -89,27 +98,20 @@ def read_json(path: Path) -> dict | None:
 # --------------------------------------------------------------------------------------------------------------------- urls
 
 def file_url(root: Path, path: Path) -> str:
-    """`/files/` URL of a built file: relative to the project root, else (the bare cache of the real repo when the root is a fixture)
-    relative to the repo, which the server's /files/ fallback serves."""
-    path = Path(path)
-    for base in (Path(root), REPO):
-        try:
-            return '/files/' + quote(path.relative_to(base).as_posix(), safe='/')
-        except ValueError:
-            continue
-    raise ValueError(f'{path} is outside the project')
+    """`/files/` URL of a built file relative to the project root (ValueError outside it: no other root is ever read, re-check R13)."""
+    try:
+        return '/files/' + quote(Path(path).relative_to(Path(root)).as_posix(), safe='/')
+    except ValueError:
+        raise ValueError(f'{path} is outside the project') from None
 
 
 def rel_path(root: Path, path: Path) -> str:
-    """The RESOLVED path relative to the project root (posix); a file outside it (the bare cache of the real repo, when the root is a fixture)
-    relative to the repo. ValueError for anything outside both (never an absolute path)."""
+    """The RESOLVED path relative to the project root (posix). ValueError for anything outside it (never an absolute path)."""
     path = Path(path).resolve()
-    for base in (Path(root), REPO):
-        try:
-            return path.relative_to(Path(base).resolve()).as_posix()
-        except ValueError:
-            continue
-    raise ValueError(f'{path} is outside the project')
+    try:
+        return path.relative_to(Path(root).resolve()).as_posix()
+    except ValueError:
+        raise ValueError(f'{path} is outside the project') from None
 
 
 def contained(path: Path, folder: Path) -> Path:
@@ -129,10 +131,33 @@ def module_dir(root: Path, model_set: str, job: str, race: str, module: str) -> 
     return Path(root) / 'models' / model_set / job / race / module
 
 
-def pointer_problem(out_root: Path, ptr: dict | None, expect: dict) -> str | None:
-    """Why a pointer does not name a published build (None = it does; see the module doc). `expect` = {kind, race, module, lod}."""
+NO_POINTER = 'no pointer'
+_VALID: dict[tuple, tuple[tuple, list]] = {}
+_VALID_LOCK = threading.Lock()
+
+
+def _validation(out_root: Path, build_id: str, ptr: dict, expect: dict, fresh: bool) -> list[str]:
+    """`build.validate_build` of the folder the pointer names (digests included), cached by the stamps of build.json and every slot file."""
+    folder = Path(out_root) / build_id
+    files = [folder / 'build.json'] + [folder / f'{slot}.{ext}' for slot in sorted(ptr.get('slots') or {}) for ext in ('glb', 'json')]
+    stamps = tuple(_stamp(f) for f in files)
+    key = (str(folder), tuple(sorted(expect.items(), key=lambda kv: kv[0])))
+    if not fresh:
+        with _VALID_LOCK:
+            hit = _VALID.get(key)
+            if hit and hit[0] == stamps:
+                return hit[1]
+    problems = lb().validate_build(folder, expect_id=build_id, expect=expect, name=build_id)
+    with _VALID_LOCK:
+        _VALID[key] = (stamps, problems)
+    return problems
+
+
+def pointer_problem(out_root: Path, ptr: dict | None, expect: dict, fresh: bool = False) -> str | None:
+    """Why a pointer does not name a published build (None = it does; see the module doc). `expect` = {kind, race, module, lod}. `fresh` skips the
+    validation cache (the dispatcher's verdict check)."""
     if not isinstance(ptr, dict) or ptr.get('status') != 'ok':
-        return 'no pointer'
+        return NO_POINTER
     build_id = ptr.get('build_id')
     if not isinstance(build_id, str) or not ID_RE.fullmatch(build_id):
         return 'bad build id'
@@ -164,7 +189,33 @@ def pointer_problem(out_root: Path, ptr: dict | None, expect: dict) -> str | Non
             return f'slot {slot} outside its build'
         if not glb.is_file():
             return f'slot {slot} missing'
+    problems = _validation(out_root, build_id, ptr, expect, fresh)
+    if problems:
+        return 'invalid build: ' + '; '.join(problems[:3])
     return None
+
+
+def verify_bytes(out_root: Path, ptr: dict) -> list[str]:
+    """Certification (Aligned approval, ready.json, re-check R3): every slot GLB of the publication still has exactly the size and sha256 the builder
+    recorded, rehashed now (uncached). Problems, empty = the bytes are the published ones."""
+    out = []
+    folder = Path(out_root) / str(ptr.get('build_id'))
+    for slot, entry in sorted((ptr.get('slots') or {}).items()):
+        if not isinstance(entry, dict):
+            out.append(f'slot {slot}: no entry')
+            continue
+        problem = lb().slot_digest_problem(folder / f'{slot}.glb', entry)
+        if problem:
+            out.append(f'slot {slot}: {problem}')
+    return out
+
+
+def snapshot(out_root: Path, pointer_name: str, expect: dict, fresh: bool = False) -> tuple[dict | None, str | None]:
+    """ONE read of a pointer (re-check R2): (the pointer when it names a valid publication else None, the problem: None, NO_POINTER or why the
+    existing pointer is not a valid publication). URLs and ids shown together must come from the same snapshot."""
+    ptr = read_json(Path(out_root) / pointer_name)
+    problem = pointer_problem(out_root, ptr, expect, fresh)
+    return (None if problem else ptr), problem
 
 
 def module_expect(module: Path, lod: str) -> dict:
@@ -173,11 +224,14 @@ def module_expect(module: Path, lod: str) -> dict:
     return {'kind': module.name, 'race': module.parent.name, 'module': lb()._rel(module), 'lod': lod}
 
 
-def pointer_at(module: Path, lod: str) -> dict | None:
+def module_snapshot(module: Path, lod: str, fresh: bool = False) -> tuple[dict | None, str | None]:
+    """`snapshot` of the module dir's `layers/current_<lod>.json`."""
+    return snapshot(Path(module) / 'layers', f'current_{lod}.json', module_expect(module, lod), fresh)
+
+
+def pointer_at(module: Path, lod: str, fresh: bool = False) -> dict | None:
     """The published build of the module dir `module` at `lod` (`layers/current_<lod>.json`), or None."""
-    out_root = Path(module) / 'layers'
-    ptr = read_json(out_root / f'current_{lod}.json')
-    return None if pointer_problem(out_root, ptr, module_expect(module, lod)) else ptr
+    return module_snapshot(module, lod, fresh)[0]
 
 
 def module_pointer(root: Path, model_set: str, job: str, race: str, module: str, lod: str) -> dict | None:
@@ -185,21 +239,30 @@ def module_pointer(root: Path, model_set: str, job: str, race: str, module: str,
     return pointer_at(module_dir(root, model_set, job, race, module), lod)
 
 
-def bare_pointer(race: str) -> dict | None:
-    out_root = bare_root() / race
-    ptr = read_json(out_root / 'current_bare.json')
-    if pointer_problem(out_root, ptr, {'kind': 'bare', 'race': race, 'module': f'bare:{race}', 'lod': None}):
-        return None
-    return ptr
+def bare_expect(race: str) -> dict:
+    return {'kind': 'bare', 'race': race, 'module': f'bare:{race}', 'lod': None}
+
+
+def bare_snapshot(root: Path, race: str, fresh: bool = False) -> tuple[dict | None, str | None]:
+    """`snapshot` of `<root>/tools/preview/cache/layers/<race>/current_bare.json`."""
+    return snapshot(bare_root(root) / race, 'current_bare.json', bare_expect(race), fresh)
+
+
+def bare_pointer(root: Path, race: str, fresh: bool = False) -> dict | None:
+    return bare_snapshot(root, race, fresh)[0]
+
+
+def slot_urls(root: Path, out_root: Path, ptr: dict | None) -> dict:
+    """`{slot: url}` of a pointer snapshot (empty without one)."""
+    if not ptr:
+        return {}
+    return {slot: file_url(root, Path(out_root) / entry['glb']) for slot, entry in ptr['slots'].items()
+            if isinstance(entry, dict) and isinstance(entry.get('glb'), str)}
 
 
 def bare_slots(root: Path, race: str) -> dict:
-    """`{slot: url}` of the current bare build of a race (empty when there is none)."""
-    ptr = bare_pointer(race)
-    if not ptr:
-        return {}
-    out_root = bare_root() / race
-    return {slot: file_url(root, out_root / entry['glb']) for slot, entry in ptr['slots'].items()}
+    """`{slot: url}` of the current bare build of a race (empty when there is none), from one pointer read."""
+    return slot_urls(root, bare_root(root) / race, bare_pointer(root, race))
 
 
 # --------------------------------------------------------------------------------------------------------------------- stale
@@ -340,6 +403,10 @@ def bare_key(race: str, fingerprint: str | None = None) -> str:
 
 BUILT = ('published', 'stale')
 SOURCE_CHANGED = 'source_changed'
+NEEDS_REVIEW = 'needs_review'          # a 3D pin without glb_sha256 (approved before digests were recorded): Back to 3D (re-check R10)
+DAMAGED = 'damaged'                    # a pointer exists but does not name a valid publication (bytes changed, invalid GLB ...; re-check R3)
+CANCELLED = 'cancelled'                # the user cancelled this approval generation's task (re-check R8): not re-queued until Retry / Rebuild
+ACTIVE_STATES = ('starting', 'running', 'orphan')
 STALL_DEFAULT = 30
 
 
@@ -373,7 +440,10 @@ def is_stalled(task: dict, now: float, minutes: int) -> bool:
 
 
 def shown_state(task: dict, now: float, minutes: int) -> str:
-    """The state the UI shows: `stalled` for a stalled active attempt, `running` for a starting one, else the stored state."""
+    """The state the UI shows: `stalled` for a stalled active attempt, `running` for a starting one, `orphan` for an attempt whose wrapper died
+    while its builder still runs (re-check R6: the slot stays taken, Kill is offered), else the stored state."""
+    if task['state'] == 'orphan':
+        return 'orphan'
     if is_stalled(task, now, minutes):
         return 'stalled'
     return 'running' if task['state'] == 'starting' else task['state']
@@ -390,11 +460,12 @@ def task_brief(task: dict, now: float, stall: int) -> dict:
     return out
 
 
-def bare_build(race: str, tasks: list[dict], stale: dict, now: float, stall: int = STALL_DEFAULT) -> dict:
-    """`item.bare_builds[race]` = {status: published | stale | building | queued | failed | none, build_id, error?, task?}; `tasks` = the bare
-    tasks of the race, newest first. A published build keeps its status while a rebuild runs (`task` shows it)."""
-    ptr = bare_pointer(race)
-    active = next((t for t in tasks if t['state'] in ('running', 'starting', 'queued')), None)
+def bare_build(race: str, snap: tuple[dict | None, str | None], tasks: list[dict], stale: dict, now: float, stall: int = STALL_DEFAULT) -> dict:
+    """`item.bare_builds[race]` = {status: published | stale | building | queued | failed | damaged | cancelled | none, build_id, error?, task?};
+    `snap` = the race's ONE pointer snapshot of this derivation (`bare_snapshot`); `tasks` = the bare tasks of the race, newest first. A published
+    build keeps its status while a rebuild runs (`task` shows it)."""
+    ptr, problem = snap
+    active = next((t for t in tasks if t['state'] in ACTIVE_STATES + ('queued',)), None)
     newest = tasks[0] if tasks else None
     record: dict = {'status': 'none', 'build_id': None}
     if ptr:
@@ -402,9 +473,13 @@ def bare_build(race: str, tasks: list[dict], stale: dict, now: float, stall: int
         record |= {'status': 'stale' if isinstance(marked, dict) and marked.get('build_id') == ptr['build_id'] else 'published',
                    'build_id': ptr['build_id']}
     elif active:
-        record['status'] = 'building' if active['state'] in ('running', 'starting') else 'queued'
+        record['status'] = 'queued' if active['state'] == 'queued' else 'building'
+    elif problem and problem != NO_POINTER:
+        record |= {'status': DAMAGED, 'error': f'the published bare build is not valid: {problem}'[:600]}
     elif newest and newest['state'] == 'failed':
         record |= {'status': 'failed', 'error': str(newest.get('error') or '')[-600:] or None}
+    elif newest and newest['state'] == 'cancelled' and newest.get('cancel_gen'):
+        record['status'] = CANCELLED
     task = active or newest
     if task:
         record['task'] = task_brief(task, now, stall)
@@ -421,19 +496,33 @@ def _failure_text(out_root: Path, lod: str, module_tail: str, task_error: str | 
     return (task_error or None) and str(task_error)[-600:]
 
 
+def task_matches(task: dict, approved: dict, gen: str | None) -> bool:
+    """A layers task belongs to the CURRENT approval of its unit (re-check R11): same job, LOD and source digest, and the same approval generation
+    (`approval_gen` column, written whenever `actions._ensure` queues the row for an approval). An older approval's attempt never matches."""
+    args = task.get('args') if isinstance(task.get('args'), dict) else {}
+    return (args.get('lod') == approved.get('lod') and args.get('job') == approved.get('job') and bool(approved.get('glb_sha256'))
+            and args.get('glb_sha256') == approved.get('glb_sha256') and gen is not None and task.get('approval_gen') == gen)
+
+
 def unit_build(root: Path, set_name: str, key: str, unit: dict, approved: dict, tasks: list[dict], stale: dict, now: float,
-               stall: int = STALL_DEFAULT) -> dict:
-    """The `item.builds[key]` record of one approved unit. `tasks` = the set's layer tasks of this unit (any state), newest first."""
+               stall: int = STALL_DEFAULT, gen: str | None = None) -> dict:
+    """The `item.builds[key]` record of one approved unit. `tasks` = the set's layer tasks of this unit (any state), newest first; only those of
+    the current approval (`task_matches`, generation `gen`) count. The pointer is read ONCE (re-check R2): status, id and slot URLs come from it."""
     race, module, model_set, job = unit['race'], unit['module'], unit['model_set'], unit['job']
     lod = approved.get('lod')
-    ptr = module_pointer(root, model_set, job, race, module, lod) if lod else None
+    mod = module_dir(root, model_set, job, race, module)
+    ptr, problem = module_snapshot(mod, lod) if lod else (None, NO_POINTER)
     pinned = approved.get('glb_sha256')
-    changed = bool(lod and pinned) and cached_sha256(source_glb(module_dir(root, model_set, job, race, module), lod)) != pinned
-    mine = [t for t in tasks if isinstance(t.get('args'), dict) and t['args'].get('lod') == lod and t['args'].get('job') == job]
-    active = next((t for t in mine if t['state'] in ('running', 'starting', 'queued')), None)
+    changed = bool(lod and pinned) and cached_sha256(source_glb(mod, lod)) != pinned
+    mine = [t for t in tasks if task_matches(t, approved, gen)]
+    active = next((t for t in mine if t['state'] in ACTIVE_STATES + ('queued',)), None)
     newest = mine[0] if mine else None
-    out_root = module_dir(root, model_set, job, race, module) / 'layers'
+    out_root = mod / 'layers'
     record = {'status': 'none', 'build_id': None, 'lod': lod, 'slots': {}, 'warnings': [], 'metrics': {}, 'error': None, 'task': None}
+    if lod and not pinned:
+        # an older pin without the source digest: nothing can be built or certified for it (re-check R10)
+        record |= {'status': NEEDS_REVIEW, 'error': 'approved before source digests were recorded; send the set back to 3D and approve it again'}
+        return record
     if changed:
         # the approved LOD GLB is not the file the approval pinned: no build of it can be certified; the old layers stay viewable
         record |= {'status': SOURCE_CHANGED, 'error': 'the approved LOD file changed since the 3D approval; send the set back to 3D'}
@@ -443,14 +532,17 @@ def unit_build(root: Path, set_name: str, key: str, unit: dict, approved: dict, 
     elif ptr:
         marked = stale.get(f'{set_name}/{key}')
         record |= {'status': 'stale' if isinstance(marked, dict) and marked.get('build_id') == ptr['build_id'] else 'published',
-                   'build_id': ptr['build_id'],
-                   'slots': {s: file_url(root, out_root / e['glb']) for s, e in ptr['slots'].items() if isinstance(e, dict) and isinstance(e.get('glb'), str)},
+                   'build_id': ptr['build_id'], 'slots': slot_urls(root, out_root, ptr),
                    'warnings': [str(w) for w in ptr.get('warnings') or []], 'metrics': ptr.get('metrics') if isinstance(ptr.get('metrics'), dict) else {}}
     elif active:
-        record['status'] = 'building' if active['state'] in ('running', 'starting') else 'queued'
+        record['status'] = 'queued' if active['state'] == 'queued' else 'building'
+    elif problem and problem != NO_POINTER:
+        record |= {'status': DAMAGED, 'error': f'the published build is not valid: {problem}'[:600]}
     elif newest and newest['state'] == 'failed':
         record['status'] = 'failed'
         record['error'] = _failure_text(out_root, lod, f'{model_set}/{job}/{race}/{module}', newest.get('error'))
+    elif newest and newest['state'] == 'cancelled' and newest.get('cancel_gen') == gen:
+        record |= {'status': CANCELLED, 'error': 'cancelled in the queue; Rebuild (or Retry in the queue) builds it'}
     task = active or newest
     if task:
         record['task'] = task_brief(task, now, stall)
@@ -460,15 +552,20 @@ def unit_build(root: Path, set_name: str, key: str, unit: dict, approved: dict, 
 
 
 def counts(builds: dict[str, dict]) -> dict:
-    """{"total", "built", "failed", "building", "none", "stale", "source_changed"} over item.builds (built = published or stale)."""
-    out = {'total': len(builds), 'built': 0, 'failed': 0, 'building': 0, 'none': 0, 'stale': 0, 'source_changed': 0}
+    """{"total", "built", "failed", "building", "none", "stale", "source_changed", "needs_review", "damaged", "cancelled"} over item.builds
+    (built = published or stale; `none` also counts the damaged and cancelled units: not built)."""
+    out = {'total': len(builds), 'built': 0, 'failed': 0, 'building': 0, 'none': 0, 'stale': 0, 'source_changed': 0, 'needs_review': 0,
+           'damaged': 0, 'cancelled': 0}
     for rec in builds.values():
         status = rec['status']
         if status in BUILT:
             out['built'] += 1
             out['stale'] += status == 'stale'
-        elif status == SOURCE_CHANGED:
-            out['source_changed'] += 1
+        elif status in (SOURCE_CHANGED, NEEDS_REVIEW):
+            out[status] += 1
+        elif status in (DAMAGED, CANCELLED):
+            out[status] += 1
+            out['none'] += 1
         elif status in ('building', 'queued'):
             out['building'] += 1
         elif status == 'failed':

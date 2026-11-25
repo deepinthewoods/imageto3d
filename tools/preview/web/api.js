@@ -73,7 +73,7 @@ export const api = {
   /** Published layer builds of a race (and the race's bare layers) for the donor dropdowns and the Mix tab. */
   layers: race => request('/layers', { query: { race } }),
   queue: () => request('/queue'),
-  /** op: retry | cancel */
-  queueOp: (op, id) => request('/queue', { method: 'POST', json: { op, id } }),
+  /** op: retry | cancel | kill_retry | rebuild_stale. `extra` is merged into the body (kill_retry: {token} of the attempt the user saw). */
+  queueOp: (op, id, extra) => request('/queue', { method: 'POST', json: { op, id, ...(extra || {}) } }),
   thumbnail: (glbUrl, blob) => request('/thumbnail', { method: 'POST', query: { url: glbUrl }, blob }),
 };

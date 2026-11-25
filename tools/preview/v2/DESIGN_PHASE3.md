@@ -180,7 +180,7 @@ Phase 4 adds services, modes and credits.
 - Layer builds read the model of a unit from `unit.model_set` (the physical dir), never from the card's set name.
 
 ## D. Backend as built (phase 3, `tools/preview/v2/`)
-**Superseded in parts by section F** (phase 3 review fixes): the approval request shapes (D.2, D.5), task states and attempts (D.3), the
+**Superseded in parts by sections F and G** (phase 3 review and re-check fixes): the approval request shapes (D.2, D.5), task states and attempts (D.3), the
 Completed rule and build statuses (D.4), the queue endpoint and ops (D.7). Where D and F differ, F is the contract.
 Where the backend settled a detail the contract left open (the frontend can rely on all of it):
 1. **Files.** `taskqueue.py` (SQLite WAL queue; `for_root(root)`), `run_task.py` (detached wrapper), `orchestrator.py` (thread, adoption, pool,
@@ -224,8 +224,7 @@ Where the backend settled a detail the contract left open (the frontend can rely
 7. **`/api/v2/queue`** adds `key` and `max_attempts` per task and `workers: {limit, running, present, mode, idle, orchestrator}`; `POST`
    `retry` needs a failed / cancelled task, `cancel` a queued one (a running build cannot be stopped from here yet); errors are 400, an unknown
    id 404.
-8. **`/files/tools/preview/cache/layers/...`** is served from the real repo when the project root is another folder (test fixtures), so
-   bare layer URLs work there too.
+8. ~~`/files/tools/preview/cache/layers/...` served from the real repo for a fixture root~~: removed by the re-check (section G.1, R13).
 9. **Stale scan** (`orchestrator.scan_stale(root)`, every 10 min and at start, in its own thread) writes `.codex_jobs/_app/stale.json`
    (`{time, units: {"S/race/module": {build_id, lod, fingerprint, current}}, bare: {race: ...}}`); the catalog reads it (also in a read-only
    server). Only published units of locked sets are scanned; fingerprints are cached by the mtimes of their inputs.
@@ -384,3 +383,75 @@ Section E is the frontend's side of the same contract; this section is what the 
    interrupted legacy approve also succeeds when the promotion was already claimed (a job folder `<set>--<id>` carrying that promotion id).
 15. **Decision files (phase 1 review #10).** `pipeline_v2.json` validation covers nested records (dropped entries, amount values 0..100, approval units
    with job / lod / build_id, required_races, bare map, approval_id); invalid UTF-8 is an unreadable file too.
+
+## G. Phase 3 re-check fixes: backend as built (R2-R13, server parts of R14-R16; supersedes D and F where they differ)
+Review: `.codex_jobs/review_v2_phase3_recheck_20261125/result.md`. Frontend parts of R1 / R14 / R16 are done in `tools/preview/web/`.
+
+1. **Bare layers belong to the project root (R13).** Output AND lookup root: `<root>/tools/preview/cache/layers/<race>/` (`builds.bare_root(root)`; on the
+   real root this is the builder's default). The dispatcher always passes `--out` (bare: that folder; module: `<module_dir>/layers`). No fallback reads
+   another root: `/files/` no longer serves the real repository's cache for a fixture root (D.8 is gone) and `builds.file_url` / `rel_path` raise outside
+   the root (ready.json `bare.<race>` = `tools/preview/cache/layers/<race>/<build id>`, relative to the project root).
+2. **Slot digests and publication = the builder's validator (R3).** The builder writes `size` + `sha256` of every slot GLB into build.json (= the pointer)
+   at publication; `build.validate_build` requires and checks them (an older build without digests is invalid and is rebuilt as `-r<n>`). A pointer counts
+   as published only when `builds.pointer_problem` passes, which now ends with `build.validate_build(folder, expect_id, expect)` (cached by the
+   (mtime, size, inode) of build.json and every slot file; `fresh=True` uncached: the dispatcher's verdict check and the Aligned approval). A pointer that
+   exists but fails is status **`damaged`** (`item.builds[*]` and `item.bare_builds[*]`, with `error`; card badge `damaged build n`, tone error); it counts
+   as not built (stage 3d), reconcile queues its rebuild (the builder never reuses it). Certification: the Aligned approval re-reads every pointer uncached
+   (bytes rehashed) under the publish locks (item 3) and writes the verified `sha256` into ready.json; Completed derivation uses the cached validation.
+3. **One pointer snapshot; approval under the builders' publish locks (R2).** `builds.snapshot()` reads a pointer ONCE and returns (pointer | None,
+   problem); `item.builds[*]` (status, id, slot URLs) and the item's bare URLs + `bare_builds` ids each come from one read per derivation
+   (`info.bare_snaps`). The Aligned approval, after its checks and still under the set lock, takes `tools/layers/build.py`'s `.publish.lock` of EVERY
+   output root it certifies (module layers folders + bare race folders, sorted path order, waiting up to 30 s, else 409 `busy`; the builder never takes a
+   set lock), re-reads every pointer uncached, compares with the displayed `args.builds` / `args.bare` (any difference, damaged bytes, or a bare build
+   republished since the fingerprint check: **409 `changed`** with `changes`), writes the decision + ready.json, then releases.
+4. **ready.json bound to the approval (R4).** `aligned_approval.ready_sha256` = sha256 of the exact ready.json bytes written in the same transaction
+   (`decisions.ready_bytes` / `ready_digest`). Completed also requires ready.json to exist, parse (an object with `approval_id`), carry the approval id and
+   have exactly that digest (`not_completed`: `ready.json is not the manifest this approval wrote ...`). Reconcile, under the set lock, **quarantines**
+   (renames to `ready.json.quarantine-<time>`, bytes kept, queue event `quarantine`, actions.jsonl `quarantine_ready`) an active ready.json whose
+   decisions are unreadable, or whose aligned approval exists but whose bytes / approval id are not its own; any other no-longer-Completed set is
+   revoked as before (`ready.json.revoked-<time>`). Reconcile output gains `quarantined`.
+5. **Lost queue adopts first (R5).** Whenever the database is missing or empty (once per database identity) or was repaired, `Orchestrator.adopt_claims()`
+   runs BEFORE reconcile queues anything: every attempt task file (`<id>-a<n>.task.json`) without a result whose claim names a live wrapper (identity
+   checked), or, with no usable claim, whose token is on a live process's command line (`--token`), is re-inserted as a running row (key, token, args,
+   `approval_gen`); a claim whose wrapper died while its builder lives is adopted as `orphan`. The attempt's task file `task` now carries `approval_gen`.
+   Reconcile output gains `adopted`.
+6. **Worker slots and Kill & retry (R6).** New task state **`orphan`** (`taskqueue.ACTIVE` = starting | running | orphan; OPEN adds queued): a dead
+   wrapper whose builder (claim / row pid + create time) is still alive is not lost: the row becomes `orphan`, keeps its slot, shows `state: "orphan"`,
+   `orphan: true` in the queue, and is lost / requeued only once the builder is gone too. `POST /api/v2/queue {op: "kill_retry", id, token}`: `token`
+   (the attempt the client saw; queue rows carry `token` for active attempts) is REQUIRED (400 without, 409 `changed` when the row runs another attempt);
+   allowed for a stalled or an orphan task. The orchestrator stops the builder, then the wrapper: a process is `gone` (not alive, or its pid now has
+   another create time), `killed` (identity + command line verified, killed, confirmed gone), `unverified` (alive but not verifiable: not touched) or
+   `survived`. Only when both are gone / killed is a fresh attempt queued; otherwise the row keeps its state and slot, `kill_requested` is cleared and
+   `error` says why ("Kill & retry could not stop the attempt: ...", event `kill_failed`).
+7. **Legacy promotion identity (R7).** `workflow.py promote --promotion-id <32 hex>` writes `.preview-promotion.json` into its STAGING folder before the
+   atomic rename into approved/ and returns `promotion_id`; `actions.legacy_approve` passes it and refuses a promote result without it (it never writes
+   into approved/ afterwards). Withdrawal (Undo `restore`, Recovery roll-back of an interrupted approve) needs POSITIVE evidence: the folder must carry
+   exactly that promotion id; an entry without a promotion id (written before the fix) withdraws nothing and fails with "manual check needed ...".
+8. **Persistent Cancel (R8).** A Queue Cancel stores `cancel_gen` on the row (layers: the set's current 3D approval generation; bare: `manual`). Reconcile
+   never re-queues a row cancelled for the current generation; the unit's build status is **`cancelled`** (counts as not built; no automatic work).
+   Retry (queue), Rebuild (set) and a new 3D approval clear it. Automatic cancels (unapprove, reconcile, dispatcher) leave `cancel_gen` empty, as before.
+9. **Builder adoption rechecks (R9).** See tools/layers/README.md "Publishing": every adoption path rechecks the source digest and fingerprint under the
+   publish lock; pointer repair tries the generation the damaged pointer names first, then the newest valid `-r<n>`.
+10. **Digests on pins (R10).** `decisions.approve_3d` refuses a unit without a 64-hex `glb_sha256`; validation rejects a malformed one (unreadable card)
+   but accepts an absent one (an older pin): such a unit's build status is **`needs_review`** (`unit.needs_review`, card badge `needs 3D review n`, error
+   tone; `rebuild` answers `needs_review`), it is never queued or built, and the set needs Back to 3D. Reconcile handles each set on its own: an exception
+   is logged (`out.errors`, orchestrator `errors`) and the pass continues.
+11. **Full unit identity (R11).** `lod_approval.approval_id` (uuid hex, new in every 3D approval; older approvals use their `time`) is the approval
+   GENERATION (`decisions.approval_gen`). Task rows carry `approval_gen` (set when `_ensure` queues / re-queues / retries the row; a waiting queued row is
+   re-tagged). `item.builds[*].task` / status and Retry match the FULL identity: set, unit, job, LOD, source digest AND generation (`builds.task_matches`);
+   an older generation's attempt never shows on a newer approval, and its failed row is retried for the new approval by reconcile. The dispatcher's
+   approval check also refuses a row tagged with another generation. A running attempt of an older generation with the SAME key (same inputs) is not
+   re-tagged: its success publishes the identical build, its failure is not shown and the row is retried for the new approval.
+12. **Pre-fix intents (R12).** `guard.intent_set(rec)`: the intent's `set`, else the set of the decision file it recorded (`models/<set>/pipeline_v2.json`
+   or `models/<set>/ready.json*`). Used by `set_intents` (409 `recovering`), recovery (set lock, the same conflict guard: an old intent without
+   `after_sha256` whose file changed is a conflict), the item's `recovering` and the Recovery card.
+13. **Stale bare builds (R14, server).** `build_counts.stale_bare`; the card badge `stale n` counts stale units + stale bare races; `GET /api/v2/state`
+   adds `stale = {units, bare: [race], sets: [set]}` (what Rebuild stale would rebuild); the stale scan covers the bare build of every live race of every
+   approved set in 3d / aligned / completed; `rebuild_stale` rebuilds a stale bare race even when no unit is stale.
+14. **Approval payloads (R15, server).** 3D: `args.lods` keys must be EXACTLY the never-saved live units (an extra or unknown key: 409 `changed`).
+   Routing is by payload: `args.builds` / `args.bare` -> the Aligned approval, `args.units` -> the 3D approval, whatever the stage became; an Aligned
+   payload for a set no longer in aligned / completed is **409 `stale`** (a pinned source changed / needs review) or **409 `changed`** (`stage: aligned
+   displayed, <stage> now`), never 400.
+15. **Queue listing (R16, server).** Rows: EVERY active attempt (starting / running / stalled / orphan; never truncated) first, then queued (newest first,
+   at most `open_limit`), then the recent terminal rows. `page` adds `active_total`, `active_shown`, `queued_total`, `queued_shown` (`open_shown` =
+   active + queued shown); totals unchanged. Rows add `orphan` and `token` (active attempts only).
