@@ -20,6 +20,9 @@
 !/experiments/shell_slots_20261122/checks/
 /experiments/shell_slots_20261122/checks/*
 !/experiments/shell_slots_20261122/checks/*.py
+!/experiments/body_mask_20261104/
+/experiments/body_mask_20261104/*
+!/experiments/body_mask_20261104/bm_core.py
 !/experiments/shell_slots_20261122/checks/README.md
 !/experiments/shell_slots_20261122/out/
 /experiments/shell_slots_20261122/out/*
