@@ -31,7 +31,7 @@ import time
 
 APP = Path('.codex_jobs') / '_app'
 DB_NAME = 'queue.sqlite3'
-LANES = ('bare', 'layers')
+LANES = ('bare', 'layers', 'monster_convert')        # monster_convert: monster_lane.py (DESIGN_PHASE5.md E), its own limit and gate
 STATES = ('queued', 'starting', 'running', 'orphan', 'done', 'failed', 'cancelled')
 ACTIVE = ('starting', 'running', 'orphan')         # rows that hold a worker slot
 OPEN = ('queued',) + ACTIVE
@@ -398,6 +398,24 @@ class TaskQueue:
             return True
         return self._tx(work)
 
+    def mark_run_now(self, task_id: int, override_pause: bool = False, detail: str = '') -> bool:
+        """Run now (Queue tab / Approved modal, monster lane): a QUEUED task gets `args.run_now` (and `args.override_pause` when the user
+        confirmed it while paused) and its backoff is cleared. False when the task is not queued (any more)."""
+        now = time.time()
+
+        def work(conn):
+            row = conn.execute('SELECT args, state FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if row is None or row['state'] != 'queued':
+                return False
+            args = json.loads(row['args'] or '{}')
+            args['run_now'] = True
+            if override_pause:
+                args['override_pause'] = True
+            conn.execute('UPDATE tasks SET args=?, not_before=0, updated=? WHERE id=?', (json.dumps(args), now, task_id))
+            self._event(conn, task_id, 'run_now', detail or ('override pause' if override_pause else 'override idle'))
+            return True
+        return self._tx(work)
+
     def cancel(self, task_id: int, detail: str = '', manual_gen: str | None = None) -> bool:
         """A queued task is cancelled; a running one cannot be cancelled (Kill & retry stops it). False when not queued. `manual_gen` (the Queue's
         Cancel button): the approval generation the user cancelled it for, kept in `cancel_gen` so reconcile never puts it back (re-check R8)."""
@@ -511,8 +529,11 @@ class TaskQueue:
         sql = 'SELECT * FROM tasks' + (' WHERE ' + ' AND '.join(where) if where else '') + ' ORDER BY id DESC LIMIT ?'
         return self._run(sql, (*params, limit), write=False, many=True)
 
-    def count(self, state: str | tuple | list | None = None, since: float | None = None) -> int:
+    def count(self, state: str | tuple | list | None = None, since: float | None = None, lanes: tuple | list | None = None) -> int:
         where, params = self._where(state, None, None, None, since)
+        if lanes is not None:
+            where.append(f'lane IN ({",".join("?" * len(lanes))})')
+            params += list(lanes)
         row = self._run('SELECT COUNT(*) AS n FROM tasks' + (' WHERE ' + ' AND '.join(where) if where else ''), params, write=False, one=True)
         return int(row['n']) if row else 0
 

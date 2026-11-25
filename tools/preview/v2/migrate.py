@@ -7,6 +7,13 @@ Derives every card's v2 stage from today's folders (nothing is moved, deleted or
 files `<out>.json` and `<out>.md`) and lists what will go where: stage counts, per-set unit status, chosen jobs and conflicts,
 existing LOD picks, legacy model approvals, stuck sets, source.glb symlinks onto D:, the convert_sets.txt allowlist effect and
 the prototype layer inventory. It is idempotent: running it twice on unchanged folders gives the same numbers.
+
+    python tools/preview/v2/migrate.py --monsters [--apply] [--root R]
+
+The phase 5 monster concept migration (DESIGN_PHASE5.md A; monsters_v2.migration_plan / apply_migration): always writes the report
+`.codex_jobs/_app/monster_migration_report.{json,md}` (every final concept that is not picked -> archive, picked ones -> approved with their
+monster / variant, the flat picks still to import). Only `--apply` writes the `concepts/<Folder>/.v2_state.json` files of the monster root
+(nothing is moved; a concept a state file already lists is kept). Run the dry run first and read the report.
 """
 from __future__ import annotations
 
@@ -24,6 +31,7 @@ for _p in (HERE.parent, HERE):
         sys.path.insert(0, str(_p))
 import serve  # noqa: E402
 import catalog  # noqa: E402
+import monsters_v2  # noqa: E402
 
 SETS_FILE = Path('.codex_jobs') / '_batch' / 'convert_sets.txt'
 LAYERS = Path('experiments') / 'shell_slots_20261122' / 'out' / 'layers'
@@ -227,8 +235,15 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=serve.DEFAULT_ROOT)
     parser.add_argument('--out', type=Path, default=Path('.codex_jobs') / '_app' / 'migration_report')
+    parser.add_argument('--monsters', action='store_true', help='the monster concept migration (report; --apply writes the state files)')
+    parser.add_argument('--apply', action='store_true', help='with --monsters: write concepts/<Folder>/.v2_state.json in the monster root')
     args = parser.parse_args()
     root = args.root.resolve()
+    if args.apply and not args.monsters:
+        parser.error('--apply is only for --monsters (the set migration report is read-only)')
+    if args.monsters:
+        print('monster root:', monsters_v2.mroot_of(root))
+        sys.exit(monsters_v2.main(['migrate', '--root', str(root)] + (['--apply'] if args.apply else [])))
     out = args.out if args.out.is_absolute() else root / args.out
     report = build_report(root)
     out.parent.mkdir(parents=True, exist_ok=True)

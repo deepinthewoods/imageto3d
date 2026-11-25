@@ -31,6 +31,14 @@ default 30) is shown as stalled in the queue, with Kill & retry. Pool limit: `la
 `layer_workers_away` (default 4) when away (idle >= 300 s: presence.json when fresh, else GetLastInputInfo); 0 while the supervisor mode is
 `pause`. Retries: 2 automatic ones (60 s backoff) for a lost task, `inputs changed during build` and transient failures, and only while the
 approval still holds; none for invalid input, a missing required slot or a changed source (those need a human).
+
+MONSTER LANE (phase 5, DESIGN_PHASE5.md E; monster_lane.py). `monster_convert` tasks share the queue, the attempts, the wrapper and the
+adopt / orphan / kill machinery, but nothing else: every tick first runs `monster_lane.tick` (the unattended auto-freeze, and a task for
+every frozen view list that has none yet), the lane has its own limit (1, outside the layer pool, so it also starts while the pool limit is 0)
+and its own gate (`monster_lane.plan_starts`: the conversion hold, the manual pauses, the idle gate and a per-task Run now), its task runs
+`monster_lane.py run` (`monster_lane.task_argv`), and its result is judged by `monster_lane.finish_outcome` (done / requeue for "Hyper3D
+profile busy" or a gate that closed mid-run / failed; never an automatic retry of a paid step). Reconcile never cancels it for want of a set
+approval (`_approved_in`); a task whose frozen view list is gone is cancelled by the lane's own plan.
 """
 from __future__ import annotations
 
@@ -55,6 +63,7 @@ import builds  # noqa: E402
 import catalog  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
+import monster_lane  # noqa: E402  (phase 5: the monster_convert lane)
 import settings as app_settings  # noqa: E402
 import taskqueue  # noqa: E402
 
@@ -77,6 +86,7 @@ KILL_WAIT = 10.0                      # seconds Kill & retry waits for a killed 
 ADOPT_CAP_S = 6 * 3600.0              # without psutil a pid cannot be proven to be the task's process: trust it for this long at most
 DEFAULTS = {'layer_workers_present': 1, 'layer_workers_away': 4, 'build_stall_minutes': 30}
 TASK_ENV = {'BODY_FIT_GPU': '1', 'PYTHONUTF8': '1', 'OMP_NUM_THREADS': '1'}
+LAYER_LANES = ('bare', 'layers')       # the layer pool; monster_lane.LANE has its own limit and gate
 DETACHED = (getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 NO_VERDICT = 'the builder exited 0 without a verdict on stdout'
 # failure classification (see the module docstring): invalid input never retries, anything else without a clear verdict is transient
@@ -426,8 +436,18 @@ class Orchestrator:
                 self.reconcile()
             except Exception as exc:  # noqa: BLE001  (one bad set must not stop the builds)
                 self.errors = (self.errors + [f'reconcile: {type(exc).__name__}: {exc}'])[-20:]
-        pool = pool_status(self.root, self.idle(), None)
+            try:
+                if monster_lane.tick(self.root)['queued']:       # the unattended auto-freeze + a task for every frozen list without one
+                    catalog.invalidate()
+            except Exception as exc:  # noqa: BLE001
+                self.errors = (self.errors + [f'monster tick: {type(exc).__name__}: {exc}'])[-20:]
+        idle = self.idle()
+        pool = pool_status(self.root, idle, None)
         started = self._start_queued(pool['limit'], now)
+        try:
+            started += self._start_monsters(now, idle)
+        except Exception as exc:  # noqa: BLE001  (a damaged monster root never stops the layer builds)
+            self.errors = (self.errors + [f'monster lane: {type(exc).__name__}: {exc}'])[-20:]
         if self.scan_stale and now - self.last_stale >= self.stale_interval:
             self.last_stale = now
             self._stale_async()
@@ -523,6 +543,8 @@ class Orchestrator:
         return 'lost'
 
     def _approved(self, task: dict) -> bool:
+        if task['lane'] == monster_lane.LANE:                  # the lane's own check (its frozen view list still stands), always applied
+            return monster_lane.task_wanted(self.root, task)[0]
         return not self.require_approval or actions.task_approved(self.root, task)
 
     def _publication_problem(self, task: dict, verdict: dict) -> str | None:
@@ -542,6 +564,16 @@ class Orchestrator:
         return None
 
     def _finish(self, task: dict, result: dict) -> None:
+        if task['lane'] == monster_lane.LANE:
+            outcome = monster_lane.finish_outcome(self.root, task, result)
+            if outcome['outcome'] == 'done':
+                self.queue.finish(task['id'], task.get('token'), True, result)
+            elif outcome['outcome'] == 'requeue':          # "Hyper3D profile busy" (5 min) or the gate closed during the run (1 min)
+                self.queue.requeue(task['id'], task.get('token'), outcome['error'], outcome['delay'])
+            else:                                          # never retried automatically: Retry resumes from the record
+                self.queue.finish(task['id'], task.get('token'), False, result, outcome['error'])
+            catalog.invalidate()
+            return
         ok, error, retryable = classify(result)
         if ok:
             problem = self._publication_problem(task, result.get('last_json'))
@@ -716,6 +748,8 @@ class Orchestrator:
 
     @staticmethod
     def _approved_in(derived: dict, task: dict) -> bool:
+        if task['lane'] == monster_lane.LANE:                  # no set approval: the lane's plan cancels the unwanted ones itself
+            return True
         args = task.get('args') if isinstance(task.get('args'), dict) else {}
         if task['lane'] == 'bare':
             race = args.get('race') or task.get('unit')
@@ -826,6 +860,8 @@ class Orchestrator:
     def default_argv(self, task: dict) -> list[str]:
         """The builder command. The output folder is ALWAYS explicit (re-check R13): bare builds go to `<root>/tools/preview/cache/layers/<race>`
         of THIS project root (never the builder's default, the real repository's cache), module builds to `<module_dir>/layers`."""
+        if task['lane'] == monster_lane.LANE:
+            return monster_lane.task_argv(self.root, task)
         args = task.get('args') or {}
         if task['lane'] == 'bare':
             race = str(args['race'])
@@ -845,12 +881,13 @@ class Orchestrator:
             return False
 
     def _start_queued(self, limit: int, now: float) -> int:
-        running = self.queue.count(taskqueue.ACTIVE)
+        """The layer pool (`bare` + `layers`): start queued layer tasks while fewer than `limit` of them are active."""
+        running = self.queue.count(taskqueue.ACTIVE, lanes=LAYER_LANES)
         if running >= limit:
             return 0
         open_bare = {t['unit'] for t in self.queue.tasks(state=taskqueue.OPEN, lane='bare')}
         started = 0
-        for task in self.queue.next_queued(taskqueue.LANES, 100, now):
+        for task in self.queue.next_queued(LAYER_LANES, 100, now):
             if running >= limit:
                 break
             args = task.get('args') or {}
@@ -870,6 +907,19 @@ class Orchestrator:
                 started += 1
         return started
 
+    def _start_monsters(self, now: float, idle: float | None) -> int:
+        """The monster lane (limit 1, its own gate; independent of the layer pool): cancel what its plan no longer wants, start what it may."""
+        plan = monster_lane.plan_starts(self.root, now, idle=idle, idle_known=True)
+        for task, why in plan['cancel']:
+            self.queue.cancel(task['id'], why or 'no longer wanted')
+        started = 0
+        for task in plan['start']:
+            if self._spawn(task):
+                started += 1
+        if plan['cancel']:
+            catalog.invalidate()
+        return started
+
     def _spawn(self, task: dict) -> bool:
         """Commit the attempt (queued -> starting, token, attempt paths), write its task file and start the detached wrapper. A start that fails
         fails the attempt (no retry). False when the row was no longer queued."""
@@ -885,7 +935,8 @@ class Orchestrator:
         try:
             for key in ('result', 'claim'):
                 paths[key].unlink(missing_ok=True)
-            spec = {'id': task['id'], 'attempt': attempt, 'token': token, 'argv': self.argv_for(task), 'env': TASK_ENV, 'log': str(paths['log']),
+            env = monster_lane.TASK_ENV if task['lane'] == monster_lane.LANE else TASK_ENV
+            spec = {'id': task['id'], 'attempt': attempt, 'token': token, 'argv': self.argv_for(task), 'env': env, 'log': str(paths['log']),
                     'err': str(paths['err']), 'result': str(paths['result']), 'claim': str(paths['claim']), 'cwd': str(REPO),
                     'task': {'key': task['key'], 'lane': task['lane'], 'set': task.get('set_name'), 'unit': task.get('unit'),
                              'args': task.get('args') or {}, 'max_attempts': task.get('max_attempts'), 'approval_gen': task.get('approval_gen')}}
@@ -1243,9 +1294,14 @@ def queue_state(root: Path, active: bool, now: float | None = None) -> dict:
     pool = pool_status(root)
     stall = read_settings(root)['build_stall_minutes']
     views = [task_view(t, now, stall) for t in tasks]
+    try:
+        monsters = monster_lane.lane_status(root)
+    except Exception as exc:  # noqa: BLE001  (display only: a damaged monster root never breaks the queue view)
+        monsters = {'lane': monster_lane.LANE, 'error': f'{type(exc).__name__}: {exc}'}
     return {'tasks': views,
-            'workers': {'limit': pool['limit'], 'running': sum(totals.get(s, 0) for s in taskqueue.ACTIVE), 'present': pool['present'],
+            'workers': {'limit': pool['limit'], 'running': queue.count(taskqueue.ACTIVE, lanes=LAYER_LANES), 'present': pool['present'],
                         'mode': pool['mode'], 'idle': pool['idle'], 'orchestrator': bool(active)},
+            'monsters': monsters,
             'totals': totals, 'stalled': sum(v['stalled'] for v in views), 'stall_minutes': stall,
             'page': {'open_limit': OPEN_PAGE, 'open_total': open_total, 'open_shown': len(open_rows), 'recent_limit': RECENT_PAGE,
                      'recent_total': recent_total, 'recent_shown': len(recent), 'recent_since': since,

@@ -9,6 +9,9 @@ import { state, refresh, subscribe, queueHealthErrors } from './state.js';
 import { toast } from './toast.js';
 import { badge, blockRepeat, button, duration, h, pretty } from './util.js';
 import { createSections } from './queue_sections.js';
+import { runNowTask } from './monster_views.js';   // phase 5: Run now of a monster conversion (409 `confirm` while paused by hand)
+
+const MONSTER_LANE = 'monster_convert';
 
 // Phase 3 re-check: the queue response carries `totals` (every state, whole table) and `page` (what was cut); the active tasks (starting /
 // running / stalled / orphan) are always shown first with their controls; an `orphan` (an adopted builder whose wrapper died) has Kill.
@@ -32,6 +35,7 @@ export function mountQueue(container) {
   const open = new Set();          // task ids whose log is expanded
 
   const summary = h('div', { class: 'queue-summary' });
+  const monsterLine = h('div', { class: 'q-monsters', hidden: true });     // phase 5: the monster conversion lane (queue.monsters)
   const table = h('div', { class: 'queue-table' });
   const note = h('div', { class: 'queue-note', hidden: true });
   const health = h('div', { class: 'queue-note health', hidden: true, role: 'alert' });
@@ -39,7 +43,7 @@ export function mountQueue(container) {
   let data = null;
   const sections = createSections({ reload: () => load() });
   const page = h('div', { class: 'queue-page' }, health, note, sections.node,
-    h('section', { class: 'q-layers' }, h('h3', { class: 'q-heading', text: 'Layer builds' }), summary, bar, table));
+    h('section', { class: 'q-layers' }, h('h3', { class: 'q-heading', text: 'Layer builds' }), summary, monsterLine, bar, table));
   blockRepeat(page);                  // a held Enter never repeats a write button
   container.replaceChildren(page);
   let rebuilding = false;
@@ -93,6 +97,34 @@ export function mountQueue(container) {
     await load();
   }
 
+  /** Run now of a queued monster conversion: overrides the idle gate; while paused by hand the server asks (409 confirm) first. */
+  async function runNow(task) {
+    if (busy.has(task.id)) return;
+    busy.add(task.id);
+    try {
+      const result = await runNowTask(task.id);
+      if (result) toast(result.warning ? `Run now: ${result.warning}` : `Task ${task.id} starts now`, { ms: result.warning ? 8000 : 2500 });
+    } catch (error) {
+      toast(`Run now failed: ${error.message}`);
+    } finally {
+      busy.delete(task.id);
+    }
+    await load();
+  }
+
+  /** The monster lane: gate, counts and the Hyper3D credits spent (paid_log.jsonl). */
+  function drawMonsters(lane) {
+    monsterLine.hidden = !lane;
+    if (!lane) return;
+    if (lane.error) { monsterLine.replaceChildren(h('strong', { text: 'Monster conversions' }), badge(`error: ${lane.error}`, 'error')); return; }
+    const gate = lane.gate || {};
+    const totals = Object.entries(lane.totals || {}).filter(([, n]) => n);
+    monsterLine.replaceChildren(h('strong', { text: 'Monster conversions' }),
+      badge(gate.open ? 'gate open' : `waiting: ${gate.reason || gate.code || 'closed'}`, gate.open ? 'ok' : 'warn'),
+      ...totals.map(([state, n]) => badge(`${state} ${n}`, TONE[state] || '')),
+      h('span', { text: `limit ${lane.limit ?? 1} · paid ${lane.paid?.count ?? 0} (${lane.paid?.credits ?? 0} Hyper3D credits)` }));
+  }
+
   function row(task) {
     const failed = task.state === 'failed';
     const attention = failed || task.state === 'stalled' || task.state === 'orphan';
@@ -103,6 +135,8 @@ export function mountQueue(container) {
       task.state === 'stalled' ? button('Kill & retry', () => op('kill_retry', task), 'danger', 'Stop the stuck build and queue it again') : null,
       task.state === 'orphan' ? button('Kill', () => op('kill_retry', task, 'kill'), 'danger',
         'The build is still running but its wrapper died: stop it (the work is queued again when the approval still stands)') : null,
+      task.state === 'queued' && task.lane === MONSTER_LANE
+        ? button('Run now', () => runNow(task), 'primary', 'Start this monster conversion now (Hyper3D, paid), even while you are at the PC') : null,
       task.state === 'queued' ? button('Cancel', () => op('cancel', task), '', 'Remove it from the queue (a running build finishes on its own)') : null);
     const expanded = open.has(task.id);
     return h('div', { class: 'queue-row' + (attention ? ' failed' : ''), dataset: { id: task.id, state: task.state } },
@@ -152,8 +186,9 @@ export function mountQueue(container) {
       if (!alive) return;
       note.hidden = true;
       const text = JSON.stringify({ ...data, services: undefined, mode: undefined, credits: undefined, disk: undefined, views: undefined,
-        conversions: undefined, holds: undefined, settings: undefined });    // the table redraws only for its own data
+        conversions: undefined, holds: undefined, settings: undefined, monsters: undefined });    // the table redraws only for its own data
       if (text !== lastText) { lastText = text; draw(data); }
+      drawMonsters(data.monsters);
       sections.update(data);
       drawHealth();
       drawBar();

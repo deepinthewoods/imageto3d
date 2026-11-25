@@ -1,12 +1,15 @@
 // 3D modal for monster variants: viewer of the chosen reduced level (five levels, 0.8% to 0.1%), the conversion
 // image and colour legend on the side. Changing the LOD saves it (POST /api/v2/lod with the monster id, which writes
-// chosen_lod.json through monsters.write_choice). Approve arrives in a later phase.
+// chosen_lod.json through monsters.write_choice).
+// PHASE 5 (marked below): Approve (button + key A, confirmation) in 3D, Unapprove in Completed, Reconvert (paid, confirmation with the view
+// ticks; sends args.confirm), and the PIPELINE_LIBRARY hint badge. Item fields: tools/preview/v2/DESIGN_PHASE5.md section H.
 import { api } from './api.js';
 import { createViewer } from './viewer.js';
 import { refresh } from './state.js';
 import { toast } from './toast.js';
 import { badge, button, faceText, field, fillSelect, h, lodLabel, picture, pretty, storage, toggle } from './util.js';
-import { showImage } from './modal.js';
+import { mutationKey, showImage } from './modal.js';
+import { confirmDialog } from './confirm.js';   // PHASE 5
 import { carry } from './model3d.js';
 
 const LODS = ['0p8', '0p6', '0p4', '0p2', '0p1'];
@@ -48,7 +51,10 @@ export async function showMonster3d(modal, host) {
   const layout = h('div', { class: 'monster-layout' }, h('div', { class: 'viewer-shell' }, wrap));
   if (item.image || item.source_image || item.roles?.length) layout.append(sidePanel(item));
   modal.body.append(layout);
-  modal.setBadges([badge('Monster', 'info'), badge(item.stage || card.stage || ''), ...(item.approved ? [badge('approved', 'ok')] : [])]);
+  const libraryHint = item.library_hint || card.library_hint;   // PHASE 5: "no library folder mapping (add to PIPELINE_LIBRARY)"
+  const outdated = (item.card?.badges || card.badges || []).filter(b => b.text === 'sections out of date');   // PHASE 5: Reconvert kept sections/
+  modal.setBadges([badge('Monster', 'info'), badge(item.stage || card.stage || ''), ...(item.approved ? [badge('approved', 'ok')] : []),
+    ...(libraryHint ? [badge(libraryHint, 'warn')] : []), ...outdated.map(b => badge(b.text, b.tone))]);
 
   if (!levels.length) {
     message.hidden = false;
@@ -69,8 +75,8 @@ export async function showMonster3d(modal, host) {
   const facesText = h('span', { class: 'faces-text' });
   const saveButton = button('Save', () => choose(lodSelect.value, { alreadyShown: true }), 'primary', 'Record this level as the chosen one');
   const wireToggle = toggle('Wire', wire, on => { wire = on; storage.set('wire', on); viewer.setWireframe(on); });
-  // LATER PHASE: the Approve button goes into this slot (a monster goes straight to Completed on approval).
-  const approveSlot = h('span', { class: 'approve-slot', dataset: { slot: 'approve', phase: 'later' } });
+  // PHASE 5: Approve (3D) / Unapprove (Completed) / Reconvert live in this slot; a monster goes straight to Completed on approval.
+  const approveSlot = h('span', { class: 'approve-slot', dataset: { slot: 'approve' } });
   modal.actions.classList.add('model-actions');
   modal.actions.append(approveSlot, field('LOD', lodSelect), saveButton, facesText, wireToggle.label,
     ...(locked ? [h('span', { class: 'lod-note', text: 'LOD view only: approved', title: 'An approved model keeps its LOD. The selector only switches the displayed mesh.' })] : []));
@@ -113,6 +119,74 @@ export async function showMonster3d(modal, host) {
     }
     if (host.isCurrent()) sync();
   }
+
+  // ---- PHASE 5: Approve / Unapprove / Reconvert ------------------------------------------------------------------------
+  const stage = item.stage || card.stage;
+  const name = card.title || pretty(card.name);
+  const canApprove = !locked && stage === '3d';
+  let asking = false;
+
+  async function askApprove() {
+    if (!canApprove || asking || !host.isCurrent()) return;
+    asking = true;
+    try {
+      const level = lodSelect.value;
+      const ok = await confirmDialog({
+        title: `Approve ${name}?`,
+        lines: [`LOD ${lodLabel(level)} (${faceText(lods[level].faces)}) becomes the approved level and ${name} moves to Completed.`,
+          saved === level ? 'This level is already the chosen one.' : 'This level is saved as the chosen one by the same step.',
+          'The level stays locked until you Unapprove it in Completed.'],
+        confirm: 'Approve',
+      });
+      if (ok && host.isCurrent()) await host.actThenAdvance(card, 'approve', { args: { lod: level }, subject: `${name} (LOD ${lodLabel(level)})` });
+    } finally {
+      asking = false;
+    }
+  }
+
+  async function askReconvert() {
+    if (asking || !host.isCurrent()) return;
+    asking = true;
+    try {
+      const made = (item.views || []).filter(view => view.url);
+      const ticks = made.map(view => h('input', { type: 'checkbox', checked: view.enabled !== false, dataset: { view: view.name } }));
+      const content = h('div', { class: 'mv-reconvert' }, made.map((view, i) => h('label', { class: 'mv-reconvert-view' },
+        h('img', { src: view.url, alt: view.name }), h('span', null, ticks[i], pretty(view.name)))));
+      const ok = await confirmDialog({
+        title: `Reconvert ${name}?`,
+        lines: ['This is PAID: it starts a new Hyper3D conversion that costs 0.5 Hyper3D credits.',
+          'The current Hyper3D result and reduced models are moved aside (kept as *_prev_<time>), not deleted. The variant goes back to Approved while it converts.',
+          'The views ticked below are used:'],
+        content,
+        confirm: 'Reconvert (0.5 credits)',
+        danger: true,
+      });
+      if (!ok || !host.isCurrent()) return;
+      const enabled = Object.fromEntries(made.map((view, i) => [view.name, ticks[i].checked]));
+      if (!Object.values(enabled).some(Boolean)) { toast('Not reconverted: tick at least one view'); return; }
+      await host.actThenAdvance(card, 'reconvert', { args: { enabled, confirm: true }, subject: `${name} (reconvert)` });   // confirm: the server refuses a paid reconvert without it
+    } finally {
+      asking = false;
+    }
+  }
+
+  if (canApprove) {
+    const approve = button('Approve', askApprove, 'primary', 'Approve this level (A): the monster moves to Completed');
+    approve.dataset.action = 'approve';
+    approveSlot.append(approve);
+  }
+  if (stage === 'completed' || item.approved === true) {
+    const unapprove = button('Unapprove', () => host.actThenAdvance(card, 'unapprove', { subject: name }), '', 'Clear the approval: the monster goes back to 3D');
+    unapprove.dataset.action = 'unapprove';
+    approveSlot.append(unapprove);
+  }
+  if ((item.views || []).some(view => view.url)) {
+    const reconvert = button('Reconvert', askReconvert, '', item.approved === true ? 'Unapprove first: an approved model keeps its files' : 'Convert again (paid, 0.5 credits)');
+    reconvert.dataset.action = 'reconvert';
+    reconvert.disabled = item.approved === true;
+    approveSlot.append(reconvert);
+  }
+  modal.setKeyHandler(event => (canApprove && event.key.toLowerCase() === 'a' ? mutationKey(event, askApprove) : false));
 
   show();
 }

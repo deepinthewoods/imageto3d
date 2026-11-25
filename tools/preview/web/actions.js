@@ -62,6 +62,7 @@ export async function raceVerb(item, race, verb, { onDone } = {}) {
  *   removes (default true): the card leaves `tab` at once (set verbs that only edit a decision pass false)
  *   rev, args: forwarded to the server
  *   onError(error): runs first when the server refuses (the caller can handle a 409 itself, e.g. keep its dialog open)
+ *   subject: the toast's name for the card, or a function (response) -> name
  * Resolves the response, or null when it failed or another action on this card is still running.
  */
 export async function runAction(card, verb, { tab, rev, args, removes = true, subject, onError } = {}) {
@@ -82,7 +83,8 @@ export async function runAction(card, verb, { tab, rev, args, removes = true, su
   try { await refresh(); } catch { /* the poll will catch up */ }
   edit?.commit();
   const warning = result?.warning ? ` · Warning: ${result.warning}` : '';
-  toast(`${PAST[verb] || verbLabel(verb)} ${subject || card.title || pretty(card.name)}${warning}`, {
+  const named = typeof subject === 'function' ? subject(result || {}) : subject;     // a function: the text may use the response (phase 5)
+  toast(`${PAST[verb] || verbLabel(verb)} ${named || card.title || pretty(card.name)}${warning}`, {
     undo: result?.undo ? () => undoAction(result.undo) : null,
   });
   return result || {};

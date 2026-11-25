@@ -23,6 +23,7 @@ import serve  # noqa: E402  (tools/preview/serve.py, used as a library)
 import builds  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
+import monsters_v2  # noqa: E402  (phase 5: monster concept and variant cards / items)
 import progress  # noqa: E402
 import taskqueue  # noqa: E402
 
@@ -737,23 +738,6 @@ def recovery_card(rec: dict) -> dict:
             'model': None, 'races': [], 'badges': badges, 'actions': actions, 'progress': None}
 
 
-def monster_stage(raw: dict) -> str:
-    if raw.get('approved'):
-        return 'completed'
-    return '3d' if raw.get('lods') else 'approved'
-
-
-def monster_card(raw: dict) -> dict:
-    stage = monster_stage(raw)
-    lods = raw.get('lods') or {}
-    lod = raw.get('lod') if raw.get('lod') in lods else ('0p4' if '0p4' in lods else next(iter(lods), None))
-    badges = [{'text': str(raw.get('status') or 'image only'), 'tone': 'info'}]
-    if raw.get('approved'):
-        badges.append({'text': 'approved', 'tone': 'ok'})
-    return {'id': raw['id'], 'type': 'monster', 'kind': 'monster', 'name': raw['name'], 'title': raw['name'], 'stage': stage,
-            'thumbnail': raw.get('image'), 'thumbnail_kind': None, 'model': lods[lod]['url'] if lod else None, 'races': [], 'badges': badges, 'actions': [], 'progress': None}
-
-
 def review_card(raw: dict) -> dict:
     modules = {e.get('module') for e in raw.get('entries', [])}
     model = next((p['model'] for p in raw.get('previews', []) if p.get('model')), None)
@@ -778,7 +762,7 @@ def _build_state(root: Path) -> dict:
         'archive': POOL.submit(serve.concepts, root, 'archive'),
         'trash': POOL.submit(serve.trash_cards, root),
         'review': POOL.submit(serve.review_cards, root),
-        'monsters': POOL.submit(monsters.cards, root),
+        'monsters': POOL.submit(monsters_v2.state_cards, root),     # phase 5: {tab: [card]} of concepts and variants
     }
     derived = futures['derived'].result()
     tabs: dict[str, list[dict]] = {tab: [] for tab in TABS}
@@ -790,8 +774,8 @@ def _build_state(root: Path) -> dict:
     tabs['review'] = [review_card(c) for c in futures['review'].result()]
     for info in derived['sets'].values():
         tabs[info['stage']].append(set_card(root, info))
-    for raw in futures['monsters'].result():
-        tabs[monster_stage(raw)].append(monster_card(raw))
+    for tab, cards in futures['monsters'].result().items():
+        tabs[tab].extend(cards)
     return {'races': derived['races'], 'tabs': {tab: _by_name(cards) for tab, cards in tabs.items()}, 'queue': None, 'credits': None, 'paused': None,
             'stale': stale_summary(derived)}
 
@@ -912,11 +896,8 @@ def item(root: Path, item_id: str) -> dict:
         raise ValueError('Missing id')
     if item_id.startswith('set:'):
         return set_item(root, serve.safe_name(item_id.removeprefix('set:')))
-    if item_id.startswith('monster:'):
-        for raw in monsters.cards(root):
-            if raw['id'] == item_id:
-                return raw | {'stage': monster_stage(raw), 'card': monster_card(raw)}
-        raise NotFound(f'Unknown monster {item_id}')
+    if item_id.startswith(('monster:', 'mconcept:')):
+        return monsters_v2.item(root, item_id)                   # unknown ids: monsters_v2.not_found = NotFound (404)
     if item_id.startswith('intent:'):
         intent_id = item_id.removeprefix('intent:')
         try:

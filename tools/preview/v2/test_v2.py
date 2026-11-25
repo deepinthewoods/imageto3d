@@ -861,7 +861,7 @@ class DecisionTests(V2Case):
         marker = self.root / 'models/s/model_approval.json'
         marker.write_text('{"approved": true}')
         for item_id, verb in (('approvedmodel:s', 'unapprove'), ('model:s', 'approve'), ('approvedmodel:s', 'restore'), ('trash:s', 'approve'),
-                              ('set:s', 'approve'), ('set:s', 'reject'), ('monster:Horse/1', 'approve'), ('review:x', 'restore'), ('intent:x', 'approve')):
+                              ('set:s', 'approve'), ('set:s', 'reject'), ('monster:Horse/1', 'reject'), ('review:x', 'restore'), ('intent:x', 'approve')):
             status, result = self.act(item_id, verb)
             self.assertEqual(status, 400, (item_id, verb))
         self.assertTrue(marker.is_file())

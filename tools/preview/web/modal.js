@@ -123,7 +123,7 @@ export function initModal() {
   $('next-set').onclick = () => current?.onNext?.();
   // a click on a dialog button leaves focus on it; hand it back to the dialog so the shortcuts keep working afterwards
   dialog().addEventListener('click', event => {
-    if (event.target instanceof Element && event.target.closest('button')) setTimeout(() => { if (isModalOpen() && !overlay) focusDialog(); }, 0);
+    if (event.target instanceof Element && event.target.closest('button')) setTimeout(() => { if (isModalOpen() && !overlay && !document.querySelector('.q-confirm')) focusDialog(); }, 0);   // PHASE 5: not while a confirmation opened by the click has the focus
   });
   document.addEventListener('keyup', event => spent.delete(keyId(event)));
   window.addEventListener('blur', () => spent.clear());

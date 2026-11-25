@@ -133,3 +133,130 @@ trash helper or a `.v2_withdrawn` rename) and the variant_names entry.
    Report and fall back to the largest same-size subset or a single view, and ask the user.
 5. Approve one LOD in 3D, check Completed, then unapprove.
 6. Report the credits used.
+
+## H. As built (phase 5 integration, 2026-11-25)
+This section replaces the two working notes of the phase (`PHASE5_INTEGRATION.md`, the backend hook list, and
+`PHASE5_FRONTEND_CONTRACT.md`, the UI's expectations); where they disagreed, the shapes below are the ones both sides now use.
+
+### H.1 Modules and wiring
+- `monsters_v2.py`: concept intake, `.v2_state.json`, folder to monster, numbering, pick / import / withdraw, view tasks, `views.json`
+  ticks / freeze / convert / reconvert, 3D approve / unapprove, cards and items, auto-freeze, the migration.
+  `monster_prompts.py`: the view prompts. `monster_lane.py`: the `monster_convert` lane and its driver.
+- `taskqueue.LANES = ('bare', 'layers', 'monster_convert')`. `TaskQueue.mark_run_now(id, override_pause)` is the public write of Run now
+  (args `run_now` / `override_pause`, backoff cleared, event `run_now`; only a queued row). `count(..., lanes=)` filters by lane.
+- `catalog`: `_build_state` takes every monster card from `monsters_v2.state_cards` ({tab: [card]}); `item()` hands `monster:` and
+  `mconcept:` ids to `monsters_v2.item` (unknown = `catalog.NotFound`, 404; a malformed id = 400). The old `monster_stage` /
+  `monster_card` are gone (`monsters_v2.monster_stage` is the same rule).
+- `actions.perform`: `mconcept:` / `monster:` ids go to `monsters_v2.perform` BEFORE the `NAME` check (their names have spaces and a
+  slash); its allowlist is `monsters_v2.ALLOWED`. `task_approved` of a monster task = `monster_lane.task_wanted`. `queue_op` has `run_now`.
+- `orchestrator`: every tick (with reconcile on) runs `monster_lane.tick` (auto-freeze + a task for every frozen list without one);
+  `_start_queued` is the layer pool only (`LAYER_LANES`, counting only their active rows); `_start_monsters` runs the lane's plan
+  (`plan_starts`: cancel unwanted, start at most 1) on its own, so it also starts while the layer pool limit is 0. `default_argv` /
+  `_spawn` env / `_finish` / `_approved` dispatch on the lane; `_approved_in` is True for the lane, so reconcile never cancels a monster
+  task (the lane's plan cancels a task whose frozen list was replaced). `queue_state` adds `monsters` and `workers.running` counts the
+  layer pool only.
+- `progress.views_section` already reads a monster view task's log under the monster root (phase 4 F19); `mviews` shows in `by_kind`.
+- `migrate.py --monsters [--apply]` (H.6). `server.py` is unchanged: 409s carry `guard.Conflict.code`, `/mfiles/` serves the PNGs.
+
+### H.2 Concept cards and items (`mconcept:<Folder>/<codexN>`)
+- Card: `{id, type: "monster", kind: "monster", name: "<Monster> codexN", title: "<Monster> · codexN", stage, thumbnail (/mfiles/ PNG),
+  actions, badges, monster, folder, concept, next_variant, library_hint}`.
+  - `actions`: concepts `provisional, approve, reject`; provisional `approve, unapprove`; archive `approve, unarchive`; trash `restore`.
+    The dialog adds Archive in concepts and provisional (the allowlist accepts `archive` from both stages).
+  - `next_variant` = the variant an approve would assign now (`main`, `2`, ...); `library_hint` = the B.6 text or null. Badges: `new monster`
+    (next variant is `main`), `no prompt record`, `state unreadable` (and no actions), `from <stage>` in the trash. The library hint is
+    NOT a concept card badge (it would sit on every concept of the monster); the dialog shows it.
+- Item = the card plus `{card, concept, image, prompt, intent, roles, variant, variant_id, state, state_error, library, pipeline_exists}`:
+  `prompt` = the prompt json's `design, notes, colour_variant, job, date, attempts, size, mode, prompt` (present keys only); `intent` =
+  `{source: text}` from the folder's set files (`adjectives.json` ...) plus the prompt json's `adjective, direction, local_description,
+  user_guidance, set`, or null; `roles` from `.colours.json`; `variant` / `variant_id` once approved.
+- Verbs: `provisional`, `approve` (`args.unattended`; response `{ok, monster, variant, id, from, tasks, library, undo, warning?}`; the
+  UI's toast names the response's variant), `reject`, `archive`, `unarchive`, `unapprove` (`args.to`), `restore`. Undo descriptors as
+  before; the undo of an approve (withdraw) is refused (409) once a view task has started.
+
+### H.3 Variant cards and items (`monster:<Monster>/<variant>`)
+- Card: the phase 4 monster card (stage `approved` | `3d` | `completed` by `monster_stage`) plus `actions` (approved: `[]`, or `["import"]`
+  for a flat pick; 3d: `["approve"]` once a LOD is saved; completed: `["unapprove"]`), `library_hint`, and badges: the status, `views a/b`,
+  `view failed n`, `Choose views`, `convert straight away`, the conversion state (`conversion queued` / `converting` / `conversion failed` /
+  `converted` / `conversion cancelled` / `conversion not queued`), `picked, not imported`, `sections out of date` (H.7), `approved`, the
+  library hint (warn). A hover Approve (3D) and a hover Import (Approved) only open the modal; a hover Unapprove (Completed) runs.
+- Item = the raw card plus:
+  - `views`: always front, left, back, right: `{name, file, exists, url, enabled, planned, task, retry}`. `url` = the `/mfiles/` URL or
+    null (a flat pick's front shows its flat file). `task` = null (no task file) or `{name, state: queued | running | done | failed,
+    attempts, max_attempts, error, job, started}` (the runner's `pending` = queued, `launching` = running; `error` of a failed task =
+    `no image written (last job ..., exit ...)`). `retry` = an extra view without an image whose task failed or was never written.
+  - `phase`: `legacy` (no views.json) | `generating` | `choose` | `frozen` | `import` (a flat pick); `legacy`, `importable` (booleans).
+  - `unattended`, `frozen` (`{time, files, sha256, names, auto?, reconvert?, moved?}` or null), `draft_differs`.
+  - `conversion`: null before anything was frozen or recorded, else `{task_id, state: queued | waiting | running | done | failed, step:
+    submit | preview | collect | reduce, waiting_reason, paid, credits, error, attempts, run_now, record, screenshots, reduced, started,
+    task}`. `step`: no record = submit, a record with nothing paid = preview, paid but no GLB = collect, an exported GLB = reduce (a failed
+    task: the verdict's step). `waiting_reason` (state `waiting`): `held` (CONVERT_HOLD), `paused`, `user_present`, `browser_busy` (a busy
+    requeue), or a text (`another monster conversion is running`, `the conversion lane queues it at its next pass`). `record` = `{status,
+    stage, pending_action, credits_committed, why, model_url, images_uploaded, actions: [names]}`; `screenshots` = `/mfiles/` URLs of the
+    record folder's PNGs, newest first. A record without a task (a hand conversion that stopped) is state `failed` with that as error.
+  - `library` (`{known, mapped, folder}`), `library_hint`, `pick` (the variant_names entry).
+- Verbs: `views` (`args.enabled`, a partial map of views with an image; 400 for a view without one), `convert` (`args.enabled`; 400 when
+  nothing is enabled; 409 `busy` while a conversion of the variant is queued / running; 409 `frozen` once a record / GLB / reduced/
+  exists: converting again is Reconvert), `reconvert` (`args.confirm: true` required, else 400; optional `args.enabled`; 409 `approved`
+  while approved; 400 when there is nothing to redo; moves `hyper3d` and `reduced` to `*_prev_<time>`), `view_retry` (`args.view`: a
+  failed task back to pending, or the missing task file written), `import` (`args.unattended`), `approve` (`args.lod`; 409 `approved`
+  when approved already), `unapprove` (completed -> 3d; on a v2 pick whose views have not started it undoes the pick).
+- `convert` is allowed while a view is still being drawn (the UI asks "use the views that exist now?"): a stuck view runner must not
+  block a conversion with the front alone. It is also allowed again on a frozen list whose conversion never started (no record, GLB or
+  reduced/: nothing was paid), which replaces the frozen list; the old task is then cancelled by the lane.
+
+### H.4 Queue
+- `POST /api/v2/queue {op: "run_now", id, confirm?}`: a queued monster task (a failed / cancelled one is queued again first, while still
+  wanted) gets `run_now`; it overrides the idle gate. While conversions are paused by hand (mode `pause` / `pause-conversions`, or a
+  manual PAUSE with scope conversions) the answer is **409 `code: "confirm"`** with the question as `error`; the client asks and sends
+  `confirm: true`, which also sets `override_pause`. The conversion hold is never overridden: the answer is 200 with a `warning`, and the
+  task starts when the hold lifts. Logged as queue event `op`.
+- `retry` / `cancel` of a monster row work as for layer rows (`task_approved` = the lane's check). `view_retry {name}` accepts
+  `mviews--...` names.
+- `GET /api/v2/queue` `monsters` = `monster_lane.lane_status`: `{lane, limit: 1, gate: {open, reason, code, mode, idle, away,
+  needs_confirm}, totals: {state: n}, paid: {count, credits, recent}, hold}`. Rows of the lane: `set` = `monster:<M>/<v>`, `unit` =
+  `convert`; a queued row has **Run now** in the Queue tab, and the tab shows one "Monster conversions" line (gate, counts, paid).
+
+### H.5 Lane gate and outcomes (E, as built)
+- Gate order: CONVERT_HOLD (`held`, never overridden) > mode `pause` / `pause-conversions` or a manual PAUSE with scope conversions
+  (`paused`, overridden only by a confirmed Run now) > in mode `auto` / `views-run` the supervisor's "user active" PAUSE or idle < 300 s
+  (`user_present`, overridden by Run now). Mode `run` skips the idle gate. The driver re-checks the gate before every step with the
+  real presence (a gate that closed mid-run = verdict `waiting` = requeue after 60 s).
+- `finish_outcome`: `done` needs exit 0, verdict `ok` and the five reduced levels; `busy` (Hyper3D profile busy) requeues after 300 s;
+  anything else fails, and a failed task is never retried automatically (max_attempts 1; Retry resumes from the record).
+
+### H.6 Migration
+- `python tools/preview/v2/migrate.py --monsters` writes the report `.codex_jobs/_app/monster_migration_report.{json,md}` only;
+  `--monsters --apply` then writes `concepts/<Folder>/.v2_state.json` (idempotent: a listed concept is kept). `--apply` without
+  `--monsters` is an argument error. The monster root is `$IMAGETO3D_MONSTERS` or `characters/monsters/aaa`; the CLI prints it first.
+
+### H.7 Decisions (user, 2026-11-25)
+- **Import of a flat pick may reuse an existing flat `<k>-back.png`** (with its `.prompts.json` / `.colours.json`) as `views/<k>/back.png`;
+  only left and right are then queued (`views.json` `planned`), and `imported` records which flat files were copied.
+- **`paid_budget_hyper3d` (settings.json) is NOT a gate.** The lane never reads it; it stays an unused setting. What the lane spends is in
+  `paid_log.jsonl` and in the Queue tab's "Monster conversions" line.
+- **Reconvert leaves `models/<v>/sections/` in place.** The card (and the 3D modal) shows `sections out of date` while the newest file of
+  `sections/` is older than `reduced/manifest.json`; rerunning the monsters' `split_monster_sections.py` clears it.
+- Never resize, crop or pad a view (C, G.4) holds unchanged: the lane uploads the frozen files as they are.
+
+### H.8 Contract reconciliation (what changed against the two drafts)
+| Topic | Draft UI | Draft backend | As built |
+| --- | --- | --- | --- |
+| concept item | flat fields | `detail.{...}` | flat fields (`detail` dropped; nothing read it) |
+| concept card | `next_variant`, `library_hint` | none | both on the card |
+| view image | `file_url` | `url` | `url` |
+| view task | `{state queued/running/..., max_attempts, error}` | the runner's raw status | the UI's words (H.3) |
+| view Retry | queue op `view_retry {name}` | verb `view_retry {view}` | the verb (it also writes a missing task file) |
+| frozen list | `views_frozen {names}` | `frozen` | `frozen` with `names` |
+| conversion | `{step, state, waiting_reason, task_id, paid, credits, error}` | `{task, record, screenshots, ...}` | the UI fields plus `record` and `screenshots` (E's failure display) |
+| Run now while paused | `override_pause: true`, 409 `paused` | `confirm: true`, 409 `confirm` | `confirm` / 409 `confirm` |
+| Reconvert | `args.enabled` | `args.confirm` required | the UI sends `confirm: true` |
+| reconvert while approved | 409 `approved` | 409 `conflict` | 409 `approved` |
+| convert after conversion | 409 `frozen` | 409 `conflict` | 409 `frozen` |
+| convert while views are drawn | 400 | allowed | allowed; the UI asks first |
+| Import (flat pick) | not drawn | verb `import` | Import button + unattended tick in the Approved modal |
+| conversion failure | error only | record + screenshots | error, record status, screenshots, Retry |
+
+### H.9 Before the first real pick
+- Restart the view runner (Queue tab, Restart views): it reads `"launcher": "monsters"` only after a restart.
+- The Hyper3D browser lock (`rodin_backend.SeleniumRodin.__enter__`) is in place; nothing else is needed.

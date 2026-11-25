@@ -18,6 +18,7 @@ import { mountQueue } from './queue.js';
 import { showMonster3d } from './monster3d.js';
 import { showReview } from './review.js';
 import { drawChip } from './status.js';
+import { monsterAction, monsterView } from './monster_ui.js';   // PHASE 5: the monster dialogs (monster_concept.js / monster_views.js)
 
 const TABS = GROUPS.flat().map(([key]) => key);
 const MODEL_TABS = ['3d', 'aligned', 'completed'];
@@ -115,7 +116,7 @@ function render() {
     onOpen: card => openCard(card),
     // 3D / Aligned / Completed sets: every verb (approve, back to 3D, unapprove) needs what the modal shows (LODs, Amounts, rev), so a
     // hover button only opens the modal
-    onAction: (card, verb) => (MODEL_TABS.includes(active) && card.id.startsWith('set:') ? openCard(card) : runAction(card, verb, { tab: active })),
+    onAction: (card, verb) => monsterAction(card, verb, active, openCard) || (MODEL_TABS.includes(active) && card.id.startsWith('set:') ? openCard(card) : runAction(card, verb, { tab: active })),
   });
   applySize();
 }
@@ -130,6 +131,8 @@ function selectTab(tab) {
 
 // ---- modal router -------------------------------------------------------------------------------------------------
 function viewFor(tab, card) {
+  const monsterDialog = monsterView(tab, card);          // PHASE 5: monster concepts and approved monster variants
+  if (monsterDialog) return monsterDialog;
   if (tab === 'review') return { show: showReview, info: false };
   if (MODEL_TABS.includes(tab)) {
     if (isMonster(card)) return { show: showMonster3d, info: false };

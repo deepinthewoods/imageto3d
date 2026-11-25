@@ -33,6 +33,8 @@ import convert_list  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
 import modes  # noqa: E402
+import monster_lane  # noqa: E402  (phase 5: the monster_convert lane)
+import monsters_v2  # noqa: E402  (phase 5: mconcept: / monster: verbs, their own allowlist monsters_v2.ALLOWED)
 import settings as app_settings  # noqa: E402
 import taskqueue  # noqa: E402
 from claim_lock import ClaimBusy, claim_lock  # noqa: E402  (tools/tripo_pipeline on sys.path through guard.py)
@@ -763,7 +765,10 @@ def task_gen(root: Path, task: dict) -> str | None:
 def task_approved(root: Path, task: dict, derived: dict | None = None) -> bool:
     """A task may (still) run: a layers task only while its set has an active 3D approval of exactly that unit (job, LOD, source digest, and the
     approval generation the row was queued for, when it carries one: re-check R11); a bare task while some approved set needs its race (phase 3
-    review F6). Unreadable decisions count as not approved."""
+    review F6). Unreadable decisions count as not approved. A monster conversion: monster_lane.task_wanted (its frozen view list still stands,
+    the variant is not approved)."""
+    if task.get('lane') == monster_lane.LANE:
+        return monster_lane.task_wanted(root, task)[0]
     args = task.get('args') if isinstance(task.get('args'), dict) else {}
     if task.get('lane') == 'bare':
         race = args.get('race') or task.get('unit')
@@ -1190,7 +1195,7 @@ def set_amount(root: Path, data: object) -> dict:
     return {'ok': True, 'rev': result['rev'], 'amount': result['amount'], 'stage': fresh['stage'] if fresh else None}
 
 
-QUEUE_OPS = ('retry', 'cancel', 'kill_retry', 'rebuild_stale')
+QUEUE_OPS = ('retry', 'cancel', 'kill_retry', 'rebuild_stale', 'run_now')      # run_now: the monster lane (phase 5)
 PIPELINE_OPS = ('service', 'mode', 'settings', 'check_tripo', 'release', 'view_retry', 'convert_reset', 'accept_drift')     # phase 4 (H)
 SHA256 = re.compile(r'[0-9a-f]{64}')
 DRIFT = ' colour DRIFT'
@@ -1439,6 +1444,12 @@ def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
         return pipeline_op(root, data, ctx)
     if data['op'] == 'rebuild_stale':
         return rebuild_stale(root)
+    if data['op'] == 'run_now':
+        # a monster conversion: overrides the idle gate; while paused by hand 409 `confirm` until the client sends confirm: true
+        result = monster_lane.run_now(root, data.get('id'), data.get('confirm') is True)
+        _log_op(root, 'run_now', f'task {data.get("id")}' + (' (override pause)' if result.get('override_pause') else ''))
+        catalog.invalidate()
+        return result
     task_id = data.get('id')
     if isinstance(task_id, bool) or not isinstance(task_id, int):
         raise ValueError('id (a task number) is required')
@@ -1484,6 +1495,10 @@ def perform(root: Path, data: object) -> dict:
     args = data.get('args') if isinstance(data.get('args'), dict) else {}
     if not isinstance(item_id, str) or not isinstance(verb, str):
         raise ValueError('id and verb are required')
+    if monsters_v2.handles(item_id):
+        # mconcept:<Folder>/<codexN> and monster:<Monster>/<variant> (names with spaces and a slash): their own allowlist
+        # monsters_v2.ALLOWED, checked before anything is read; they invalidate the catalog themselves
+        return monsters_v2.perform(root, data)
     parts = item_id.split(':')
     if not all(NAME.fullmatch(p) for p in parts):
         raise ValueError('Invalid ID')
