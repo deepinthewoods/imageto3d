@@ -35,9 +35,12 @@ for _p in (HERE.parent, HERE):
         sys.path.insert(0, str(_p))
 import serve  # noqa: E402  (tools/preview/serve.py, used as a library)
 import actions  # noqa: E402
+import builds  # noqa: E402
 import catalog  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
+import orchestrator  # noqa: E402
+import taskqueue  # noqa: E402
 
 WEB = HERE.parent / 'web'
 DEFAULT_ROOT = serve.DEFAULT_ROOT
@@ -51,7 +54,17 @@ PLACEHOLDER = ('<!doctype html><html><head><meta charset="utf-8"><title>Preview 
                '<p>Preview v2 backend is running. The web app (tools/preview/web/index.html) has not been written yet.</p></body></html>')
 META = re.compile(r'<meta\s+name="v2-token"[^>]*>', re.I)
 BAD_PATH_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')       # drive letters / alternate streams / wildcards: none belongs in a served path
-POST_PATHS = ('/api/v2/action', '/api/v2/lod', '/api/v2/thumbnail')
+POST_PATHS = ('/api/v2/action', '/api/v2/lod', '/api/v2/thumbnail', '/api/v2/amount', '/api/v2/queue')
+BARE_PREFIX = 'tools/preview/cache/layers/'      # the bare layers live in the repo's cache, also when the project root is a copy
+
+
+def queue_health(root: Path) -> dict | None:
+    """`state.queue_health` (DESIGN_PHASE3.md E5): None while the layer-build queue database is fine, else {ok: false, errors, corrupt, since}
+    (the catalog keeps working; the orchestrator keeps the damaged file and rebuilds the queue). A repair is reported once as {ok: true, repaired}."""
+    health = taskqueue.for_root(root).health_view()
+    if health.get('ok'):
+        return {'ok': True, 'repaired': health['repaired']} if health.get('repaired') else None
+    return {'ok': False, 'errors': [str(health.get('error'))], 'corrupt': bool(health.get('corrupt')), 'since': health.get('since')}
 
 
 def inject_token(html: str, token: str) -> str:
@@ -139,8 +152,14 @@ def _symmap(file: Path) -> bool:
 
 
 def files_lookup(root: Path, path: str) -> tuple[Path | None, int]:
-    """serve.py's `/files/` rule: image/GLB suffixes (and the fit lab symmetry maps) inside the project root."""
-    return lookup(root, path.removeprefix('/files/'), FILE_SUFFIXES, _symmap)
+    """serve.py's `/files/` rule: image/GLB suffixes (and the fit lab symmetry maps) inside the project root. The bare layer cache
+    (`tools/preview/cache/layers/`) of the REAL repo is served too when the root is another folder (a test fixture)."""
+    tail = path.removeprefix('/files/')
+    found = lookup(root, tail, FILE_SUFFIXES, _symmap)
+    clean = clean_relative(tail)
+    if found[0] is None and found[1] == 404 and clean and clean.startswith(BARE_PREFIX) and Path(root).resolve() != builds.REPO.resolve():
+        return lookup(builds.REPO, tail, FILE_SUFFIXES)
+    return found
 
 
 def mfiles_lookup(root: Path, path: str) -> tuple[Path | None, int]:
@@ -232,8 +251,17 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
                 self.send_bytes(inject_token(html, token).encode(), 'text/html; charset=utf-8', 'no-store')
             elif path == '/api/v2/state':
                 data = dict(catalog.state(root))
-                data['server'] = {'read_only': bool(ctx.get('read_only')), 'message': ctx.get('message'), 'notes': list(ctx.get('notes') or [])}
+                data['server'] = {'read_only': bool(ctx.get('read_only')), 'message': ctx.get('message'), 'notes': list(ctx.get('notes') or []),
+                                  'orchestrator': bool(ctx.get('orchestrator'))}
+                data['queue_health'] = queue_health(root)
                 self.send_json(200, data)
+            elif path == '/api/v2/layers':
+                try:
+                    self.send_json(200, catalog.layers_for_race(root, (query.get('race') or [''])[0]))
+                except catalog.NotFound as exc:
+                    self.fail(404, str(exc))
+            elif path == '/api/v2/queue':
+                self.send_json(200, orchestrator.queue_state(root, bool(ctx.get('orchestrator'))))
             elif path == '/api/v2/item':
                 try:
                     self.send_json(200, catalog.item(root, (query.get('id') or [''])[0]))
@@ -292,11 +320,13 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
                     self.send_json(200, result)
                     return
                 body = json.loads(self.read_body(BODY_LIMIT))
-                handler = actions.perform if split.path == '/api/v2/action' else actions.set_lod
+                handler = {'/api/v2/action': actions.perform, '/api/v2/lod': actions.set_lod, '/api/v2/amount': actions.set_amount,
+                           '/api/v2/queue': actions.queue_op}[split.path]
                 self.send_json(200, handler(root, body))
             except guard.Conflict as exc:
                 catalog.invalidate()
-                extra = {'rev': exc.current} if isinstance(exc, decisions.RevConflict) else {}
+                extra = {k: v for k, v in (getattr(exc, 'extra', None) or {}).items() if k in ('changes',)}      # e.g. `changes` of 409 changed / stale
+                extra |= {'rev': exc.current} if isinstance(exc, decisions.RevConflict) else {}
                 self.send_json(409, {'ok': False, 'error': str(exc), 'code': exc.code, 'item': self.current_item(body)} | extra)
             except catalog.NotFound as exc:
                 self.fail(404, str(exc))
@@ -317,8 +347,12 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     lock: guard.ServerLock | None = None
+    orchestrator: orchestrator.Orchestrator | None = None
 
     def server_close(self) -> None:
+        if self.orchestrator:
+            self.orchestrator.stop()           # the thread and its lock; running builds are detached and keep going
+            self.orchestrator = None
         super().server_close()
         if self.lock:
             self.lock.release()
@@ -326,9 +360,11 @@ class Server(ThreadingHTTPServer):
 
 
 def create_server(root: Path = DEFAULT_ROOT, host: str = '127.0.0.1', port: int = 0, token: str | None = None, web: Path = WEB,
-                  extra_hosts: list[str] | None = None, read_only: bool | None = None) -> Server:
+                  extra_hosts: list[str] | None = None, read_only: bool | None = None, run_orchestrator: bool = False) -> Server:
     """`extra_hosts` = additional accepted Host names (None = discover the tailnet name and settings.json; [] = loopback only).
-    `read_only` None = take the single-writer lock and serve read-only when another server holds it; True = never write."""
+    `read_only` None = take the single-writer lock and serve read-only when another server holds it; True = never write.
+    `run_orchestrator` starts the layer-build orchestrator thread, only in the server that holds the writer lock (and its own
+    orchestrator.lock: when another process holds that, this server is read-only with a banner)."""
     root = Path(root)
     token = token or secrets.token_urlsafe(18)
     ctx: dict = {'hosts': None, 'read_only': False, 'message': None, 'notes': []}
@@ -344,6 +380,14 @@ def create_server(root: Path = DEFAULT_ROOT, host: str = '127.0.0.1', port: int 
     else:
         server.lock = lock
         ctx['notes'] = actions.recover_at_start(root)
+        if run_orchestrator:
+            runner = orchestrator.Orchestrator(root)
+            if runner.start():
+                server.orchestrator = runner
+                ctx['orchestrator'] = True
+            else:
+                ctx['read_only'] = True
+                ctx['message'] = 'Read-only: another process holds the orchestrator lock (.codex_jobs/_app/orchestrator.lock) and runs the builds'
     return server
 
 
@@ -353,10 +397,11 @@ def main() -> None:
     parser.add_argument('--root', type=Path, default=DEFAULT_ROOT)
     parser.add_argument('--open', action='store_true')
     parser.add_argument('--read-only', action='store_true')
+    parser.add_argument('--no-orchestrator', action='store_true', help='do not run the layer-build orchestrator in this server')
     args = parser.parse_args()
-    server = create_server(args.root.resolve(), port=args.port, read_only=True if args.read_only else None)
+    server = create_server(args.root.resolve(), port=args.port, read_only=True if args.read_only else None, run_orchestrator=not args.no_orchestrator)
     url = f'http://127.0.0.1:{server.server_port}/'
-    print(url, '(read-only)' if server.ctx['read_only'] else '', flush=True)
+    print(url, '(read-only)' if server.ctx['read_only'] else '', '(orchestrator)' if server.ctx.get('orchestrator') else '', flush=True)
     for note in server.ctx['notes']:
         print('recovery:', note, flush=True)
     if args.open:

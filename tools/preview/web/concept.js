@@ -4,7 +4,7 @@
 // Space = next, arrows = previous / next. modal.js drops every shortcut whose target is a button / input / select / textarea.
 import { api } from './api.js';
 import { h, layered, picture, pretty, button } from './util.js';
-import { onDialogBody } from './modal.js';
+import { mutationKey, onDialogBody } from './modal.js';
 import { verbClass, verbLabel } from './actions.js';
 
 /** Verbs offered in the dialog: the card's own, plus Archive for concepts (the dialog has room for it). */
@@ -56,7 +56,7 @@ export async function showConcept(modal, host) {
   modal.setKeyHandler(event => {
     const has = verb => verbs.includes(verb);
     const key = event.key.toLowerCase();
-    const run = verb => { event.preventDefault(); if (!event.repeat) act(verb); return true; };
+    const run = verb => mutationKey(event, () => act(verb));   // fresh press only: a held key never repeats the verb
     if (event.key === 'Enter' && has('approve') && onDialogBody(event)) return run('approve');   // never while a button has focus
     if (key === 'p' && has('provisional')) return run('provisional');
     if (event.key === 'Escape' && has('reject')) return run('reject');

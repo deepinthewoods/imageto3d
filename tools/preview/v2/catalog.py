@@ -19,8 +19,10 @@ for _p in (HERE.parent, HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 import serve  # noqa: E402  (tools/preview/serve.py, used as a library)
+import builds  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
+import taskqueue  # noqa: E402
 
 monsters = serve.monsters
 NAME = serve.NAME
@@ -241,7 +243,12 @@ def _models_scan(root: Path, model_set: str, races: list[str], deps: dict) -> di
     if top.get(decisions.FILENAME) is False:
         serve._stamp(f'{base}/{decisions.FILENAME}', deps)
         raw, error = decisions.read_raw(Path(f'{base}/{decisions.FILENAME}'))
-    return {'jobs': jobs, 'decisions': raw, 'decisions_error': error}
+    ready = None
+    if top.get(decisions.READY) is False:
+        serve._stamp(f'{base}/{decisions.READY}', deps)
+        value = read_json(Path(f'{base}/{decisions.READY}'))
+        ready = {'approval_id': value.get('approval_id') if isinstance(value.get('approval_id'), str) else None}
+    return {'jobs': jobs, 'decisions': raw, 'decisions_error': error, 'ready': ready}
 
 
 def scan_models(root: Path, races: list[str], plan: dict[str, list[str]]) -> dict[str, dict]:
@@ -257,7 +264,7 @@ def scan_models(root: Path, races: list[str], plan: dict[str, list[str]]) -> dic
             for job_id, by_race in scanned[ms]['jobs'].items():
                 merged.setdefault(job_id, {}).update(by_race)
         own = scanned.get(set_name) or {'decisions': None, 'decisions_error': None}
-        out[set_name] = {'jobs': merged, 'decisions': own['decisions'], 'decisions_error': own['decisions_error']}
+        out[set_name] = {'jobs': merged, 'decisions': own['decisions'], 'decisions_error': own['decisions_error'], 'ready': own.get('ready')}
     return out
 
 
@@ -290,8 +297,93 @@ def required_races(jobs: list[dict], fronts: dict, dec: dict, races: list[str]) 
     return [race for race in races if race in wanted] + sorted(r for r in wanted if r not in races)
 
 
-def derive_set(root: Path, set_name: str, jobs: list[dict], models: dict, races: list[str], fronts: dict | None = None) -> dict:
-    """The units, stage and decisions of one claimed set (DESIGN.md section 2)."""
+AMOUNT_GROUPS = {'armour': ('body', 'limbs'), 'outfit': ('outfit',), 'legacy': ('outfit',)}
+SLOT_GROUP = {'torso': 'body', 'lower_arm.l': 'limbs', 'lower_arm.r': 'limbs', 'lower_leg.l': 'limbs', 'lower_leg.r': 'limbs', 'outfit': 'outfit'}
+DEFAULT_AMOUNT = 100
+
+
+def amount_of(dec: dict, race: str, group: str) -> int:
+    groups = dec['amount'].get(race)
+    value = groups.get(group) if isinstance(groups, dict) else None
+    return value if isinstance(value, int) and not isinstance(value, bool) else DEFAULT_AMOUNT
+
+
+def _unit_builds(root: Path, set_name: str, units: list[dict], dec: dict) -> dict[str, dict]:
+    """`{"race/module": build record}` of the approved units of a set (empty without a 3D approval; see builds.unit_build).
+    pin_missing and dropped units have none: they cannot be built."""
+    approved = (dec['lod_approval'] or {}).get('units')
+    if not isinstance(approved, dict):
+        return {}
+    by_unit: dict[str, list[dict]] = {}
+    try:                     # the queue is a derived cache: a damaged database must never break the catalog (its health is in /api/v2/state)
+        tasks = taskqueue.for_root(root).tasks(lane='layers', set_name=set_name, limit=2000)
+    except Exception:  # noqa: BLE001
+        tasks = []
+    for task in tasks:
+        by_unit.setdefault(task['unit'], []).append(task)
+    stale = builds.stale_state(root)['units']
+    now = time.time()
+    stall = builds.stall_minutes(root)
+    out = {}
+    for unit in units:
+        key = f'{unit["race"]}/{unit["module"]}'
+        if unit['status'] == 'reduced' and isinstance(approved.get(key), dict):
+            out[key] = builds.unit_build(root, set_name, key, unit, approved[key], by_unit.get(key, []), stale, now, stall)
+    return out
+
+
+def bare_builds(root: Path, races: list[str]) -> dict[str, dict]:
+    """`item.bare_builds` = {race: builds.bare_build(...)} (status, build_id, task) of the live races of an approved set."""
+    try:
+        tasks = taskqueue.for_root(root).tasks(lane='bare', limit=2000)
+    except Exception:  # noqa: BLE001  (a damaged queue never breaks the item)
+        tasks = []
+    stale = builds.stale_state(root)['bare']
+    now, stall = time.time(), builds.stall_minutes(root)
+    return {race: builds.bare_build(race, [t for t in tasks if t['unit'] == race], stale, now, stall) for race in races}
+
+
+def completed_problems(dec: dict, live_keys: list[str], unit_builds: dict[str, dict], races: list[str], ready: dict | None) -> list[str]:
+    """Why the Aligned approval does not hold any more (empty = Completed; phase 3 review F3): the approved unit set must be the live required
+    unit set (frozen required races) and the 3D-approved set, every approved build id must be the published one, every approved bare build
+    must still be the published bare build of its race, and models/<set>/ready.json must carry the approval's `approval_id`."""
+    approval, pinned = dec['aligned_approval'] or {}, (dec['lod_approval'] or {}).get('units') or {}
+    approved = approval.get('units') if isinstance(approval.get('units'), dict) else {}
+    out = []
+    live = set(live_keys)
+    if set(approved) != live:
+        out.append('approved units differ from the live units')
+    if set(pinned) != live:
+        out.append('3D-approved units differ from the live units')
+    for key in sorted(live):
+        rec, entry = unit_builds.get(key), approved.get(key)
+        if not rec or rec['status'] not in builds.BUILT:
+            out.append(f'{key}: no published build')
+        elif not isinstance(entry, dict) or entry.get('build_id') != rec['build_id']:
+            out.append(f'{key}: published build is not the approved one')
+    bare = approval.get('bare') if isinstance(approval.get('bare'), dict) else {}
+    for race in races:
+        ptr = builds.bare_pointer(race)
+        if not ptr or bare.get(race) != ptr['build_id']:
+            out.append(f'bare {race}: published bare build is not the approved one')
+    approval_id = approval.get('approval_id')
+    if not approval_id or not ready or ready.get('approval_id') != approval_id:
+        out.append('ready.json is missing or belongs to another approval')
+    return out
+
+
+def _amount_changed(dec: dict, kind: str, races: list[str]) -> bool:
+    """The saved Amount differs from the one the Aligned approval froze (races x groups of the set's kind, default 100)."""
+    approval = dec['aligned_approval']
+    if not approval:
+        return False
+    frozen = {'amount': approval.get('amount') if isinstance(approval.get('amount'), dict) else {}}
+    return any(amount_of(dec, race, group) != amount_of(frozen, race, group) for race in races for group in AMOUNT_GROUPS.get(kind, ('outfit',)))
+
+
+def derive_set(root: Path, set_name: str, jobs: list[dict], models: dict, races: list[str], fronts: dict | None = None,
+               intents: list[dict] | None = None) -> dict:
+    """The units, stage and decisions of one claimed set (DESIGN.md section 2). `intents` = the unresolved guard intents (read-only marker)."""
     dec, dec_error = decisions.interpret(set_name, (models or {}).get('decisions'), (models or {}).get('decisions_error'))
     model_jobs = (models or {}).get('jobs', {})
     modules = sorted({m for job in jobs for _race, m in job['modules']}, key=lambda m: (MODULE_RANK.get(m, 99), m))
@@ -319,7 +411,10 @@ def derive_set(root: Path, set_name: str, jobs: list[dict], models: dict, races:
                 chosen = pin if pin else max(reduced, key=lambda j: (reduced[j]['mtime'], j))
                 entry = reduced[chosen]
                 unit |= {'status': 'reduced', 'job': chosen, 'lod': entry['lod'] or DEFAULT_LOD, 'lod_saved': entry['lod'] is not None,
-                         'model_set': entry['set'], 'multi': sorted(reduced) if len(reduced) > 1 else None}
+                         'model_set': entry['set'], 'multi': sorted(reduced) if len(reduced) > 1 else None, 'frozen': False}
+                if pin:
+                    # a 3D-approved unit shows the FROZEN LOD of the approval, never the mutable chosen_lod.json (phase 1 review #12)
+                    unit |= {'lod': pinned[key]['lod'], 'lod_saved': True, 'frozen': True}
                 if chosen in job_by_id:
                     record = job_by_id[chosen]
                     unit['folder'] = record['rel']
@@ -341,20 +436,34 @@ def derive_set(root: Path, set_name: str, jobs: list[dict], models: dict, races:
             units.append(unit)
     live = [u for u in units if u['status'] != 'dropped']
     blocking = [u for u in live if u['status'] not in ('reduced', 'pin_missing')]
+    kind = _kind_of(modules)
+    unit_builds = _unit_builds(root, set_name, units, dec)
+    for unit in units:
+        rec = unit_builds.get(f'{unit["race"]}/{unit["module"]}')
+        unit['source_changed'] = bool(rec and rec['status'] == builds.SOURCE_CHANGED)
+    counts = builds.counts(unit_builds)
+    live_races = [r for r in required if r not in dec['dropped']]
+    not_completed = []
     if live and not blocking:
         stage = '3d'
-        if dec['lod_approval']:
-            stage = 'aligned'          # phase 3 adds "layer builds published" here
+        if dec['lod_approval'] and counts['built'] >= counts['total']:          # rule 3: every approved unit's layer build is published (or stale)
+            stage = 'aligned'
             if dec['aligned_approval']:
-                stage = 'completed'
+                not_completed = completed_problems(dec, [f'{u["race"]}/{u["module"]}' for u in live], unit_builds, live_races,
+                                                   (models or {}).get('ready'))
+                if not not_completed:
+                    stage = 'completed'
     else:
         stage = 'approved'
     not_converted = [{'race': r, 'reason': 'fronts failed' if (fronts or {}).get(r) == 'failed' else 'never claimed'}
                      for r in races if r not in required]
-    return {'name': set_name, 'kind': _kind_of(modules), 'modules': modules, 'stage': stage, 'units': units,
+    recovering = [rec for rec in (intents or []) if rec.get('set') == set_name]
+    return {'name': set_name, 'kind': kind, 'modules': modules, 'stage': stage, 'units': units,
+            'builds': unit_builds, 'build_counts': counts, 'amount_changed': _amount_changed(dec, kind, [u['race'] for u in live]),
             'decisions': dec, 'decisions_error': dec_error, 'rev': dec['rev'], 'jobs': jobs,
             'required_races': required, 'not_converted': not_converted, 'locked': bool(dec['lod_approval']),
-            'races': [r for r in required if r not in dec['dropped']]}
+            'races': live_races, 'ready': (models or {}).get('ready'), 'not_completed': not_completed,
+            'recovering': [{'id': rec['id'], 'label': rec.get('label'), 'conflict': bool(rec.get('conflict'))} for rec in recovering]}
 
 
 def derive_all(root: Path) -> dict:
@@ -366,7 +475,8 @@ def _derive_all(root: Path) -> dict:
     jobs, retired = scan_jobs(root, races)
     models = scan_models(root, races, {name: model_sets(name, jobs[name]) for name in sorted(jobs)})
     fronts = fronts_index(root, races)
-    sets = {name: derive_set(root, name, jobs[name], models.get(name), races, fronts.get(name)) for name in sorted(jobs)}
+    intents = guard.list_intents(root)
+    sets = {name: derive_set(root, name, jobs[name], models.get(name), races, fronts.get(name), intents) for name in sorted(jobs)}
     return {'races': races, 'sets': sets, 'retired': retired}
 
 
@@ -377,7 +487,7 @@ def derive_one(root: Path, set_name: str) -> dict | None:
     if set_name not in jobs:
         return None
     models = scan_models(root, races, {set_name: model_sets(set_name, jobs[set_name])})
-    return derive_set(root, set_name, jobs[set_name], models[set_name], races, fronts_index(root, races).get(set_name))
+    return derive_set(root, set_name, jobs[set_name], models[set_name], races, fronts_index(root, races).get(set_name), guard.list_intents(root))
 
 
 # ------------------------------------------------------------------------------------------------------------------ cards
@@ -423,6 +533,8 @@ def set_card(root: Path, info: dict) -> dict:
     thumbnail = model = kind = None
     if info['decisions_error']:
         badges.append({'text': 'decisions unreadable', 'tone': 'error'})
+    if info.get('recovering'):
+        badges.append({'text': 'recovering: read-only', 'tone': 'error'})
     if stage == 'approved':
         badges.append({'text': f'reduced {counts["reduced"]}/{len(live)}', 'tone': 'info'})
         for status, tone in (('converting', 'info'), ('ready', 'info'), ('views', 'info'), ('held', 'warn'), ('failed', 'error'),
@@ -442,6 +554,21 @@ def set_card(root: Path, info: dict) -> dict:
             model = serve.rel_url(root, glb)
             thumbnail = serve.fresh_thumb(root, glb)
             kind = 'render' if thumbnail else None
+    counts = info.get('build_counts') or {}
+    if info['decisions']['lod_approval'] and counts.get('total'):
+        if stage == '3d':
+            if counts['building']:
+                badges.append({'text': f'building {counts["built"]}/{counts["total"]}', 'tone': 'info'})
+            if counts['failed']:
+                badges.append({'text': f'build failed {counts["failed"]}', 'tone': 'error'})
+            if counts['none']:
+                badges.append({'text': f'not built {counts["none"]}', 'tone': 'warn'})
+        if counts.get('source_changed'):
+            badges.append({'text': f'source changed {counts["source_changed"]}', 'tone': 'error'})
+        if counts['stale']:
+            badges.append({'text': f'stale {counts["stale"]}', 'tone': 'warn'})
+    if info.get('amount_changed'):
+        badges.append({'text': 'amount changed since approval', 'tone': 'warn'})
     alerts = _alert_units(live)
     if alerts:
         badges.append({'text': f'warnings {alerts}', 'tone': 'warn'})
@@ -490,14 +617,19 @@ RECOVERY_KINDS = {'flat_move': 'interrupted move', 'files_tx': 'interrupted writ
 
 
 def recovery_card(rec: dict) -> dict:
-    """A Trash-tab card for an interrupted multi-step change (guard.py intents): Complete / Roll back."""
+    """A Trash-tab card for an interrupted multi-step change (guard.py intents). Moves: Complete / Roll back. Writes: Roll back; a write whose
+    files were changed again since (`conflict`) needs a manual choice: Complete = keep the files as they are now, Roll back = restore the backups."""
     kind = rec.get('kind')
-    actions = ['complete', 'rollback'] if kind == 'flat_move' else ['rollback']
+    conflict = bool(rec.get('conflict'))
+    actions = ['complete', 'rollback'] if kind == 'flat_move' or conflict else ['rollback']
+    badges = [{'text': RECOVERY_KINDS.get(kind, str(kind)), 'tone': 'warn'}, {'text': str(rec.get('created') or '')[:19], 'tone': 'info'}]
+    if conflict:
+        badges.insert(0, {'text': 'conflict: choose keep or restore', 'tone': 'error'})
+    if rec.get('set'):
+        badges.append({'text': f'set {rec["set"]} read-only', 'tone': 'warn'})
     return {'id': f'intent:{rec["id"]}', 'type': 'character', 'kind': 'recovery', 'name': rec['id'],
             'title': f'Recovery: {rec.get("label") or RECOVERY_KINDS.get(kind, kind)}', 'stage': 'trash', 'thumbnail': None, 'thumbnail_kind': None,
-            'model': None, 'races': [], 'badges': [{'text': RECOVERY_KINDS.get(kind, str(kind)), 'tone': 'warn'},
-                                                   {'text': str(rec.get('created') or '')[:19], 'tone': 'info'}],
-            'actions': actions, 'progress': None}
+            'model': None, 'races': [], 'badges': badges, 'actions': actions, 'progress': None}
 
 
 def monster_stage(raw: dict) -> str:
@@ -594,13 +726,38 @@ def set_item_of(root: Path, info: dict) -> dict:
         units.append({'race': unit['race'], 'module': unit['module'], 'status': unit['status'], 'job': unit['job'], 'jobs': unit['jobs'],
                       'folder': unit['folder'], 'views': views,
                       'lods': _lods_of(root, unit) if unit['status'] == 'reduced' else {},
-                      'lod': unit['lod'], 'lod_saved': unit['lod_saved'], 'error': unit['error'], 'backend': unit['backend'],
+                      'lod': unit['lod'], 'lod_saved': unit['lod_saved'], 'frozen': bool(unit.get('frozen')),
+                      'source_changed': bool(unit.get('source_changed')), 'error': unit['error'], 'backend': unit['backend'],
                       'model_set': unit['model_set'], 'warnings': unit['warnings'], 'review_levels': unit['review_levels']})
     card = set_card(root, info)
+    bare = {race: builds.bare_slots(root, race) for race in info['races']} if info['locked'] else {}
+    bare_state = bare_builds(root, info['races']) if info['locked'] else {}
     return {'id': f'set:{set_name}', 'name': set_name, 'kind': info['kind'], 'stage': info['stage'], 'rev': info['rev'],
             'races': info['races'], 'required_races': info['required_races'], 'not_converted': info['not_converted'],
             'modules': info['modules'], 'locked': info['locked'], 'error': info['decisions_error'], 'units': units,
-            'decisions': info['decisions'], 'builds': {}, 'card': card}
+            'decisions': info['decisions'], 'builds': info['builds'], 'bare': bare, 'bare_builds': bare_state,
+            'not_completed': info.get('not_completed') or [], 'recovering': info.get('recovering') or [], 'card': card}
+
+
+def layers_for_race(root: Path, race: str) -> dict:
+    """GET /api/v2/layers?race=R: the bare layers of the race and every published build of it in sets in 3d / aligned / completed
+    (`amount` = the set's saved Amount of the group of the slot: torso -> body, lower_* -> limbs, outfit -> outfit; default 100)."""
+    derived = derive_all(root)
+    if race not in derived['races']:
+        raise NotFound(f'Unknown race {race}')
+    layers = []
+    for name, info in sorted(derived['sets'].items()):
+        if info['stage'] not in ('3d', 'aligned', 'completed') or not info['locked']:
+            continue
+        title = pretty(name)
+        for key, rec in sorted(info['builds'].items()):
+            unit_race, module = key.split('/', 1)
+            if unit_race != race or rec['status'] not in builds.BUILT:
+                continue
+            for slot, url in sorted(rec['slots'].items()):
+                layers.append({'set': name, 'title': title, 'kind': info['kind'], 'module': module, 'slot': slot, 'url': url, 'stage': info['stage'],
+                               'build_id': rec['build_id'], 'amount': amount_of(info['decisions'], race, SLOT_GROUP.get(slot, 'outfit'))})
+    return {'race': race, 'bare': builds.bare_slots(root, race), 'layers': layers}
 
 
 def _concept_raw(root: Path, item_id: str) -> dict:
@@ -643,7 +800,8 @@ def item(root: Path, item_id: str) -> dict:
         card = recovery_card(rec)
         files = rec.get('files') or []
         facts = {'kind': rec.get('kind'), 'label': rec.get('label'), 'created': rec.get('created'), 'files': len(files),
-                 'verb': rec.get('verb'), 'approved_set': rec.get('approved_set')}
+                 'verb': rec.get('verb'), 'approved_set': rec.get('approved_set'), 'set': rec.get('set'), 'conflict': rec.get('conflict'),
+                 'conflict_files': rec.get('conflict_files')}
         facts = {k: v for k, v in facts.items() if v not in (None, '')}
         return card | {'detail': {'races': [{'name': 'recovery', 'images': {}, 'info': {'intent': facts}}]}}
     if item_id.startswith('review:'):

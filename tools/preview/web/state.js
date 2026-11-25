@@ -17,8 +17,22 @@ export const state = {
   paused: null,
   /** {read_only, message, notes}: this server may be a read-only second instance (another one holds the writer lock) */
   server: { read_only: false, message: null, notes: [] },
+  /** GET /api/v2/state `queue_health` as the server sent it, and its error texts (see queueHealthErrors) */
+  queueHealth: null,
+  queueErrors: [],
   error: null,
 };
+
+/** The error texts of the state's `queue_health`: a string, a list of strings / {message|error}, or {ok, errors|error}. */
+export function queueHealthErrors(health) {
+  if (health == null || health === true) return [];
+  const text = entry => (typeof entry === 'string' ? entry : entry?.message || entry?.error || JSON.stringify(entry));
+  if (typeof health === 'string') return [health];
+  if (Array.isArray(health)) return health.map(text);
+  const list = [].concat(health.errors ?? health.error ?? []).filter(Boolean).map(text);
+  if (!list.length && health.ok === false) list.push(health.message || 'queue unhealthy');
+  return list;
+}
 
 let raw = null;          // last server response
 let rawText = '';        // its JSON, to skip identical polls
@@ -55,6 +69,8 @@ function derive() {
   state.credits = raw?.credits ?? null;
   state.paused = raw?.paused ?? null;
   state.server = raw?.server ?? { read_only: false, message: null, notes: [] };
+  state.queueHealth = raw?.queue_health ?? null;
+  state.queueErrors = queueHealthErrors(state.queueHealth);
 }
 
 /** Fetch the state; resolves true when something changed. Responses overtaken by a newer request are dropped. */

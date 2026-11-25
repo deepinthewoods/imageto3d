@@ -43,7 +43,9 @@ export function button(label, onclick, cls = '', title = '') {
 }
 
 export function badge(text, tone = '') {
-  return h('span', { class: 'badge' + (tone ? ' tone-' + tone : ''), text, title: text });
+  // "building n/m" pulses so a set that is still working is not mistaken for a finished one
+  const busy = /^building/i.test(text) ? ' busy' : '';
+  return h('span', { class: 'badge' + (tone ? ' tone-' + tone : '') + busy, text, title: text });
 }
 
 /** An <img> that does not take part in layout until loaded. */

@@ -6,12 +6,16 @@ multi-file write transaction (DESIGN.md section 6). Stdlib only; nothing here kn
 * `ServerLock` (`.codex_jobs/_app/server.lock`): the one v2 server per root that may write; a second server serves read-only.
 * Intents (`.codex_jobs/_app/intents/<id>.json`) are written BEFORE a multi-step change and deleted when it finished, so an
   interrupted change is found again (listed in the Trash tab as "Recovery", or rolled back at the next server start).
-* `apply_transaction`: all-or-nothing replacement of several small files (in-memory backups + an intent for a crash).
+* `apply_transaction`: all-or-nothing replacement of several small files (in-memory backups + an intent for a crash). The intent names the
+  set it belongs to and the sha256 of every file's old and new content: recovery (`recover_files`) restores a backup only while each file still
+  holds what the transaction wrote (or its old content); anything else is a CONFLICT left for a manual choice (phase 3 review F8). While a set has
+  an unresolved intent every write of that set is refused (`check_recovering`, HTTP 409 `recovering`).
 """
 from __future__ import annotations
 
 import base64
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -66,9 +70,34 @@ class JobMismatch(Conflict):
     code = 'job'
 
 
+class AlreadyApproved(Conflict):
+    """The set already has the approval this verb would write (send it back first)."""
+    code = 'approved'
+
+
+class StaleChoice(Conflict):
+    """A LOD or conversion the client sent is not what the server has (reload)."""
+    code = 'lod'
+
+
 class Busy(Conflict):
     """Another process holds the lock (a claim in progress, or another writer)."""
     code = 'busy'
+
+
+class Changed(Conflict):
+    """The approval request does not describe what the server has now (another conversion, LOD, build or race than the client displayed)."""
+    code = 'changed'
+
+
+class StaleBuild(Conflict):
+    """A displayed build is stale (code / inputs changed) or its pinned source GLB changed: rebuild, or send the set back to 3D."""
+    code = 'stale'
+
+
+class Recovering(Conflict):
+    """The set has an interrupted multi-file change that is not resolved yet: read-only until recovery finishes."""
+    code = 'recovering'
 
 
 class ReadOnly(Exception):
@@ -288,8 +317,65 @@ def list_intents(root: Path) -> list[dict]:
 
 # ------------------------------------------------------------------------------------------------------------ transaction
 
+_FAULTS: dict = {}        # tests only: {'replace': fn(path) called before every file after the first, 'rollback': fn() before the rollback}
+
 def _rel(root: Path, path: Path) -> str:
     return Path(path).resolve().relative_to(Path(root).resolve()).as_posix()
+
+
+def sha256_or_none(data: bytes | None) -> str | None:
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def set_intents(root: Path, set_name: str) -> list[dict]:
+    """Unresolved intents (not running in this process right now) that belong to `set_name`."""
+    return [rec for rec in list_intents(root) if rec.get('set') == set_name]
+
+
+def check_recovering(root: Path, set_name: str) -> None:
+    """Refuse (409 `recovering`) a write of a set with an unresolved interrupted change."""
+    pending = set_intents(root, set_name)
+    if pending:
+        state = 'needs a manual choice in Trash > Recovery' if any(r.get('conflict') for r in pending) else 'is being recovered'
+        raise Recovering(f'{set_name} has an interrupted change ({pending[0].get("label")}) that {state}; try again when it is resolved')
+
+
+def recovery_plan(root: Path, files: list[dict]) -> tuple[list[dict], list[str]]:
+    """(entries to restore, conflicting paths) of an interrupted transaction. A file is restored when it still holds what the transaction
+    wrote (`after_sha256`), skipped when it already holds its old content, and a CONFLICT otherwise (a later write changed it). An entry of an
+    old intent without `after_sha256` can only be skipped (old content) or is a conflict."""
+    restore, conflicts = [], []
+    for entry in files:
+        path = Path(root) / entry['path']
+        try:
+            current = sha256_or_none(read_bytes_or_none(path))
+        except OSError as exc:
+            conflicts.append(f'{entry["path"]} ({exc})')
+            continue
+        before = entry.get('before_b64')
+        before_sha = entry.get('before_sha256', sha256_or_none(None if before is None else base64.b64decode(before)))
+        if current == before_sha:
+            continue
+        if 'after_sha256' in entry and current == entry['after_sha256']:
+            restore.append(entry)
+        else:
+            conflicts.append(entry['path'])
+    return restore, conflicts
+
+
+def recover_files(root: Path, rec: dict, force: bool = False) -> str:
+    """Roll an interrupted transaction back: 'restored' (every file is back to its old content), or 'conflict' (nothing was changed: some file
+    holds content neither the transaction nor its backup has). `force` (a manual choice) restores every backup anyway. Call it under the
+    set's lock."""
+    files = rec.get('files') or []
+    if force:
+        restore_files(root, files)
+        return 'restored'
+    restore, conflicts = recovery_plan(root, files)
+    if conflicts:
+        return 'conflict'
+    restore_files(root, restore)
+    return 'restored'
 
 
 def restore_files(root: Path, files: list[dict]) -> None:
@@ -312,19 +398,21 @@ def restore_files(root: Path, files: list[dict]) -> None:
         raise OSError('; '.join(errors))
 
 
-def apply_transaction(root: Path, label: str, plan: list[tuple[Path, bytes | None]]) -> None:
-    """Replace several files all-or-nothing. `plan` = [(path, new bytes | None to delete)].
+def apply_transaction(root: Path, label: str, plan: list[tuple[Path, bytes | None]], set_name: str | None = None) -> None:
+    """Replace several files all-or-nothing. `plan` = [(path, new bytes | None to delete)]; `set_name` = the set the files belong to (its writes
+    are refused while the intent is unresolved).
 
-    1. back the old contents up (memory + an intent file, so a crash can still be rolled back at the next start);
+    1. back the old contents up (memory + an intent file with the old and new sha256 of every file, so a crash can still be rolled back);
     2. write every new content to a unique temp file next to its target;
     3. replace / delete one by one; on any error restore the already replaced ones from the backups.
     The intent is removed when everything is in place or fully rolled back; if the rollback itself fails it stays for recovery."""
     root = Path(root)
     backups = []
-    for path, _new in plan:
+    for path, new in plan:
         old = read_bytes_or_none(path)
-        backups.append({'path': _rel(root, path), 'before_b64': None if old is None else base64.b64encode(old).decode('ascii')})
-    intent = new_intent(root, {'kind': 'files_tx', 'label': label, 'files': backups})
+        backups.append({'path': _rel(root, path), 'before_b64': None if old is None else base64.b64encode(old).decode('ascii'),
+                        'before_sha256': sha256_or_none(old), 'after_sha256': sha256_or_none(new)})
+    intent = new_intent(root, {'kind': 'files_tx', 'label': label, 'files': backups} | ({'set': set_name} if set_name else {}))
     temps: list[Path | None] = []
     try:
         try:
@@ -336,7 +424,9 @@ def apply_transaction(root: Path, label: str, plan: list[tuple[Path, bytes | Non
                 tmp = tmp_name(path)
                 temps.append(tmp)
                 tmp.write_bytes(new)
-            for (path, new), tmp in zip(plan, temps):
+            for index, ((path, new), tmp) in enumerate(zip(plan, temps)):
+                if index and _FAULTS.get('replace'):
+                    _FAULTS['replace'](path)
                 if tmp is None:
                     try:
                         path.unlink()
@@ -346,9 +436,11 @@ def apply_transaction(root: Path, label: str, plan: list[tuple[Path, bytes | Non
                     replace_retry(tmp, path)
         except BaseException:
             try:
+                if _FAULTS.get('rollback'):
+                    _FAULTS['rollback']()
                 restore_files(root, backups)
             except OSError:
-                abandon_intent(intent)           # the intent file stays: Recovery / the next start finishes the rollback
+                abandon_intent(intent)           # the intent file stays: Recovery / the orchestrator finishes the rollback
                 raise
             finish_intent(root, intent)
             raise

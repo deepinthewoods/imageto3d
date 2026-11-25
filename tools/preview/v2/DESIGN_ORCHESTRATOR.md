@@ -56,12 +56,13 @@ v2 does **not** rewrite them. The server becomes their **process manager**, give
   is fresh (< 30 s), else `GetLastInputInfo` (same rule as the supervisor: away = idle >= 300 s).
 
 ## 2. v2 lanes (new work owned by the server)
-### Queue store `.codex_jobs/_app/queue.sqlite3` (`v2/queue.py`, stdlib sqlite3, WAL)
+### Queue store `.codex_jobs/_app/queue.sqlite3` (`v2/taskqueue.py`, stdlib sqlite3, WAL)
 ```sql
 tasks(id INTEGER PRIMARY KEY, lane TEXT, key TEXT UNIQUE, set_name TEXT, unit TEXT, args TEXT /*json*/,
-      state TEXT /*queued|running|done|failed|cancelled*/, priority INTEGER, attempts INTEGER, max_attempts INTEGER,
+      state TEXT /*queued|starting|running|done|failed|cancelled*/, priority INTEGER, attempts INTEGER, max_attempts INTEGER,
       pid INTEGER, pid_create REAL, started REAL, finished REAL, log TEXT, result TEXT /*json*/, error TEXT,
-      created REAL, updated REAL)
+      created REAL, updated REAL, not_before REAL /*retry backoff, added in phase 3*/,
+      token TEXT, builder_pid INTEGER, builder_create REAL, kill_requested INTEGER /*phase 3 review: attempts, Kill & retry*/)
 events(id INTEGER PRIMARY KEY, time REAL, task_id INTEGER, kind TEXT, detail TEXT)
 ```
 - `key` = `<lane>:<set>:<race>/<module>:<lod>:<job>`. Enqueueing an existing key that is done or running is a no-op. A failed one
@@ -69,15 +70,24 @@ events(id INTEGER PRIMARY KEY, time REAL, task_id INTEGER, kind TEXT, detail TEX
 - Only the orchestrator thread writes task state. HTTP handlers call `queue.enqueue` / `queue.request(op)`, which take the same
   lock.
 
-### Running a task
-- Each task runs `python tools/preview/v2/run_task.py <task-json-file>` detached, so it survives a server restart.
-- `run_task.py` runs the real command (e.g. `python tools/layers/build.py module <dir> --lod 0p2`), tees output to
-  `.codex_jobs/_app/logs/<task id>.log`, and on exit writes `<task id>.result.json` (`{exit, last_json, finished}`).
+### Running a task (attempts; phase 3 review F5-F10, DESIGN_PHASE3.md section F)
+- Each START is an attempt, COMMITTED before anything is spawned: `queued -> starting` only from `queued` (a cancel wins), with a new uuid
+  `token`, attempts + 1 and the attempt's own files `.codex_jobs/_app/logs/<id>-a<n>.log / .err.log / .result.json / .claim.json / .task.json`.
+- Each attempt runs `python tools/preview/v2/run_task.py <task json> --token <token>` detached, so it survives a server restart. The wrapper FIRST
+  writes the claim file (token, task, its own pid + create time), starts the real command (e.g. `python tools/layers/build.py module <dir> --lod 0p2
+  --expect-source-sha256 <pinned digest>`), adds the builder's pid + create time to the claim, appends stdout to `.log` and stderr to `.err.log`, and
+  on exit writes `.result.json` (`{token, attempt, exit, last_json, finished}`; the verdict comes from stdout only).
 - The orchestrator loop (every 3 s) handles:
-  - **Running tasks.** A result file means the task finished: read it, set the task to done or failed, and record the result. A
-    dead PID with no result file means `failed` ("lost"), with up to 2 automatic retries for local tasks.
-  - **Queued tasks.** Start them while the lane has free slots and its gate is open.
-  - **On startup.** Adopt running PIDs (pid + create_time) before starting anything.
+  - **Active attempts.** A result file with the attempt's token finishes it: `done` needs exit 0, an `ok` / `current` verdict AND that build being
+    the valid publication; exit 0 without a verdict fails. A dead wrapper with no result means lost, with up to 2 automatic retries while the
+    approval still holds. A `starting` attempt (a crash between commit and recording the pid) with a live claim, or a live process carrying its
+    token, is adopted. Logs that stopped growing for `build_stall_minutes` show the attempt as `stalled`; Kill & retry kills the builder, then the
+    wrapper (PID + create time + command line checked) and queues a fresh attempt.
+  - **Reconcile.** The queue is a derived cache of the decisions: damaged database -> kept as `.corrupt-<time>`, rebuilt, surviving wrappers re-adopted
+    from their claims; interrupted file transactions recovered; approved units with no valid publication and no live task queued; queued tasks
+    without a matching approval cancelled; a ready.json whose approval no longer holds revoked.
+  - **Queued tasks.** Start them while the lane has free slots and its gate is open, after rechecking the approval and the pinned source digest.
+  - **On startup.** Adopt active attempts and reconcile before starting anything.
 
 ### Layer lane (phase 3)
 - **Approve in 3D** (`set:S` verb `approve`):

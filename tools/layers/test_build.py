@@ -119,6 +119,18 @@ class StubLayers:
         return {'race': race, 'set': 'bare', 'module': 'bare', 'slots': slots, 'skipped': {}, 'expected': list(slots), 'load': {}}
 
 
+BODY_PARTS = ('head.x', 'spine_01.x', 'forearm_stretch.l', 'hand.l', 'forearm_stretch.r', 'hand.r', 'leg_stretch.l', 'foot.l', 'leg_stretch.r', 'foot.r')
+
+
+def write_body(path, legs=False, salt='', compressed=False):
+    """A small game body cache npz (part / part_names like tools/preview/cache/bases/<race>.npz): with or without lower-leg faces. The fake
+    human_male of these tests is LEGLESS by default (two gloves, like the stub's default result); tests that need legs pass legs=True."""
+    part = np.array([0, 1, 2, 3, 4, 5] + ([6, 7, 8, 9] if legs else []), dtype=np.int64)
+    with open(path, 'wb') as f:
+        (np.savez_compressed if compressed else np.savez)(f, part=part, part_names=np.array(BODY_PARTS),
+                                                          salt=np.array([len(salt)] + [ord(c) for c in salt], dtype=np.int32))
+
+
 def make_module(root, set_name='set_a', job='job1', race='human_male', kind='right_gauntlet_boot'):
     mod = root / 'models' / set_name / job / race / kind
     (mod / 'reduced').mkdir(parents=True)
@@ -155,8 +167,10 @@ class Base(unittest.TestCase):
         self.mod = make_module(self.tmp)
         self.bases = self.tmp / 'bases'
         self.bases.mkdir()
-        for n in ('human_male.npz', 'human_male_rig.npz', 'gnome_female.npz', 'gnome_female_rig.npz'):
+        for n in ('human_male_rig.npz', 'gnome_female_rig.npz'):
             (self.bases / n).write_bytes(n.encode())
+        for race in ('human_male', 'gnome_female'):
+            write_body(self.bases / f'{race}.npz')
         self._old = (build.BASE_CACHE, build.BARE_ROOT, {k: sys.modules.get(k) for k in ('layers', 'body_fit', 'geodiv', 'fit_lab')}, os.environ.get('BODY_FIT_GPU'))
         build.BASE_CACHE = self.bases
         build.BARE_ROOT = self.tmp / 'bare_cache'
@@ -403,7 +417,7 @@ class PublishTest(Base):
         self.assertEqual(sorted(r['slots']), ['head', 'lower_arm.l', 'lower_arm.r', 'torso'])  # bare layers have no 'fill' morph and need none
         self.assertTrue((self.out / 'bare' / 'current_bare.json').is_file())
         self.assertEqual(build.build_bare('human_male', self.out / 'bare', gpu=False)['status'], 'current')
-        (self.bases / 'human_male.npz').write_bytes(b'new body')
+        write_body(self.bases / 'human_male.npz', salt='new body')
         r2 = build.build_bare('human_male', self.out / 'bare', gpu=False)
         self.assertEqual(r2['status'], 'ok')
         self.assertNotEqual(r2['build_id'], r['build_id'])
@@ -456,7 +470,7 @@ class PublishTest(Base):
         (self.mod / 'fit' / 'align.json').write_text('{"b": 4}', encoding='utf-8')
         self.assertEqual(self.build()['status'], 'ok')
         self.assertEqual(stub_bf._BODIES['human_male'], 'fresh')
-        (self.bases / 'human_male.npz').write_bytes(b'a different body cache (size and mtime change)')
+        write_body(self.bases / 'human_male.npz', salt='a different body cache (size and mtime change)')
         stub_gd._GAME_BODY[('human_male', 100.0)] = 'sub2'
         self.assertEqual(self.build()['status'], 'ok')                                         # the body cache changed: every cache of the race is dropped
         self.assertNotIn('human_male', stub_bf._BODIES)
@@ -472,6 +486,10 @@ class PublishTest(Base):
 
 
 class RequiredSlotsTest(Base):
+    def setUp(self):
+        super().setUp()
+        write_body(self.bases / 'human_male.npz', legs=True)                                    # these humans have legs: boots are required
+
     def test_one_glove_human_fails(self):
         self.stub.expected = ['lower_arm.r', 'lower_arm.l', 'lower_leg.r', 'lower_leg.l']
         self.stub.skipped = {'lower_arm.l': 'no garment in this slot'}
@@ -497,6 +515,62 @@ class RequiredSlotsTest(Base):
         self.stub.expected = ['lower_arm.r', 'lower_arm.l']                                    # layers.slots(): the gnome body has no leg slots
         g = build.build_module(gmod, '0p2', self.out / 'gnome', gpu=False)
         self.assertEqual((g['status'], sorted(g['slots'])), ('ok', ['lower_arm.l', 'lower_arm.r']), g.get('error'))
+        # a human result WITHOUT its boots (both boots and their declaration gone) is not the human contract: refused
+        hmod = make_module(self.tmp / 'h', race='human_male')
+        h = build.build_module(hmod, '0p2', self.out / 'human2', gpu=False)
+        self.assertEqual(h['status'], 'failed')
+        self.assertIn('lower_leg', h['error'])
+
+    def test_required_slots_come_from_the_game_body(self):
+        self.assertEqual(build.required_slots('right_gauntlet_boot', 'human_male'), ['lower_arm.l', 'lower_arm.r', 'lower_leg.l', 'lower_leg.r'])
+        self.assertEqual(build.required_slots('right_gauntlet_boot', 'gnome_female'), ['lower_arm.l', 'lower_arm.r'])
+        self.assertEqual(build.required_slots('bare', 'gnome_female'), ['head', 'torso', 'lower_arm.l', 'lower_arm.r'])
+        self.assertEqual((build.required_slots('outfit', 'gnome_female'), build.required_slots('body_armor', 'x')), (['outfit'], ['torso']))
+        write_body(self.bases / 'gnome_female.npz', legs=True, compressed=True)                 # the stdlib reader also reads a compressed npz
+        self.assertEqual(build.required_slots('bare', 'gnome_female')[-2:], ['lower_leg.l', 'lower_leg.r'])
+        for bad in (('nope', 'human_male'), ('bare', 'Bad Race'), ('bare', 'elf_female')):
+            with self.assertRaises(ValueError):
+                build.required_slots(*bad)
+        (self.bases / 'elf_female.npz').write_bytes(b'not a zip')
+        with self.assertRaises(ValueError):
+            build.required_slots('bare', 'elf_female')
+        # the stdlib .npy reader agrees with numpy on the real repo caches (read only, when they exist)
+        real = build.ROOT / 'tools' / 'preview' / 'cache' / 'bases'
+        for race in ('human_male', 'gnome_female'):
+            if (real / f'{race}.npz').is_file():
+                z = np.load(real / f'{race}.npz', allow_pickle=False)
+                legs = {str(n) for n in z['part_names'][np.unique(z['part'])]} & {'leg_stretch.l', 'foot.l', 'leg_stretch.r', 'foot.r'}
+                old = build.BASE_CACHE
+                build.BASE_CACHE = real
+                try:
+                    self.assertEqual(bool(build.body_leg_sides(race)), bool(legs), race)
+                finally:
+                    build.BASE_CACHE = old
+
+    def test_stored_build_without_boots_or_with_foreign_slots_is_invalid(self):
+        self.stub.expected = ['lower_arm.r', 'lower_arm.l', 'lower_leg.r', 'lower_leg.l']
+        r = self.build()
+        self.assertEqual(r['status'], 'ok', r.get('error'))
+        d = self.out / r['build_id']
+        rec = json.loads((d / 'build.json').read_text(encoding='utf-8'))
+        # both boots and their declaration removed: the stored manifest still follows the generic kind contract, but not the human's
+        cut = dict(rec, required=['lower_arm.r', 'lower_arm.l'], slots={k: v for k, v in rec['slots'].items() if k.startswith('lower_arm')})
+        (d / 'build.json').write_text(json.dumps(cut), encoding='utf-8')
+        self.assertTrue(any('lower_leg' in p for p in build.validate_build(d)))
+        # an extra (foreign) slot in the map, or a slot path outside the build folder
+        bid = r['build_id']
+        for damaged in (dict(rec, slots=dict(rec['slots'], torso={'glb': f'{bid}/torso.glb', 'faces': 10})),
+                        dict(rec, slots=dict(rec['slots'], **{'lower_arm.l': dict(rec['slots']['lower_arm.l'], glb='../elsewhere/lower_arm.l.glb')}))):
+            (d / 'build.json').write_text(json.dumps(damaged), encoding='utf-8')
+            self.assertTrue(build.validate_build(d), damaged['slots'])
+        (d / 'build.json').write_text(json.dumps(rec), encoding='utf-8')
+        self.assertEqual(build.validate_build(d), [])
+        self.assertTrue(build.validate_build(d, expect={'race': 'gnome_female'}))           # another module identity
+        # the publish path checks the same: the boot-less build.json is not 'current', it is rebuilt under a fresh id
+        (d / 'build.json').write_text(json.dumps(cut), encoding='utf-8')
+        (self.out / 'current_0p2.json').write_text(json.dumps(cut), encoding='utf-8')
+        r2 = self.build()
+        self.assertEqual((r2['status'], r2['build_id']), ('ok', bid + '-r1'), r2.get('error'))
 
     def test_contract_per_module_kind(self):
         self.assertEqual(build._required_problems('outfit', ['outfit']), [])
@@ -584,10 +658,44 @@ class RecoveryTest(Base):
         (self.out / 'current_0p2.json').unlink()                                                # the pointer is lost (crash after the rename)
         calls = self.stub.calls
         r2 = self.build()
-        self.assertEqual((r2['status'], r2['build_id'], self.stub.calls), ('current', r['build_id'], calls + 1))   # attempt built, then adopted
+        self.assertEqual((r2['status'], r2['build_id'], self.stub.calls), ('current', r['build_id'], calls))   # adopted from build.json, nothing built
         self.assertEqual(self.pointer()['build_id'], r['build_id'])
         self.assertEqual(self.pointer()['time'], r['time'])                                    # the retained build.json, not new metadata
         self.assertEqual(self.attempts(), [])
+
+    def test_damaged_pointer_is_repaired_from_build_json(self):
+        r = self.build()
+        ptr = self.out / 'current_0p2.json'
+        good = json.loads(ptr.read_text(encoding='utf-8'))
+        for damaged in (dict(good, slots={}), dict(good, required=['lower_arm.r']), dict(good, warnings=['copied from elsewhere'])):
+            ptr.write_text(json.dumps(damaged), encoding='utf-8')
+            calls = self.stub.calls
+            r2 = self.build()
+            self.assertEqual((r2['status'], r2['build_id'], self.stub.calls), ('current', r['build_id'], calls), damaged)
+            self.assertEqual(json.loads(ptr.read_text(encoding='utf-8')), good)              # the pointer is the build's own build.json again
+
+    def test_expected_source_digest(self):
+        glb = self.mod / 'reduced' / 'lod_error_0p2.glb'
+        sha = build._sha256(glb)
+        with self.assertRaises(ValueError):
+            build.build_module(self.mod, '0p2', self.out, gpu=False, expect_source_sha256='xyz')
+        f = build.build_module(self.mod, '0p2', self.out, gpu=False, expect_source_sha256='0' * 64)
+        self.assertEqual(f['status'], 'failed')
+        self.assertIn('source changed', f['error'])
+        self.assertFalse(f.get('retryable'))
+        self.assertEqual(self.stub.calls, 0)
+        self.assertFalse((self.out / 'current_0p2.json').exists())
+        # the file changes WHILE the build runs: refused under the publish lock, nothing published
+        self.stub.hook = lambda: glb.write_bytes(b'another approved LOD')
+        f = build.build_module(self.mod, '0p2', self.out, gpu=False, expect_source_sha256=sha)
+        self.assertEqual(f['status'], 'failed')
+        self.assertIn('source changed', f['error'])
+        self.assertFalse((self.out / 'current_0p2.json').exists())
+        self.assertEqual(self.attempts(), [])
+        self.stub.hook = None
+        ok = build.build_module(self.mod, '0p2', self.out, gpu=False, expect_source_sha256=build._sha256(glb))
+        self.assertEqual(ok['status'], 'ok', ok.get('error'))
+        self.assertEqual(build.build_module(self.mod, '0p2', self.out, gpu=False, expect_source_sha256=build._sha256(glb))['status'], 'current')
 
     def test_glb_checker(self):
         good = self.tmp / 'g.glb'
@@ -712,6 +820,7 @@ class CliTest(Base):
         self.assertFailed(['module', str(self.tmp / 'missing'), '--lod', '0p2'], 'module dir not found')
         self.assertFailed(['bare', '../escape'], 'invalid race')
         self.assertFailed(['bare', 'nobody'], 'missing game body cache')
+        self.assertFailed(['module', str(self.mod), '--lod', '0p2', '--expect-source-sha256', 'nothex'], 'expect_source_sha256')
         occupied = self.tmp / 'occupied'
         occupied.write_text('x', encoding='utf-8')
         res = self.assertFailed(['module', str(self.mod), '--lod', '0p2', '--out', str(occupied)])    # the output path is a file (also: no game body cache here)
@@ -886,7 +995,7 @@ for n in ('obj', 'obj_names'):
         ss.load_npz(d / (n + '.npz'), {'body_part_glb_order': 'iu', 'body_part_names': 'US'})
         out[n] = 'accepted'
     except ValueError as e:
-        out[n] = str(e)[:200]
+        out[n] = str(e)
 print(json.dumps(out))
 '''
         out = self.run_py(code)

@@ -1,10 +1,10 @@
 """The layer builder as a tool (pipeline v2, phase 2): per-module API, fingerprint, validated atomic publish, CLI.
 
-    python tools/layers/build.py module <module_dir> --lod 0p2 [--out DIR] [--cpu] [--force]
+    python tools/layers/build.py module <module_dir> --lod 0p2 [--out DIR] [--cpu] [--force] [--expect-source-sha256 HEX]
     python tools/layers/build.py bare <race> [--out DIR] [--cpu] [--force]
     python tools/layers/build.py parity <ref_dir> <ref_set> <new_dir> [--lod 0p2] [--json FILE]
 
-    build_module(module_dir, lod, out_root=None, gpu=True, force=False) -> dict    every slot of one generated module at one reduction level
+    build_module(module_dir, lod, out_root=None, gpu=True, force=False, expect_source_sha256=None) -> dict    every slot of one module at one LOD
     build_bare(race, out_root=None, gpu=True, force=False) -> dict                 the game body's own layers of a race
 
 What is built is the prototype's layer code (layers.py / geodiv.py / shell_slots.py / pieces.py, moved here from experiments/shell_slots_20261122/);
@@ -23,13 +23,21 @@ this file adds the contract around it:
 
 REQUIRED SLOTS (a missing one fails the build, e.g. 'no garment found for lower_leg.r (boot)'): outfit -> outfit; body_armor -> torso;
 right_gauntlet_boot -> lower_arm.l/.r + lower_leg.l/.r, the leg slots only where the race's game body has legs (layers.slots(), the gnome has none);
-bare -> head, torso, lower_arm.l/.r (+ lower_leg.l/.r where the body has legs).
+bare -> head, torso, lower_arm.l/.r (+ lower_leg.l/.r where the body has legs). `required_slots(kind, race)` gives that list from the race's game
+body cache (leg faces present or not); a stored build must name EXACTLY that list, with nothing else in its slot map (validate_build).
+
+SOURCE DIGEST: `--expect-source-sha256` (the sha256 of reduced/lod_error_<lod>.glb the 3D approval pinned) is checked before anything is built and
+again under the publish lock; a mismatch is a failure 'source changed' (not retryable: the approval no longer describes this file).
+
+POINTER REPAIR: a pointer whose content is not exactly the build.json of the valid build it names (cleared slot map, a copied pointer) is never
+trusted: the build is re-adopted from its own build.json under the publish lock (status 'current'), before anything is built.
 
 One build per process is the production use (the layer lane starts a fresh process per task); repeated in-process calls are safe too (the
 game-body caches are dropped when the body cache files change). The CLI prints the result dict as JSON on its LAST stdout line on every path
 (argument errors, bad inputs, build failures); exit 0 for 'ok' / 'current', 1 for 'failed'.
 """
 import argparse
+import ast
 import contextlib
 import hashlib
 import json
@@ -40,6 +48,7 @@ import struct
 import sys
 import time
 import traceback
+import zipfile
 from pathlib import Path
 
 for _v in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'MKL_NUM_THREADS'):      # one build per process; the callers run several processes
@@ -67,9 +76,13 @@ SLOT_ALLOWED = {'outfit': ('outfit',), 'body_armor': ('torso',), 'right_gauntlet
                 'bare': ('head', 'torso', 'lower_arm.l', 'lower_arm.r') + LEG_SLOTS}
 SLOT_LABEL = {'outfit': 'outfit', 'torso': 'armour', 'lower_arm': 'glove', 'lower_leg': 'boot', 'head': 'head'}
 RACE_RE = re.compile(r'[a-z][a-z0-9_]*')
+BUILD_ID_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')               # a build id (a single folder name)
+SHA256_RE = re.compile(r'[0-9a-f]{64}')
+LEG_PARTS = {'l': ('leg_stretch.l', 'foot.l'), 'r': ('leg_stretch.r', 'foot.r')}     # geodiv.lower_leg: the parts of a lower_leg slot
 ATTEMPT_STALE_S = 3600.0                                            # an '.attempt-*' older than this with no live owner process is abandoned
 ATTEMPT_MAX_S = 24 * 3600.0                                         # ... and one older than this is abandoned whoever owns the pid (a reused pid)
 LOCK_TIMEOUT_S = 300.0
+SOURCE_CHANGED = 'source changed: the LOD GLB is not the one the 3D approval pinned (send the set back to 3D)'
 
 
 # ----------------------------------------------------------------------------------------------- fingerprint
@@ -329,6 +342,79 @@ def check_glb(path, need_morph=False):
     return problems[:6], info
 
 
+# ----------------------------------------------------------------------------------------------- required slots of a race
+
+_NPY_INT = {'i1': 'b', 'u1': 'B', 'i2': 'h', 'u2': 'H', 'i4': 'i', 'u4': 'I', 'i8': 'q', 'u8': 'Q'}
+
+
+def _npy_1d(raw):
+    """A 1-D numeric or unicode array of a .npy file as a list (stdlib only: the v2 server imports this module and has no numpy). Raises ValueError."""
+    if raw[:6] != b'\x93NUMPY':
+        raise ValueError('not a .npy array')
+    major = raw[6]
+    if major == 1:
+        hlen, start = struct.unpack_from('<H', raw, 8)[0], 10
+    elif major in (2, 3):
+        hlen, start = struct.unpack_from('<I', raw, 8)[0], 12
+    else:
+        raise ValueError(f'unsupported .npy version {major}')
+    header = ast.literal_eval(raw[start:start + hlen].decode('latin-1'))
+    if not isinstance(header, dict) or header.get('fortran_order') or len(header.get('shape') or ()) != 1:
+        raise ValueError('not a 1-D C-order array')
+    descr, n, data = str(header.get('descr')), int(header['shape'][0]), raw[start + hlen:]
+    order = '>' if descr[:1] == '>' else '<'
+    body = descr.lstrip('<>|=')
+    if body in _NPY_INT:
+        fmt = f'{order}{n}{_NPY_INT[body]}'
+        if struct.calcsize(fmt) > len(data):
+            raise ValueError('truncated array')
+        return list(struct.unpack_from(fmt, data))
+    if body.startswith('U') and body[1:].isdigit():
+        width = int(body[1:]) * 4
+        if width * n > len(data):
+            raise ValueError('truncated array')
+        codec = 'utf-32-be' if order == '>' else 'utf-32-le'
+        return [data[i * width:(i + 1) * width].decode(codec).rstrip('\x00') for i in range(n)]
+    raise ValueError(f'unsupported dtype {descr!r} (object arrays are never read)')
+
+
+_LEGS = {}
+
+
+def body_leg_sides(race):
+    """The sides ('l' / 'r') whose lower leg the race's game body has (faces of leg_stretch.<s> or foot.<s> in <BASE_CACHE>/<race>.npz; the gnome
+    has none). Cached by the file's size and mtime. ValueError when the cache is missing or unreadable."""
+    path = Path(BASE_CACHE) / f'{race}.npz'
+    try:
+        st = path.stat()
+    except OSError:
+        raise ValueError(f'missing game body cache {path}') from None
+    key = (str(path), st.st_size, st.st_mtime_ns)
+    if key in _LEGS:
+        return _LEGS[key]
+    try:
+        with zipfile.ZipFile(path) as z:
+            part, names = _npy_1d(z.read('part.npy')), _npy_1d(z.read('part_names.npy'))
+    except (OSError, KeyError, ValueError, SyntaxError, zipfile.BadZipFile, struct.error, UnicodeDecodeError) as error:
+        raise ValueError(f'cannot read the game body cache {path}: {type(error).__name__}: {error}') from None
+    used = set(part)
+    sides = tuple(s for s in 'lr' if any(i in used for i, n in enumerate(names) if n in LEG_PARTS[s]))
+    _LEGS[key] = sides
+    return sides
+
+
+def required_slots(kind, race):
+    """The EXACT list of slots a build of `kind` ('outfit' | 'body_armor' | 'right_gauntlet_boot' | 'bare') must have on `race` (layers.slots():
+    the leg slots only where the race's game body has legs). ValueError for an unknown kind or an unreadable body cache."""
+    if kind not in SLOT_MIN:
+        raise ValueError(f'unknown kind {kind!r}')
+    if kind in ('outfit', 'body_armor'):
+        return list(SLOT_MIN[kind])
+    if not isinstance(race, str) or not RACE_RE.fullmatch(race):
+        raise ValueError(f'invalid race {race!r}')
+    return list(SLOT_MIN[kind]) + [f'lower_leg.{s}' for s in body_leg_sides(race)]
+
+
 def _required_problems(kind, required):
     """The module kind's contract on the list of required slots: at least SLOT_MIN, nothing outside SLOT_ALLOWED, the leg slots both or neither."""
     if kind not in SLOT_MIN:
@@ -346,10 +432,13 @@ def _required_problems(kind, required):
     return out
 
 
-def validate_build(build_dir, fp=None, expect_id=None):
-    """Problems ([str], empty = valid) of a build folder: build.json present and ok (matching `fp` / `expect_id` when given), required slots follow the
-    kind's contract, every required slot has its GLB (parsed whole, morph target 'fill' for module layers, faces) and its JSON."""
+def validate_build(build_dir, fp=None, expect_id=None, expect=None, name=None):
+    """Problems ([str], empty = valid) of a build folder: build.json present and ok (matching `fp` / `expect_id` when given, and every key of `expect`,
+    e.g. {'kind', 'race', 'module', 'lod'}), the required slots are EXACTLY required_slots(kind, race) and the slot map has no other slot, every
+    slot entry names its own file in this folder, every required slot has its GLB (parsed whole, morph target 'fill' for module layers, faces) and
+    its JSON. `name` = the build id the folder is published under (default: the folder's name; an attempt folder is checked before its rename)."""
     build_dir = Path(build_dir)
+    name = name or build_dir.name
     rec = _read_json(build_dir / 'build.json')
     if not isinstance(rec, dict):
         return ['build.json missing or unreadable']
@@ -360,26 +449,46 @@ def validate_build(build_dir, fp=None, expect_id=None):
         problems.append(f"build.json build_id {rec.get('build_id')!r} != {expect_id!r}")
     if fp is not None and rec.get('fingerprint') != fp:
         problems.append('build.json fingerprint differs')
+    for key, value in (expect or {}).items():
+        if rec.get(key) != value:
+            problems.append(f'build.json {key} {rec.get(key)!r} != {value!r}')
     kind = rec.get('kind')
     required = rec.get('required')
-    if not isinstance(required, list) or not required:
+    if not isinstance(required, list) or not required or not all(isinstance(k, str) for k in required):
         problems.append('build.json has no required slot list')
         return problems
     problems += _required_problems(kind, required)
+    try:
+        want = required_slots(kind, rec.get('race'))
+    except ValueError as error:
+        problems.append(f'required slots unknown: {error}')
+    else:
+        if sorted(required) != sorted(want):
+            problems.append(f"required slots {sorted(required)} are not the {kind} slots of {rec.get('race')} {sorted(want)}")
     slots = rec.get('slots') if isinstance(rec.get('slots'), dict) else {}
+    extra = sorted(set(slots) - set(required))
+    if extra:
+        problems.append(f'slots outside the required list: {", ".join(map(str, extra))}')
     for k in required:
         if k not in slots:
             problems.append(f'slot {k}: not in build.json')
             continue
+        entry = slots[k] if isinstance(slots[k], dict) else {}
+        if entry.get('glb') != f'{name}/{k}.glb':
+            problems.append(f"slot {k}: glb path {entry.get('glb')!r} is not this build's own {name}/{k}.glb")
+            continue
         g, j = build_dir / f'{k}.glb', build_dir / f'{k}.json'
+        if g.is_symlink() or j.is_symlink():
+            problems.append(f'slot {k}: glb/json is a link')
+            continue
         if not g.is_file() or not j.is_file() or not isinstance(_read_json(j), dict):
             problems.append(f'slot {k}: glb/json missing or unreadable')
             continue
         bad, info = check_glb(g, need_morph=kind != 'bare')
         if bad:
             problems.append(f'slot {k}: glb {"; ".join(bad)}')
-        elif info['faces'] != slots[k].get('faces'):
-            problems.append(f"slot {k}: glb has {info['faces']} faces, build.json says {slots[k].get('faces')}")
+        elif info['faces'] != entry.get('faces'):
+            problems.append(f"slot {k}: glb has {info['faces']} faces, build.json says {entry.get('faces')}")
     return problems
 
 
@@ -467,11 +576,16 @@ def _race_problem(race):
 class _Job:
     """What one build is: tag ('0p2' | 'bare'), lod, race, kind, fingerprint and the way to recompute it, and how to run the layer code."""
 
-    def __init__(self, tag, lod, race, kind, module_path, fp, fp_fn, gpu, force, run):
+    def __init__(self, tag, lod, race, kind, module_path, fp, fp_fn, gpu, force, run, source_ok=None):
         self.tag, self.lod, self.race, self.kind, self.module_path = tag, lod, race, kind, module_path
         self.fp, self.fp_fn, self.gpu, self.force, self.run = fp, fp_fn, gpu, force, run
+        self.source_ok = source_ok                                   # None, or () -> bool: the pinned source GLB is still the one asked for
         self.base_id = f'{tag}-{fp[:12]}'
         self.bare = kind == 'bare'
+
+    def expect(self):
+        """What build.json of a build of this job must say (validate_build `expect`)."""
+        return {'kind': self.kind, 'race': self.race, 'module': self.module_path, 'lod': self.lod}
 
 
 def _pointer(out_root, tag):
@@ -561,23 +675,26 @@ def _adopt(out_root, job):
     names = [job.base_id] + sorted((p.name for p in out_root.glob(f'{job.base_id}-r*') if p.is_dir()), key=lambda n: int(n.rsplit('-r', 1)[1]) if n.rsplit('-r', 1)[1].isdigit() else 0)
     for name in names:
         d = out_root / name
-        if not d.is_dir() or validate_build(d, fp=job.fp, expect_id=name):
+        if not d.is_dir() or d.is_symlink() or validate_build(d, fp=job.fp, expect_id=name, expect=job.expect()):
             continue
         rec = _read_json(d / 'build.json')
         ptr = _read_json(_pointer(out_root, job.tag))
-        if not (isinstance(ptr, dict) and ptr.get('build_id') == name and ptr.get('fingerprint') == job.fp):
+        if ptr != rec:                                               # lost, damaged or copied pointer: repaired from the immutable build.json
             _write_json_atomic(_pointer(out_root, job.tag), rec)
         return dict(rec, status='current', out_root=str(out_root))
     return None
 
 
 def _current(out_root, job):
-    """The cheap path: the pointer names a build with this fingerprint that validates."""
+    """The cheap path: the pointer names a build with this fingerprint that validates AND is exactly that build's build.json."""
     rec = _read_json(_pointer(out_root, job.tag))
-    if isinstance(rec, dict) and rec.get('status') == 'ok' and rec.get('fingerprint') == job.fp and isinstance(rec.get('build_id'), str) and \
-            not validate_build(Path(out_root) / rec['build_id'], fp=job.fp, expect_id=rec['build_id']):
-        return dict(rec, status='current', out_root=str(out_root))
-    return None
+    if not (isinstance(rec, dict) and rec.get('status') == 'ok' and rec.get('fingerprint') == job.fp and isinstance(rec.get('build_id'), str)
+            and BUILD_ID_RE.fullmatch(rec['build_id'])):
+        return None
+    d = Path(out_root) / rec['build_id']
+    if d.is_symlink() or validate_build(d, fp=job.fp, expect_id=rec['build_id'], expect=job.expect()) or _read_json(d / 'build.json') != rec:
+        return None
+    return dict(rec, status='current', out_root=str(out_root))
 
 
 def _commit(out_root, job, attempt, res, seconds):
@@ -585,6 +702,9 @@ def _commit(out_root, job, attempt, res, seconds):
     out_root = Path(out_root)
     with _publish_lock(out_root):
         _clean_abandoned(out_root, keep=attempt)
+        if job.source_ok is not None and not job.source_ok():
+            shutil.rmtree(attempt, ignore_errors=True)
+            return _failure(out_root, job, SOURCE_CHANGED, seconds=seconds, gpu=_gpu_used(job.gpu), retryable=False)
         if job.fp_fn() != job.fp:
             shutil.rmtree(attempt, ignore_errors=True)
             return _failure(out_root, job, 'inputs changed during build (retry)', seconds=seconds, gpu=_gpu_used(job.gpu), retryable=True)
@@ -596,7 +716,7 @@ def _commit(out_root, job, attempt, res, seconds):
         build_id = _free_id(out_root, job.base_id)
         rec = _record(res, build_id, job, seconds, _gpu_used(job.gpu))
         _write_json_atomic(attempt / 'build.json', rec)
-        problems = validate_build(attempt, fp=job.fp, expect_id=build_id)
+        problems = validate_build(attempt, fp=job.fp, expect_id=build_id, expect=job.expect(), name=build_id)
         if problems:
             raise RuntimeError('build check failed: ' + '; '.join(problems))
         _rename_dir(attempt, out_root / build_id)
@@ -635,11 +755,15 @@ def _publish(out_root, job):
             got = _current(out_root, job)
             if got is not None:
                 return got
+            with _publish_lock(out_root):                         # a valid build of this fingerprint whose pointer is lost or damaged: repair it
+                got = _adopt(out_root, job)
+            if got is not None:
+                return got
         attempt = out_root / f'.attempt-{job.tag}-{job.fp[:12]}-{os.getpid()}'
         if attempt.exists():
             shutil.rmtree(attempt, ignore_errors=True)               # (our own leftover of an earlier run of this pid)
         attempt.mkdir(parents=True)
-    except OSError as error:
+    except (OSError, TimeoutError) as error:
         return _failure(out_root, job, f'cannot set up the output folder: {type(error).__name__}: {error}')
     t0 = time.monotonic()
     err = None
@@ -658,14 +782,26 @@ def _publish(out_root, job):
     return _fail_build(out_root, job, attempt, err, t0)
 
 
-def build_module(module_dir, lod, out_root=None, gpu=True, force=False):
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, 'rb') as f:
+        for chunk in iter(lambda: f.read(1 << 20), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def build_module(module_dir, lod, out_root=None, gpu=True, force=False, expect_source_sha256=None):
     """Build every layer slot of one generated module (models/<set>/<job>/<race>/<module>) at reduction level `lod` ('0p4' | '0p2' | '0p1').
     out_root defaults to <module_dir>/layers. `force` builds even when a valid build with this fingerprint is published (the old one is never touched;
     the new build gets a '-r<n>' id). Returns the build record (the pointer's content) with status 'ok' (built now), 'current' (the same fingerprint was
     already published and validates; nothing done) or 'failed' (error + traceback; the pointers and earlier builds are untouched).
-    ValueError for a bad lod or a module dir that does not exist."""
+    `expect_source_sha256`: the sha256 the 3D approval pinned for reduced/lod_error_<lod>.glb; checked before building and again under the publish
+    lock (a mismatch fails with SOURCE_CHANGED, not retryable).
+    ValueError for a bad lod, a bad digest or a module dir that does not exist."""
     if lod not in LODS:
         raise ValueError(f'lod must be one of {LODS}, got {lod!r}')
+    if expect_source_sha256 is not None and not (isinstance(expect_source_sha256, str) and SHA256_RE.fullmatch(expect_source_sha256)):
+        raise ValueError('expect_source_sha256 must be 64 lowercase hex digits')
     module_dir = Path(module_dir).resolve()
     if not module_dir.is_dir():
         raise ValueError(f'module dir not found: {module_dir}')
@@ -680,6 +816,17 @@ def build_module(module_dir, lod, out_root=None, gpu=True, force=False):
     problem = _race_problem(race)
     if problem:
         return _fail_early(out_root, mp_, lod, problem, lod)
+    source_ok = None
+    if expect_source_sha256 is not None:
+        glb = module_dir / 'reduced' / f'lod_error_{lod}.glb'
+
+        def source_ok():
+            try:
+                return _sha256(glb) == expect_source_sha256
+            except OSError:
+                return False
+        if not source_ok():
+            return _fail_early(out_root, mp_, lod, SOURCE_CHANGED, lod, write=False)
     try:
         fp = fingerprint_module(module_dir, lod)
     except OSError as error:
@@ -688,7 +835,7 @@ def build_module(module_dir, lod, out_root=None, gpu=True, force=False):
     def run(attempt):
         import layers
         return layers.module_layers(module_dir, lod, attempt)
-    return _publish(out_root, _Job(lod, lod, race, kind, mp_, fp, lambda: fingerprint_module(module_dir, lod), gpu, force, run))
+    return _publish(out_root, _Job(lod, lod, race, kind, mp_, fp, lambda: fingerprint_module(module_dir, lod), gpu, force, run, source_ok))
 
 
 def build_bare(race, out_root=None, gpu=True, force=False):
@@ -920,6 +1067,7 @@ def _main(argv):
     a.add_argument('--out')
     a.add_argument('--cpu', action='store_true')
     a.add_argument('--force', action='store_true')
+    a.add_argument('--expect-source-sha256', dest='expect_source_sha256')
     b = sub.add_parser('bare')
     b.add_argument('race')
     b.add_argument('--out')
@@ -952,7 +1100,7 @@ def _main(argv):
         tag = 'bare'
     try:
         if args.cmd == 'module':
-            res = build_module(args.module_dir, args.lod, args.out, gpu=not args.cpu, force=args.force)
+            res = build_module(args.module_dir, args.lod, args.out, gpu=not args.cpu, force=args.force, expect_source_sha256=args.expect_source_sha256)
         else:
             res = build_bare(args.race, args.out, gpu=not args.cpu, force=args.force)
     except ValueError as error:                                       # bad arguments (no such module dir)

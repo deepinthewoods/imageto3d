@@ -1,0 +1,153 @@
+// Queue tab (v0): the tasks of GET /api/v2/queue as a table: state, elapsed, attempts, the error tail, Retry / Cancel.
+// Refreshes every 3 s while the tab is visible (and the page is). Phase 4 adds services, modes and credits.
+// Phase 3 review fixes: a task that is `stalled` has "Kill & retry" (POST /api/v2/queue {op: 'kill_retry', id}); "Rebuild stale"
+// (POST /api/v2/queue {op: 'rebuild_stale'}) re-queues every stale layer build of the sets in Aligned / Completed / 3D; the queue's
+// own health errors (state.queue_health, or `queue_health` / `health` of the queue response) are shown at the top.
+import { api } from './api.js';
+import { state, refresh, subscribe, queueHealthErrors } from './state.js';
+import { toast } from './toast.js';
+import { badge, button, h, pretty } from './util.js';
+
+const TONE = { running: 'info', queued: 'info', done: 'ok', failed: 'error', cancelled: 'warn', stalled: 'error' };
+const OP_TEXT = { retry: ['Retrying', 'Retry'], cancel: ['Cancelled', 'Cancel'], kill_retry: ['Killed and re-queued', 'Kill & retry'] };
+
+/** Sets whose card carries a "stale n" badge (the stale scan found their published builds out of date). */
+const staleSets = () => ['3d', 'aligned', 'completed'].flatMap(tab => state.tabs[tab] || [])
+  .filter(card => (card.badges || []).some(b => /^stale\b/i.test(b.text || '')));
+const POLL_MS = 3000;
+
+const duration = seconds => {
+  if (seconds == null || Number.isNaN(+seconds)) return '';
+  const s = Math.max(0, Math.round(+seconds));
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
+};
+
+/** Build the page into `container`. Returns {unmount}. */
+export function mountQueue(container) {
+  let alive = true;
+  let timer = null;
+  let busy = new Set();            // task ids with a request in flight
+  let lastText = '';
+  const open = new Set();          // task ids whose log is expanded
+
+  const summary = h('div', { class: 'queue-summary' });
+  const table = h('div', { class: 'queue-table' });
+  const note = h('div', { class: 'queue-note', hidden: true });
+  const health = h('div', { class: 'queue-note health', hidden: true, role: 'alert' });
+  const bar = h('div', { class: 'queue-bar' });
+  let data = null;
+  container.replaceChildren(h('div', { class: 'queue-page' }, summary, bar, health, note, table));
+  let rebuilding = false;
+
+  /** Queue health: the state's `queue_health` plus the one of the queue response, e.g. a damaged or unreadable queue database. */
+  function drawHealth() {
+    const errors = [...new Set([...(state.queueErrors || []), ...queueHealthErrors(data?.queue_health ?? data?.health)])];
+    health.hidden = !errors.length;
+    health.replaceChildren(...(errors.length ? [h('b', { text: 'Queue problem' }), ...errors.map(text => h('div', { text }))] : []));
+  }
+
+  function drawBar() {
+    const stale = staleSets();
+    const button1 = button(rebuilding ? 'Rebuilding...' : 'Rebuild stale', rebuildStale, stale.length ? 'primary' : '',
+      'Queue a rebuild of every stale layer build (built with older layer code)');
+    button1.disabled = rebuilding || !stale.length;
+    bar.replaceChildren(button1, h('span', { class: 'q-stale', text: stale.length
+      ? `${stale.length} set${stale.length === 1 ? '' : 's'} with stale builds: ${stale.map(c => c.title || pretty(c.name)).join(', ')}` : 'No stale builds' }));
+  }
+
+  async function rebuildStale() {
+    if (rebuilding) return;
+    rebuilding = true;
+    drawBar();
+    try {
+      const result = await api.queueOp('rebuild_stale');
+      const n = result?.queued;
+      toast(n != null ? `Rebuilding ${n} stale build${n === 1 ? '' : 's'}` : 'Stale builds queued', { ms: 2500 });
+    } catch (error) {
+      if (!error.conflict) toast(`Rebuild stale failed: ${error.message}`);
+    } finally {
+      rebuilding = false;
+      drawBar();
+    }
+    refresh().catch(() => {});          // the stale badges of the cards go away once the rebuild is under way
+    await load();
+  }
+
+  async function op(kind, task) {
+    if (busy.has(task.id)) return;
+    busy.add(task.id);
+    try {
+      await api.queueOp(kind, task.id);
+      toast(`${OP_TEXT[kind][0]} task ${task.id}`, { ms: 2000 });
+    } catch (error) {
+      if (!error.conflict) toast(`${OP_TEXT[kind][1]} failed: ${error.message}`);
+    } finally {
+      busy.delete(task.id);
+    }
+    await load();
+  }
+
+  function row(task) {
+    const failed = task.state === 'failed';
+    const log = task.log_tail || '';
+    const errorText = task.error || '';
+    const actions = h('span', { class: 'queue-actions' },
+      failed || task.state === 'cancelled' ? button('Retry', () => op('retry', task), 'primary', 'Run this task again') : null,
+      task.state === 'stalled' ? button('Kill & retry', () => op('kill_retry', task), 'danger', 'Stop the stuck build and queue it again') : null,
+      task.state === 'queued' ? button('Cancel', () => op('cancel', task), '', 'Remove it from the queue (a running build finishes on its own)') : null);
+    const expanded = open.has(task.id);
+    return h('div', { class: 'queue-row' + (failed || task.state === 'stalled' ? ' failed' : ''), dataset: { id: task.id, state: task.state } },
+      h('span', { class: 'q-id', text: `#${task.id}` }),
+      h('span', { class: 'q-lane', text: task.lane || '' }),
+      h('span', { class: 'q-what' }, h('b', { text: task.set ? pretty(task.set) : '' }), task.unit ? ` ${pretty(task.unit)}` : ''),
+      h('span', { class: 'q-state' }, badge(task.state, TONE[task.state] || ''), task.attempts > 1 ? ` attempt ${task.attempts}` : ''),
+      h('span', { class: 'q-time', text: duration(task.elapsed) }),
+      actions,
+      errorText ? h('pre', { class: 'q-error', text: errorText }) : null,
+      log ? h('details', { class: 'q-log', open: expanded, ontoggle: event => { if (event.target.open) open.add(task.id); else open.delete(task.id); } },
+        h('summary', { text: 'log' }), h('pre', { text: log })) : null);
+  }
+
+  function draw(data) {
+    const tasks = data?.tasks || [];
+    const workers = data?.workers;
+    const counts = {};
+    for (const t of tasks) counts[t.state] = (counts[t.state] || 0) + 1;
+    summary.replaceChildren(
+      h('strong', { text: 'Queue' }),
+      ...Object.entries(counts).map(([state, n]) => badge(`${state} ${n}`, TONE[state] || '')),
+      workers ? h('span', { class: 'q-workers', text: `workers ${workers.running ?? 0}/${workers.limit ?? '?'} · ${workers.present ? 'you are at the PC' : 'away'}` }) : null);
+    table.replaceChildren(...(tasks.length ? tasks.map(row) : [h('div', { class: 'queue-empty', text: 'No tasks in the last 24 hours.' })]));
+  }
+
+  async function load() {
+    if (!alive) return;
+    try {
+      data = await api.queue();
+      if (!alive) return;
+      note.hidden = true;
+      const text = JSON.stringify(data);
+      if (text !== lastText) { lastText = text; draw(data); }
+      drawHealth();
+      drawBar();
+    } catch (error) {
+      if (!alive) return;
+      note.hidden = false;
+      note.textContent = `Queue not available: ${error.message}`;
+    }
+  }
+
+  const unsubscribe = subscribe(() => { drawHealth(); drawBar(); });   // stale badges and queue health arrive with the state
+  drawHealth();
+  drawBar();
+  load();
+  timer = setInterval(() => { if (!document.hidden) load(); }, POLL_MS);
+  return {
+    unmount() {
+      alive = false;
+      unsubscribe();
+      clearInterval(timer);
+      container.replaceChildren();
+    },
+  };
+}

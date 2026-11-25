@@ -13,7 +13,11 @@ original) with the geometry code unchanged; see `PIPELINE_V2_PLAN.md` section 6 
 
 **A required slot with no garment fails the build** (`no garment found for lower_leg.r (boot)`): a one-glove or one-boot publish, or a module whose boots
 were labelled as skin, never reaches Aligned. The contract is checked twice: on the layer code's result (`build._check_result`) and again, from
-`build.json`, whenever a build is reused (`build.validate_build`).
+`build.json`, whenever a build is reused (`build.validate_build`). Both compare with `build.required_slots(kind, race)` (phase 3 review F4): the EXACT
+slot list of that kind on that race, legs taken from the race's game body cache (`tools/preview/cache/bases/<race>.npz`: faces of `leg_stretch.<s>` /
+`foot.<s>`, read with a stdlib .npy reader, since the v2 server imports build.py and has no numpy). A stored build whose `required` list or slot map is
+not exactly that list (both boots removed with their declaration, an extra foreign slot), whose slot path is not `<build_id>/<slot>.glb`, or whose
+`kind` / `race` / `module` / `lod` is not the module's own, is invalid. The v2 server applies the same rule to pointers (`v2/builds.py`).
 
 ## API (`build.py`)
 
@@ -31,6 +35,9 @@ Each returns the build record (the content of the LOD's pointer file) with `stat
   winner of a concurrent worker / an earlier interrupted publish was adopted); `failed`: `error`, `traceback`, `previous_build` (the LOD's published
   build, also on missing-input failures), `retryable: true` for `inputs changed during build`; `last_failure.json` written (see below), pointers and earlier
   builds untouched.
+- `expect_source_sha256=<hex>` (`--expect-source-sha256`, what the v2 layer lane always passes: the digest the 3D approval pinned): the module's
+  `reduced/lod_error_<lod>.glb` must still have that sha256, checked before anything is built and again under the publish lock; otherwise `failed`
+  with `source changed: ...` (not retryable, nothing published, no `last_failure.json`).
 - `force=True` (`--force`): skip the `current` short-circuit and the adoption; the build is made again under a fresh `-r<n>` id and the pointer moved to it
   (CPU / GPU comparisons: the GLBs are byte-identical, the record's `gpu` says which path ran).
 - `ValueError` for a `lod` not in `0p4 / 0p2 / 0p1` or a module dir that does not exist (the CLI turns it into a JSON failure). A missing
@@ -46,7 +53,7 @@ Each returns the build record (the content of the LOD's pointer file) with `stat
 ## CLI
 
 ```
-python tools/layers/build.py module <module_dir> --lod 0p2 [--out DIR] [--cpu] [--force]
+python tools/layers/build.py module <module_dir> --lod 0p2 [--out DIR] [--cpu] [--force] [--expect-source-sha256 HEX]
 python tools/layers/build.py bare <race> [--out DIR] [--cpu] [--force]
 python tools/layers/build.py parity <ref_dir> <ref_set> <new_dir> [--lod 0p2] [--json FILE]
 ```
@@ -86,10 +93,13 @@ the other layer vertices lying on a ring line / inner ring (inserted by the snap
 
 ## Publishing (validation, locking, recovery)
 
-1. **Reuse** (`current`) only when the LOD's pointer has this fingerprint **and** `validate_build` of its folder is empty: `build.json` present, ok, same
-   fingerprint, a required-slot list that satisfies the kind's contract, and for every required slot the JSON, and the GLB parsed whole (header, JSON
+1. **Reuse** (`current`) only when the LOD's pointer has this fingerprint, is EXACTLY the `build.json` of the folder it names, **and** `validate_build`
+   of that folder is empty: `build.json` present, ok, same fingerprint and module identity, exactly `required_slots(kind, race)`, and for every required
+   slot the JSON, and the GLB parsed whole (header, JSON
    chunk, BIN chunk length equals the file, buffer views and accessors inside the buffer, every primitive's POSITION and morph accessors, materials,
    morph target `fill` for module layers, face count equal to `build.json`). The check is cheap (reads the files, no geometry).
+   A pointer that is lost or damaged (cleared slot map, a copied pointer) while a valid build of this fingerprint exists is **repaired** before
+   anything is built: under the publish lock the build is adopted and the pointer rewritten from its own `build.json` (result `current`).
 2. Otherwise the layer code runs into `.attempt-*`, the result is checked (every required slot built), and the **commit** happens under the exclusive
    `<out_root>/.publish.lock`:
    - abandoned `.attempt-*` folders / stray `*.tmp-<pid>` files are removed (older than 1 h with no live owner pid, or older than 24 h);

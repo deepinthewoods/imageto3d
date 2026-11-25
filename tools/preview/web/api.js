@@ -68,5 +68,12 @@ export const api = {
     request('/action', { method: 'POST', json: { id, verb, ...(rev != null ? { rev } : {}), ...(args ? { args } : {}) } }),
   /** One unit: {id, race, module, lod, rev}; every unit: {id, lod, all: true, rev}; monsters: {id, lod}. */
   lod: body => request('/lod', { method: 'POST', json: body }),
+  /** Set an Amount: {id, race, group: outfit|body|limbs, value: 0..100, rev}. */
+  amount: body => request('/amount', { method: 'POST', json: body }),
+  /** Published layer builds of a race (and the race's bare layers) for the donor dropdowns and the Mix tab. */
+  layers: race => request('/layers', { query: { race } }),
+  queue: () => request('/queue'),
+  /** op: retry | cancel */
+  queueOp: (op, id) => request('/queue', { method: 'POST', json: { op, id } }),
   thumbnail: (glbUrl, blob) => request('/thumbnail', { method: 'POST', query: { url: glbUrl }, blob }),
 };

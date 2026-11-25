@@ -61,9 +61,10 @@ export async function raceVerb(item, race, verb, { onDone } = {}) {
  * runAction(card, 'approve', {tab: 'concepts'})
  *   removes (default true): the card leaves `tab` at once (set verbs that only edit a decision pass false)
  *   rev, args: forwarded to the server
+ *   onError(error): runs first when the server refuses (the caller can handle a 409 itself, e.g. keep its dialog open)
  * Resolves the response, or null when it failed or another action on this card is still running.
  */
-export async function runAction(card, verb, { tab, rev, args, removes = true, subject } = {}) {
+export async function runAction(card, verb, { tab, rev, args, removes = true, subject, onError } = {}) {
   if (inflight.has(card.id)) return null;
   inflight.add(card.id);
   const edit = removes ? optimistic.remove(tab, card.id) : null;
@@ -72,6 +73,7 @@ export async function runAction(card, verb, { tab, rev, args, removes = true, su
     result = await api.action(card.id, verb, { rev, args });
   } catch (error) {
     edit?.revert();
+    onError?.(error);
     if (!error.conflict) toast(`${verbLabel(verb)} failed: ${error.message}`); // a 409 is reported by the conflict handler
     return null;
   } finally {

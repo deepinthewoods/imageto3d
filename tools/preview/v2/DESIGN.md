@@ -75,8 +75,11 @@ tools/layers/      the production layer builder (phase 2): build.py (API + CLI),
   3. `lod_approval` but any approved unit's layer build not published (phase 3) -> **3d** with badge "building n/m" (failed
      builds: badge error + Retry).  *Phase 1 skips this rule (there are no builds yet): `lod_approval` alone gives aligned.* A `pin_missing` unit keeps the set in aligned /
   completed with an error badge: it cannot advance (phase 3 approve verbs refuse it) until it is sent back to 3D.
-  4. no `aligned_approval` (or its build ids are no longer the published ones) -> **aligned**
-  5. else -> **completed**
+  4. no `aligned_approval`, or it no longer holds -> **aligned**
+  5. else -> **completed**. The Aligned approval holds (phase 3 review F3, DESIGN_PHASE3.md F.3) only when its units are exactly the live units (frozen
+     required races) and the 3D-approved units, every one with its approved build id still published, every approved bare build still published,
+     and `models/<S>/ready.json` carries the approval's `approval_id`. 3D-approved units show the FROZEN LOD of `lod_approval`; a unit whose pinned
+     source GLB changed is `source_changed` (not built; Back to 3D).
 - **Default LOD** shown (not saved, `lod_saved: false`) when a module has no `chosen_lod.json`: `0p2` (124 of the 132 existing picks).
 - **Monster variant** (`monsters.cards`): `reduced` LODs and not approved -> **3d**; approved (`chosen_lod.json approved`) ->
   **completed**; otherwise -> **approved** (in progress). Monster concepts: phase 5.
@@ -86,10 +89,11 @@ tools/layers/      the production layer builder (phase 2): build.py (API + CLI),
 ```json
 {"schema": 1, "set": "S", "rev": 7,
  "dropped": {"gnome_female": {"time": "...", "reason": "..."}},
- "lod_approval": {"time": "...", "units": {"human_male/body_armor": {"job": "a28c0e5ad46d", "lod": "0p2", "glb_sha256": "..."}}},
+ "lod_approval": {"time": "...", "units": {"human_male/body_armor": {"job": "a28c0e5ad46d", "lod": "0p2", "glb_sha256": "..."}},
+                  "required_races": ["human_male", "..."]},
  "amount": {"human_male": {"body": 100, "limbs": 100}, "elf_female": {"outfit": 80}},
- "aligned_approval": {"time": "...", "units": {"human_male/body_armor": {"job": "...", "lod": "0p2", "build_id": "..."}},
-                      "amount": {"human_male": {"body": 100, "limbs": 100}}},
+ "aligned_approval": {"time": "...", "approval_id": "<uuid hex>", "units": {"human_male/body_armor": {"job": "...", "lod": "0p2", "build_id": "..."}},
+                      "bare": {"human_male": "bare-..."}, "amount": {"human_male": {"body": 100, "limbs": 100}}},
  "history": [{"time": "...", "action": "approve_3d", "detail": {}}]}
 ```
 - `amount` groups: outfit sets `{"outfit": n}`; armour sets `{"body": n, "limbs": n}` (body = torso layer, limbs = gloves and
@@ -97,15 +101,16 @@ tools/layers/      the production layer builder (phase 2): build.py (API + CLI),
 - Every mutation bumps `rev` **including LOD picks** (their `chosen_lod.json` files and the bumped `pipeline_v2.json` are one transaction, section 6);
   mutating requests carry the `rev` the client saw and get **409** + the current item on mismatch. `lod_approval.required_races` (list) is
   written by the phase 3 approve and freezes the required races of the set.
-- The file is only replaced by defaults when it is ABSENT. If it exists but is not valid JSON, is not an object, has `schema` other than 1,
-  or has a wrongly typed `rev` / `dropped` / `amount` / `history` / `lod_approval` / `aligned_approval`, the item shows `error` (and the card a
+- The file is only replaced by defaults when it is ABSENT. If it exists but is not valid UTF-8 / JSON, is not an object, has `schema` other than 1,
+  or has a wrongly typed `rev` / `dropped` / `amount` / `history` / `lod_approval` / `aligned_approval` (nested records included: approval units,
+  amount values, required_races, bare map, approval_id), the item shows `error` (and the card a
   `decisions unreadable` badge) and every mutation of that set (set verbs, LOD writes) answers **409 `code: unreadable`** until it is fixed.
 - `chosen_lod.json` per module dir keeps its existing format (`{"lod","reduced","wearable","updated"}`, see `serve.write_lod`);
   v2 writes it in the module dir of the job the client displayed (= the pinned one, else the newest conversion; a mismatch is a 409).
   Characters: `0p4|0p2|0p1`; monsters `0p8|0p6|0p4|0p2|0p1` via `decisions.write_monster_lod` (the `monsters.write_choice` record, written
   under a per-variant lock with a unique temp file).
-- `models/<S>/ready.json` (phase 3, on Aligned approval): `{"schema":1,"set","kind","approved_at","races":{race:{"amount":{..},
-  "units":{module:{"job","lod","build_id","slots":{slot:{"glb": rel path,"sha256"}}}}}},"bare":{race: rel dir}}`.
+- `models/<S>/ready.json` (phase 3, on Aligned approval): `{"schema":1,"set","kind","approved_at","approval_id","races":{race:{"amount":{..},
+  "units":{module:{"job","lod","build_id","slots":{slot:{"glb": rel path,"sha256"}}}}}},"bare":{race: rel dir}}` (every path relative to the project root, posix; see DESIGN_PHASE3.md D.5).
 - Legacy files are left alone: `model_approval.json`, `fit_choice.json`, marks, fitlab outputs.
 
 ## 4. HTTP API (v2)
@@ -172,7 +177,7 @@ job's record (`conversion_errors` entry of the unit such as the doubled interior
 **Allowlist.** Only these (id type, verb) pairs exist; anything else is a 400 (there is no fallthrough to `serve.action`, so the old site's
 `model:` / `approvedmodel:` branches are unreachable): concepts: provisional, approve, reject, archive; archive: provisional, approve, unarchive;
 provisional: approve, unapprove; approved: unapprove; legacy: approve, reject, archive; archlegacy: approve, unarchive; trash / trashlegacy:
-restore; set: drop_race, undrop_race, unapprove; intent: complete, rollback. v2 performs every move itself (section 6).
+restore; set: drop_race, undrop_race, unapprove, approve, rebuild; intent: complete, rollback. v2 performs every move itself (section 6).
 Concept verbs: `provisional` (concepts|archive -> provisional = old first hop), `approve` (concepts|archive -> approved directly,
 provisional -> approved, legacy flat -> `workflow.py promote --approve` as today), `reject`, `unapprove`, `archive`, `unarchive`,
 `restore`. Direct approve = rename into `approved/` (refuse when `provisional/<S>` or `approved/<S>` exists) then
@@ -288,4 +293,18 @@ read-only server. JSON bodies <= 4 KB, thumbnail <= 8 MB; JSON over 4 KB is gzip
   `.` / `..` segments, a leading `/`, any of `<>:"|?*` or control characters, trailing dots / spaces), before any filesystem access; then the suffix
   allowlist, then resolved containment. Forbidden = 403 (static: 404), permitted but missing = 404. `index.html` goes through the same check.
 - **Contract for phase 3**: `orchestrator.lock` of DESIGN_PHASE3 stays a separate lock; a server without `server.lock` must also not start the
-  orchestrator. Phase 3 verbs reuse `guard.apply_transaction` for anything that writes several files.
+  orchestrator. Phase 3 verbs reuse `guard.apply_transaction` for anything that writes several files (LOD picks, both approvals, unapprove with its
+  ready.json revocation, the orchestrator's revocation).
+- **Recovery (phase 3 review F8)**: a `files_tx` intent names its set and the sha256 of every file's old and new content. Recovery (server start and
+  every orchestrator loop) runs under the set lock and restores the backups only while every file holds what the transaction wrote or its old content;
+  a file changed since makes the intent a `conflict` (Recovery card: `complete` keeps the files, `rollback` restores the backups). Until the intent is
+  resolved every write of the set is 409 `recovering`.
+- **Promotions (phase 1 review #3, #4)**: a legacy approve marks `approved/<set>/.preview-promotion.json` with a `promotion_id` that the origin sidecar
+  and the intent also record; an Undo withdraws only that promotion, and Recovery `complete` accepts a promotion that was already claimed.
+
+### CUTOVER notes (phase 1 review #2 and #9: legacy writers)
+The two remaining partial findings are coexistence issues with the OLD site (`tools/preview/serve.py` on :8765), not v2 defects: its Unapprove handler
+checks only the job record (no claim lock) and its monster LOD writer uses a fixed temp file without the v2 per-variant lock. Both end at cut-over,
+when the old site is stopped (CUTOVER.md step 1) and v2 is the only writer; no code change is made to serve.py / monsters.py (section 0). Until then,
+do not use the old site's Unapprove or monster LOD picker on a set / variant that v2 is also changing. A write the old site makes to a set that has an
+interrupted v2 transaction is detected by the recovery digest check (F8) and becomes a conflict instead of being overwritten.

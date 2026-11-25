@@ -1,7 +1,12 @@
-// 3D modal for character sets in the 3D / Aligned / Completed tabs (phase 1: the unit's labelled LOD GLB plus the
-// LOD choice; Approve and the real Aligned view arrive in phase 3). Bottom bar: race, module, LOD with face counts,
-// All, wireframe. A small race x module grid shows the chosen LOD of every unit so an odd one stands out.
-// Race, module, wireframe and camera carry over between sets.
+// 3D modal for character sets in the 3D tab: the unit's labelled LOD GLB plus the LOD choice, and Approve (key A) for the whole set.
+// Bottom bar: Approve, race, module, LOD with face counts, All, wireframe. A small race x module grid shows the chosen LOD of every
+// unit so an odd one stands out. Race, module, wireframe and camera carry over between sets.
+//
+// Approve opens a confirmation that lists the LOD and conversion of every race x module cell; confirming sends `approve` with
+// args.units = {"race/module": {job, lod}} for EVERY cell shown (the server refuses with a 409 when a newer conversion or another LOD
+// is current: the dialog then stays open, the item is reloaded and the changed cells are highlighted) and args.lods = the cells whose
+// LOD was never saved (the server writes them with the approval). A held key never repeats the approval (modal.js mutationKey). After it the set stays in 3D while its layers are built: a
+// progress bar "Building layers n/m", per-unit errors with Retry (`rebuild`), the item is polled every 2 s until the set moves on.
 //
 // LOD writes (DESIGN.md section 4): every write carries the set's `rev` and the `job` of each unit the user was looking at; a 409
 // (stale rev, newer conversion, approved set) reloads the item and never retries. "All" returns the previous picks and the new rev;
@@ -9,7 +14,8 @@
 // the LOD selector is view-only: it changes the displayed mesh and posts nothing.
 import { api } from './api.js';
 import { createViewer } from './viewer.js';
-import { raceVerb } from './actions.js';
+import { raceVerb, undoAction } from './actions.js';
+import { mutationKey } from './modal.js';
 import { refresh } from './state.js';
 import { toast } from './toast.js';
 import { badge, button, faceText, field, fillSelect, h, lodLabel, pretty, storage, toggle } from './util.js';
@@ -41,8 +47,9 @@ export async function showModel3d(modal, host) {
   const message = h('div', { class: 'viewer-message', hidden: true });
   const gridBox = h('details', { class: 'lod-grid', open: !matchMedia('(max-width:650px)').matches });
   const notes = h('div', { class: 'viewer-notes' });
+  const buildPanel = h('div', { class: 'build-panel', hidden: true });
   wrap.append(message);
-  modal.body.append(h('div', { class: 'viewer-shell' }, wrap, gridBox, notes));
+  modal.body.append(h('div', { class: 'viewer-shell' }, wrap, buildPanel, gridBox, notes));
   const viewer = createViewer(wrap);
   viewer.setWireframe(wire);
 
@@ -65,17 +72,14 @@ export async function showModel3d(modal, host) {
   };
   const prevRace = button('‹', () => stepRace(-1), '', 'Previous race');
   const nextRace = button('›', () => stepRace(1), '', 'Next race');
-  // PHASE 3: the Approve button goes into this slot (3D tab: approve the whole set at the chosen LODs).
-  const approveSlot = h('span', { class: 'approve-slot', dataset: { slot: 'approve', phase: '3' } });
+  const approveButton = button('Approve', () => askApprove(), 'primary', 'Approve the whole set at the chosen LODs (A)');
+  const approveSlot = h('span', { class: 'approve-slot' }, approveButton);
   const lodNote = h('span', { class: 'lod-note', hidden: true, text: 'LOD view only: approved' });
   const backButton = button('Back to 3D', () => sendBack(), '', 'Clear the 3D approval so the LODs can be changed again');
   backButton.hidden = true;
-  const hint = tab === 'aligned' || tab === 'completed'
-    ? h('span', { class: 'phase-hint', text: `${tab === 'aligned' ? 'Aligned' : 'Completed'} view: phase 3 (showing the labelled LOD)` })
-    : null;
   modal.actions.classList.add('model-actions');
   modal.actions.append(approveSlot, h('span', { class: 'entry-picker' }, prevRace, nextRace, raceSelect), moduleField,
-    field('LOD', lodSelect), allButton, facesText, wireToggle.label, lodNote, backButton, ...(hint ? [hint] : []));
+    field('LOD', lodSelect), allButton, facesText, wireToggle.label, lodNote, backButton);
 
   // ---- data -----------------------------------------------------------------------------------------------
   const units = () => item?.units || [];
@@ -115,6 +119,10 @@ export async function showModel3d(modal, host) {
     lodNote.hidden = !locked;
     lodNote.title = 'The LOD of an approved set cannot change: use Back to 3D first. The selector only switches the displayed mesh.';
     backButton.hidden = !locked;
+    const block = approveBlock();
+    approveButton.hidden = locked;
+    approveButton.disabled = !!block;
+    approveButton.title = block || 'Approve the whole set at the chosen LODs (A)';
     const faces = unit?.lods?.[lodSelect.value]?.faces;
     facesText.textContent = faces != null ? faceText(faces) + (unit.lod_saved || locked ? '' : ' · not saved') : '';
     facesText.classList.toggle('unsaved', !!unit && !unit.lod_saved && !locked);
@@ -157,6 +165,17 @@ export async function showModel3d(modal, host) {
       nodes.push(h('div', { class: 'drop-line', text: 'Not converted: ' + item.not_converted.map(n => `${pretty(n.race)} (${n.reason})`).join(', ') }));
     }
     notes.replaceChildren(...nodes);
+  }
+
+  /** Why Approve is not possible, or null. The server checks the same (and answers 400 with the missing units). */
+  function approveBlock() {
+    if (item?.error) return `Decisions unreadable: ${item.error}`;
+    if (!item) return 'Loading...';
+    const live = units().filter(u => u.status !== 'dropped');
+    if (!live.length) return 'No unit to approve';
+    const bad = live.filter(u => u.status !== 'reduced' || !hasLods(u));
+    if (bad.length) return `Not ready: ${bad.map(u => `${pretty(u.race)} ${moduleShort(u.module)} (${u.status})`).join(', ')}`;
+    return null;
   }
 
   function setMessage(text) {
@@ -298,7 +317,7 @@ export async function showModel3d(modal, host) {
   async function reload() {
     try {
       item = await api.item(card.id);
-      if (host.isCurrent()) { pick(); show(); }
+      if (host.isCurrent()) { pick(); show(); drawBadges(); drawBuild(); watch(); }
     } catch (error) {
       toast(`Reload failed: ${error.message}`);
     }
@@ -320,9 +339,220 @@ export async function showModel3d(modal, host) {
     await reload();
   }
 
+  // ---- approval and layer builds ---------------------------------------------------------------------------
+  let confirm = null;     // the open confirmation: {node, shown: {"race/module": {job, lod, saved}}, busy}
+  let timer = null;
+
+  const liveUnits = () => units().filter(u => u.status !== 'dropped' && hasLods(u));
+  const buildOf = unit => item?.builds?.[keyOf(unit)];
+  const built = unit => ['published', 'stale'].includes(buildOf(unit)?.status);
+  const shortJob = job => String(job || '').slice(0, 8);
+
+  function closeConfirm() {
+    confirm?.node.remove();
+    confirm = null;
+  }
+
+  /** What the confirmation shows (and what Approve sends back): the conversion (job) and LOD of every live unit. */
+  const shownUnits = () => Object.fromEntries(liveUnits().map(u => [keyOf(u), { job: u.job, lod: u.lod, saved: !!u.lod_saved }]));
+
+  /** Differences between two shown maps: [{key, text}] (a unit's LOD, its conversion, a unit that appeared or went). */
+  function diffShown(before, now) {
+    const out = [];
+    for (const key of new Set([...Object.keys(before), ...Object.keys(now)])) {
+      const a = before[key];
+      const b = now[key];
+      if (!a || !b) { out.push({ key, text: `${key}: ${a ? 'no longer a unit of this set' : 'new unit'}` }); continue; }
+      const parts = [];
+      if (a.lod !== b.lod) parts.push(`LOD ${lodLabel(a.lod)} -> ${lodLabel(b.lod)}`);
+      if (a.job !== b.job) parts.push(`conversion ${shortJob(a.job)} -> ${shortJob(b.job)}`);
+      if (parts.length) out.push({ key, text: `${key}: ${parts.join(', ')}` });
+    }
+    return out;
+  }
+
+  /**
+   * (Re)draw the confirmation from the units as they are NOW: the LOD and conversion of every race x module cell, the cells that
+   * differ from what the reviewer saw before highlighted, and a fresh confirm required (the same dialog stays open after a 409).
+   */
+  function renderConfirm(changes = []) {
+    const live = liveUnits();
+    const races = [...new Set(live.map(u => u.race))];
+    const modules = allModules();
+    const unsaved = live.filter(u => !u.lod_saved);
+    const changed = new Set(changes.map(c => c.key));
+    const head = h('tr', null, h('th'), modules.map(m => h('th', { text: moduleShort(m), title: pretty(m) })));
+    const rows = races.map(race => h('tr', null, h('th', { class: 'race-name', text: pretty(race) }), modules.map(module => {
+      const unit = unitOf(race, module);
+      const ready = unit && hasLods(unit);
+      const cls = [unit && !unit.lod_saved && 'unsaved', changed.has(keyOf({ race, module })) && 'changed'].filter(Boolean).join(' ');
+      return h('td', { class: cls, title: ready ? `conversion ${unit.job}${unit.lod_saved ? '' : ' - LOD not saved yet: it is saved with the approval'}` : '' },
+        ready ? [lodLabel(unit.lod) + (unit.lod_saved ? '' : ' *'), h('small', { class: 'job', text: shortJob(unit.job) })] : '-');
+    })));
+    const box = h('div', { class: 'confirm-box' },
+      h('h3', { text: `Approve ${card.title || pretty(card.name)}?` }),
+      changes.length ? h('div', { class: 'confirm-changes' }, h('b', { text: 'The set changed since you looked at it. Check the highlighted cells and confirm again:' }),
+        ...changes.map(c => h('div', { text: c.text }))) : null,
+      h('p', { text: `The ${live.length} unit${live.length === 1 ? '' : 's'} below get their layers built at these LODs (conversion id under each LOD). `
+        + 'The LODs are frozen until you use Back to 3D.' }),
+      h('table', null, h('thead', null, head), h('tbody', null, ...rows)),
+      unsaved.length ? h('p', { class: 'note', text: `* ${unsaved.length} LOD${unsaved.length === 1 ? ' is' : 's are'} not saved yet (the default is shown); approving saves ${unsaved.length === 1 ? 'it' : 'them'}.` }) : null,
+      h('div', { class: 'confirm-buttons' }, button('Cancel', closeConfirm, '', 'Esc'), button('Approve', doApprove, 'primary', 'Enter or A')));
+    const node = h('div', { class: 'confirm-overlay', tabIndex: -1 }, box);
+    if (confirm) confirm.node.replaceWith(node); else modal.body.querySelector('.viewer-shell').append(node);
+    confirm = { node, shown: shownUnits(), busy: false };
+    node.focus();
+  }
+
+  /** Approve: show the LOD and conversion of every race x module cell first (the one place a wrong "All" would show up). */
+  function askApprove() {
+    const block = approveBlock();
+    if (block) { toast(block); return; }
+    if (confirm || isLocked()) return;
+    renderConfirm();
+  }
+
+  /**
+   * Confirmed. Sends `args.units` = {"race/module": {job, lod}} for EVERY unit the confirmation shows (so the server refuses when a
+   * newer conversion or another LOD is current) and `args.lods` for the cells whose LOD was never saved (the server writes those
+   * with the approval). Nothing else about the units is sent. A 409 keeps the dialog open: the item is reloaded and the table
+   * redrawn with the differences highlighted; the reviewer has to confirm again.
+   */
+  async function doApprove() {
+    if (!confirm || confirm.busy) return;
+    const mine = confirm;
+    mine.busy = true;
+    mine.node.querySelectorAll('button').forEach(b => { b.disabled = true; });
+    let done = false;
+    try {
+      await writes.catch(() => {});             // pending LOD saves first, so the rev is the newest
+      if (confirm !== mine) return;
+      const drift = diffShown(mine.shown, shownUnits());
+      if (drift.length) { renderConfirm(drift); return; }    // what the cells show changed behind the dialog: look again
+      const sent = Object.fromEntries(Object.entries(mine.shown).map(([key, v]) => [key, { job: v.job, lod: v.lod }]));
+      const lods = Object.fromEntries(Object.entries(mine.shown).filter(([, v]) => !v.saved).map(([key, v]) => [key, v.lod]));
+      const result = await api.action(item.id, 'approve', { rev: item.rev, args: { lods, units: sent } });
+      done = true;
+      closeConfirm();
+      // the server's undo descriptor has no rev: ask for the current one (the approval just bumped it)
+      const undoable = result?.undo ? async () => {
+        const rev = typeof result.rev === 'number' ? result.rev : (await api.item(item.id)).rev;
+        await undoAction({ ...result.undo, rev });
+        refresh().catch(() => {});
+      } : null;
+      toast('Approved: building layers', { undo: undoable });
+    } catch (error) {
+      if (error.conflict && confirm === mine && [null, 'rev', 'job', 'lod', 'changed'].includes(error.code)) {
+        await changedUnderDialog(mine, error);
+        return;
+      }
+      if (confirm === mine) closeConfirm();
+      if (!error.conflict) toast(`Approve failed: ${error.message}`);
+    } finally {
+      if (confirm === mine && !done) { mine.busy = false; mine.node.querySelectorAll('button').forEach(b => { b.disabled = false; }); }
+    }
+    refresh().catch(() => {});
+    await reload();
+  }
+
+  /** The server says the set changed since the confirmation was drawn: reload it and show the confirmation again with the differences. */
+  async function changedUnderDialog(old, error) {
+    try {
+      item = await api.item(card.id);
+    } catch (reloadError) {
+      closeConfirm();
+      toast(`Reload failed: ${reloadError.message}`);
+      return;
+    }
+    if (!host.isCurrent()) return;
+    pick();
+    show();
+    drawBadges();
+    drawBuild();
+    watch();
+    if (isLocked() || approveBlock()) { closeConfirm(); toast(isLocked() ? 'Not approved: the set was approved elsewhere' : `Not approved: ${approveBlock()}`); return; }
+    const server = [].concat(error.body?.changes ?? []).map(c => ({ key: '', text: typeof c === 'string' ? c : c?.message || JSON.stringify(c) }));
+    let changes = diffShown(old.shown, shownUnits());
+    if (!changes.length) changes = server.length ? server : [{ key: '', text: 'The set was changed elsewhere (revision). The cells are as shown now.' }];
+    renderConfirm(changes);
+  }
+
+  async function retry(unit) {
+    try {
+      await api.action(item.id, 'rebuild', { rev: item.rev, args: { race: unit.race, module: unit.module } });
+      toast(`Rebuilding ${pretty(unit.race)} ${moduleShort(unit.module)}`);
+    } catch (error) {
+      if (!error.conflict) toast(`Retry failed: ${error.message}`);
+    }
+    await pollItem();
+  }
+
+  /** "Building layers n/m", the units still working and the failed ones with their error and Retry. */
+  function drawBuild() {
+    if (!item?.decisions?.lod_approval) { buildPanel.hidden = true; return; }
+    const live = liveUnits();
+    const done = live.filter(built).length;
+    const failed = live.filter(u => buildOf(u)?.status === 'failed');
+    const working = live.filter(u => ['queued', 'building'].includes(buildOf(u)?.status) || ['queued', 'running', 'stalled'].includes(buildOf(u)?.task?.state));
+    const moved = item.stage && item.stage !== '3d';
+    const nodes = [h('div', { class: 'build-line' },
+      h('strong', { text: moved ? `Layers built ${done}/${live.length}` : `Building layers ${done}/${live.length}` }),
+      h('progress', { max: Math.max(live.length, 1), value: done }))];
+    if (moved) {
+      nodes.push(h('div', { class: 'build-line' }, `The set is now in ${pretty(item.stage)}.`,
+        button(`Open in ${pretty(item.stage)}`, () => host.openIn?.(item.stage), 'primary')));
+    }
+    for (const unit of failed) {
+      nodes.push(h('div', { class: 'build-error' }, h('b', { text: `${pretty(unit.race)} ${moduleShort(unit.module)}: build failed` }),
+        h('pre', { text: buildOf(unit).error || 'no error text' }), button('Retry', () => retry(unit), '', 'Build this unit again')));
+    }
+    if (working.length) {
+      nodes.push(h('div', { class: 'build-working', text: working.map(u => {
+        const b = buildOf(u);
+        return `${pretty(u.race)} ${moduleShort(u.module)}: ${b.task?.state === 'stalled' ? 'stalled' : b.status}${b.task?.elapsed != null ? ` ${Math.round(b.task.elapsed)}s` : ''}`;
+      }).join(' · ') }));
+    }
+    buildPanel.replaceChildren(...nodes);
+    buildPanel.hidden = false;
+  }
+
+  const drawBadges = () => modal.setBadges([badge(item?.stage || card.stage || tab), ...((item?.card || card).badges || []).map(b => badge(b.text, b.tone))]);
+
+  /** Re-read the item while layers are being built (no viewer reload): progress, errors, and the move to Aligned. */
+  async function pollItem() {
+    try {
+      const fresh = await api.item(card.id);
+      if (!host.isCurrent()) return;
+      item = fresh;
+      drawBadges();
+      drawControls();
+      drawGrid();
+      drawBuild();
+    } catch { /* the next poll tries again */ }
+    watch();
+  }
+
+  function watch() {
+    const busy = !!item?.decisions?.lod_approval && item?.stage === '3d' && liveUnits().some(u => !built(u));
+    if (busy && !timer) timer = setInterval(pollItem, 2000);
+    if (!busy && timer) { clearInterval(timer); timer = null; }
+  }
+
+  modal.setKeyHandler(event => {
+    if (confirm) {
+      if (event.key === 'Escape') closeConfirm();
+      else if (event.key === 'Enter' || event.key.toLowerCase() === 'a') return mutationKey(event, doApprove);   // a fresh press, never a repeat
+      return true;                          // nothing else (arrows, other shortcuts) reaches the dialog while the confirmation is open
+    }
+    if (event.key.toLowerCase() === 'a' && !isLocked()) return mutationKey(event, askApprove);   // opens the confirmation once per press
+    return false;
+  });
+
   // ---- start ----------------------------------------------------------------------------------------------
   modal.setTeardown(() => {
     carry.view = viewer.hasModel ? viewer.getView() : carry.view;
+    clearInterval(timer);
+    timer = null;
     viewer.dispose();
   });
   modal.setBadges([badge(card.stage || tab), ...(card.badges || []).map(b => badge(b.text, b.tone))]);
@@ -336,6 +566,8 @@ export async function showModel3d(modal, host) {
   if (!host.isCurrent()) return;
   pick();
   drawGrid();
+  drawBuild();
+  watch();
   if (!sel.race) {
     drawControls();
     drawNotes();

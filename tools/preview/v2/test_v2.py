@@ -43,6 +43,7 @@ if command=='promote':
  print(json.dumps({'set':target.name,'stage':'approved'}))
 '''
 RACES = ('human_male', 'dwarf_male')
+LAYER_SLOTS = {'outfit': ('outfit',), 'body_armor': ('torso',), 'right_gauntlet_boot': ('lower_arm.l', 'lower_arm.r', 'lower_leg.l', 'lower_leg.r')}
 PNG = b'\x89PNG\r\n\x1a\n' + b'0' * 16
 
 
@@ -172,6 +173,24 @@ class V2Case(unittest.TestCase):
         for race, module in units:
             self.reduce(name, job, race, module)
 
+    def publish(self, set_name, job, race, module, lod='0p2', fingerprint='fp0', slots=None, model_set=None):
+        """A published layer build (pointer + build folder with stub GLBs) of a module, as tools/layers/build.py would leave it."""
+        ms = model_set or set_name
+        out = self.root / 'models' / ms / job / race / module / 'layers'
+        build_id = f'{lod}-{fingerprint[:12]}'
+        (out / build_id).mkdir(parents=True, exist_ok=True)
+        slots = slots or LAYER_SLOTS[module]
+        for slot in slots:
+            (out / build_id / f'{slot}.glb').write_bytes(b'glb-' + slot.encode())
+            (out / build_id / f'{slot}.json').write_text('{}')
+        import builds as _builds
+        record = {'build_id': build_id, 'fingerprint': fingerprint, 'lod': lod, 'status': 'ok', 'kind': module, 'race': race, 'set': ms,
+                  'module': _builds.lb()._rel(out.parent), 'required': list(slots), 'warnings': [], 'metrics': {'wall_crossings_left': 0},
+                  'slots': {slot: {'glb': f'{build_id}/{slot}.glb', 'json': f'{build_id}/{slot}.json', 'faces': 10} for slot in slots}}
+        (out / build_id / 'build.json').write_text(json.dumps(record))
+        (out / f'current_{lod}.json').write_text(json.dumps(record))
+        return record
+
     def monster(self, monster='Horse', variant='1', lods=('0p4',), approved=None, image=True):
         views = self.mroot / 'pipeline' / monster / 'views' / variant
         models = self.mroot / 'pipeline' / monster / 'models' / variant
@@ -249,10 +268,18 @@ class StageTests(V2Case):
         pin = {'schema': 1, 'rev': 3, 'lod_approval': {'units': {'human_male/outfit': {'job': 'old', 'lod': '0p2'}}}}
         (self.root / 'models/s/pipeline_v2.json').write_text(json.dumps(pin))
         unit, item = self.unit('s')
+        self.assertEqual((unit['job'], item['rev'], item['stage'], item['locked']), ('old', 3, '3d', True))   # approved, layer build not published yet
+        self.publish('s', 'old', 'human_male', 'outfit')
+        unit, item = self.unit('s')
         self.assertEqual((unit['job'], item['rev'], item['stage'], item['locked']), ('old', 3, 'aligned', True))   # lod_approval without aligned_approval
-        pin['aligned_approval'] = {'units': {}}
+        self.assertEqual((unit['lod'], unit['lod_saved'], unit['frozen']), ('0p2', True, True))     # the FROZEN LOD, not chosen_lod.json (#12)
+        (self.root / 'models/s/old/human_male/outfit/chosen_lod.json').write_text(json.dumps({'lod': '0p4'}))
+        self.assertEqual(self.unit('s')[0]['lod'], '0p2')
+        pin['aligned_approval'] = {'units': {'human_male/outfit': {'job': 'old', 'lod': '0p2', 'build_id': '0p2-fp0'}}}
         (self.root / 'models/s/pipeline_v2.json').write_text(json.dumps(pin))
-        self.assertEqual(self.unit('s')[1]['stage'], 'completed')
+        unit, item = self.unit('s')
+        self.assertEqual(item['stage'], 'aligned')                                     # no bare builds / ready.json: not Completed (F3)
+        self.assertIn('ready.json is missing or belongs to another approval', item['not_completed'])
 
     def test_physical_model_path_of_suffixed_jobs(self):
         """`<set>_<race>--<id>` and `<set>_gnome--<id>` belong to the base set card, but the converter wrote models/<record set>/<id>/..."""
@@ -319,6 +346,8 @@ class StageTests(V2Case):
         pin = {'schema': 1, 'rev': 4, 'lod_approval': {'units': {'human_male/outfit': {'job': 'gone', 'lod': '0p2'},
                                                                    'dwarf_male/outfit': {'job': 'old', 'lod': '0p2'}}}}
         (self.root / 'models/s/pipeline_v2.json').write_text(json.dumps(pin))
+        self.assertEqual(self.unit('s')[1]['stage'], '3d')           # dwarf_male/outfit is approved but not built yet
+        self.publish('s', 'old', 'dwarf_male', 'outfit')
         unit, item = self.unit('s')
         self.assertEqual((unit['status'], unit['job'], item['stage']), ('pin_missing', 'gone', 'aligned'))
         self.assertIn('gone', unit['error'])
@@ -387,7 +416,11 @@ class StageTests(V2Case):
         self.assertEqual(([c['id'] for c in state['tabs']['aligned']], state['tabs']['3d']), (['set:s'], []))
         (self.root / 'models/s/pipeline_v2.json').write_text(json.dumps({'rev': 2, 'lod_approval': {'units': {}}, 'aligned_approval': {'units': {}}}))
         _, state = self.get('/api/v2/state')
-        self.assertEqual([c['id'] for c in state['tabs']['completed']], ['set:s'])
+        # an aligned approval that does not name every live unit, its bare builds and a matching ready.json is NOT Completed (phase 3 review F3;
+        # the full Completed rule is tested in test_phase3.py)
+        self.assertEqual(([c['id'] for c in state['tabs']['aligned']], state['tabs']['completed']), (['set:s'], []))
+        item = self.get('/api/v2/item?id=set:s')[1]
+        self.assertIn('approved units differ from the live units', item['not_completed'])
 
     def test_card_kind_and_fresh_thumb(self):
         self.full_set('arm', modules=('body_armor', 'right_gauntlet_boot'))
@@ -743,6 +776,28 @@ class DecisionTests(V2Case):
         path.write_text(json.dumps({'schema': 1, 'rev': 7}))        # fixed: mutations work again
         self.assertEqual(self.act('set:s', 'drop_race', rev=7, args={'race': 'dwarf_male'})[0], 200)
 
+    def test_malformed_nested_records_and_invalid_utf8_give_an_unreadable_card(self):
+        """Phase 1 review #10: nested approval data is validated and a decoding error is an unreadable card, never a broken derivation."""
+        self.full_set('s')
+        path = self.root / 'models/s/pipeline_v2.json'
+        for raw in (json.dumps({'rev': 1, 'lod_approval': {'units': {'human_male/outfit': 'x'}}}),
+                    json.dumps({'rev': 1, 'lod_approval': {'units': {'human_male/outfit': {'job': 'j1', 'lod': '0p9'}}}}),
+                    json.dumps({'rev': 1, 'lod_approval': {'units': [1]}}),
+                    json.dumps({'rev': 1, 'amount': {'human_male': {'outfit': 'lots'}}}),
+                    json.dumps({'rev': 1, 'aligned_approval': {'units': {'human_male/outfit': {'job': 'j1', 'lod': '0p2'}}}}),
+                    json.dumps({'rev': 1, 'dropped': {'human_male': 3}})):
+            path.write_text(raw)
+            status, state = self.get('/api/v2/state')
+            self.assertEqual(status, 200, raw)
+            card = next(c for c in sum(state['tabs'].values(), []) if c['id'] == 'set:s')
+            self.assertIn('decisions unreadable', [b['text'] for b in card['badges']], raw)
+            self.assertTrue(self.get('/api/v2/item?id=set:s')[1]['error'], raw)
+            self.assertEqual(self.act('set:s', 'drop_race', rev=1, args={'race': 'dwarf_male'})[1]['code'], 'unreadable', raw)
+        path.write_bytes(b'{"rev": 1, "note": "' + bytes([0xff, 0xfe]) + b'"}')
+        status, item = self.get('/api/v2/item?id=set:s')
+        self.assertEqual(status, 200)
+        self.assertIn('UTF-8', item['error'])
+
     def test_set_verbs_check_the_set_before_creating_anything(self):
         before = sorted(str(p.relative_to(self.root)) for p in self.root.rglob('*'))
         self.assertEqual(self.act('set:ghost', 'drop_race', rev=0, args={'race': 'human_male'})[0], 404)
@@ -949,6 +1004,58 @@ class MoveSafetyTests(V2Case):
         untouched()
         self.assertEqual(guard.list_intents(self.root), [])
 
+    def test_an_old_undo_never_withdraws_a_later_promotion_of_the_same_name(self):
+        """Phase 1 review #3: the promotion id of the sidecar must match the mark in approved/<set>/."""
+        self.legacy()
+        self.assertEqual(self.act('legacy:batch:01_plate', 'approve')[0], 200)
+        approved = self.root / 'approved/batch_01_plate'
+        sidecar = json.loads((self.root / 'trash/concepts/batch/01_plate.preview-origin.json').read_text())
+        mark = json.loads((approved / actions.PROMOTION_MARK).read_text())
+        self.assertEqual(sidecar['promotion_id'], mark['promotion_id'])
+        # the first promotion went away and a LATER one of the same name took its place
+        approved.rename(self.root / 'elsewhere')
+        approved.mkdir()
+        (approved / actions.PROMOTION_MARK).write_text(json.dumps({'promotion_id': 'a-later-one'}))
+        status, result = self.act('trashlegacy:batch:01_plate', 'restore')
+        self.assertEqual(status, 400)
+        self.assertIn('later promotion', result['error'])
+        self.assertTrue((approved / actions.PROMOTION_MARK).is_file())               # untouched
+        (approved / actions.PROMOTION_MARK).unlink()                                 # a promotion without any mark is not withdrawn either
+        self.assertEqual(self.act('trashlegacy:batch:01_plate', 'restore')[0], 400)
+        self.assertTrue(approved.is_dir())
+
+    def test_complete_of_an_interrupted_legacy_approve_whose_promotion_was_claimed(self):
+        """Phase 1 review #4: the promotion was claimed by the supervisor after the flat move was interrupted: Complete finishes the move."""
+        batch = self.legacy()
+        real = shutil.move
+
+        def only_first(src, dst):
+            if not getattr(only_first, 'used', False):
+                only_first.used = True
+                return real(src, dst)
+            raise OSError('disk went away')
+        with mock.patch.object(actions.shutil, 'move', only_first), mock.patch.object(actions, '_rollback_flat', side_effect=OSError('rollback failed')):
+            self.assertEqual(self.act('legacy:batch:01_plate', 'approve')[0], 400)
+        intent = guard.list_intents(self.root)[0]
+        self.assertTrue(intent['promoted'] and intent['promotion_id'])
+        (self.root / 'approved/batch_01_plate').rename(self.root / 'processing_views/batch_01_plate--abc')     # the claim moved it on
+        status, result = self.act(f'intent:{intent["id"]}', 'complete')
+        self.assertEqual(status, 200, result)
+        self.assertEqual(guard.list_intents(self.root), [])
+        self.assertEqual(sorted(p.name for p in batch.iterdir()), [])
+        self.assertTrue((self.root / 'trash/concepts/batch/01_plate.preview-origin.json').is_file())
+        # a claimed folder of ANOTHER promotion does not count
+        self.legacy()
+        with mock.patch.object(actions.shutil, 'move', only_first), mock.patch.object(actions, '_rollback_flat', side_effect=OSError('x')):
+            only_first.used = False
+            (self.root / 'processing_views/batch_01_plate--abc').rename(self.root / 'processing_views/batch_01_plate--old')
+            self.assertEqual(self.act('legacy:batch:01_plate', 'approve')[0], 400)
+        intent = guard.list_intents(self.root)[0]
+        approved = self.root / 'approved/batch_01_plate'
+        (approved / actions.PROMOTION_MARK).write_text(json.dumps({'promotion_id': 'someone-else'}))
+        approved.rename(self.root / 'processing_views/batch_01_plate--new')
+        self.assertEqual(self.act(f'intent:{intent["id"]}', 'complete')[0], 400)
+
     def test_reject_writes_the_origin_sidecar_before_the_rename(self):
         self.concept('one')
         sidecar = self.root / 'concepts/one/.preview-origin.json'
@@ -1149,13 +1256,25 @@ class WriterTests(V2Case):
         self.full_set('s')
         path = self.root / 'models/s/pipeline_v2.json'
         path.write_text(json.dumps({'rev': 4}))
-        guard.new_intent(self.root, {'kind': 'files_tx', 'label': 'lod s', 'files': [{'path': 'models/s/pipeline_v2.json', 'before_b64': None}]})
+        written = guard.sha256_or_none(path.read_bytes())
+        guard.new_intent(self.root, {'kind': 'files_tx', 'label': 'lod s', 'set': 's',
+                                     'files': [{'path': 'models/s/pipeline_v2.json', 'before_b64': None, 'after_sha256': written}]})
         guard._ACTIVE.clear()                                                        # the process that wrote it is gone
         self.restart_writer()
         started = server.create_server(self.root, port=0, web=self.web, extra_hosts=[], read_only=False)
         started.server_close()
         self.assertFalse(path.exists())                                              # restored to "absent"
         self.assertEqual(guard.list_intents(self.root), [])
+        # an OLD intent without the written digest, over a file that is neither its old nor any known content: never restored blindly
+        path.write_text(json.dumps({'rev': 9}))
+        guard.new_intent(self.root, {'kind': 'files_tx', 'label': 'lod s', 'set': 's', 'files': [{'path': 'models/s/pipeline_v2.json', 'before_b64': None}]})
+        guard._ACTIVE.clear()
+        started = server.create_server(self.root, port=0, web=self.web, extra_hosts=[], read_only=False)
+        started.server_close()
+        self.assertTrue(path.exists())
+        self.assertEqual([bool(i.get('conflict')) for i in guard.list_intents(self.root)], [True])
+        for intent in guard.list_intents(self.root):
+            guard.finish_intent(self.root, intent['id'])
         self.start_writer()
 
     def test_set_lock_is_cross_process(self):

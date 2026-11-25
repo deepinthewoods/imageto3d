@@ -77,12 +77,32 @@ export const isModalOpen = () => !$('modal').hidden;
 const dialog = () => document.querySelector('#modal .dialog');
 
 /** Keyboard focus goes into the dialog (not the card underneath), so a key the opening gesture repeats lands on the dialog body. */
-function focusDialog() {
+export function focusDialog() {
   dialog()?.focus({ preventScroll: true });
 }
 
 /** True when the key event targets the dialog body itself (nothing inside it has focus): the only place Enter = approve works. */
 export const onDialogBody = event => event.target === dialog() || event.target === document.body;
+
+// ---- fresh key presses for mutation shortcuts ------------------------------------------------------------------------
+// A held key repeats (`event.repeat`); a shortcut that CHANGES something (approve, reject, provisional ...) must come from one fresh
+// press: repeats are ignored, and once a shortcut fired (or opened a confirmation, or moved to the next card) its key stays "spent"
+// until it is released (keyup) or the window loses focus, so a key held across a dialog change never fires a second action.
+const spent = new Set();
+const keyId = event => String(event.key).toLowerCase();
+/** True for a fresh press of a key that has not fired a mutation shortcut since it went down. */
+export const freshKey = event => !event.repeat && !spent.has(keyId(event));
+/**
+ * Run `fn` for a mutation shortcut only on a fresh press, and spend the key. Always returns true (the event is handled, repeats are
+ * swallowed too so they do not fall through to Esc-closes / arrows).
+ */
+export function mutationKey(event, fn) {
+  event.preventDefault();
+  if (!freshKey(event)) return true;
+  spent.add(keyId(event));
+  fn();
+  return true;
+}
 
 /** Full size picture over the dialog; click or Esc closes it. */
 export function showImage(url) {
@@ -105,6 +125,8 @@ export function initModal() {
   dialog().addEventListener('click', event => {
     if (event.target instanceof Element && event.target.closest('button')) setTimeout(() => { if (isModalOpen() && !overlay) focusDialog(); }, 0);
   });
+  document.addEventListener('keyup', event => spent.delete(keyId(event)));
+  window.addEventListener('blur', () => spent.clear());
   document.addEventListener('keydown', event => {
     if (!current || event.defaultPrevented || event.ctrlKey || event.altKey || event.metaKey) return;
     if (overlay) {

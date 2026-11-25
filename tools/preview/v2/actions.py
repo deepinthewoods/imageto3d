@@ -13,22 +13,25 @@ write surface, so a request can never reach the old site's `model:` / `approvedm
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import json
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
+import uuid
 
 HERE = Path(__file__).resolve().parent
 for _p in (HERE.parent, HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 import serve  # noqa: E402  (tools/preview/serve.py, used as a library)
+import builds  # noqa: E402
 import catalog  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
+import taskqueue  # noqa: E402
 from claim_lock import ClaimBusy, claim_lock  # noqa: E402  (tools/tripo_pipeline on sys.path through guard.py)
 
 NAME = serve.NAME
@@ -45,11 +48,12 @@ ALLOWED = frozenset({
     ('concepts', 'archive'), ('legacy', 'archive'), ('archive', 'unarchive'), ('archlegacy', 'unarchive'),
     ('trash', 'restore'), ('trashlegacy', 'restore'),
     ('intent', 'complete'), ('intent', 'rollback'),
-    ('set', 'drop_race'), ('set', 'undrop_race'), ('set', 'unapprove'),
+    ('set', 'drop_race'), ('set', 'undrop_race'), ('set', 'unapprove'), ('set', 'approve'), ('set', 'rebuild'),
 })
-SET_VERBS = ('drop_race', 'undrop_race', 'unapprove')
+SET_VERBS = ('drop_race', 'undrop_race', 'unapprove', 'approve', 'rebuild')
 FLAT_TYPES = ('legacy', 'archlegacy', 'trashlegacy')
 WITHDRAWN = guard.APP / 'withdrawn'
+PROMOTION_MARK = '.preview-promotion.json'       # written into approved/<set>/ by a legacy approve; travels with the folder into its job when claimed
 JOB_STAGES = ('processing_views', 'multiview_ready', 'processing', 'failed', 'completed', serve.HELD)
 
 
@@ -214,15 +218,38 @@ def restore_set(root: Path, name: str) -> dict:
 
 # -------------------------------------------------------------------------------------------------------------- flat moves
 
-def withdraw_approved(root: Path, set_name: str) -> tuple[str, Path | None]:
+def promotion_of(folder: Path) -> str | None:
+    """The promotion id a legacy approve wrote into a promoted set folder (None when there is none)."""
+    value = serve.read_json(Path(folder) / PROMOTION_MARK).get('promotion_id')
+    return value if isinstance(value, str) else None
+
+
+def claimed_promotion(root: Path, set_name: str, promotion_id: str) -> str | None:
+    """The job folder (`<stage>/<set>--<job>`) a claim moved the promotion `promotion_id` of `set_name` into, if any."""
+    for stage in JOB_STAGES:
+        parent = root / stage
+        if not parent.is_dir():
+            continue
+        for folder in parent.iterdir():
+            if folder.name.split('--')[0] == set_name and '--' in folder.name and promotion_of(folder) == promotion_id:
+                return f'{stage}/{folder.name}'
+    return None
+
+
+def withdraw_approved(root: Path, set_name: str, promotion_id: str | None = None, strict: bool = False) -> tuple[str, Path | None]:
     """Take `approved/<set>` out of approved/ if nobody claimed it (moved to .codex_jobs/_app/withdrawn/, never deleted).
     Returns ('withdrawn', where it went), or ('absent', None) when the set is not in approved/ and nothing else holds it; a claim, or a copy that already
-    moved on to another review stage, is a ValueError and changes nothing."""
+    moved on to another review stage, is a ValueError and changes nothing. `promotion_id` (phase 1 review #3): the folder must carry that promotion
+    (a later promotion of the same name is never withdrawn by an old Undo); `strict` refuses a folder without any promotion mark too."""
     src = serve.direct(root, 'approved', set_name)
     with _locked_claim(root, set_name):
         if src.exists():
             if _claimed(src):
                 raise ValueError(f'{set_name} has already been claimed; it cannot be withdrawn')
+            if promotion_id is not None:
+                found = promotion_of(src)
+                if found != promotion_id and (found is not None or strict):
+                    raise ValueError(f'approved/{set_name} is a later promotion of that name, not the one this entry made; it was not withdrawn')
             dst = serve.unique(root / WITHDRAWN / set_name)
             dst.parent.mkdir(parents=True, exist_ok=True)
             src.rename(dst)
@@ -272,7 +299,8 @@ def _rollback_flat(root: Path, rec: dict) -> None:
     """Undo an interrupted flat move: withdraw the promoted set (legacy approve), put the files back, remove the sidecar."""
     approved = rec.get('approved_set')
     if approved and (rec.get('promoted') or (root / 'approved' / approved).exists()):
-        withdraw_approved(root, approved)               # the pre-check guaranteed the set did not exist before this approve
+        # the pre-check guaranteed the set did not exist before this approve; a mark of ANOTHER promotion still refuses
+        withdraw_approved(root, approved, rec.get('promotion_id'))
     _back_pairs(root, rec.get('files') or [])
     sidecar = rec.get('sidecar')
     if sidecar:
@@ -283,8 +311,14 @@ def _rollback_flat(root: Path, rec: dict) -> None:
 
 
 def _complete_flat(root: Path, rec: dict) -> None:
-    if rec.get('verb') == 'approve' and not (rec.get('approved_set') and (root / 'approved' / rec['approved_set']).is_dir()):
-        raise ValueError('The promotion did not finish; roll this back instead')
+    """Finish an interrupted flat move. For a legacy approve the promotion must exist: still in approved/ (with this promotion's mark when the
+    intent has an id), or already CLAIMED by the supervisor (a job folder carrying this promotion id; phase 1 review #4)."""
+    if rec.get('verb') == 'approve':
+        approved, promotion = rec.get('approved_set'), rec.get('promotion_id')
+        folder = root / 'approved' / approved if approved else None
+        here = bool(folder) and folder.is_dir() and (promotion is None or promotion_of(folder) == promotion)
+        if not here and not (approved and promotion and claimed_promotion(root, approved, promotion)):
+            raise ValueError('The promotion did not finish; roll this back instead')
     _write_sidecar(root, rec)
     _move_pairs(root, rec.get('files') or [])
 
@@ -334,6 +368,7 @@ def legacy_approve(root: Path, kind: str, parts: list[str]) -> dict:
         raise FileExistsError(f'approved/{approved_set} already exists')
     dst = serve.unique(root / 'trash' / 'concepts' / batch.name)
     result: dict = {}
+    promotion_id = uuid.uuid4().hex
 
     def promote(rec: dict) -> dict:
         command = [sys.executable, str(root / 'tools' / 'tripo_pipeline' / 'workflow.py'),
@@ -343,14 +378,18 @@ def legacy_approve(root: Path, kind: str, parts: list[str]) -> dict:
             raise ValueError(run.stderr.strip() or run.stdout.strip() or 'Promote failed')
         promoted = json.loads(run.stdout)
         result['promoted'] = promoted | ({'path': str(promoted['path']).replace('\\', '/')} if 'path' in promoted else {})
+        mark = serve.direct(root, 'approved', promoted['set']) / PROMOTION_MARK
+        guard.write_atomic(mark, json.dumps({'promotion_id': promotion_id, 'created': guard.now(), 'source': f'{origin_dir}/{batch.name}/{key}'}).encode())
         sidecar = rec['sidecar']
-        sidecar['content'] = sidecar['content'] | {'approved_set': promoted['set']}
+        sidecar['content'] = sidecar['content'] | {'approved_set': promoted['set'], 'promotion_id': promotion_id}
         return {'approved_set': promoted['set'], 'sidecar': sidecar, 'promoted': True}
 
-    sidecar = (dst / f'{key}.preview-origin.json', {'kind': 'legacy', 'src': f'{origin_dir}/{batch.name}', 'approved_set': approved_set})
+    sidecar = (dst / f'{key}.preview-origin.json', {'kind': 'legacy', 'src': f'{origin_dir}/{batch.name}', 'approved_set': approved_set,
+                                                     'promotion_id': promotion_id})
     with serve.LOCK:
         try:
-            flat_move(root, 'approve', files, dst, sidecar, extra={'approved_set': approved_set, 'promoted': False}, before=promote)
+            flat_move(root, 'approve', files, dst, sidecar, extra={'approved_set': approved_set, 'promoted': False, 'promotion_id': promotion_id},
+                      before=promote)
         except Exception as exc:
             serve.log_action(root, 'approve', f'{origin_dir}/{batch.name}/{key}', None, f'error: {exc}')
             raise
@@ -406,7 +445,8 @@ def restore_legacy(root: Path, parts: list[str]) -> dict:
     with serve.LOCK:
         try:
             if isinstance(origin.get('approved_set'), str):
-                withdrawn, kept = withdraw_approved(root, serve.safe_name(origin['approved_set']))
+                promotion = origin.get('promotion_id') if isinstance(origin.get('promotion_id'), str) else None
+                withdrawn, kept = withdraw_approved(root, serve.safe_name(origin['approved_set']), promotion, strict=promotion is not None)
             # the origin sidecar stays in the trash folder as an audit record; no files are deleted
             flat_move(root, 'restore', files, dst)
         except Exception as exc:
@@ -430,11 +470,18 @@ def resolve_intent(root: Path, intent_id: str, verb: str) -> dict:
         raise guard.Busy('That change is still running')
     rec = guard.read_intent(root, intent_id)
     kind = rec.get('kind')
-    with serve.LOCK:
+    with serve.LOCK, (decisions.set_lock(root, rec['set']) if isinstance(rec.get('set'), str) and NAME.fullmatch(rec['set']) else nullcontext()):
         if kind == 'files_tx':
-            if verb != 'rollback':
+            rec = guard.read_intent(root, intent_id)            # (re-read under the set lock)
+            if rec.get('conflict'):
+                # a manual choice: Complete keeps the files as they are now, Roll back restores the backups over the later changes
+                if verb == 'rollback':
+                    guard.recover_files(root, rec, force=True)
+            elif verb != 'rollback':
                 raise ValueError('An interrupted write can only be rolled back')
-            guard.restore_files(root, rec.get('files') or [])
+            elif guard.recover_files(root, rec) == 'conflict':
+                guard.update_intent(root, intent_id, conflict=True, conflict_files=guard.recovery_plan(root, rec.get('files') or [])[1])
+                raise guard.Conflict('A file of this write was changed again since; choose Complete (keep) or Roll back (restore the backups)')
         elif kind == 'flat_move':
             (_complete_flat if verb == 'complete' else _rollback_flat)(root, rec)
         else:
@@ -444,19 +491,40 @@ def resolve_intent(root: Path, intent_id: str, verb: str) -> dict:
     return {'ok': True, 'undo': None}
 
 
-def recover_at_start(root: Path) -> list[str]:
-    """Server start (single writer): roll back interrupted multi-file writes (LOD transactions) from their backups. Interrupted moves
-    stay listed as Recovery cards. Returns what was rolled back / what failed."""
+def recover_transactions(root: Path) -> list[str]:
+    """Roll back interrupted multi-file writes (server start, and every orchestrator loop): each under its set's lock, and only while every file
+    still holds what the transaction wrote or its old content (guard.recover_files); anything else marks the intent `conflict` (a Recovery card
+    needing a manual choice; the set stays read-only). Interrupted moves stay listed as Recovery cards. Returns what was done."""
     notes = []
     for rec in guard.list_intents(root):
-        if rec.get('kind') == 'files_tx':
-            try:
-                guard.restore_files(root, rec.get('files') or [])
-                guard.finish_intent(root, rec['id'])
-                notes.append(f'rolled back {rec.get("label")}')
-            except OSError as exc:
-                notes.append(f'could not roll back {rec.get("label")}: {exc}')
+        if rec.get('kind') != 'files_tx' or rec.get('conflict'):
+            continue
+        set_name = rec.get('set') if isinstance(rec.get('set'), str) and NAME.fullmatch(rec.get('set') or '') else None
+        try:
+            with decisions.set_lock(root, set_name) if set_name else nullcontext():
+                try:
+                    rec = guard.read_intent(root, rec['id'])
+                except FileNotFoundError:
+                    continue
+                outcome = guard.recover_files(root, rec)
+                if outcome == 'restored':
+                    guard.finish_intent(root, rec['id'])
+                    notes.append(f'rolled back {rec.get("label")}')
+                else:
+                    guard.update_intent(root, rec['id'], conflict=True, conflict_files=guard.recovery_plan(root, rec.get('files') or [])[1])
+                    notes.append(f'conflict: {rec.get("label")} was changed again since; it needs a manual choice (Trash > Recovery)')
+        except guard.Busy:
+            notes.append(f'{rec.get("label")}: the set is busy; recovery retries later')
+        except OSError as exc:
+            notes.append(f'could not roll back {rec.get("label")}: {exc}')
+    if notes:
+        catalog.invalidate()
     return notes
+
+
+def recover_at_start(root: Path) -> list[str]:
+    """Server start (single writer): recover_transactions."""
+    return recover_transactions(root)
 
 
 # ----------------------------------------------------------------------------------------------------------------- concepts
@@ -513,6 +581,378 @@ def concept_action(root: Path, verb: str, item_id: str, args: dict) -> dict:
 
 # ------------------------------------------------------------------------------------------------------------------ set verbs
 
+# ------------------------------------------------------------------------------------------------ phase 3: approvals and builds
+
+def _live_units(info: dict) -> list[dict]:
+    return [u for u in info['units'] if u['status'] != 'dropped']
+
+
+def _unit_key(unit: dict) -> str:
+    return f'{unit["race"]}/{unit["module"]}'
+
+
+def _check_writable(info: dict, rev: object) -> None:
+    """Under the set lock: readable decisions and the client's rev."""
+    if info['decisions_error']:
+        raise decisions.Unreadable(info['decisions_error'])
+    if isinstance(rev, bool) or not isinstance(rev, int) or rev != info['rev']:
+        raise decisions.RevConflict(info['rev'], rev)
+
+
+def _not_reduced(live: list[dict]) -> list[str]:
+    return [f'{_unit_key(u)} ({u["status"].replace("_", " ")})' for u in live if u['status'] != 'reduced']
+
+
+def _layer_args(root: Path, unit: dict, lod: str, glb_sha256: str) -> dict:
+    return {'module_dir': str(builds.module_dir(root, unit['model_set'], unit['job'], unit['race'], unit['module'])), 'lod': lod,
+            'race': unit['race'], 'module': unit['module'], 'job': unit['job'], 'model_set': unit['model_set'], 'glb_sha256': glb_sha256}
+
+
+def _ensure(queue: taskqueue.TaskQueue, lane: str, key: str, key_with_fp, current, retry_failed: bool, set_name: str | None, unit: str,
+            args: dict, priority: int) -> str:
+    """Make sure a task for `key` is on its way and return what happened: `queued`, `retried`, `running`, `current` (a done task whose build
+    is still current and valid), or `failed` (left as it is). A done task whose build is NOT current (code or inputs changed, or the build is
+    gone) gets a NEW key (`key_with_fp()`): the fingerprint changed, so the work is new. When that fingerprint key is itself done and its
+    publication is still missing or invalid, the row gets a fresh attempt (phase 3 review F11: every done key is revalidated, never assumed)."""
+    task = queue.by_key(key)
+    if task is None:
+        queue.enqueue(lane, key, set_name, unit, args, priority)
+        return 'queued'
+    state = task['state']
+    if state == 'queued':
+        return 'waiting'                                       # already queued (nothing new)
+    if state == 'running':
+        return state
+    if state == 'starting':
+        return 'running'
+    if state == 'cancelled':
+        queue.enqueue(lane, key, set_name, unit, args, priority)
+        return 'queued'
+    if state == 'failed':
+        if retry_failed:
+            queue.retry(task['id'])
+            return 'retried'
+        return 'failed'
+    if current():
+        return 'current'
+    if key_with_fp is None:
+        queue.reset_done(task['id'], 'the published build is missing or invalid: built again')
+        return 'queued'
+    fp_key = key_with_fp()
+    if fp_key == key:
+        queue.reset_done(task['id'], 'the published build is missing or invalid: built again')
+        return 'queued'
+    return _ensure(queue, lane, fp_key, None, current, retry_failed, set_name, unit, args, priority)
+
+
+def _bare_current(race: str) -> bool:
+    ptr = builds.bare_pointer(race)
+    return bool(ptr) and ptr.get('fingerprint') == builds.fingerprint_bare(race)
+
+
+def _ensure_bare(root: Path, race: str, retry_failed: bool) -> str:
+    return _ensure(taskqueue.for_root(root), 'bare', builds.bare_key(race), lambda: builds.bare_key(race, builds.fingerprint_bare(race)),
+                   lambda: _bare_current(race), retry_failed, None, race, {'race': race}, 3)
+
+
+def _ensure_layers(root: Path, set_name: str, unit: dict, approved: dict, retry_failed: bool) -> str:
+    key, lod, job, sha = _unit_key(unit), approved['lod'], approved['job'], approved['glb_sha256']
+    module = builds.module_dir(root, unit['model_set'], unit['job'], unit['race'], unit['module'])
+
+    def current() -> bool:
+        ptr = builds.pointer_at(module, lod)
+        return bool(ptr) and ptr.get('fingerprint') == builds.fingerprint_module(module, lod)
+    return _ensure(taskqueue.for_root(root), 'layers', builds.layer_key(set_name, key, lod, job, sha),
+                   lambda: builds.layer_key(set_name, key, lod, job, sha, builds.fingerprint_module(module, lod)), current, retry_failed,
+                   set_name, key, _layer_args(root, unit, lod, sha), 5)
+
+
+def task_approved(root: Path, task: dict, derived: dict | None = None) -> bool:
+    """A task may (still) run: a layers task only while its set has an active 3D approval of exactly that unit (job, LOD, source digest); a bare
+    task while some approved set needs its race (phase 3 review F6). Unreadable decisions count as not approved."""
+    args = task.get('args') if isinstance(task.get('args'), dict) else {}
+    if task.get('lane') == 'bare':
+        race = args.get('race') or task.get('unit')
+        derived = derived or catalog.derive_all(root)
+        return any(info['locked'] and race in info['races'] for info in derived['sets'].values())
+    set_name = task.get('set_name')
+    if not isinstance(set_name, str) or not NAME.fullmatch(set_name):
+        return False
+    try:
+        dec = decisions.load(root, set_name)
+    except guard.Conflict:
+        return False
+    entry = ((dec['lod_approval'] or {}).get('units') or {}).get(task.get('unit'))
+    if not isinstance(entry, dict) or task.get('unit') in (dec['dropped'] or {}):
+        return False
+    return entry.get('job') == args.get('job') and entry.get('lod') == args.get('lod') and \
+        (not args.get('glb_sha256') or entry.get('glb_sha256') == args.get('glb_sha256'))
+
+
+def ensure_set_tasks(root: Path, info: dict, retry_failed: bool = False) -> dict[str, str]:
+    """Queue what an approved set still needs (idempotent; the orchestrator's reconcile step and Approve both call it): the bare task of every live
+    race without a published bare build, and a layers task for every approved unit WITHOUT a valid publication and without a live / queued task.
+    A failed unit is only retried when `retry_failed` (a deterministic failure must not loop); a published one (even stale) is left alone; a unit
+    whose pinned source changed is never queued (it needs Back to 3D)."""
+    approved = (info['decisions']['lod_approval'] or {}).get('units') or {}
+    actions: dict[str, str] = {}
+    for race in sorted({u['race'] for u in _live_units(info)}):
+        if not builds.bare_pointer(race):
+            actions[f'bare:{race}'] = _ensure_bare(root, race, retry_failed)
+    for unit in _live_units(info):
+        key = _unit_key(unit)
+        rec = info['builds'].get(key)
+        if unit['status'] != 'reduced' or not isinstance(approved.get(key), dict) or rec is None:
+            continue
+        if rec['status'] in builds.BUILT + (builds.SOURCE_CHANGED, 'queued', 'building') or (rec['status'] == 'failed' and not retry_failed):
+            continue
+        actions[key] = _ensure_layers(root, info['name'], unit, approved[key], retry_failed)
+    return {k: v for k, v in actions.items() if v != 'waiting'}        # only what this call changed
+
+
+def _units_arg(args: dict) -> tuple[dict[str, dict], dict[str, str]]:
+    """(args.units, args.lods). `units` = {"race/module": {job, lod}} for EVERY live unit the confirmation showed; `lods` = {"race/module": lod}
+    for the never-saved cells only (DESIGN_PHASE3.md E1; each equals units[key].lod)."""
+    units = args.get('units')
+    if not isinstance(units, dict) or not units or not all(isinstance(k, str) and isinstance(v, dict) and isinstance(v.get('job'), str)
+                                                           and isinstance(v.get('lod'), str) for k, v in units.items()):
+        raise ValueError('args.units is required: {"race/module": {"job", "lod"}} for EVERY unit the client displayed')
+    lods = args.get('lods') if args.get('lods') is not None else {}
+    if not isinstance(lods, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in lods.items()):
+        raise ValueError('args.lods must map "race/module" to a LOD')
+    bad = sorted({v['lod'] for v in units.values()} | set(lods.values()) - set(decisions.LOD_LEVELS))
+    bad = [b for b in bad if b not in decisions.LOD_LEVELS]
+    if bad:
+        raise ValueError(f'Invalid LOD {bad[0]!r}')
+    wrong = sorted(k for k, v in lods.items() if k in units and units[k]['lod'] != v)
+    if wrong:
+        raise ValueError(f'args.lods contradicts args.units for {", ".join(wrong)}')
+    return units, lods
+
+
+def _diff(kind: str, shown: dict, now: dict, label) -> list[str]:
+    """Differences between what the client displayed and what the server has (missing, extra, changed)."""
+    out = []
+    for key in sorted(set(shown) | set(now)):
+        if key not in shown:
+            out.append(f'{kind} {key} was not displayed')
+        elif key not in now:
+            out.append(f'{kind} {key} is not part of the set any more')
+        elif shown[key] != now[key]:
+            out.append(f'{kind} {key}: {label(shown[key])} displayed, {label(now[key])} now')
+    return out
+
+
+def approve_3d(root: Path, set_name: str, rev: object, args: dict) -> dict:
+    """`approve` in 3d (DESIGN_PHASE3.md A, C, E), under the set lock. `args.units` = {"race/module": {job, lod}} for EVERY live unit the client
+    displayed (unsaved cells included); any difference from the resolved job and the saved-or-default LOD, a missing or an extra unit is a 409
+    `changed` (review F1). Then ONE transaction (the unsaved picks' chosen_lod.json + lod_approval with glb_sha256 and required_races); the
+    tasks are queued afterwards, best effort: the orchestrator's reconcile step queues whatever is missing (review F7)."""
+    shown, unsaved = _units_arg(args)
+    with decisions.set_lock(root, set_name):
+        info = catalog.derive_one(root, set_name)
+        if not info:
+            raise catalog.NotFound(f'Unknown set {set_name}')
+        _check_writable(info, rev)
+        if info['locked']:
+            raise guard.AlreadyApproved(f'{set_name} is already approved in 3D; send it back first')
+        live = _live_units(info)
+        if info['stage'] != '3d' or not live:
+            missing = _not_reduced(live)
+            raise ValueError(f'{set_name} is not ready for approval: ' + (', '.join(missing) if missing else 'every race is dropped'))
+        now = {_unit_key(u): {'job': u['job'], 'lod': u['lod']} for u in live}
+        diffs = _diff('unit', {k: {'job': v['job'], 'lod': v['lod']} for k, v in shown.items()}, now, lambda v: f'job {v["job"]} lod {v["lod"]}')
+        saved = {_unit_key(u) for u in live if u['lod_saved']}
+        diffs += [f'unit {k}: its LOD was saved meanwhile' for k in sorted(set(unsaved) & saved)]
+        diffs += [f'unit {k}: shown as saved, but it has no saved LOD' for k in sorted(set(now) - saved - set(unsaved)) if k in shown]
+        if diffs:
+            raise guard.Changed('the set changed since it was displayed (' + '; '.join(diffs[:6]) + '); review it again', changes=diffs)
+        approved: dict[str, dict] = {}
+        writes: list[tuple[str, str, str, str, str]] = []
+        for unit in live:
+            key, lod = _unit_key(unit), unit['lod']
+            if not unit['lod_saved']:
+                writes.append((unit['model_set'], unit['job'], unit['race'], unit['module'], lod))
+            glb = builds.source_glb(builds.module_dir(root, unit['model_set'], unit['job'], unit['race'], unit['module']), lod)
+            if not glb.is_file():
+                raise ValueError(f'{key} has no {lod} model')
+            approved[key] = {'job': unit['job'], 'lod': lod, 'glb_sha256': builds.file_sha256(glb)}
+        data = decisions.approve_3d(root, set_name, rev, writes, approved, info['required_races'])
+        queue_error = None
+        try:
+            catalog.invalidate()
+            fresh = catalog.derive_one(root, set_name)
+            if fresh:
+                ensure_set_tasks(root, fresh, retry_failed=True)
+        except Exception as exc:  # noqa: BLE001  (the approval stands; the reconcile step queues the work)
+            queue_error = f'{type(exc).__name__}: {exc}'
+    out = {'ok': True, 'undo': _undo('unapprove', f'set:{set_name}', {'to': '3d'}, data['rev']), 'rev': data['rev'], 'queued': len(live)}
+    return out | ({'queue_error': queue_error} if queue_error else {})
+
+
+def _amount_arg(raw: object, kind: str, races: list[str]) -> dict[str, dict[str, int]]:
+    """args.amount = {race: {group: 0..100}}: the client's FULL map (every live race, every group of the kind). Another set of races is a 409
+    `changed`; a missing / unknown group or a bad value a 400."""
+    if not isinstance(raw, dict):
+        raise ValueError('args.amount is required: {race: {group: 0..100}} for every race the client displayed')
+    diffs = _diff('race', {r: True for r in raw}, {r: True for r in races}, str)
+    if diffs:
+        raise guard.Changed('the races changed since the set was displayed (' + '; '.join(diffs[:6]) + ')', changes=diffs)
+    groups = catalog.AMOUNT_GROUPS.get(kind, ('outfit',))
+    out: dict[str, dict[str, int]] = {}
+    for race, values in raw.items():
+        if not isinstance(values, dict) or sorted(values) != sorted(groups):
+            raise ValueError(f'amount.{race}: a {kind} set has exactly the groups {", ".join(groups)}')
+        out[race] = {group: _percent(value) for group, value in values.items()}
+    return out
+
+
+def _percent(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 100:
+        raise ValueError('value must be an integer from 0 to 100')
+    return value
+
+
+def _ids_arg(args: dict, name: str) -> dict[str, str | None]:
+    raw = args.get(name)
+    if not isinstance(raw, dict) or not all(isinstance(k, str) and (v is None or isinstance(v, str)) for k, v in raw.items()):
+        raise ValueError(f'args.{name} is required: the {"build" if name == "builds" else "bare build"} id the client displayed per '
+                         f'{"unit" if name == "builds" else "race"} (null for none)')
+    return raw
+
+
+def approve_aligned(root: Path, set_name: str, rev: object, args: dict) -> dict:
+    """`approve` in aligned / completed (DESIGN_PHASE3.md A, D.5, E). The request carries what the client displayed: `args.builds` =
+    {"race/module": build_id}, `args.bare` = {race: bare build_id}, `args.amount` (full map); under the set lock they must be the published ids
+    (409 `changed`, review F1). Every displayed build is then re-checked synchronously: the module and bare fingerprints are recomputed and the
+    approved source GLB rehashed; a stale build or a changed source is a 409 `stale` (review F2). ONE transaction writes `aligned_approval`
+    (units, bare ids, amount, a new `approval_id`) and `models/<set>/ready.json` (same approval_id; every path relative to the project root and
+    checked to resolve inside its build folder, review F4)."""
+    shown_builds, shown_bare = _ids_arg(args, 'builds'), _ids_arg(args, 'bare')
+    with decisions.set_lock(root, set_name):
+        info = catalog.derive_one(root, set_name)
+        if not info:
+            raise catalog.NotFound(f'Unknown set {set_name}')
+        _check_writable(info, rev)
+        if info['stage'] not in ('aligned', 'completed'):          # completed: approving again (new amounts) rewrites aligned_approval and ready.json
+            raise ValueError(f'{set_name} is in {info["stage"]}; only an aligned or completed set can be approved here')
+        live = _live_units(info)
+        pins = [_unit_key(u) for u in live if u['status'] == 'pin_missing']
+        if pins:
+            raise ValueError(f'the approved conversion of {", ".join(pins)} is missing; send the set back to 3D')
+        races = sorted({u['race'] for u in live}, key=catalog.race_rank)
+        now_builds = {_unit_key(u): (info['builds'].get(_unit_key(u)) or {}).get('build_id') for u in live}
+        bare_ptrs = {race: builds.bare_pointer(race) for race in races}
+        now_bare = {race: ptr['build_id'] if ptr else None for race, ptr in bare_ptrs.items()}
+        diffs = _diff('build', shown_builds, now_builds, str) + _diff('bare', shown_bare, now_bare, str)
+        if diffs:
+            raise guard.Changed('the layers changed since they were displayed (' + '; '.join(diffs[:6]) + '); review them again', changes=diffs)
+        given = _amount_arg(args.get('amount'), info['kind'], races)
+        changed = [k for k, rec in info['builds'].items() if rec['status'] == builds.SOURCE_CHANGED]
+        if changed:
+            raise guard.StaleBuild(f'the approved LOD file of {", ".join(changed)} changed since the 3D approval; send the set back to 3D',
+                                   changes=[f'{k}: source changed' for k in changed])
+        problems = [f'{key} ({rec["status"]})' for key, rec in info['builds'].items() if rec['status'] not in builds.BUILT]
+        problems += [f'{_unit_key(u)} (no build)' for u in live if _unit_key(u) not in info['builds']]
+        if problems:
+            raise ValueError('layer builds are not published: ' + ', '.join(problems))
+        no_bare = [race for race in races if not bare_ptrs[race]]
+        if no_bare:
+            raise ValueError('the bare layers are not built for: ' + ', '.join(no_bare))
+        approved = info['decisions']['lod_approval']['units']
+        stale = []
+        units, ready_units = {}, {race: {} for race in races}
+        for unit in live:
+            key = _unit_key(unit)
+            rec = info['builds'][key]
+            module = builds.module_dir(root, unit['model_set'], unit['job'], unit['race'], unit['module'])
+            ptr = builds.pointer_at(module, rec['lod'])
+            if not ptr or ptr['build_id'] != rec['build_id']:
+                raise guard.Changed(f'{key}: the published build changed while approving; review it again', changes=[f'build {key} changed'])
+            try:
+                if builds.lb().fingerprint_module(module, rec['lod']) != ptr.get('fingerprint'):
+                    stale.append(f'{key} (code or inputs changed since the build)')
+                if builds.file_sha256(builds.source_glb(module, rec['lod'])) != approved[key].get('glb_sha256'):
+                    stale.append(f'{key} (the approved LOD file changed)')
+            except OSError as exc:
+                stale.append(f'{key} ({exc})')
+            out_root, folder = module / 'layers', module / 'layers' / ptr['build_id']
+            slots = {}
+            for slot in sorted(ptr['slots']):
+                glb = builds.contained(out_root / ptr['slots'][slot]['glb'], folder)
+                slots[slot] = {'glb': builds.rel_path(root, glb), 'sha256': builds.file_sha256(glb)}
+            units[key] = {'job': approved[key]['job'], 'lod': rec['lod'], 'build_id': rec['build_id']}
+            ready_units[unit['race']][unit['module']] = units[key] | {'slots': slots}
+        bare_dirs = {}
+        for race in races:
+            if builds.lb().fingerprint_bare(race) != bare_ptrs[race].get('fingerprint'):
+                stale.append(f'bare {race} (code or game body changed since the build)')
+            out_root = builds.bare_root() / race
+            folder = builds.contained(out_root / bare_ptrs[race]['build_id'], out_root)
+            bare_dirs[race] = builds.rel_path(root, folder)
+        stale = [f'{key} (marked stale by the stale scan)' for key, rec in info['builds'].items() if rec['status'] == 'stale' and
+                 not any(s.startswith(key + ' ') for s in stale)] + stale
+        if stale:
+            raise guard.StaleBuild('stale layers cannot be approved: ' + ', '.join(stale[:8]) + '; rebuild them (or send the set back to 3D)', changes=stale)
+        stamp, approval_id = guard.now(), uuid.uuid4().hex
+        aligned = {'time': stamp, 'approval_id': approval_id, 'units': units, 'amount': given, 'bare': {r: now_bare[r] for r in races}}
+        ready = {'schema': 1, 'set': set_name, 'kind': info['kind'], 'approved_at': stamp, 'approval_id': approval_id,
+                 'races': {race: {'amount': given[race], 'units': ready_units[race]} for race in races}, 'bare': bare_dirs}
+        data = decisions.approve_aligned(root, set_name, rev, aligned, given, decisions.models_dir(root, set_name) / decisions.READY, ready)
+    return {'ok': True, 'undo': _undo('unapprove', f'set:{set_name}', {'to': 'aligned'}, data['rev']), 'rev': data['rev'], 'approval_id': approval_id}
+
+
+def rebuild_set(root: Path, set_name: str, rev: object, args: dict) -> dict:
+    """`rebuild` (optionally one `race` / `module`): failed tasks are retried; stale, unpublished or lost builds get a task with a new key (the
+    fingerprint changed); a current build stays current; a unit whose pinned source changed is not built (`source_changed`: Back to 3D). The
+    bare layers of the affected races are included. Writes no decision."""
+    race_filter, module_filter = args.get('race'), args.get('module')
+    for value in (race_filter, module_filter):
+        if value is not None and not isinstance(value, str):
+            raise ValueError('args.race / args.module must be text')
+    with decisions.set_lock(root, set_name):
+        info = catalog.derive_one(root, set_name)
+        if not info:
+            raise catalog.NotFound(f'Unknown set {set_name}')
+        if info['decisions_error']:
+            raise decisions.Unreadable(info['decisions_error'])
+        if not info['locked']:
+            raise ValueError(f'{set_name} is not approved in 3D: nothing to rebuild')
+        approved = info['decisions']['lod_approval']['units']
+        picked = [u for u in _live_units(info) if u['status'] == 'reduced' and isinstance(approved.get(_unit_key(u)), dict)
+                  and race_filter in (None, u['race']) and module_filter in (None, u['module'])]
+        if not picked:
+            raise ValueError('no approved unit matches')
+        actions: dict[str, str] = {}
+        for race in sorted({u['race'] for u in picked}):
+            actions[f'bare:{race}'] = _ensure_bare(root, race, True)
+        for unit in picked:
+            if unit.get('source_changed'):
+                actions[_unit_key(unit)] = builds.SOURCE_CHANGED
+                continue
+            actions[_unit_key(unit)] = _ensure_layers(root, set_name, unit, approved[_unit_key(unit)], True)
+    queued = sum(1 for v in actions.values() if v in ('queued', 'retried'))
+    return {'ok': True, 'undo': None, 'queued': queued, 'actions': actions}
+
+
+def unapprove_set(root: Path, set_name: str, rev: object, info: dict, args: dict) -> dict:
+    """`unapprove`: 3d (building) / aligned -> 3d clears lod_approval; completed -> aligned clears aligned_approval; any step that clears
+    aligned_approval also revokes ready.json. ONE transaction (rev checked before anything is renamed; review F7). Queued tasks of the set are
+    cancelled afterwards (best effort: the reconcile step cancels whatever has no matching approval); running ones finish once."""
+    default = {'aligned': '3d', 'completed': 'aligned'}.get(info['stage']) or ('3d' if info['locked'] else None)
+    target = args.get('to') if isinstance(args.get('to'), str) else default
+    if target not in ('3d', 'aligned') or default is None:
+        raise ValueError(f'{set_name} is in {info["stage"]}; nothing to send back')
+    data = decisions.send_back(root, set_name, rev, target)
+    cancelled = 0
+    if target == '3d':
+        try:
+            cancelled = taskqueue.for_root(root).cancel_set(set_name)
+        except taskqueue.QueueError:
+            pass
+    return data | {'_cancelled': cancelled}
+
+
 def set_action(root: Path, verb: str, set_name: str, rev: object, args: dict) -> dict:
     info = catalog.derive_one(root, set_name)          # the set must exist BEFORE anything is created or locked
     if not info:
@@ -520,6 +960,7 @@ def set_action(root: Path, verb: str, set_name: str, rev: object, args: dict) ->
     if rev is None:
         raise ValueError('rev is required for set verbs')
     race = args.get('race')
+    extra: dict = {}
     if verb in ('drop_race', 'undrop_race'):
         if not isinstance(race, str):
             raise ValueError('args.race is required')
@@ -533,17 +974,131 @@ def set_action(root: Path, verb: str, set_name: str, rev: object, args: dict) ->
             data = decisions.undrop_race(root, set_name, race, rev)
             prior = data.pop('_undropped', {}) or {}
             undo = lambda new: _undo('drop_race', f'set:{set_name}', {'race': race, 'meta': {'time': prior.get('time'), 'reason': prior.get('reason', '')}}, new)  # noqa: E731
-    else:     # unapprove: aligned -> 3d clears lod_approval (and the pin with it); completed -> aligned clears aligned_approval
-        default = {'aligned': '3d', 'completed': 'aligned'}.get(info['stage'])
-        target = args.get('to') if isinstance(args.get('to'), str) else default
-        if target not in ('3d', 'aligned') or (not default and not info['locked']):
-            raise ValueError(f'{set_name} is in {info["stage"]}; nothing to send back')
-        data = decisions.send_back(root, set_name, rev, target)
+    elif verb == 'approve':
+        result = approve_3d(root, set_name, rev, args) if info['stage'] in ('3d', 'approved') else approve_aligned(root, set_name, rev, args)
+        return _finish_set(root, verb, set_name, result)
+    elif verb == 'rebuild':
+        return _finish_set(root, verb, set_name, rebuild_set(root, set_name, rev, args))
+    else:     # unapprove: see unapprove_set
+        data = unapprove_set(root, set_name, rev, info, args)
+        extra = {'cancelled': data.pop('_cancelled'), 'revoked': data.pop('_revoked')}
         undo = lambda new: None                                                        # noqa: E731
     catalog.invalidate()
     fresh = catalog.derive_one(root, set_name)
     serve.log_action(root, verb, f'models/{set_name}', f'models/{set_name}/{decisions.FILENAME}', f'ok rev {data["rev"]}')
-    return {'ok': True, 'undo': undo(data['rev']), 'rev': data['rev'], 'stage': fresh['stage'] if fresh else None}
+    return {'ok': True, 'undo': undo(data['rev']), 'rev': data['rev'], 'stage': fresh['stage'] if fresh else None} | extra
+
+
+def _finish_set(root: Path, verb: str, set_name: str, result: dict) -> dict:
+    catalog.invalidate()
+    fresh = catalog.derive_one(root, set_name)
+    serve.log_action(root, verb, f'models/{set_name}', f'models/{set_name}/{decisions.FILENAME}', f'ok rev {result.get("rev", "-")}')
+    return result | {'stage': fresh['stage'] if fresh else None} | ({} if 'rev' in result else {'rev': fresh['rev'] if fresh else None})
+
+
+def set_amount(root: Path, data: object) -> dict:
+    """POST /api/v2/amount {id: "set:S", race, group, value, rev}: save one Amount. The group must match the set's kind (outfit: `outfit`;
+    armour: `body` / `limbs`). Needs the 3D approval (the sliders live in Aligned). A different value bumps the rev; the stage stays (a
+    Completed set shows the "amount changed since approval" badge until it is approved again)."""
+    if not isinstance(data, dict) or not isinstance(data.get('id'), str) or not data['id'].startswith('set:'):
+        raise ValueError('id (set:<name>) is required')
+    set_name = serve.safe_name(data['id'].removeprefix('set:'))
+    rev, race, group = data.get('rev'), data.get('race'), data.get('group')
+    if rev is None:
+        raise ValueError('rev is required')
+    value = _percent(data.get('value'))
+    if not isinstance(race, str) or not isinstance(group, str):
+        raise ValueError('race and group are required')
+    if not catalog.derive_one(root, set_name):
+        raise catalog.NotFound(f'Unknown set {set_name}')
+    with decisions.set_lock(root, set_name):
+        info = catalog.derive_one(root, set_name)
+        if not info:
+            raise catalog.NotFound(f'Unknown set {set_name}')
+        _check_writable(info, rev)
+        groups = catalog.AMOUNT_GROUPS.get(info['kind'], ('outfit',))
+        if group not in groups:
+            raise ValueError(f'a {info["kind"]} set has the amount groups {", ".join(groups)}, not {group!r}')
+        if race not in info['races']:
+            raise ValueError(f'{race} is not a live race of {set_name}')
+        if not info['locked']:
+            raise ValueError(f'{set_name} is not approved in 3D yet')
+        result = decisions.set_amount(root, set_name, rev, race, group, value)
+    catalog.invalidate()
+    fresh = catalog.derive_one(root, set_name)
+    return {'ok': True, 'rev': result['rev'], 'amount': result['amount'], 'stage': fresh['stage'] if fresh else None}
+
+
+QUEUE_OPS = ('retry', 'cancel', 'kill_retry', 'rebuild_stale')
+
+
+def rebuild_stale(root: Path) -> dict:
+    """POST /api/v2/queue {op: "rebuild_stale"}: for every set in 3d / aligned / completed with a 3D approval, queue the rebuild of every stale
+    published layer build (a new fingerprint key) and of the stale bare builds of its races (DESIGN_PHASE3.md E4). Returns {queued, sets}."""
+    derived = catalog.derive_all(root)
+    stale_bare = set(builds.stale_state(root)['bare'])
+    queued, sets = 0, []
+    for name, info in sorted(derived['sets'].items()):
+        if not info['locked'] or info['stage'] not in ('3d', 'aligned', 'completed') or info['decisions_error'] or info.get('recovering'):
+            continue
+        units = [u for u in _live_units(info) if (info['builds'].get(_unit_key(u)) or {}).get('status') == 'stale']
+        races = sorted({u['race'] for u in _live_units(info)} & stale_bare)
+        if not units and not races:
+            continue
+        with decisions.set_lock(root, name):
+            fresh = catalog.derive_one(root, name)
+            if not fresh or not fresh['locked']:
+                continue
+            approved = fresh['decisions']['lod_approval']['units']
+            got = [_ensure_bare(root, race, True) for race in races]
+            for unit in _live_units(fresh):
+                key = _unit_key(unit)
+                if (fresh['builds'].get(key) or {}).get('status') == 'stale' and isinstance(approved.get(key), dict):
+                    got.append(_ensure_layers(root, name, unit, approved[key], True))
+        n = sum(1 for g in got if g in ('queued', 'retried'))
+        if n:
+            queued += n
+            sets.append(name)
+    catalog.invalidate()
+    return {'ok': True, 'queued': queued, 'sets': sets}
+
+
+def queue_op(root: Path, data: object) -> dict:
+    """POST /api/v2/queue {op: "retry" | "cancel" | "kill", id}: Retry puts a failed / cancelled task back in the queue (fresh attempts), only
+    while its approval is still active (a withdrawn set's task is refused, review F6); Cancel stops a QUEUED one; Kill (& retry) flags a
+    starting / running one (e.g. stalled): the orchestrator kills its builder, then its wrapper (each by PID after a command-line and
+    create-time check) and queues a fresh attempt (review F10). Phase 4 extends this."""
+    if not isinstance(data, dict) or data.get('op') not in QUEUE_OPS:
+        raise ValueError('op must be retry, cancel, kill_retry or rebuild_stale')
+    if data['op'] == 'rebuild_stale':
+        return rebuild_stale(root)
+    task_id = data.get('id')
+    if isinstance(task_id, bool) or not isinstance(task_id, int):
+        raise ValueError('id (a task number) is required')
+    queue = taskqueue.for_root(root)
+    task = queue.get(task_id)
+    if task is None:
+        raise catalog.NotFound(f'Unknown task {task_id}')
+    op = data['op']
+    if op == 'retry':
+        if task['state'] in ('failed', 'cancelled') and not task_approved(root, task):
+            raise ValueError(f'task {task_id} belongs to an approval that was withdrawn or changed; approve the set again instead')
+        done = queue.retry(task_id)
+    elif op == 'cancel':
+        done = queue.cancel(task_id, 'manual')
+    else:
+        import time
+        if not builds.is_stalled(task, time.time(), builds.stall_minutes(root)):
+            raise ValueError(f'task {task_id} is not stalled; Kill & retry is only for a build whose output stopped')
+        done = queue.request_kill(task_id)
+    if not done:
+        state = queue.get(task_id)['state']
+        raise ValueError(f'task {task_id} is {state}; ' + {'retry': 'only a failed or cancelled task can be retried',
+                                                          'cancel': 'only a queued task can be cancelled',
+                                                          'kill_retry': 'only a starting or running task can be killed'}[op])
+    catalog.invalidate()
+    row = queue.get(task_id)
+    return {'ok': True, 'id': task_id, 'state': row['state'], 'kill_requested': bool(row.get('kill_requested'))}
 
 
 def perform(root: Path, data: object) -> dict:

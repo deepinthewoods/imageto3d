@@ -1,4 +1,4 @@
-// Tab bar: two groups, counts after filtering. Mix and Queue are placeholders until later phases.
+// Tab bar: two groups, counts after filtering. Mix and Queue are full pages (no cards): main.js mounts mix.js / queue.js into #page.
 import { h, $ } from './util.js';
 
 export const GROUPS = [
@@ -8,11 +8,11 @@ export const GROUPS = [
 ];
 
 export const TAB_NAMES = Object.fromEntries(GROUPS.flat());
-export const PLACEHOLDERS = {
-  mix: 'Mix (free try-on of any built layers) is coming in a later phase.',
-  queue: 'Queue (running, waiting and failed work) is coming in a later phase.',
-};
+export const PLACEHOLDERS = {};
 export const isPlaceholder = tab => tab in PLACEHOLDERS;
+/** Tabs that are a page of their own instead of a grid of cards. */
+export const PAGES = ['mix', 'queue'];
+export const isPage = tab => PAGES.includes(tab);
 
 /** counts: tab -> number (placeholders have none). */
 export function renderTabs(active, counts, onSelect) {

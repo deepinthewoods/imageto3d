@@ -2,7 +2,7 @@
 //   #<tab>             selects a tab;  #<tab>/<card id>  opens that card's modal (back button closes it).
 import { onConflict } from './api.js';
 import { state, refresh, startPolling, subscribe } from './state.js';
-import { TAB_NAMES, isPlaceholder, PLACEHOLDERS, renderTabs, GROUPS } from './tabs.js';
+import { TAB_NAMES, isPlaceholder, isPage, PLACEHOLDERS, renderTabs, GROUPS } from './tabs.js';
 import { applyFilters, applySize, mountFilters, stepSize } from './filters.js';
 import { renderGrid } from './cards.js';
 import { closeModal, initModal, isModalOpen, openModal } from './modal.js';
@@ -12,6 +12,9 @@ import { $, badge, pretty, shortcutKey, storage } from './util.js';
 import { showConcept } from './concept.js';
 import { showApproved } from './approved.js';
 import { showModel3d } from './model3d.js';
+import { showAligned, showCompleted } from './aligned.js';
+import { mountMix } from './mix.js';
+import { mountQueue } from './queue.js';
 import { showMonster3d } from './monster3d.js';
 import { showReview } from './review.js';
 
@@ -26,6 +29,7 @@ let lastIndex = 0;           // its position, for when it leaves the list
 let pushed = false;          // a history entry belongs to the open modal
 let replaceNext = false;     // the next openCard reuses the current history entry (deep link on load)
 let filterUi = null;
+let page = null;               // {tab, unmount} of the mounted Mix / Queue page
 
 const isMonster = card => card.type === 'monster' || card.kind === 'monster';
 const visible = tab => applyFilters(state.tabs[tab] || []);
@@ -53,22 +57,44 @@ function statusLine() {
   if (state.paused) parts.push('Paused');
   const banner = $('banner');
   const notes = state.server.notes || [];
-  banner.hidden = !(state.server.read_only || notes.length);
-  banner.textContent = state.server.read_only ? (state.server.message || 'Read-only: this server cannot change anything')
-    : notes.length ? `Recovered at start: ${notes.join('; ')}` : '';
-  banner.classList.toggle('read-only', !!state.server.read_only);
+  const queueErrors = state.queueErrors || [];
+  const lines = [];
+  if (state.server.read_only) lines.push(state.server.message || 'Read-only: this server cannot change anything');
+  else if (notes.length) lines.push(`Recovered at start: ${notes.join('; ')}`);
+  if (queueErrors.length) lines.push(`Queue problem: ${queueErrors.join('; ')}`);
+  banner.hidden = !lines.length;
+  banner.textContent = lines.join(' | ');
+  banner.classList.toggle('read-only', !!state.server.read_only || queueErrors.length > 0);
   $('status-line').textContent = parts.join(' · ') || 'Concept and model review';
   $('status-line').classList.toggle('error', !!state.error);
 }
 
+/** Mix and Queue are pages of their own: mounted into #page while their tab is active, unmounted (viewer disposed, timer stopped) after. */
+function syncPage() {
+  if (page && page.tab !== active) { page.unmount(); page = null; }
+  $('page').hidden = !isPage(active);
+  $('filters').hidden = isPage(active);
+  if (isPage(active) && !page && state.loaded) {
+    const mount = active === 'mix' ? mountMix : mountQueue;
+    page = { tab: active, ...mount($('page')) };
+  }
+}
+
 function render() {
-  const counts = Object.fromEntries(TABS.filter(t => !isPlaceholder(t)).map(t => [t, visible(t).length]));
+  const counts = Object.fromEntries(TABS.filter(t => !isPlaceholder(t) && !isPage(t)).map(t => [t, visible(t).length]));
   renderTabs(active, counts, selectTab);
   filterUi?.setRaces(state.races);
   statusLine();
   const grid = $('grid');
   const placeholder = $('placeholder');
   const empty = $('empty');
+  syncPage();
+  if (isPage(active)) {
+    grid.hidden = true;
+    empty.hidden = true;
+    placeholder.hidden = true;
+    return;
+  }
   if (isPlaceholder(active)) {
     grid.hidden = true;
     empty.hidden = true;
@@ -83,7 +109,12 @@ function render() {
   empty.hidden = cards.length > 0 || !state.loaded;
   empty.textContent = total ? `No ${TAB_NAMES[active]} cards match the filters (${total} hidden).`
     : `No ${TAB_NAMES[active]} cards.`;
-  renderGrid(grid, cards, active, { onOpen: card => openCard(card), onAction: (card, verb) => runAction(card, verb, { tab: active }) });
+  renderGrid(grid, cards, active, {
+    onOpen: card => openCard(card),
+    // 3D / Aligned / Completed sets: every verb (approve, back to 3D, unapprove) needs what the modal shows (LODs, Amounts, rev), so a
+    // hover button only opens the modal
+    onAction: (card, verb) => (MODEL_TABS.includes(active) && card.id.startsWith('set:') ? openCard(card) : runAction(card, verb, { tab: active })),
+  });
   applySize();
 }
 
@@ -100,7 +131,7 @@ function viewFor(tab, card) {
   if (tab === 'review') return { show: showReview, info: false };
   if (MODEL_TABS.includes(tab)) {
     if (isMonster(card)) return { show: showMonster3d, info: false };
-    if (card.id.startsWith('set:')) return { show: showModel3d, info: false };
+    if (card.id.startsWith('set:')) return { show: tab === 'aligned' ? showAligned : tab === 'completed' ? showCompleted : showModel3d, info: false };
   }
   if (tab === 'approved' && card.id.startsWith('set:')) return { show: showApproved, info: false };
   return { show: showConcept, info: true };
@@ -146,11 +177,25 @@ function openCard(card) {
     modal,
     isCurrent: () => token === mine && isModalOpen(),
     go,
+    /** Switch to another tab and open this set there (after a verb moved it, or the builds finished). */
+    openIn(target) {
+      refresh().catch(() => {}).finally(() => { location.hash = `#${target}/${encodeURIComponent(card.id)}`; });
+    },
     /** Run a verb for the card in the modal and move on to the neighbour at once (the action runs in the background). */
     actAndAdvance(target, verb, options = {}) {
       const next = neighbor(target.id, 1) || neighbor(target.id, -1);
       runAction(target, verb, { tab, ...options });
       if (host.isCurrent()) { if (next) openCard(next); else closeModal(); }
+    },
+    /**
+     * Run a verb and move on only AFTER the server accepted it (a refusal or a 409 leaves the dialog on this set, which can then show
+     * what changed). `options.onError(error)` sees the refusal. Resolves the response or null.
+     */
+    async actThenAdvance(target, verb, options = {}) {
+      const next = neighbor(target.id, 1) || neighbor(target.id, -1);
+      const result = await runAction(target, verb, { tab, removes: false, ...options });
+      if (result && host.isCurrent()) { if (next) openCard(next); else closeModal(); }
+      return result;
     },
   };
   view.show(modal, host).catch(error => {

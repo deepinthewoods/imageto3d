@@ -83,8 +83,10 @@ fingerprint changed. A current build stays current; `build.py` returns `current`
 **`POST /api/v2/amount`** `{id, race, group, value, rev}`:
 - The group must match the kind: outfit sets use `outfit`, armour sets use `body` and `limbs`.
 - `value` is an integer from 0 to 100.
-- It bumps the rev and sends the set back to aligned. While `aligned_approval` exists, a changed amount makes Completed show an
-  "amount changed since approval" badge; the user approves again.
+- It bumps the rev (a value equal to the saved one writes nothing and keeps the rev). **Backend as built:** it does NOT move the set to
+  another stage; while `aligned_approval` exists, a changed amount keeps the set in Completed with the card badge "amount changed since
+  approval" (`item.card.badges`), and the user approves again from there (`approve` is accepted in aligned AND completed). It needs the 3D approval
+  (400 otherwise).
 
 **Build status per unit**, added as `item.builds["race/module"]`:
 ```json
@@ -176,3 +178,209 @@ Phase 4 adds services, modes and credits.
 - The orchestrator thread starts only in a server that holds `.codex_jobs/_app/server.lock` (`server.ctx['read_only']` false); a read-only server
   also skips `orchestrator.lock`.
 - Layer builds read the model of a unit from `unit.model_set` (the physical dir), never from the card's set name.
+
+## D. Backend as built (phase 3, `tools/preview/v2/`)
+**Superseded in parts by section F** (phase 3 review fixes): the approval request shapes (D.2, D.5), task states and attempts (D.3), the
+Completed rule and build statuses (D.4), the queue endpoint and ops (D.7). Where D and F differ, F is the contract.
+Where the backend settled a detail the contract left open (the frontend can rely on all of it):
+1. **Files.** `taskqueue.py` (SQLite WAL queue; `for_root(root)`), `run_task.py` (detached wrapper), `orchestrator.py` (thread, adoption, pool,
+   stale scan, `queue_state`), `builds.py` (pointers, URLs, fingerprint cache, task keys, per-unit status), plus `decisions.approve_3d /
+   approve_aligned / set_amount`, `actions.approve_3d / approve_aligned / rebuild_set / set_amount / queue_op`, `catalog.layers_for_race`.
+   The `tasks` table has one extra column, `not_before REAL` (the retry backoff). `create_server(..., run_orchestrator=False)`: only
+   `server.py main()` turns it on (`--no-orchestrator` turns it off); the state's `server.orchestrator` says whether this server runs it.
+   A writer server that cannot get `orchestrator.lock` becomes read-only with a banner message.
+2. **`approve` in 3d** (`rev` required): `args.lods` = `{"race/module": lod}` for the units with no saved pick (400 when one is missing; an
+   unknown unit or an invalid LOD is a 400; a lod that contradicts a SAVED pick is **409 `code: lod`**), optional `args.jobs` =
+   `{"race/module": job}` (the conversions the client displayed; mismatch = 409 `code: job`). A set that is already approved is **409
+   `code: approved`**. Units that are not reduced / dropped, or a set still in `approved`, are a 400 that lists them (`race/module (status)`).
+   Response `{ok, rev, stage, queued: <units>, undo: {verb: "unapprove", id, args: {to: "3d"}, rev}}`. The snapshot is written by
+   `decisions.approve_3d` in ONE `guard.apply_transaction` (the unsaved `chosen_lod.json` files + `pipeline_v2.json`); tasks are queued
+   afterwards, still under the set lock; if queueing fails the approval is cleared again (400 "rolled back").
+3. **Task keys / queue rules.** Layers `layers:<S>:<race>/<module>:<lod>:<job>:<glb sha12>`, bare `bare:<race>:<game body npz sha12>`; a
+   `rebuild` of a stale / unpublished unit appends `:<fingerprint[:12]>` (a done task whose build is no longer current gets that new key).
+   Approve and Rebuild retry failed tasks of the same key (fresh attempts) and re-queue cancelled ones. **Bare dependency:** a layers task
+   waits while a bare task of its race is queued or running and no CURRENT bare build exists; a FAILED bare task does not block the layers
+   (they build independently; Aligned approval then reports the missing bare layers). Bare tasks have `set_name` null, so `unapprove` never
+   cancels them. Automatic retries: 2 (60 s backoff) for a lost task, `inputs changed during build`, `retryable` results, crashes without a
+   verdict and error texts matching `PermissionError|timed out|MemoryError|out of memory|device lost|GPU|CUDA|Errno|busy|lost`; none for
+   `missing input|no garment found|required slot|invalid race|unknown module|argument error|must be one of|module dir not found|...`
+   and for any other build error text (deterministic).
+4. **`item.builds["race/module"]`** exists for every approved, reduced, non-dropped unit: `{status, build_id, lod, slots: {slot: url},
+   warnings, metrics, error, task: {id, state, elapsed}|null}`. `status`: published and stale win over a running / queued rebuild (the
+   old build stays visible, `task` shows the new one); without a published build: `building` (task running), `queued`, `failed` (newest
+   task failed; `error` = `layers/last_failure.json` text when it is about this unit, else the task error), `none` (no task, e.g. cancelled).
+   `item.bare` = `{race: {slot: url}}` for the live races (only when approved); `server.orchestrator` in `/api/v2/state`.
+   Card badges: `building n/m` (info), `build failed n` (error), `not built n` (warn), `stale n` (warn), `amount changed since approval` (warn).
+   A unit whose approved conversion is `pin_missing` has no build and does not count for rule 3.
+5. **`approve` in aligned / completed**: the set must be in `aligned` (or `completed`, to approve again after an amount change); 400 when a
+   unit has no published build, a pin is missing, or a race has no bare build. `args.amount` = `{race: {group: 0..100}}` (missing values
+   keep the saved amount, default 100); the merged map is stored in `aligned_approval.amount` AND `amount`. Response `{ok, rev, stage:
+   "completed", undo: {verb: "unapprove", id, args: {to: "aligned"}, rev}}`. `ready.json` paths (`races.<race>.units.<module>.slots.<slot>.glb`,
+   `bare.<race>`) are **relative to the project root** (posix); the bare dir is `tools/preview/cache/layers/<race>/<bare build id>`.
+   `unapprove` clears `aligned_approval` in every case and renames an existing `ready.json` to `ready.json.revoked-<time>`; response adds
+   `{cancelled: <queued tasks cancelled>, revoked: <file name>|null}`.
+6. **`rebuild`** response `{ok, queued: n, actions: {"race/module" | "bare:<race>": "queued|retried|running|current|failed"}}`; 400 when the
+   set is not approved in 3D or no unit matches the filters. It writes no decision (the `rev` must be present but is not compared).
+7. **`/api/v2/queue`** adds `key` and `max_attempts` per task and `workers: {limit, running, present, mode, idle, orchestrator}`; `POST`
+   `retry` needs a failed / cancelled task, `cancel` a queued one (a running build cannot be stopped from here yet); errors are 400, an unknown
+   id 404.
+8. **`/files/tools/preview/cache/layers/...`** is served from the real repo when the project root is another folder (test fixtures), so
+   bare layer URLs work there too.
+9. **Stale scan** (`orchestrator.scan_stale(root)`, every 10 min and at start, in its own thread) writes `.codex_jobs/_app/stale.json`
+   (`{time, units: {"S/race/module": {build_id, lod, fingerprint, current}}, bare: {race: ...}}`); the catalog reads it (also in a read-only
+   server). Only published units of locked sets are scanned; fingerprints are cached by the mtimes of their inputs.
+
+## E. Phase 3 review fixes: what the frontend sends and expects (findings 1, 12-15)
+The frontend was changed first; the backend has to accept and CHECK these shapes. Fixture server for the browser tests:
+`scratchpad/v2_fixture_p3/fixture_server_p3.py` implements them and answers 409 when they differ; the flows are in `flows3.mjs`.
+
+### E1. Approve in 3D (`POST /api/v2/action {id: "set:S", verb: "approve", rev, args}`)
+```json
+{"rev": 4, "args": {
+  "units": {"human_male/body_armor": {"job": "9ba3b6ee4095", "lod": "0p2"}, "...": "ONE ENTRY FOR EVERY UNIT THE CONFIRMATION SHOWS"},
+  "lods":  {"human_male/body_armor": "0p2"}}}
+```
+- `units` = the conversion (`job`) and LOD the reviewer SAW in the confirmation, for every live (non-dropped) unit, saved or not. It is the contract
+  for what gets approved: compare it, under the set lock, with the job the catalog resolves now and the LOD that would be frozen (the saved pick, else
+  the unsaved default). The key set must equal the live unit set exactly.
+- `lods` (unchanged from section D.2) = only the cells whose LOD was never saved: the units whose LOD the server must write with the approval. For
+  those cells it always equals `units[key].lod`; nothing else about the units is sent.
+- **409** `{ok: false, error, code: "changed", changes: ["race/module: job a -> b, lod 0p2 -> 0p1", ...], item}` when any entry differs (newer
+  conversion, another saved LOD, a unit added or removed). The client also treats `code` `rev`, `job`, `lod` (and no code) as "reload and look again".
+  On such a 409 the client KEEPS the dialog open, reloads the item (`GET /api/v2/item`), redraws the table with the changed cells highlighted and the
+  differences listed (computed by the client from its snapshot; the `changes` strings are shown only when the client finds no difference itself) and
+  needs a fresh confirm. Any other 409 code (`approved`, `locked`, `unreadable` ...) closes the dialog and reloads. Nothing is written on a 409.
+
+### E2. Approve in Aligned (`verb: "approve"`, set in `aligned`)
+```json
+{"rev": 9, "args": {
+  "builds": {"human_male/body_armor": "0p2-869db65548b6", "...": "EVERY unit of EVERY race of the set"},
+  "bare":   {"human_male": "bare-697f1bde9abc", "...": "every race of the set"},
+  "amount": {"human_male": {"body": 100, "limbs": 100}, "...": "every race"}}}
+```
+- `builds` = the published build id shown for each unit (the id the reviewer's composition was made of); `bare` = the id of the bare build shown per
+  race (the directory name under `tools/preview/cache/layers/<race>/`).
+- Compare both with the CURRENT published ids under the lock and refuse stale builds / stale bare builds: **409** `{code: "changed" | "stale",
+  changes: [...], item}` (`stale`: a unit or bare build is published but the stale scan found it out of date; `changed`: an id differs or the key
+  sets differ). The client then reloads, lists what changed (build and bare ids, old -> new) in the layer notes and STAYS on the set (it advances only
+  after a 200). Nothing is written on a 409. A missing `builds` or `bare` is a 400.
+- The Approve button is disabled until every unit of every race has a published build, the bare layers exist, AND the composition on screen is
+  complete (the bare head and the set's own slots all loaded, no load failure, own pieces selected - not a donor's gloves).
+
+### E3. Item additions the frontend reads (requested)
+- `item.bare_builds = {race: {status: "published|stale|building|queued|failed|none", build_id, error?, task?: {id, state, elapsed, error?}}}`. When it
+  is missing, the bare build id is parsed from the bare layer URL (`/layers/<race>/<build id>/<slot>.glb`) and no bare status is shown. A stale or
+  failed bare build is shown as a warning in the Aligned notes.
+- `build.task.state` is one of `queued | running | stalled | failed`; `build.task.error` for a failed one. The Aligned viewer polls the item every
+  2.5 s while ANY build or bare build of the set has a task in `queued | running | stalled` or a status of `queued | building`, shows
+  `rebuild failed - <error>` for `task.state == "failed"` next to a still-published older build, and re-reads the layer files when a published
+  `build_id` (and so the file URLs) changes.
+- A queue task `state` may be `stalled` (a running task past its progress deadline).
+
+### E4. Queue operations the frontend sends (`POST /api/v2/queue`)
+| body | meaning | response |
+| --- | --- | --- |
+| `{op: "kill_retry", id}` | for a `stalled` task: kill the wrapper AND the builder, then queue a fresh attempt (400 when the task is not stalled) | `{ok: true}` |
+| `{op: "rebuild_stale"}` | **chosen instead of a per-set action**: re-queue the rebuild of every stale published layer build (and stale bare build) of all sets in 3d / aligned / completed, i.e. what `rebuild` with `args: {stale: true}` would do for each set; no `id`, no `rev` | `{ok: true, queued: <n builds>, sets: [<set names>]}` |
+
+Queue tab: **Rebuild stale** is enabled while a card of the 3D / Aligned / Completed tabs carries a `stale n` badge; **Kill & retry** is shown on
+rows in state `stalled`.
+
+### E5. State addition
+`GET /api/v2/state` may carry `queue_health`: `null` / `true` / `{ok: true}` when healthy, otherwise a string, a list of strings, or
+`{ok: false, errors: [...]}` (`error` / `message` are also accepted). The errors are shown in a banner on every tab and at the top of the Queue tab.
+
+### E6. Keyboard and sliders (client-only rules)
+- No mutation shortcut (A, Enter, P, Esc-reject) acts on a repeated key event, or on a key that already fired one before it was released
+  (`modal.js` `mutationKey`); opening a confirmation or advancing to another card spends the key. Aligned approve advances only after the 200.
+- Amount sliders are bound to the set and race they were drawn for and are disabled synchronously when the race changes; a release on a stale slider
+  never POSTs. `POST /api/v2/amount` bodies keep the shape of section A.
+- A layer that fails to load removes the mesh it was to replace; the Aligned notes name slot, URL and error; a bare fallback is labelled
+  "bare (fallback)".
+
+## F. Phase 3 review fixes: backend as built (findings 1-11, 16, 17; supersedes section D where they differ)
+Section E is the frontend's side of the same contract; this section is what the backend checks. Findings 12-15 are frontend-only.
+
+1. **3D approval binding (F1).** `args.units` = `{"race/module": {job, lod}}` for EVERY live unit (400 when missing / malformed / a bad LOD) and
+   `args.lods` = the never-saved cells (each must equal `units[key].lod`, else 400). Under the set lock: the resolved job and the saved-or-default LOD
+   of every live unit must equal `units`, with exactly the same key set, and `lods` must name exactly the units that have no saved pick; anything else
+   is **409 `changed`** with `changes: [text, ...]` (and the current `item`). Nothing is written on a 409. `args.jobs` is gone. The server writes the
+   unsaved picks (the default LOD) in the approval's transaction. The tasks are queued after the transaction, best effort: an enqueue failure no longer
+   rolls the approval back; the response then carries `queue_error` and the orchestrator's reconcile step queues the work (F7).
+2. **Aligned approval binding + recheck (F1, F2, F4).** `args.builds` = `{"race/module": build_id|null}` for every live unit, `args.bare` =
+   `{race: bare build_id|null}` for every live race (400 when either is missing), `args.amount` = the FULL map (every live race, exactly the kind's
+   groups; another race set is 409 `changed`, a missing / unknown group or a bad value 400). Order of checks under the set lock: rev; stage; a
+   `pin_missing` unit (400); the displayed ids vs the published ids (409 `changed` + `changes`); the amount; a unit whose pinned source changed (409
+   `stale`); unpublished units / missing bare builds (400); then, synchronously (~1 s per set), every module fingerprint and every bare fingerprint is
+   recomputed (uncached) and every approved source GLB rehashed: a stale build or a digest mismatch is **409 `stale`** + `changes`. ONE transaction then
+   writes `aligned_approval = {time, approval_id (uuid hex), units: {key: {job, lod, build_id}}, amount, bare: {race: build_id}}`, the merged `amount`,
+   and `models/<S>/ready.json` (with the same `approval_id`; an older ready.json is kept as a revoked copy). Every ready.json path is RESOLVED, checked to
+   lie inside its build folder (slots) / the bare root (bare dirs), and written relative to the project root (`builds.rel_path` raises for anything
+   outside the project; never an absolute path). Response adds `approval_id`.
+3. **Completed (F3).** A set is `completed` only when (catalog.completed_problems is empty): `aligned_approval.units` key set == the live unit set (of
+   the frozen required races) == `lod_approval.units` key set; every live unit's build is published (or stale) with exactly the approved build id; for
+   every live race `aligned_approval.bare[race]` is the published bare build id; and `models/<S>/ready.json` exists with the approval's `approval_id`.
+   The item lists the reasons in `not_completed`. `drop_race` / `undrop_race` answer **409 `approved`** while `lod_approval` exists (Back to 3D first).
+   The orchestrator's reconcile step (never a GET) revokes a ready.json whose set is not Completed: renamed to `ready.json.revoked-<time>` under the set
+   lock (a guard transaction), queue event `revoke`, `tools/preview/actions.jsonl` entry `revoke_ready`.
+4. **Pointer validation (F4).** A module pointer counts as published only when `builds.pointer_problem` is None: status ok; `kind`, `race`, `lod` and
+   `module` equal the module's own (module = `build._rel(module_dir)`: the repo-relative path, or the absolute posix path outside the repo; exact
+   equality, no suffix match); `required` and the slot map are exactly `build.required_slots(kind, race)`; the build folder is a real folder directly in
+   the output root; the pointer equals that folder's `build.json`; every slot path is `<build_id>/<slot>.glb`, resolves inside the build folder and
+   exists. Bare pointers the same (`kind: bare`, `module: bare:<race>`, `lod: null`). A damaged pointer shows `none`; the reconcile step queues a build,
+   and the builder repairs the pointer from build.json under its publish lock (`current`).
+5. **Source digest (F2).** Layer tasks carry `args.glb_sha256`; the builder runs with `--expect-source-sha256` (checked before building and under the
+   publish lock: `source changed: ...`, never retried); the dispatcher compares the digest before starting (mismatch: the queued task is failed with that
+   error). `item.builds[key].status = "source_changed"` when the approved LOD file's sha256 is no longer the pinned one (old layers still listed in
+   `slots` for viewing; `error` says to send the set back to 3D); the unit gets `source_changed: true`, the card a `source changed n` (error) badge, the
+   set stays in 3D (not built), `rebuild` answers `source_changed` for it and never queues it. A 3D-approved unit always shows the FROZEN LOD of
+   `lod_approval` (`frozen: true`), never the mutable chosen_lod.json (phase 1 review #12).
+6. **Attempts (F5, F6).** Task states: `queued -> starting -> running -> done | failed`, `queued -> cancelled`. Starting an attempt: (a) the
+   approval is checked again (withdrawn: the queued task is cancelled; also on every automatic retry / lost requeue: a withdrawn task is failed, not
+   requeued), (b) `claim` = `UPDATE ... WHERE state='queued'` (rowcount 1, else nothing starts) with a new uuid `token`, attempts + 1 and the attempt's
+   files `logs/<id>-a<n>.log / .err.log / .result.json / .claim.json / .task.json` (n stays unique also after a manual reset), (c) the detached wrapper
+   `run_task.py <task json> --token <token>` writes the claim file {token, attempt, task: {key, lane, set, unit, args, max_attempts}, wrapper_pid,
+   wrapper_create} first and adds builder_pid / builder_create after starting the builder, (d) the row becomes running with the wrapper's pid. Adoption:
+   a `starting` row with a live claim (or, without one, a live process whose command line has the token) becomes running; otherwise it is lost. Results
+   and `finish` / `requeue` apply only to the row that still carries the attempt's token (a build finishes once). New columns: `token`, `builder_pid`,
+   `builder_create`, `kill_requested` (added by ALTER TABLE to an older database).
+7. **Verdict (F10).** The wrapper keeps stderr in `<id>-a<n>.err.log` and reads the verdict from STDOUT only. `done` needs exit 0, a verdict
+   `ok` / `current` AND that verdict's build_id being the valid publication now (module pointer / bare pointer); exit 0 without a verdict is
+   `failed` ("the builder exited 0 without a verdict on stdout", not retried); a verdict without its publication is failed (retried while attempts last).
+8. **Stalled builds (F10).** Heartbeat = the mtime of the attempt's two logs. A starting / running attempt whose logs have not grown for
+   `settings.json build_stall_minutes` (integer >= 1, default 30; the phase 4 settings module should accept the key) is shown as state `stalled`
+   (queue rows: `state: "stalled"`, `stored_state`, `stalled: true`, `last_output`; `item.builds[*].task.state` / `item.bare_builds[*].task.state`).
+   `POST /api/v2/queue {op: "kill_retry", id}` (400 unless the task is stalled) sets `kill_requested`; the orchestrator then kills the builder and then
+   the wrapper, each by PID only after its create time and command line (builder: the claim's argv; wrapper: the token) were checked, and queues a fresh
+   attempt (attempts reset; error "killed by the user (Kill & retry): ..."); with the approval withdrawn it fails the task instead.
+9. **Queue = derived cache (F7, F9).** Reconcile (orchestrator start + every loop; ~0.1 s on the real 102-set catalog): (a) a damaged database
+   (`file is not a database`, `malformed`, ...) is renamed `queue.sqlite3[-wal|-shm].corrupt-<time>`, a fresh one created, and every surviving
+   wrapper (claim file, live wrapper, no result) re-inserted as a running row with its token; (b) interrupted file transactions are recovered (item
+   10); (c) for every approved set: a bare task for each live race without a bare pointer, and a layers task for each approved unit whose build status
+   is `none` (no valid publication, no live / queued task; failed units are NOT retried automatically, stale ones are NOT rebuilt automatically);
+   (d) queued tasks without a matching approval (job, LOD and digest of `lod_approval`) and bare tasks no approved set needs are cancelled; (e) the
+   ready.json revocation of item 3. Readers never raise on a damaged database: they return empty results and record `queue_health`;
+   `GET /api/v2/state` has `queue_health` (null when fine, `{ok: false, errors: [..], corrupt, since}`, or `{ok: true, repaired: <kept file>}` after a
+   repair), `GET /api/v2/queue` has `queue_health` (the raw health record). Unapprove is ONE transaction (pipeline_v2.json + the ready.json
+   revocation, the rev checked before anything is renamed); its queued-task cancel is best effort (reconcile cancels the rest).
+10. **Recovery (F8).** Every `files_tx` intent names its `set` and keeps, per file, `before_sha256` and `after_sha256`. Recovery (server start and every
+   orchestrator loop) runs under the set lock and restores the backups only when every file holds either what the transaction wrote or its old content;
+   otherwise nothing is touched and the intent is marked `conflict` (`conflict_files`): its Recovery card offers `complete` (keep the files as they are
+   now) and `rollback` (restore the backups anyway). While a set has an unresolved intent every write of it (LOD, amount, approvals, unapprove, races) is
+   **409 `recovering`**; the item has `recovering: [{id, label, conflict}]` and the card a `recovering: read-only` badge.
+11. **Repair (F11).** `_ensure` revalidates the publication of every done key; a done fingerprint key whose publication is still missing / invalid is
+   reset to queued (attempts kept, event `repair`), for module and bare builds alike. An already-queued key answers `waiting` (new action value in
+   `rebuild` / reconcile output; `queued` now means "queued by this call").
+12. **Queue totals (F16).** `GET /api/v2/queue` adds `totals` ({state: count} over the whole table), `workers.running` = SQL count of starting + running,
+   `page` = `{open_limit, open_total, open_shown, recent_limit, recent_total, recent_shown, recent_since, truncated}`, `stalled` and `stall_minutes`.
+   `POST {op: "rebuild_stale"}` (no id): for every approved set in 3d / aligned / completed, rebuild every published unit the stale scan marked stale
+   and the stale bare builds of its races; response `{ok, queued, sets}`.
+13. **Item additions.** `item.bare_builds = {race: {status: published|stale|building|queued|failed|none, build_id, error?, task?: {id, state, elapsed,
+   error?}}}` for the live races of an approved set; `item.builds[*].task` gains `error` for a failed task and shows `stalled`; units gain `frozen` and
+   `source_changed`; the item gains `not_completed` and `recovering`.
+14. **Promotion id (phase 1 review #3, #4).** A legacy approve writes `approved/<set>/.preview-promotion.json` `{promotion_id}` (it travels with the folder
+   into its job when claimed) and records the same `promotion_id` in the origin sidecar and the flat-move intent. Undo (`restore trashlegacy`) withdraws
+   only the folder with that promotion id (a folder without a mark, or with another one, is refused: "a later promotion"). Recovery `complete` of an
+   interrupted legacy approve also succeeds when the promotion was already claimed (a job folder `<set>--<id>` carrying that promotion id).
+15. **Decision files (phase 1 review #10).** `pipeline_v2.json` validation covers nested records (dropped entries, amount values 0..100, approval units
+   with job / lod / build_id, required_races, bare map, approval_id); invalid UTF-8 is an unreadable file too.
