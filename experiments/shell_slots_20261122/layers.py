@@ -611,6 +611,8 @@ def add_end_caps(lay, U1, seam_keys, gd):
     kq = np.round(lay.V * 1e7).astype(np.int64)
     _, first, canon = np.unique(kq, axis=0, return_index=True, return_inverse=True)
     rep = first[canon.ravel()]
+    if U1 is not None and (rep != np.arange(n)).any():               # copies of one position move as one along the slider (else a cap welded to
+        U1 = U1[rep].copy()                                           # the first copy opens from the others at Amount 100)
     Fr = rep[lay.F]
     d = np.stack([Fr, np.roll(Fr, -1, axis=1)], axis=2).reshape(-1, 2)              # halfedge h: face h // 3
     hl = np.flatnonzero(d[:, 0] != d[:, 1])
@@ -898,8 +900,247 @@ def amount_morph(lay, body, ring_v, gd, rings=(), slot=None):
         notes['face_push']['faces_flipped_after'] = int(((n0 * n1).sum(1) < 0).sum())
     if LAYER_GUARD:
         notes['fill_layer_guard'] = pc.fill_layer_guard(lay, U1, gd)
+    if HIDDEN_STAY_MM > 0 and slot is not None:
+        notes['hidden_kept'] = keep_hidden(lay, U1, body, gd, slot)
     U1[ring_v] = lay.V[ring_v]
     return U1, notes
+
+
+HIDDEN_STAY_MM = 5.0         # Amount 100: garment OUTSIDE the layer's slot that lies wholly inside the body at Amount 0 (deeper than this at its
+                             # centre and corners) is hidden by the neighbouring layer there, and stays (a plate cop's lower lining 7-15 mm inside
+                             # the shin was pushed out below the cop as a flap: magic plate mail 15). Garment only partly sunk in is still pushed
+
+
+def keep_hidden(lay, U1, body, gd, slot):
+    """In place on U1: garment vertices outside the layer's slot that lie inside the body at Amount 0 keep their Amount 0 position, in full from
+    HIDDEN_STAY_MM deep, fading to the normal push at the body surface (vertices of skin faces, and garment in the slot, are pushed as before).
+    Deliberate (Codex review 2026-11-25 item 3, tried and reverted): a vertex shared with a face that shows at Amount 0 is also kept, so such a
+    face can sink back into the body at Amount 100 exactly as far as it is at Amount 0; requiring every face of the vertex to be buried (and
+    keeping shown corners out) brought back the flap below the plate cop that this rule is for."""
+    gv = np.unique(lay.F[lay.role != gd.SKIN])
+    gv = np.setdiff1d(gv, np.unique(lay.F[lay.role == gd.SKIN]))
+    if not len(gv):
+        return 0
+    ms = body.measure(lay.V[gv])
+    out_slot = ~np.isin(np.asarray(ms['part']), slot)
+    w = np.clip(-ms['d'] / (HIDDEN_STAY_MM / 1000), 0, 1) * out_slot
+    v = gv[w > 0]
+    U1[v] = U1[v] + (lay.V[v] - U1[v]) * w[w > 0, None]
+    return int(len(v))
+
+
+def _seg_tri(P0, P1, T, params=False):
+    """Per row: does segment P0-P1 pass through triangle T (Moller-Trumbore, both ends included)? With params: (hit, t along the segment,
+    barycentric u, v in T)."""
+    e1, e2 = T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]
+    d = P1 - P0
+    h = np.cross(d, e2)
+    a = (e1 * h).sum(1)
+    ok = np.abs(a) > 1e-14
+    f = 1 / np.where(ok, a, 1.)
+    s = P0 - T[:, 0]
+    u = f * (s * h).sum(1)
+    q = np.cross(s, e1)
+    v = f * (d * q).sum(1)
+    t = f * (e2 * q).sum(1)
+    hit = ok & (u >= 0) & (v >= 0) & (u + v <= 1) & (t >= 0) & (t <= 1)
+    return (hit, t, u, v) if params else hit
+
+
+
+def _bary(P, T):
+    """Barycentric coordinates of points P (projected) in triangles T, per row."""
+    v0, v1, v2 = T[:, 1] - T[:, 0], T[:, 2] - T[:, 0], P - T[:, 0]
+    d00, d01, d11 = (v0 * v0).sum(1), (v0 * v1).sum(1), (v1 * v1).sum(1)
+    d20, d21 = (v2 * v0).sum(1), (v2 * v1).sum(1)
+    den = np.where(np.abs(d00 * d11 - d01 * d01) > 1e-24, d00 * d11 - d01 * d01, 1.)
+    b = (d11 * d20 - d01 * d21) / den
+    c = (d00 * d21 - d01 * d20) / den
+    return np.c_[1 - b - c, b, c]
+
+
+def wall_sides(lay, body, gd):
+    """Per face: +1 garment facing away from the body (an outer wall), -1 garment facing it (an inner wall: the generator makes cloth and armour
+    as closed thin slabs, outer surface + an inward-facing one 5-15 mm inside), 0 skin, caps, strips and edge-on faces (rims)."""
+    T = lay.V[lay.F]
+    nf = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0])
+    nf /= np.maximum(np.linalg.norm(nf, axis=1), 1e-18)[:, None]
+    _, tri, _ = body.closest(T.mean(1))
+    dot = (nf * body.tri_n[tri]).sum(1)
+    side = np.where(dot > WALL_SIDE_COS, 1, np.where(dot < -WALL_SIDE_COS, -1, 0))
+    side[(lay.role == gd.SKIN) | np.isin(lay.prov, ['cap', 'endcap', 'seamband'])] = 0
+    return side
+
+
+def _pair_hits(X, F, pi, po):
+    """For face pairs (inner pi, outer po): every edge of one passing through the other, where neither end of the edge is a corner the two
+    faces share (pairs sharing an edge are neighbours, not crossings). Returns (pair index, barycentric weights of the crossing point ON THE
+    INNER FACE (n, 3))."""
+    A, B = X[F[pi]], X[F[po]]
+    FA, FB = F[pi], F[po]
+    nshare = (FA[:, :, None] == FB[:, None, :]).any(2).sum(1)
+    out_k, out_w = [], []
+    for k in range(3):
+        k1 = (k + 1) % 3
+        # an inner edge through the outer face: the point on the inner face's edge k -> k1
+        ok = nshare < 2
+        okA = ok & ~(FA[:, [k]] == FB).any(1) & ~(FA[:, [k1]] == FB).any(1)
+        hit, t, _, _ = _seg_tri(A[:, k], A[:, k1], B, params=True)
+        idx = np.flatnonzero(hit & okA)
+        w = np.zeros((len(idx), 3))
+        w[:, k], w[:, k1] = 1 - t[idx], t[idx]
+        out_k.append(idx)
+        out_w.append(w)
+        # an outer edge through the inner face: the point inside the inner face
+        okB = ok & ~(FB[:, [k]] == FA).any(1) & ~(FB[:, [k1]] == FA).any(1)
+        hit, _, u, v = _seg_tri(B[:, k], B[:, k1], A, params=True)
+        idx = np.flatnonzero(hit & okB)
+        out_k.append(idx)
+        out_w.append(np.c_[1 - u[idx] - v[idx], u[idx], v[idx]])
+    return np.concatenate(out_k), np.concatenate(out_w)
+
+
+def wall_crossings(X, F, side, reach=None):
+    """Pairs (inner face, outer face) of a garment that pass through each other (an edge of one through the other, an edge not ending at a
+    corner they share; pairs sharing an edge are left out), at positions X. Returns (inner ids, outer ids)."""
+    from scipy.spatial import cKDTree
+    I, O = np.flatnonzero(side < 0), np.flatnonzero(side > 0)
+    if not len(I) or not len(O):
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    T = X[F]
+    c = T.mean(1)
+    rad = np.linalg.norm(T - c[:, None], axis=2).max(1)
+    tree = cKDTree(c[O])
+    lists = tree.query_ball_point(c[I], rad[I] + rad[O].max() + 1e-6)
+    pi = np.repeat(I, [len(x) for x in lists])
+    if not len(pi):
+        return np.zeros(0, np.int64), np.zeros(0, np.int64)
+    po = O[np.concatenate([np.asarray(x, np.int64) for x in lists])]
+    close = np.linalg.norm(c[pi] - c[po], axis=1) <= rad[pi] + rad[po]
+    pi, po = pi[close], po[close]
+    k, _ = _pair_hits(X, F, pi, po)
+    k = np.unique(k)
+    return pi[k], po[k]
+
+
+
+WALL_CLEAR = True            # the inner wall of a garment slab must stay behind the outer surface over it: where the polygon reduction (or the
+WALL_GAP_MM = 1.5            # Amount push) made them cross, its back showed through (red in the viewer; magic leather 08). The inner wall's
+WALL_MAX_MM = 15.0           # free vertices move inward until it is WALL_GAP_MM behind, at most WALL_MAX_MM in all (it is only ever seen from
+WALL_ROUNDS = 10             # inside an opening, so moving it in is safe); outer walls, skin and the rings never move
+WALL_SIDE_COS = 0.3
+WALL_TURN_OUTER_DEG = 25.0   # a clearance move may tilt an outer-wall face (it shows) at most this much, any other face at most WALL_TURN_DEG
+WALL_TURN_DEG = 60.0
+
+
+def wall_clearance(lay, X, side, fixed):
+    """Move inner-wall vertices of the positions X (in place) inward until no inner face passes through an outer one. For each crossing pair the
+    inner face must lie WALL_GAP_MM behind the outer face's plane wherever the two overlap along the outer normal: sample points of both faces,
+    and the points where an edge of one passes through the other, give the need at a point of the inner face, shared over its corners by
+    barycentric weight (least-norm share, the corner keeps its largest), along the outer face's inward normal. Vertices only of outer-wall
+    faces, of skin faces and `fixed` ones are pinned. A move that turns any face (an outer one by WALL_TURN_OUTER_DEG, any other by
+    WALL_TURN_DEG) from how it was when this started is taken back. Returns notes."""
+    from shell_slots import SKIN
+    F = lay.F
+    pinned = fixed.copy()
+    pinned[np.unique(F[side > 0])] = True                             # outer-wall vertices stay, except at a rim (a vertex of inner faces too:
+    pinned[np.unique(F[side < 0])] = False                            # a thin low-poly slab's walls meet at one edge, its inner faces have only
+    pinned[np.unique(F[lay.role == SKIN])] = True                     # rim corners and one free one), skin and rings always
+    pinned |= fixed
+    gap, cap = WALL_GAP_MM / 1000, WALL_MAX_MM / 1000
+    X0 = X.copy()
+    n_start = np.cross(X0[F[:, 1]] - X0[F[:, 0]], X0[F[:, 2]] - X0[F[:, 0]])
+    a_start = np.linalg.norm(n_start, axis=1)
+    live = a_start > 1e-12
+    lim = np.where(side > 0, np.cos(np.radians(WALL_TURN_OUTER_DEG)), np.cos(np.radians(WALL_TURN_DEG)))
+    vf = [[] for _ in range(len(X))]
+    for f, tri in enumerate(F):
+        for v in tri:
+            vf[v].append(f)
+    S = _FACE_SAMPLES
+    cw = S / (S ** 2).sum(1, keepdims=True)
+    first, refused, rnd = None, 0, 0
+    best, best_X = None, X.copy()
+    pi = po = np.zeros(0, np.int64)
+    for rnd in range(WALL_ROUNDS):
+        pi, po = wall_crossings(X, F, side)
+        first = len(pi) if first is None else first
+        if best is None or len(pi) < best:                            # the state with the fewest crossings is kept: a round that makes more
+            best, best_X = len(pi), X.copy()                          # (a moved rim corner meeting another sheet) ends the clearance
+        elif len(pi) > best:
+            break
+        if not len(pi):
+            break
+        Ti, To = X[F[pi]], X[F[po]]
+        ng = np.cross(To[:, 1] - To[:, 0], To[:, 2] - To[:, 0])
+        ng /= np.maximum(np.linalg.norm(ng, axis=1), 1e-18)[:, None]
+        nf = np.cross(Ti[:, 1] - Ti[:, 0], Ti[:, 2] - Ti[:, 0])
+        nf /= np.maximum(np.linalg.norm(nf, axis=1), 1e-18)[:, None]
+        corner = np.zeros((len(pi), 3))
+        # (a) points of the inner face in front of (or within gap behind) the outer face, over it
+        P = np.einsum('kj,fjd->fkd', S, Ti)                                       # (pairs, samples, 3)
+        sd = ((P - To[:, None, 0]) * ng[:, None]).sum(2)
+        Pp = P - sd[..., None] * ng[:, None]
+        w = _bary(Pp.reshape(-1, 3), np.repeat(To, len(S), axis=0)).reshape(len(pi), len(S), 3)
+        need = np.where((w >= -1e-6).all(2) & (sd > -gap), sd + gap, 0.)
+        corner = np.maximum(corner, (need[:, :, None] * cw[None]).max(1))
+        # (b) points of the outer face with the inner face in front of them (projected along the outer normal onto the inner face)
+        Q = np.einsum('kj,fjd->fkd', S, To)
+        den = (ng * nf).sum(1)
+        den = np.where(np.abs(den) > 1e-6, den, -1e-6)
+        t = -((Q - Ti[:, None, 0]) * nf[:, None]).sum(2) / den[:, None]            # inner face point = Q + t ng
+        Pf = Q + t[..., None] * ng[:, None]
+        wf = _bary(Pf.reshape(-1, 3), np.repeat(Ti, len(S), axis=0)).reshape(len(pi), len(S), 3)
+        ok = (wf >= -1e-6).all(2) & (t > -gap)
+        nd = np.where(ok, t + gap, 0.)
+        sh = np.clip(wf, 0, None) / np.maximum((wf ** 2).sum(2, keepdims=True), 1e-12)
+        corner = np.maximum(corner, (nd[..., None] * sh).max(1))
+        # (c) the crossing points themselves (two thin triangles can cross between both sample grids): there the inner face needs `gap`
+        hk, hw = _pair_hits(X, F, pi, po)
+        if len(hk):
+            share_c = hw * gap / np.maximum((hw ** 2).sum(1, keepdims=True), 1e-12)
+            np.maximum.at(corner, hk, share_c)
+        need_v = np.zeros(len(X))
+        dirs = np.zeros_like(X)
+        for k in range(3):
+            v = F[pi, k]
+            np.maximum.at(need_v, v, corner[:, k])
+            np.add.at(dirs, v, -ng * corner[:, k:k + 1])
+        need_v[pinned] = 0.
+        mv = np.flatnonzero(need_v > 1e-7)
+        if not len(mv):
+            break
+        X_prev = X.copy()
+        dn = dirs[mv] / np.maximum(np.linalg.norm(dirs[mv], axis=1), 1e-18)[:, None]
+        X[mv] += dn * need_v[mv, None]
+        D = X[mv] - X0[mv]                                                        # at most WALL_MAX_MM from where it started
+        L = np.linalg.norm(D, axis=1)
+        X[mv] = X0[mv] + D * np.minimum(1., cap / np.maximum(L, 1e-18))[:, None]
+        moved = set(mv.tolist())
+        for _ in range(6):                                                        # take back moves that turn a face
+            fs = np.unique(np.concatenate([np.asarray(vf[v], np.int64) for v in moved])) if moved else np.zeros(0, np.int64)
+            if not len(fs):
+                break
+            n1 = np.cross(X[F[fs, 1]] - X[F[fs, 0]], X[F[fs, 2]] - X[F[fs, 0]])
+            cs = (n_start[fs] * n1).sum(1) / np.maximum(a_start[fs] * np.linalg.norm(n1, axis=1), 1e-30)
+            bad = fs[live[fs] & (cs < lim[fs])]
+            if not len(bad):
+                break
+            back = [v for v in np.unique(F[bad]).tolist() if v in moved]
+            if not back:
+                break
+            X[back] = X_prev[back]
+            refused += len(back)
+            moved -= set(back)
+        if not moved:
+            break
+    X[:] = best_X
+    disp = np.linalg.norm(X - X0, axis=1)
+    left = len(wall_crossings(X, F, side)[0]) if first else 0
+    n1 = np.cross(X[F[:, 1]] - X[F[:, 0]], X[F[:, 2]] - X[F[:, 0]])
+    turned = int((live & ((n_start * n1).sum(1) < 0)).sum())
+    return {'crossing_pairs': first, 'left': int(left), 'rounds': rnd + 1 if first else 0, 'vertices_moved': int((disp > 1e-6).sum()),
+            'max_move_mm': round(float(disp.max()) * 1000, 1) if len(disp) else 0., 'moves_taken_back': int(refused), 'faces_turned_over': turned}
 
 
 def slider_fold_guard(m, U1, rounds=12):
@@ -980,6 +1221,9 @@ def _ring_edge_use(lay, R, h=None):
         on = np.flatnonzero((dist < 1e-7) & (t > 1e-9) & (t < 1 - 1e-9))
         chain = [a] + [int(x) for x in on[np.argsort(t[on])]] + [b]
         uses = {(h.get((u, v), 0), h.get((v, u), 0)) for u, v in zip(chain, chain[1:])}
+        if len(chain) > 2:                                            # a face on the whole edge a - b covers every piece too
+            da, db = h.get((a, b), 0), h.get((b, a), 0)
+            uses = {(f_ + da, g_ + db) for f_, g_ in uses}
         out.append(uses.pop() if len(uses) == 1 else (-1, -1))
     return out
 
@@ -1023,12 +1267,12 @@ def build_layer(m, slot, body, gd):
     lay, U1, rec = _build_layer(m, slot, body, gd, rings0, [])
     if not BODY_BAND or lay is None or not rings0:
         return lay, U1, rec
-    use = [k for k, nk in enumerate(rec['seams']['rings']) if _full(nk.get('ring_edges_joined', '0/0'))]   # no garment rule (user 2026-11-24)
+    use = {k: 1.0 for k, nk in enumerate(rec['seams']['rings']) if _full(nk.get('ring_edges_joined', '0/0'))}   # no garment rule (user 2026-11-24)
     tried = []
-    for _ in range(3):
+    for _ in range(5):
         if not use:
             break
-        tried.append(list(use))
+        tried.append({int(k): w for k, w in use.items()})
         lay2, U2, rec2 = _build_layer(m, slot, body, gd, rings0, use)
         if lay2 is None:
             break
@@ -1036,9 +1280,84 @@ def build_layer(m, slot, body, gd):
         if not bad:
             rec2['band_tries'] = tried
             return lay2, U2, rec2
-        use = [k for k in use if k not in bad]
+        for k in bad:                                                 # a full-row strip that cannot be joined is tried narrower, then dropped
+            if use[k] >= 1 and BAND_NARROW:
+                use[k] = BAND_NARROW
+            else:
+                del use[k]
     rec['band_tries'] = tried
     return lay, U1, rec
+
+
+BAND_NARROW = 0.4            # a seam whose full body strip cannot be joined (the generated skin does not reach all round the body's next row: a
+                             # mail hem above the knee) is tried with a strip this fraction of the first row wide (its faces split there)
+
+
+def _band_body(ob, slot, rings0, use):
+    """The output body with the strip of each used ring k marked part -2 (k -> width: 1 = the body's faces touching the ring on the slot side,
+    less = those faces split at that fraction of the way from the ring to the next row, the outer part the strip). New vertices sit on the
+    ring-to-inner edges, shared by both faces of the edge (the strip's edges inside are split alike, so no T-junction). Returns the body, with
+    `part_orig` (each face's part before the marking)."""
+    import copy
+    V, F, part, orig = [*ob.V], [], [], []
+    newv = {}
+    strip_of = np.full(len(ob.F), -1)
+    for k in use:
+        strip_of[_strip(ob, slot, rings0[k]) & (strip_of < 0)] = k
+    ring_sets = {k: set(np.asarray(rings0[k]['ids']).tolist()) for k in use}
+
+    def x(r, i, fr):
+        key = (r, i)
+        if key not in newv:
+            newv[key] = len(V)
+            V.append(ob.V[r] + fr * (ob.V[i] - ob.V[r]))
+        return newv[key]
+
+    def add(t, pp, pf):
+        F.append(tuple(t))
+        part.append(pp)
+        orig.append(pf)
+    for fi, f in enumerate(ob.F):
+        k = int(strip_of[fi])
+        pf = int(ob.part[fi])
+        f = [int(v) for v in f]
+        if k < 0:
+            add(f, pf, pf)
+            continue
+        fr = use[k]
+        onr = [v in ring_sets[k] for v in f]
+        if fr >= 1 or all(onr) or not any(onr):
+            add(f, -2, pf)
+            continue
+        if sum(onr) == 2:                                             # (r1, r2, i): the ring edge's strip quad, the rest a triangle
+            j = onr.index(False)
+            i, r1, r2 = f[j], f[(j + 1) % 3], f[(j + 2) % 3]
+            x1, x2 = x(r1, i, fr), x(r2, i, fr)
+            add((r1, r2, x2), -2, pf)
+            add((r1, x2, x1), -2, pf)
+            add((x1, x2, i), pf, pf)
+        else:                                                         # (r, i1, i2): the strip a triangle at the ring vertex, the rest a quad
+            j = onr.index(True)
+            r, i1, i2 = f[j], f[(j + 1) % 3], f[(j + 2) % 3]
+            x1, x2 = x(r, i1, fr), x(r, i2, fr)
+            add((r, x1, x2), -2, pf)
+            add((x1, i1, i2), pf, pf)
+            add((x1, i2, x2), pf, pf)
+    V, F, part, orig = np.array(V), np.array(F, np.int64), np.array(part, np.int64), np.array(orig, np.int64)
+    keep = np.linalg.norm(np.cross(V[F[:, 1]] - V[F[:, 0]], V[F[:, 2]] - V[F[:, 0]]), axis=1) > 1e-12   # the constructor's own test, so it
+    F, part, orig = F[keep], part[keep], orig[keep]                   # drops nothing and the face order (and part_orig) stays
+    fb = copy.copy(ob)
+    for a in [a for a in fb.__dict__ if a == '_pn' or a.startswith('_gpu')]:   # caches of the output body: the GPU triangle buffer above
+        del fb.__dict__[a]                                            # all (shared by the shallow copy, the band body released it on its
+                                                                      # first query and the output body's next query hit a dead buffer:
+                                                                      # every worker fell back to the CPU)
+    type(ob).__init__(fb, V, F, part, ob.part_names)
+    for a in ('H', 'o', '_race'):
+        if hasattr(ob, a):
+            setattr(fb, a, getattr(ob, a))
+    assert len(fb.F) == len(F), 'band body: faces dropped'
+    fb.part_orig = orig
+    return fb
 
 
 def _build_layer(m, slot, body, gd, rings0, use):
@@ -1046,11 +1365,8 @@ def _build_layer(m, slot, body, gd, rings0, use):
     from shell_slots import Mesh
     ob = out_body(body, gd)
     if use:
-        band = np.zeros(len(ob.F), bool)
-        for k in use:
-            band |= _strip(ob, slot, rings0[k])
-        fb = copy.copy(ob)
-        fb.part = np.where(band, -2, ob.part)                         # the strips are out of the slot for the cut
+        fb = _band_body(ob, slot, rings0, use)                        # the strips are out of the slot for the cut
+        band = fb.part == -2
         rings = rings_of(fb, slot, gd)
     else:
         band, fb, rings = None, ob, rings0
@@ -1073,28 +1389,34 @@ def _build_layer(m, slot, body, gd, rings0, use):
     blend_notes = seam_blend(lay, body, ring_v, gd)
     U1, anotes = amount_morph(lay, body, ring_v, gd, rings, slot)
     anotes['seam_blend'] = blend_notes
+    if WALL_CLEAR:                                                    # both ends of the slider: no inner wall through an outer one
+        side = wall_sides(lay, body, gd)
+        fixed = np.zeros(len(lay.V), bool)
+        fixed[ring_v] = True
+        anotes['walls'] = {'a0': wall_clearance(lay, lay.V, side, fixed), 'a100': wall_clearance(lay, U1, side, fixed)}
     band_notes = {}
     if use:
         for k in use:                                                 # the rings the strip of ring k leaves on its slot side
-            sv = set(ob.F[_strip(ob, slot, rings0[k])].ravel().tolist())
+            sk = band & np.isin(fb.F, rings0[k]['ids']).any(1)
+            sv = set(fb.F[sk].ravel().tolist())
             own = set(np.asarray(rings0[k]['ids']).tolist())
             inner = [j for j, R in enumerate(rings) if set(np.asarray(R['ids']).tolist()) <= sv and not set(np.asarray(R['ids']).tolist()) <= own]
-            band_notes[k] = {'faces': int(_strip(ob, slot, rings0[k]).sum()), 'inner_rings': inner,
+            band_notes[k] = {'faces': int(sk.sum()), 'width': use[k], 'inner_rings': inner,
                              'inner_joined': [snotes['rings'][j]['ring_edges_joined'] for j in inner],
                              'inner_complete': bool(inner) and all(_full(snotes['rings'][j]['ring_edges_joined']) for j in inner)}
         q = {tuple(x): i for i, x in enumerate(np.round(lay.V * 1e7).astype(np.int64))}
         Vn, Un, Fb = [*lay.V], [*U1], []
-        for f in ob.F[band]:
+        for f in fb.F[band]:
             ids = []
             for v in f:
-                key = tuple(np.round(ob.V[v] * 1e7).astype(np.int64))
+                key = tuple(np.round(fb.V[v] * 1e7).astype(np.int64))
                 if key not in q:
                     q[key] = len(Vn)
-                    Vn.append(ob.V[v].copy())
-                    Un.append(ob.V[v].copy())
+                    Vn.append(fb.V[v].copy())
+                    Un.append(fb.V[v].copy())
                 ids.append(q[key])
             Fb.append(ids)
-        lay = Mesh(np.array(Vn), np.r_[lay.F, np.array(Fb, np.int64)], np.r_[lay.role, [gd.SKIN] * len(Fb)], np.r_[lay.part, ob.part[band]],
+        lay = Mesh(np.array(Vn), np.r_[lay.F, np.array(Fb, np.int64)], np.r_[lay.role, [gd.SKIN] * len(Fb)], np.r_[lay.part, fb.part_orig[band]],
                    np.r_[lay.prov, ['seamband'] * len(Fb)])
         U1 = np.array(Un)
         h = _halfedges(lay)                                           # after welding: every inner ring edge has exactly two faces, one each way,
@@ -1122,6 +1444,9 @@ def _build_layer(m, slot, body, gd, rings0, use):
             seam_keys |= {frozenset((Pk[i], Pk[(i + 1) % len(Pk)])) for i in range(len(Pk))}
         lay, U1, enotes = add_end_caps(lay, U1, seam_keys, gd)
     gnotes = slider_fold_guard(lay, U1)                               # last: nothing may turn over anywhere along the slider
+    if WALL_CLEAR:                                                    # (the guard can pull Amount 100 back towards Amount 0: re-counted)
+        side = wall_sides(lay, body, gd)
+        gnotes['wall_crossings_left'] = [int(len(wall_crossings(X, lay.F, side)[0])) for X in (lay.V, U1)]
     return lay, U1, {'select': selnotes, 'seams': snotes, 'amount': anotes, 'neck_caps': cnotes, 'end_caps': enotes, 'faces': int(len(lay.F)),
                      'band': band_notes, 'slider_fold_guard': gnotes, 'ring_vertices': int(len(ring_v)),
                      'ring_vertices_expected': int(sum(len(R['P']) for R in rings0))}
@@ -1271,10 +1596,123 @@ def slots(body, gd, tidy=True):
     return {k: v for k, v in S.items() if v}
 
 
+LEG_CENTRE = True            # body armour: a generated leg standing off the game leg (the alignment saw too little bare skin on it: magic plate
+LEG_CENTRE_MIN_MM = 30.0     # mail 15 human_male right leg 49-83 mm forward, the left within 12 mm) is moved onto it, when its SHIN sections (the
+LEG_CENTRE_MAX_MM = 150.0    # generated bare skin: reliable) are off by more than this; sections 0.2-0.8 of the thigh and 0.2-0.6 of the shin give
+LEG_OUTLIER_MM = 40.0        # the offset (a section this far from their median - a skirt or tasset - is not used), interpolated along the leg,
+LEG_SECTIONS = ((0, .2), (0, .4), (0, .6), (0, .8), (1, .2), (1, .4), (1, .6))   # tapering to nothing at the hip joint
+LEG_AGREE_MM = 30.0          # the shin's skin sections must agree within this to trigger (dwarf plate 15: 15 and 63 mm apart, no real offset)
+LEG_VOTE = 0.5               # a vertex is on the leg (and moves with it) when at least this share of its faces are leg faces
+
+
+def centre_legs(m, body, gd):
+    """Move each generated leg of a body-armour module across the game leg by the offset of their cross-section centres (see LEG_CENTRE_MIN_MM).
+    The trigger is the generated BARE SKIN of the shin (asymmetric armour on a leg that is in place does not trigger it); the offset profile comes
+    from all the leg's faces. Each vertex moves by the share of its faces that are on
+    that leg (a vertex also on the pelvis or the other leg moves partly, the pelvis not at all), tapering to nothing at the hip joint (a vertex
+    is on the leg when LEG_VOTE of its faces are: a fixed rule, not the label of whichever face was written last). Faces the correction turns
+    over (where the generated leg's offset changes steeply below the hip) are counted in the notes. In place."""
+    pn = body.part_names
+    root = [i for i, n in enumerate(pn) if n.startswith(('root', 'spine'))]
+    notes = {}
+
+    def vs(ids):
+        return set(body.F[np.isin(body.part, ids)].ravel().tolist())
+    nV = len(m.V)
+    inc = np.maximum(np.bincount(m.F.ravel(), minlength=nV), 1)
+    D = np.zeros_like(m.V)
+    skin_f = m.role == gd.SKIN
+    for side in ('r', 'l'):
+        names = [f'thigh_stretch.{side}', f'leg_stretch.{side}', f'foot.{side}']
+        if not all(n in pn for n in names) or not root:
+            continue
+        th, lg, ft = (pn.index(n) for n in names)
+        if min(int(np.isin(body.part, ids).sum()) for ids in ([th], [lg], [ft], root)) < 4:   # a leg-less body (the gnome: parts named, no faces)
+            notes[side] = 'no game leg'
+            continue
+        J0, J1, J2 = gd._joint(body, vs([th]), vs(root)), gd._joint(body, vs([th]), vs([lg])), gd._joint(body, vs([lg]), vs([ft]))
+        segs = [(J0, J1), (J1, J2)]
+        legp = [pn.index(n) for n in (f'thigh_stretch.{side}', f'leg_stretch.{side}', f'knee_cop.{side}') if n in pn]
+        mf, gf = np.isin(m.part, legp), np.isin(body.part, [th, lg])
+        sf = np.isin(m.part, [lg]) & skin_f                           # the generated bare shin
+        us, offs, skin_offs = [], [], []
+        for k, fr in LEG_SECTIONS:
+            A, B = segs[k]
+            Lk = np.linalg.norm(B - A)
+            a = (B - A) / max(Lk, 1e-9)
+            gc = gd._section_centre(body.V, body.F[gf], A, a, fr * Lk)
+            if gc is None:
+                continue
+            mc = gd._section_centre(m.V, m.F[mf], A, a, fr * Lk)
+            if mc is None:
+                continue
+            o = gc - mc
+            us.append(k + fr)
+            offs.append(o - (o @ a) * a)
+            sc = gd._section_centre(m.V, m.F[sf], A, a, fr * Lk) if k == 1 else None
+            if sc is not None:                                        # the trigger's own measure: the generated bare shin alone
+                o = gc - sc
+                skin_offs.append(o - (o @ a) * a)
+        if len(us) < 4:
+            notes[side] = 'too few sections'
+            continue
+        us, offs = np.array(us), np.array(offs)
+        keep = np.linalg.norm(offs - np.median(offs, axis=0), axis=1) < LEG_OUTLIER_MM / 1000
+        so = np.array(skin_offs).reshape(-1, 3)                       # the trigger: skin sections, without those far from their own median
+        so = so[np.linalg.norm(so - np.median(so, axis=0), axis=1) < LEG_OUTLIER_MM / 1000] if len(so) else so
+        agree = len(so) >= 2 and float(np.linalg.norm(so[:, None] - so[None], axis=2).max()) < LEG_AGREE_MM / 1000
+        mag = float(np.median(np.linalg.norm(so, axis=1))) if agree else 0.   # (sections that disagree - a stubby dwarf shin - say nothing)
+        notes[side] = {'shin_skin_offset_mm': round(mag * 1000, 1), 'skin_sections': int(len(so)), 'sections': int(len(us)),
+                       'outliers': int((~keep).sum()),
+                       'offsets_mm': {f'{"thigh" if u < 1 else "shin"}{u % 1:.1f}': [round(float(x) * 1000) for x in o] for u, o in zip(us, offs)}}
+        if mag < LEG_CENTRE_MIN_MM / 1000 or keep.sum() < 3:
+            continue
+        us, offs = us[keep], offs[keep]
+        on_leg = np.isin(m.part, legp + [ft])
+        share = np.bincount(m.F[on_leg].ravel(), minlength=nV) / inc
+        sel = np.flatnonzero(share >= LEG_VOTE - 1e-9)                # (a fixed rule, not the label of whichever face was written last)
+        P = m.V[sel]
+        a0 = (J1 - J0) / np.linalg.norm(J1 - J0)
+        a1 = (J2 - J1) / np.linalg.norm(J2 - J1)
+        t0 = (P - J0) @ a0 / np.linalg.norm(J1 - J0)
+        t1 = (P - J1) @ a1 / np.linalg.norm(J2 - J1)
+        u = np.where(t0 <= 1, np.clip(t0, 0, 1), 1 + np.clip(t1, 0, 1))
+        o = np.stack([np.interp(u, us, offs[:, c]) for c in range(3)], 1)
+        x = np.clip(u / us.min(), 0, 1)
+        o *= (x * x * (3 - 2 * x))[:, None]                           # nothing at the hip joint, in full from the first section down
+        n_ = np.linalg.norm(o, axis=1, keepdims=True)
+        o = np.where(n_ > LEG_CENTRE_MAX_MM / 1000, o * (LEG_CENTRE_MAX_MM / 1000) / np.maximum(n_, 1e-12), o)
+        D[sel] += o
+        notes[side]['moved_vertices'] = int(len(sel))
+        notes[side]['max_move_mm'] = round(float(np.linalg.norm(o, axis=1).max()) * 1000, 1)
+    if np.abs(D).max() > 0:
+        F = m.F
+        n0 = np.cross(m.V[F[:, 1]] - m.V[F[:, 0]], m.V[F[:, 2]] - m.V[F[:, 0]])
+        live = np.linalg.norm(n0, axis=1) > 1e-12
+
+        def turned(Dx):
+            X = m.V + Dx
+            n1 = np.cross(X[F[:, 1]] - X[F[:, 0]], X[F[:, 2]] - X[F[:, 0]])
+            return live & ((n0 * n1).sum(1) <= 0)
+        notes['faces_turning_over'] = int(turned(D).sum())            # (reported: halving their moves only spread them, a cascade of halvings
+                                                                      # left the knee 85 mm behind the leg; smoothing the field turned more)
+    m.V = m.V + D
+    return notes
+
+
+LOD_OVERRIDE = {                    # set -> reduction level used instead of shell_slots.LV ('0p4'), for every race and module of that set
+    'magic_plate_mail_15_phloem_shell': '0p2',      # user 2026-11-25: "try just process this one at lod 0.2" (right thigh)
+}
+
+
+def source_lod(mod):
+    return LOD_OVERRIDE.get(Path(mod).parts[-4])
+
+
 def prep(mod, body, race, gd):
     """The aligned generated module (white-anchor alignment as before) with its skin labels cleaned; no rim snapping onto the game body."""
     rig = gd.ab.Rig.from_npz(gd.bf.BASE_CACHE / f'{race}_rig.npz')
-    m, info = gd.load_shell(mod, gd.bf.get_body(race), rig)
+    m, info = gd.load_shell(mod, gd.bf.get_body(race), rig, lv=source_lod(mod))
     slots(body, gd)                                                   # makes sure the body's own part fixes are done
     for joint, n, ui, li in getattr(body, '_replanes', []):          # the module carries the base's part labels: same joint-plane fix
         sel = np.isin(m.part, [ui, li])
@@ -1364,6 +1802,8 @@ def _task_module(mod, written):
     if module == 'outfit':
         one('outfit', m, {})
     elif module == 'body_armor':
+        if LEG_CENTRE:
+            info['legs_centred'] = centre_legs(m, body, gd)
         one('torso', m, {})
     elif module == 'right_gauntlet_boot':
         if gd.CENTRE_LIMBS:

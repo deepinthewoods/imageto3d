@@ -211,11 +211,12 @@ def module_identity(mod):
     return s, j, r, m
 
 
-def load_shell(mod, body, rig):
-    """The module's full labelled LOD, welded, in game world space, aligned with the wearable's field. Returns (Mesh, info)."""
+def load_shell(mod, body, rig, lv=None):
+    """The module's full labelled LOD (`lv`, default LV), welded, in game world space, aligned with the wearable's field. Returns (Mesh, info)."""
     mod = Path(mod)
+    lv = lv or LV
     man = json.loads((mod / 'reduced' / 'manifest.json').read_text(encoding='utf-8-sig'))
-    glb = bf.Glb(mod / 'reduced' / f'lod_error_{LV}.glb')
+    glb = bf.Glb(mod / 'reduced' / f'lod_error_{lv}.glb')
     surf = bf.Surface(glb, man, body)
     names = [m.get('name') for m in glb.js.get('materials', [])]
     role = []
@@ -226,8 +227,8 @@ def load_shell(mod, body, rig):
     role = np.array(role, '<U10')
     nF = len(surf.Tw)
     part = np.full(nF, -1, np.int64)
-    cz_path = mod / 'reduced' / f'lod_error_{LV}_colors.npz'
-    info = {'labelled_faces': int(nF)}
+    cz_path = mod / 'reduced' / f'lod_error_{lv}_colors.npz'
+    info = {'labelled_faces': int(nF), 'source_lod': lv}
     if cz_path.is_file():
         cz = np.load(cz_path, allow_pickle=True)
         if 'body_part_glb_order' in cz.files and len(cz['body_part_glb_order']) == nF:
