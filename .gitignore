@@ -9,27 +9,13 @@
 !/TRIPO_HANDOFF.md
 !/PIPELINE_V2_PLAN.md
 !/tools/
-# The shell/slot/layer prototype's processing code + viewer pages (user 2026-11-24: "I just wanna be able to go back to this");
-# its generated outputs (out/ GLBs, scenes, renders) stay local
+# The shell/slot/layer prototype: its code and viewer pages were retired in pipeline v2 phase 6 (2026-11-25; the builder is tools/layers,
+# the pages are the app's Mix / Aligned tabs; commit 82e6de1 has them). Only its README is tracked; its outputs (out/) stay local.
 !/experiments/
 /experiments/*
 !/experiments/shell_slots_20261122/
 /experiments/shell_slots_20261122/*
-!/experiments/shell_slots_20261122/*.py
 !/experiments/shell_slots_20261122/README.md
-!/experiments/shell_slots_20261122/checks/
-/experiments/shell_slots_20261122/checks/*
-!/experiments/shell_slots_20261122/checks/*.py
-!/experiments/shell_slots_20261122/checks/README.md
-!/experiments/shell_slots_20261122/out/
-/experiments/shell_slots_20261122/out/*
-!/experiments/shell_slots_20261122/out/*.html
-!/experiments/shell_slots_20261122/out/pieces/
-/experiments/shell_slots_20261122/out/pieces/*
-!/experiments/shell_slots_20261122/out/pieces/mix.html
-!/experiments/shell_slots_20261122/out/layers/
-/experiments/shell_slots_20261122/out/layers/*
-!/experiments/shell_slots_20261122/out/layers/mix.html
 
 tools/lowpoly/lib/
 node_modules/
