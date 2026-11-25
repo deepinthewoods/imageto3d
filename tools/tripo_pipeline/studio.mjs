@@ -61,6 +61,10 @@ if(!process.env[LOCK_ENV]){
 // time, <profile>.imageto3d.pid; it prints the path) and the next acquirer treats the profile as busy while this process, or a
 // Firefox started on the profile, still runs. The file is removed only after the command ended normally (context closed); after
 // an error it stays and the next acquirer clears it once nothing uses the profile.
+// Final-verify row 18: the check and the registration are ONE handshake with acquisition (tripo_browser_lock.register_browser): the
+// one-time token of the holder that spawned this process is compared with the live reservation file and the pid is published under
+// the same handshake lock an acquirer holds, so this process cannot register once its holder is gone and a replacement took the
+// profile (it is refused here and never opens the profile). Never verify first and register in a second call.
 let browserPidFile=null;
 {
  const check=spawnSync(PY,['-X','utf8',LOCK_TOOL,'verify','--profile',profile,'--lock',process.env[LOCK_ENV],'--token',process.env[TOKEN_ENV]??'','--register-pid',String(process.pid)],{encoding:'utf8',stdio:['ignore','pipe','pipe']});
@@ -77,7 +81,9 @@ function unregisterBrowser(){
 // Click-time paid gate (DESIGN_PHASE4 I.8, tools/paid_gate.py): with IMAGETO3D_PAID_GATE set (convert_job passes it to a paid submit)
 // the gate is checked right before the Generate click; null = open (or no gate: a manual run), else the reason it is closed.
 // Recheck finding 6: "right before" means AFTER Playwright's actionability wait (paid_click.mjs gatedPaidClick: trial click first,
-// then this gate, then the intent and a dispatch with a short bounded timeout), never before an auto-waiting click().
+// then this gate, then the intent and the dispatch), never before an auto-waiting click(). Final-verify row 6: the dispatch itself
+// does not auto-wait either (a forced click on the element pinned before the gate: delivered at once or failed), and the gate is
+// asked again after it: a hold that took effect meanwhile makes the outcome `uncertain` (needs review), never `clicked`.
 const GATE_TOOL = fileURLToPath(new URL('../paid_gate.py',import.meta.url));
 const EXIT_GATE_CLOSED = 4;
 function paidGateClosed(){
@@ -233,7 +239,7 @@ async function submit(){
    fs.renameSync(recordPath,recordPath.replace(/\.json$/,`.gate_closed_${Date.now()}.json`));
    console.error(`PAID GATE CLOSED: ${gate}`);process.exitCode=EXIT_GATE_CLOSED;return;
   }
-  // 'clicked', or 'uncertain': the dispatch failed / timed out after the intent was written, so the click MAY have happened.
+  // 'clicked', or 'uncertain': the dispatch failed / timed out after the intent was written, or the gate closed while it was under way, so the click MAY have happened.
   await page.waitForTimeout(7000);
   record.response=responses[0]??null;record.project_id=record.response?.project_id??page.url().match(/[a-f0-9-]{36}$/)?.[0]??null;
   const delivered=record.response?.code===0&&Boolean(record.project_id);

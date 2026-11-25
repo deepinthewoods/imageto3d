@@ -391,17 +391,117 @@ def record_inputs(record):
     return result
 
 
-def _unprotect(path):
-    """Make a (read-only) snapshot file writable again; missing = nothing to do."""
-    try:
-        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
-    except FileNotFoundError:
-        pass
-
-
 def _protect(path):
     """Read-only for everyone (Windows: the read-only attribute): the snapshot cannot be overwritten in place by accident."""
     os.chmod(path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+
+
+def _lstat(path):
+    """os.lstat (the entry itself, never what a link points to), None when nothing is there."""
+    try:
+        return os.lstat(path)
+    except FileNotFoundError:
+        return None
+
+
+def _is_link(info):
+    """A symbolic link, or on Windows any reparse point (junction, symlink, mount point): an entry that leads elsewhere."""
+    return stat.S_ISLNK(info.st_mode) or bool(getattr(info, 'st_file_attributes', 0)
+                                              & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+
+
+def _same_file_path(a, b):
+    return os.path.normcase(os.path.realpath(str(a))) == os.path.normcase(os.path.realpath(str(b)))
+
+
+def _upload_dir(out_dir):
+    """<out_dir>/upload_inputs/ as a real folder of the output dir (created when missing); Stop when it is a link / junction or
+    resolves anywhere else (final-verify row 14)."""
+    out_dir = Path(out_dir)
+    target = out_dir / UPLOAD_DIR
+    info = _lstat(target)
+    if info is None:
+        target.mkdir(parents=True, exist_ok=True)
+        info = _lstat(target)
+    if info is None or _is_link(info) or not stat.S_ISDIR(info.st_mode):
+        raise Stop(f'upload snapshot folder is not a plain folder of the output (a link, junction or file): {target}')
+    if not _same_file_path(target, Path(os.path.realpath(str(out_dir))) / UPLOAD_DIR):
+        raise Stop(f'upload snapshot folder resolves outside the output: {target} -> {os.path.realpath(str(target))}')
+    return target
+
+
+def _own_destination(target, name):
+    """(path, lstat or None) of the final file <target>/<name>, checked (final-verify row 14): `name` is a bare file name, and an
+    existing entry is this snapshot's OWN regular file: not a link / junction / reparse point, not a folder, not a hard link
+    shared with another name (its attributes and bytes would be another file's too), and it resolves to exactly
+    <resolved target>/<name>. Stop otherwise; nothing is changed."""
+    if not isinstance(name, str) or name in ('', '.', '..') or Path(name).name != name:
+        raise Stop(f'upload snapshot: not a plain file name: {name!r}')
+    path = Path(target) / name
+    info = _lstat(path)
+    if info is None:
+        return path, None
+    if _is_link(info) or not stat.S_ISREG(info.st_mode):
+        raise Stop(f'upload snapshot destination is a link, junction or not a regular file; not written: {path}')
+    if info.st_nlink > 1:
+        raise Stop(f'upload snapshot destination is hard-linked to another file ({info.st_nlink} names); not written: {path}')
+    if not _same_file_path(path, Path(os.path.realpath(str(target))) / name):
+        raise Stop(f'upload snapshot destination resolves outside the snapshot folder; not written: {path}')
+    return path, info
+
+
+def _unprotect_own(path, info):
+    """Clear the read-only bit of a destination _own_destination verified (`info`): through a handle opened without following
+    links where the OS can, else by path after checking that it is still the same file."""
+    flags = os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
+    if os.chmod in getattr(os, 'supports_fd', ()):
+        fd = os.open(path, flags)
+        try:
+            now = os.fstat(fd)
+            if (now.st_dev, now.st_ino) != (info.st_dev, info.st_ino) or not stat.S_ISREG(now.st_mode) or now.st_nlink > 1:
+                raise Stop(f'upload snapshot destination changed while it was replaced; not written: {path}')
+            os.chmod(fd, stat.S_IREAD | stat.S_IWRITE)
+        finally:
+            os.close(fd)
+        return
+    again = _lstat(path)
+    if (again is None or _is_link(again) or not stat.S_ISREG(again.st_mode) or again.st_nlink > 1
+            or (again.st_dev, again.st_ino) != (info.st_dev, info.st_ino)):
+        raise Stop(f'upload snapshot destination changed while it was replaced; not written: {path}')
+    os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+
+
+def _remove_own(target, name):
+    """Delete <target>/<name> when it exists and is the snapshot's own file (_own_destination); a link is refused, not followed."""
+    path, info = _own_destination(target, name)
+    if info is not None:
+        _unprotect_own(path, info)
+        os.unlink(path)
+
+
+def _replace_own(source, target, name):
+    """Put a read-only copy of `source` at <target>/<name> without ever writing THROUGH an existing entry (final-verify row 14):
+    the bytes go to a new temp file of the same folder (exclusive create), are hashed there, and the temp file is renamed over
+    the destination (os.replace swaps the directory entry; it never follows a link). An existing destination must be the
+    snapshot's own file (_own_destination) and only that verified file loses its read-only bit. Returns (sha256, size)."""
+    path, info = _own_destination(target, name)
+    temp = Path(target) / f'.{name}.{os.getpid()}.{os.urandom(4).hex()}.tmp'
+    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0), 0o600)
+    try:
+        with os.fdopen(fd, 'wb') as out, open(source, 'rb') as data:
+            shutil.copyfileobj(data, out)
+        digest, size = sha256_file(temp), os.lstat(temp).st_size
+        _protect(temp)
+        path, info = _own_destination(target, name)      # looked at again right before the swap
+        if info is not None:
+            _unprotect_own(path, info)
+        os.replace(temp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.chmod(temp, stat.S_IREAD | stat.S_IWRITE)
+            os.unlink(temp)
+        raise
+    return digest, size
 
 
 def snapshot_inputs(plan, out_dir):
@@ -409,24 +509,23 @@ def snapshot_inputs(plan, out_dir):
     [{name, sha256, size}] of the uploaded views in upload order). The browser uploads these copies, so the recorded hashes
     are the bytes uploaded; verify_upload_inputs re-hashes them before the upload and before every paid step. A
     views_omitted.json marker is copied too (validate_views reads it). An earlier snapshot of a submission that was set aside
-    (not_submitted) is replaced."""
-    target = Path(out_dir) / UPLOAD_DIR
-    target.mkdir(parents=True, exist_ok=True)
+    (not_submitted) is replaced.
+
+    Final-verify row 14: every final destination is checked before anything is written (_upload_dir, _own_destination: no link
+    or junction, resolved inside the output dir) and a file is replaced by renaming a new temp file over it, never by writing
+    or changing permissions through the existing name; a destination that is not the snapshot's own file stops the submit
+    (Stop) with nothing overwritten."""
+    target = _upload_dir(out_dir)
     source = Path(plan['views_dir'])
-    marker = target / 'views_omitted.json'
-    _unprotect(marker)
+    names = ['views_omitted.json', *plan['images']]
+    for name in names:                                   # all destinations first: nothing is written when one is refused
+        _own_destination(target, name)
     if (source / 'views_omitted.json').is_file():
-        shutil.copyfile(source / 'views_omitted.json', marker)
-        _protect(marker)
+        _replace_own(source / 'views_omitted.json', target, 'views_omitted.json')
     else:
-        marker.unlink(missing_ok=True)
-    for name in plan['images']:
-        _unprotect(target / name)
-        shutil.copyfile(source / name, target / name)
-    inputs = [{'name': name, 'sha256': sha256_file(target / name), 'size': (target / name).stat().st_size}
-              for name in plan['uploaded']]
-    for name in plan['images']:
-        _protect(target / name)
+        _remove_own(target, 'views_omitted.json')
+    written = {name: _replace_own(source / name, target, name) for name in plan['images']}
+    inputs = [{'name': name, 'sha256': written[name][0], 'size': written[name][1]} for name in plan['uploaded']]
     return target, inputs
 
 

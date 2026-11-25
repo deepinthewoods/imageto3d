@@ -425,20 +425,32 @@ These names and semantics are fixed. Both the daemon-side fixes and the v2-side 
 service, time, terminated, owner_pid}]} before `suspend()`, marks `terminated` before `terminate()`, and removes the entry once the process is
 resumed or gone (a failed record write means it is not suspended). `begin_management` -> `recover_suspensions`: an entry whose process still
 runs as this checkout's service (`verified_handle`) and is still suspended is resumed (also one a terminate was already sent to, so a POSIX
-SIGTERM is delivered); a dead process's entry is dropped; a pid that is something else is never touched.
+SIGTERM is delivered); a dead process's entry is dropped; a pid that is something else is never touched. **Indeterminate identity (final
+verification, new finding 2):** `_suspended_identity` answers gone (no process, zombie, other create time = pid reused) / other (the command
+line and cwd were read and it is not this checkout's service) / match / **unknown** (AccessDenied or another inspection failure, an unreadable
+cwd that would decide, no recorded create time). An unknown entry, and one whose `status()` / `resume()` failed, is KEPT with `retries`,
+`last_error`, `last_try` and tried again by `begin_management` and by every `tick` (which calls `recover_suspensions` first whenever
+suspensions.json exists) until exit, pid reuse or a successful resume is established; its event is reported once. Nothing is signalled while
+the identity is unknown.
 
 **Registered ownership (finding 2).** `convert_list.add_sets` now does everything under `convert_sets.lock`: `read_namespace_strict`
 (`NamespaceUnreadable` when set_namespace.json exists but is not `{"sets": {...}, "families": {id: set}}`: nothing is written, the file is
 never replaced; `namespace_conflict` refuses the approval with the same text), then `id_claims` over processing_views, multiview_ready,
 processing, completed, failed, held_conversions and `models/<id>`. A family id (or a release's `extra` job prefix) already used there is
 written for set S only when `claim_problem` finds it provably S's: the job record says `"parent_set": "S"`, or the id is already registered
-as S's family id. A record naming another parent (itself included) = an independent set: skipped / approval refused. No recorded parent, or
+as S's family id. **Both maps are required (final verification row 2):** `read_namespace_strict` and the worker's
+`convert_queue.read_namespace` treat a file without `sets` or without `families`, a map of the wrong type, a key that is not a set id / an
+empty string or a family owner that is not a string exactly like invalid JSON: UNREADABLE (a missing map is never an empty map). Unreadable =
+registration refused (`NamespaceUnreadable`, the file never replaced) AND no job authorised at dispatch: `owner_allows` answers
+`set_namespace.json is unreadable: the owner of <id> cannot be verified` for every job, with or without `parent_set` (a parentless family
+job whose owner is excluded by `!S` would otherwise pass). A file that does not exist is not unreadable (the list and the record decide).
+A record naming another parent (itself included) = an independent set: skipped / approval refused. No recorded parent, or
 a `models/<id>` folder no job record accounts for = AMBIGUOUS: skipped / approval refused, never guessed from the suffix (to adopt such a
 legacy job, add `parent_set` to its `.tripo-job.json`). Dispatch: `convert_queue.owner_allows(root, job, record, patterns)` (called from
 `next_job` through `owner_ok`, and by `convert_list.pending_jobs` / `eligible_jobs` / `held_jobs` reason `owner` with `detail`, and
 `progress` `held_kind: owner`): a job with `parent_set` X needs X on the list and, when the namespace records an owner of the job's prefix,
-that owner must be X (an unreadable namespace = cannot be verified = not dispatched); a job without `parent_set` whose prefix is registered
-as a family id of S needs S on the list. The worker reports a refusal once: `OWNER <job>: not converted: ...`.
+that owner must be X; a job without `parent_set` whose prefix is registered as a family id of S needs S on the list; an unreadable namespace
+= cannot be verified = nothing dispatched (above). The worker reports a refusal once: `OWNER <job>: not converted: ...`.
 
 **Supervisor stop delivery (finding 7).** The supervisor record carries `stop_delivery` = {state: requested | delivered | unconfirmed |
 failed, time, pid, create_time, why?}. `requested` is saved before the hold names the supervisor in `retiring` and before the stop command
@@ -447,7 +459,18 @@ NON-DELIVERY (`_stop_not_delivered`): the request is withdrawn (`stop_requested`
 of the hold's `retiring` (`withdraw_retiring`; owner, reason and `since` kept) and the call fails with a ServiceError; that supervisor's next
 tick releases the hold. A failed command whose stop file exists counts as delivered. The tick reconciles a pending stop too: the same
 supervisor still running with no stop file `STOP_DELIVERY_GRACE` (15 s) after the request is non-delivery as well (`completed` entry with
-ok false for the request).
+ok false for the request). **Crash-safe cleanup (final verification row 7):** `_stop_not_delivered` writes in the order (1)
+`withdraw_retiring`, (2) the record (`stop_requested` cleared, `stop_delivery.state` failed). A manager that dies in between leaves a
+pending stop (`release_blocker`: "still pending") with no stop file and no `retiring` entry: the next manager's tick reconciles it after the
+grace into the same call (the withdrawal is idempotent) and the supervisor's ticks release the hold. The state the old order (record first)
+could leave - `stop_delivery` failed, nothing pending, the hold still naming that very {pid, create_time} in `retiring` - is repaired at
+manager start: `begin_management` -> `replay_stop_cleanup` withdraws it (a later real stop of the same process sets `stop_delivery` to
+`requested` before it is named, so the combination only means an interrupted withdrawal).
+
+**Rollback checker (final verification, new finding 3).** CUTOVER.md's checker has one enumeration of convert workers, `workers()` = every
+process of the checkout running `tools/convert_queue.py` (any `--worker N`), used by `drained` and by `rollback`; `rollback` tests each
+one with `services.legacy_worker` (`old_workers()`; a worker whose start time cannot be read counts as old) and answers `REFUSED: keep the
+hold: ...` (exit 1) for a live older worker of any number. `services.scan(['convert'])` sees the managed worker 1 only and is not used there.
 
 **Restart outcome (finding 20).** `services.stop(then_start=True)` returns `replacement` = {pid, create_time} or raises. In the tick a
 finished stop with a pending restart no longer reports at once: the record keeps `restart_request` = {id, text} until the start decision of

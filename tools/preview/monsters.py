@@ -54,14 +54,17 @@ def _dirs(path: Path) -> list[str]:
 
 
 def _url(base: Path, path: Path) -> str | None:
-    """`/mfiles/` URL of a regular file under the monsters root, or None."""
+    """`/mfiles/` URL of a regular file under the monsters root, or None. The version is the file's modification time in
+    nanoseconds plus its size (2026-11-25: whole seconds let a file replaced within the same second keep its URL, so a
+    browser could show the cached old model under the new one's name)."""
     try:
         if not path.is_file() or path.is_symlink():
             return None
         rel = path.resolve().relative_to(base.resolve()).as_posix()
+        st = path.stat()
     except (OSError, ValueError):
         return None
-    return FILE_PREFIX + quote(rel, safe='/') + f'?v={int(path.stat().st_mtime)}'
+    return FILE_PREFIX + quote(rel, safe='/') + f'?v={st.st_mtime_ns}-{st.st_size}'
 
 
 def _faces(manifest: dict, level: str) -> int | None:

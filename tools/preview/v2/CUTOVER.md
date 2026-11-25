@@ -184,12 +184,13 @@ Stopping v2 never stops a service. A conversion hold v2 left behind (`.codex_job
 delete it on sight. First ask the script whether it is safe (it changes nothing):
 
 ```powershell
-Invoke-Check rollback         # exit 0 only when the hold may be removed by hand; otherwise it says what is outstanding
+Invoke-Check rollback         # exit 0 (SAFE) only when the hold may be removed by hand; otherwise REFUSED and what is outstanding
 ```
 
 It refuses while any of these holds, and names it:
 - a drain is outstanding: `CONVERT_DRAIN` exists, the convert record still has a pending legacy stop (`drain_hold`), a recorded suspended
-  process (`suspensions.json`) still exists, or a `convert_job.py` / an old-code `convert_queue.py` of this checkout still runs. Finish
+  process (`suspensions.json`) still exists, or a `convert_job.py` / an old-code `convert_queue.py` of this checkout still runs (EVERY
+  convert worker counts, whatever its `--worker N`: the same enumeration as `drained`, each worker's code age tested on its own). Finish
   step 4 with v2 running (start v2 again as in step 2: at start it resumes anything a stopped manager left suspended and finishes or
   continues the drain), or wait for those processes to exit by themselves. If v2 will not be started again and NO convert worker runs,
   `CONVERT_DRAIN` may be deleted by hand together with the hold; with an old worker still running it must stay;
@@ -253,6 +254,26 @@ def running(rel):
             continue
     return out
 
+def workers():
+    """EVERY convert worker of this checkout (`--worker N` for any N, or none): the one enumeration both `drained` and `rollback` use."""
+    return running('tools/convert_queue.py')
+
+def old_workers():
+    """pids of the convert workers (any worker number) that run code older than the current tools/convert_queue.py
+    (services.legacy_worker: the per-worker code-age test); a worker whose start time cannot be read counts as old."""
+    out = []
+    for proc in workers():
+        try:
+            inst = {'pid': proc.pid, 'create_time': proc.create_time()}
+        except psutil.NoSuchProcess:
+            continue
+        except psutil.Error:
+            out.append(proc.pid)
+            continue
+        if services.legacy_worker(repo, inst):
+            out.append(proc.pid)
+    return out
+
 def listeners(port):
     return sorted({c.pid for c in psutil.net_connections('tcp') if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == port and c.pid})
 
@@ -278,14 +299,14 @@ if what == 'stop-listener':                # stop-listener <port> <script>: exac
 elif what == 'drained':                    # the old paid work is gone: hold present, drain finished, no convert_job.py, no convert worker
     hold = services.read_hold(repo)
     jobs = running('tools/tripo_pipeline/convert_job.py')
-    workers = running('tools/convert_queue.py')
+    queue = workers()
     conv = services.read_record(repo, 'convert')
     pending = services.read_drain(repo) is not None or bool(conv.get('stop_requested') and conv.get('drain_hold'))
     frozen = [i['pid'] for i in services.read_suspensions(repo) if psutil.pid_exists(i['pid'])]
     waiters = [w['pid'] for w in services.gate_waiters(repo, clean=False)]
     print(f'hold: {"present" if hold is not None else "MISSING"}; drain: {"pending" if pending else "none"}; gate waiters: {waiters}; '
-          f'convert_job.py: {[p.pid for p in jobs]}; convert_queue.py: {[p.pid for p in workers]}; suspended: {frozen}')
-    sys.exit(0 if hold is not None and not pending and not jobs and not workers and not frozen else 1)
+          f'convert_job.py: {[p.pid for p in jobs]}; convert_queue.py: {[p.pid for p in queue]}; suspended: {frozen}')
+    sys.exit(0 if hold is not None and not pending and not jobs and not queue and not frozen else 1)
 elif what == 'rollback':                   # read-only: may a conversion hold left by a stopped v2 be removed by hand?
     hold = services.read_hold(repo)
     if hold is None:
@@ -305,9 +326,9 @@ elif what == 'rollback':                   # read-only: may a conversion hold le
     jobs = [p.pid for p in running('tools/tripo_pipeline/convert_job.py')]
     if jobs:
         why.append(f'convert_job.py still runs {jobs}')
-    old = [w['pid'] for w in services.scan(repo, ['convert'])['convert'] if services.legacy_worker(repo, w)]
+    old = old_workers()                    # every worker number, not only the managed worker 1
     if old:
-        why.append(f'a convert worker of older code still runs {old}')
+        why.append(f'a convert worker of older code still runs {old} (any --worker number counts)')
     sups = services.scan(repo, ['supervisor'])['supervisor']
     if len(sups) != 1:
         why.append(f'{len(sups)} supervisors run; exactly one, of the intended generation, is needed')
@@ -321,7 +342,7 @@ elif what == 'rollback':                   # read-only: may a conversion hold le
         if not services.supervisor_ticked(repo, sup, services._hold_time(hold)):
             why.append(f'supervisor pid {sup["pid"]} has not completed a tick since the hold was written')
     print('SAFE: the supervisor is the intended generation and ticked after the hold; no drain is outstanding. CONVERT_HOLD may be deleted.'
-          if not why else 'KEEP the hold:\n  - ' + '\n  - '.join(why))
+          if not why else 'REFUSED: keep the hold:\n  - ' + '\n  - '.join(why))
     sys.exit(1 if why else 0)
 elif what == 'views':                      # exactly one view runner, a current one (launch reservation, holds view_runner.lock)
     runners = services.scan(repo, ['views'])['views']

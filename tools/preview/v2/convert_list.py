@@ -122,8 +122,10 @@ def family_ids(root, set_id: str, races: list[str] | None = None) -> list[str]:
 # job folders of every stage and at models/<id>. A family id `S_<race>` that an existing job / model folder already uses is written for S only
 # when that use is provably S's: the job record names `parent_set: S`, or the id was registered as S's family id before. A record that names
 # another parent (itself included) makes the id an independent set; no recorded parent is AMBIGUOUS and refused (never guessed from the
-# suffix). An unreadable set_namespace.json blocks every registration (NamespaceUnreadable) and is never replaced. The worker checks the
-# recorded owner again at dispatch (tools/convert_queue.py owner_allows; owner_refusal here).
+# suffix). An unreadable set_namespace.json blocks every registration (NamespaceUnreadable) and is never replaced; unreadable includes a
+# file that lacks one of the two maps (final verification row 2: a missing `families` is never read as an empty one). The worker checks
+# the recorded owner again at dispatch (tools/convert_queue.py owner_allows; owner_refusal here) and authorises no job at all while the
+# file is unreadable.
 
 CONCEPT_STAGES = ('concepts', 'provisional', 'approved', 'archive/concepts')
 JOB_STAGES = ('processing_views', 'multiview_ready', 'processing', 'completed', 'failed', 'held_conversions')
@@ -131,7 +133,8 @@ _NS_CACHE: dict[str, tuple] = {}
 
 
 class NamespaceUnreadable(ValueError):
-    """set_namespace.json exists but cannot be read as {"sets": {...}, "families": {...}}: nothing is registered until it is repaired."""
+    """set_namespace.json exists but cannot be read as {"sets": {...}, "families": {...}} (BOTH maps present, with the right types): nothing
+    is registered until it is repaired."""
 
 
 def namespace_path(root) -> Path:
@@ -163,7 +166,8 @@ def read_namespace(root) -> dict:
 
 def read_namespace_strict(root) -> dict:
     """{"sets": {...}, "families": {...}} for a WRITER: empty when the file does not exist; NamespaceUnreadable when it exists but cannot be
-    read, is not JSON or does not have that shape (an entry that is not a set id included). Never cached."""
+    read, is not JSON or does not have that shape: BOTH maps must be present (a missing one is never taken for an empty one: final
+    verification row 2) and be objects, every key a set id and every family owner a set id. Never cached."""
     path = namespace_path(root)
     try:
         text = path.read_text(encoding='utf-8')
@@ -175,12 +179,12 @@ def read_namespace_strict(root) -> dict:
         raw = json.loads(text)
     except ValueError as exc:
         raise NamespaceUnreadable(f'{path.name} is not valid JSON ({exc}); nothing is registered until it is repaired') from None
-    sets, families = (raw.get('sets', {}), raw.get('families', {})) if isinstance(raw, dict) else (None, None)
+    sets, families = (raw.get('sets'), raw.get('families')) if isinstance(raw, dict) else (None, None)
     if not isinstance(sets, dict) or not isinstance(families, dict) \
             or not all(isinstance(k, str) and NAME.fullmatch(k) for k in sets) \
             or not all(isinstance(k, str) and isinstance(v, str) and NAME.fullmatch(k) and NAME.fullmatch(v) for k, v in families.items()):
-        raise NamespaceUnreadable(f'{path.name} does not hold {{"sets": {{...}}, "families": {{id: set}}}}; nothing is registered until it is '
-                                  'repaired')
+        raise NamespaceUnreadable(f'{path.name} does not hold both maps {{"sets": {{...}}, "families": {{id: set}}}}; nothing is registered '
+                                  'until it is repaired')
     return {'sets': dict(sets), 'families': dict(families)}
 
 

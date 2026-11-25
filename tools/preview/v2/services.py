@@ -55,12 +55,14 @@ record's `drain_restored`), the job locks naming the terminated worker are remov
 Suspension record (phase-4 row 6 residual): frozen_stop writes `.codex_jobs/_app/services/suspensions.json` = {"items": [{pid, create_time,
 service, time, terminated}]} BEFORE it suspends a process and removes the entry once the process is resumed or gone. begin_management
 (recover_suspensions) resumes every recorded process that still runs as this checkout's service and is still suspended (a manager that
-crashed in between), and drops the entries of processes that are gone.
+crashed in between), and drops the entries of processes that are gone. An entry whose identity is indeterminate (AccessDenied, a transient
+inspection failure, a failed resume) is kept and retried by every tick until exit, pid reuse or a successful resume is established.
 
 Supervisor stop delivery (finding 7): the supervisor record carries `stop_delivery` = {state: requested -> delivered | failed, ...}. A stop
 command that fails, or a pending stop whose `supervisor.stop` file is gone while the same supervisor still runs (after STOP_DELIVERY_GRACE),
 is NON-DELIVERY: the stop request is withdrawn, the supervisor is taken out of the hold's `retiring` generations (the hold keeps its
-`since`), and the healthy supervisor's next tick releases the hold again.
+`since`), and the healthy supervisor's next tick releases the hold again. The cleanup is crash-safe: `retiring` is withdrawn before the
+record clears the request, and begin_management replays a withdrawal an earlier manager left incomplete (replay_stop_cleanup).
 
 Restart outcome (finding 20): a restart's `completed` entry (and the stop() result) is terminal only once the replacement is identified
 (`replacement` = {pid, create_time}, ok true) or the start failed / is blocked (ok false with the reason).
@@ -640,13 +642,34 @@ def _stop_delivered(root, inst: dict) -> bool:
 
 
 def _stop_not_delivered(root, rec: dict, inst: dict, why: str, now: float) -> None:
-    """Non-delivery of a supervisor stop is established (finding 7): withdraw the request and the `retiring` designation, record why."""
+    """Non-delivery of a supervisor stop is established (finding 7): withdraw the request and the `retiring` designation, record why.
+    Crash-safe order (final verification row 7): the `retiring` designation is withdrawn FIRST, while the record's pending request still
+    guards the release (release_blocker). A manager that dies between the two writes leaves a pending stop with no stop file, which the
+    tick's reconcile turns into this very call again (withdraw_retiring is idempotent); the old order left a healthy supervisor marked
+    retiring with nothing pending, for ever. replay_stop_cleanup repairs that state when a manager starts."""
+    withdraw_retiring(root, inst)
     rec.update(stop_requested=None, then_start=False, stop_note=None,
                stop_delivery={'state': 'failed', 'time': now, 'pid': inst['pid'], 'create_time': inst['create_time'], 'why': why[:300]})
     rec.pop('pause_backup', None)             # the supervisor did not exit: its PAUSE file was never removed
     rec.pop('restart_request', None)
     write_record(root, 'supervisor', rec)
-    withdraw_retiring(root, inst)
+
+
+def replay_stop_cleanup(root) -> list[str]:
+    """Finish a failed-stop cleanup an earlier manager did not complete (final verification row 7): the supervisor record says the stop of
+    {pid, create_time} was NOT delivered (`stop_delivery.state` failed) and no stop is pending, yet the hold still names that very process
+    in `retiring`. A later stop of the same process would have set `stop_delivery` to `requested` before naming it, so this combination
+    only exists when the withdrawal was interrupted: it is replayed (withdraw_retiring). Returns event texts."""
+    rec = read_record(root, 'supervisor')
+    delivery = rec.get('stop_delivery')
+    if rec.get('stop_requested') or not isinstance(delivery, dict) or delivery.get('state') != 'failed' \
+            or not isinstance(delivery.get('pid'), int):
+        return []
+    inst = {'pid': delivery['pid'], 'create_time': delivery.get('create_time')}
+    if withdraw_retiring(root, inst):
+        return [f'supervisor: the withdrawal of the undelivered stop of pid {inst["pid"]} was incomplete; it is no outgoing generation any '
+                'more and its ticks release the conversion hold again']
+    return []
 
 
 def supervisor_tick(root) -> dict | None:
@@ -711,6 +734,7 @@ def begin_management(root) -> list[str]:
         text = assert_hold(root, 'preview app manager start', renew=True)
         events = [text] if text else []
         try:                                   # after the hold: what a manager that crashed left behind (row 6 residual, I.10)
+            events += replay_stop_cleanup(root)
             events += recover_suspensions(root)
             events += settle_drain(root)
         except Exception as error:  # noqa: BLE001  (never keeps the hold from being reported)
@@ -935,34 +959,86 @@ def _clear_suspension(root, inst: dict) -> None:
         pass
 
 
+def _suspended_identity(root, svc: Service, item: dict) -> tuple[str, object]:
+    """What the recorded suspended process is right now, never guessed (final verification, new finding 2):
+      ('gone', None)     no such process, a zombie, or the pid has another create time (reused): the entry can be forgotten;
+      ('other', None)    the very process, but it is established that it is not this checkout's `svc` (identify answered from a command
+                         line and cwd that were both read): never touched, the entry can be forgotten;
+      ('match', proc)    the very process and still this checkout's `svc`;
+      ('unknown', why)   an inspection failed (AccessDenied, a transient error) or could not decide (no create time recorded, an unreadable
+                         cwd with a relative script path): INDETERMINATE, the entry is kept and tried again."""
+    created = item.get('create_time')
+    try:
+        proc = psutil.Process(item['pid'])
+        if isinstance(created, (int, float)) and not isinstance(created, bool) and created \
+                and abs(proc.create_time() - float(created)) >= CREATE_TIME_TOLERANCE:
+            return 'gone', None                                       # the pid was reused
+        if proc.status() == psutil.STATUS_ZOMBIE:
+            return 'gone', None
+        if not isinstance(created, (int, float)) or isinstance(created, bool) or not created:
+            return 'unknown', 'no create time was recorded'
+        cmd = proc.cmdline()
+        cwd, cwd_error = None, None
+        try:
+            cwd = proc.cwd()
+        except psutil.NoSuchProcess:
+            raise
+        except (psutil.Error, OSError) as error:
+            cwd_error = type(error).__name__
+    except psutil.NoSuchProcess:
+        return 'gone', None
+    except (psutil.Error, OSError) as error:
+        return 'unknown', type(error).__name__
+    answer = identify(root, svc, cmd, cwd)
+    if answer == 'match':
+        return 'match', proc
+    if answer == 'unverified' or (cwd_error and not cmd):
+        return 'unknown', cwd_error or 'its script path cannot be resolved'
+    if cwd_error and identify(root, svc, cmd, str(root)) == 'match':
+        return 'unknown', cwd_error                                   # it would match from this checkout's folder: the cwd decides
+    return 'other', None
+
+
 def recover_suspensions(root) -> list[str]:
     """Resume what a crashed manager left suspended (phase-4 row 6 residual): every recorded process that still runs with the recorded create
-    time, is still this checkout's service (verified_handle) and is still suspended is resumed; an entry whose process is gone (terminated,
-    or exited) is dropped; a pid that now is something else is never touched. Returns event texts."""
+    time, is still this checkout's service and is still suspended is resumed; an entry whose process is gone (terminated, exited, pid
+    reused) is dropped; a pid that now is something else is never touched. An entry whose identity or state is INDETERMINATE
+    (_suspended_identity 'unknown': AccessDenied or another transient inspection failure; a status / resume that failed) is KEPT, marked
+    `retries` / `last_error`, and tried again by every later call (begin_management and every tick) until exit, pid reuse or a successful
+    resume is established (final verification, new finding 2). Its event is reported once, not on every retry. Returns event texts."""
     events, keep = [], []
     with _LOCK:
         items = read_suspensions(root)
         for item in items:
             svc = {**SERVICES, **PROBES}.get(item.get('service'))
-            inst = {'pid': item['pid'], 'create_time': item.get('create_time') or 0.0}
-            if svc is None or not _process_alive(item['pid'], item.get('create_time')):
-                continue                                              # gone (terminated or exited), or not a known service: forget it
-            proc = verified_handle(root, svc, inst)
-            if proc is None:
+            if svc is None:
+                continue                                              # not a known service: forget it
+            state, value = _suspended_identity(root, svc, item)
+            if state == 'gone':
+                continue                                              # terminated, exited or the pid was reused: forget it
+            if state == 'other':
                 events.append(f'{svc.name}: pid {item["pid"]} was recorded as suspended but is no longer this checkout\'s {svc.name}; not touched')
                 continue
-            try:
-                if proc.status() != psutil.STATUS_STOPPED:
-                    continue                                          # it runs: nothing to do
-                proc.resume()
-                events.append(f'{svc.name}: pid {item["pid"]} was left suspended by an earlier manager; resumed'
-                              + (' (a stop was already sent to it)' if item.get('terminated') else ''))
-            except psutil.NoSuchProcess:
-                continue
-            except psutil.Error as error:
-                keep.append(item)
-                events.append(f'{svc.name}: pid {item["pid"]} is still suspended and could not be resumed ({type(error).__name__})')
-        if len(keep) != len(items):
+            failure = None
+            if state == 'unknown':
+                failure = f'cannot be inspected ({value})'
+            else:
+                try:
+                    if value.status() != psutil.STATUS_STOPPED:
+                        continue                                      # it runs: nothing to do
+                    value.resume()
+                    events.append(f'{svc.name}: pid {item["pid"]} was left suspended by an earlier manager; resumed'
+                                  + (' (a stop was already sent to it)' if item.get('terminated') else ''))
+                except psutil.NoSuchProcess:
+                    continue
+                except (psutil.Error, OSError) as error:
+                    failure = f'could not be resumed ({type(error).__name__})'
+            if failure:
+                first = not item.get('retries')
+                keep.append({**item, 'retries': int(item.get('retries') or 0) + 1, 'last_error': failure, 'last_try': time.time()})
+                if first:
+                    events.append(f'{svc.name}: pid {item["pid"]} is recorded as suspended and {failure}; it is tried again on every pass')
+        if keep or items:
             _write_suspensions(root, keep)
     return events
 
@@ -1729,6 +1805,11 @@ def tick(root, settings: dict | None = None, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     events: list[str] = []
     with _LOCK:
+        try:                                     # entries a manager start (or an earlier pass) could not settle: retried until they are
+            if suspensions_path(root).exists():
+                events += recover_suspensions(root)
+        except Exception as error:  # noqa: BLE001
+            events.append(f'suspension recovery: manager error {type(error).__name__}: {error}')
         found, maybe = scan_full(root)
         sups = found['supervisor']
         sup = sups[0] if len(sups) == 1 else None

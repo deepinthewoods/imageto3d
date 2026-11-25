@@ -14,6 +14,13 @@ fresh uuid4 in the mode file; a mode file or PAUSE file written by somebody else
 id is derived from the file itself (`file:` + a digest of its inode, creation / modification time in ns, size and bytes: every rewrite is
 a new file, hence a new id, also within one second). `manual_pause(root)` names the manual pause of conversions in force; a confirmed
 Run now of the monster lane overrides exactly that `pause_id` and no later pause.
+
+ALL INDEPENDENT PAUSES (final-verify review, row 5). Two manual pauses can be in force at once: the pause MODE and a separate manual
+maintenance PAUSE file. `manual_pauses(root)` lists every independent one; the supervisor's own PAUSE file is NOT independent when it
+only reflects the mode (`reason: "manual <the current pause mode>"` with the scope the supervisor writes for it and no other field) or
+the user's activity (IDLE_REASONS). `manual_pause(root)['pause_id']` identifies the whole SET (one pause: its own id; several: their
+ids joined with `+`), and `consent_covers(consent, manual)` is true only when every pause in force is in the confirmed set, so a consent
+given for the mode pause does not cover a manual PAUSE added afterwards.
 """
 from __future__ import annotations
 
@@ -41,6 +48,7 @@ PRESENCE_FRESH_S = 30.0
 AWAY_AFTER = 300.0   # = pipeline_supervisor.AWAY_AFTER
 LOCK_OFFSET = 1 << 20   # = pipeline_supervisor.LOCK_OFFSET
 PAUSE_MODES = ('pause', 'pause-conversions')   # the modes that pause conversions by hand
+ID_JOIN = '+'                                  # joins the ids of several independent manual pauses into one `pause_id`
 IDLE_REASONS = ('user active', 'user active (views keep running)')   # pipeline_supervisor: the screen-on pauses (not manual)
 
 
@@ -106,7 +114,8 @@ def write_mode(root, mode: str) -> dict:
 
 def read_pause(root) -> dict | None:
     """The PAUSE file as {"since", "reason", "scope": [...], "pause_id"} or None when absent (an unreadable file counts as a pause of
-    everything). `pause_id` = the file's own `pause_id` when its writer stored one, else the identity of this write (file_identity)."""
+    everything). `pause_id` = the file's own `pause_id` when its writer stored one, else the identity of this write (file_identity).
+    (This shape is what GET /api/v2/state `status.paused` shows; the fields the supervisor never writes are `pause_extra`.)"""
     path = batch(root) / 'PAUSE'
     if not path.exists():
         return None
@@ -123,18 +132,71 @@ def read_pause(root) -> dict | None:
             'pause_id': stored if isinstance(stored, str) and stored else ident}
 
 
-def manual_pause(root, mode: dict | None = None, pause: dict | None = None) -> dict | None:
-    """The MANUAL pause of conversions now in force, {"pause_id", "kind": mode | pause, "reason"}, or None: a pause mode (its pause_id),
-    else a PAUSE file with `conversions` in its scope for a manual reason (a "user active" PAUSE is the idle gate, not a manual pause).
-    `mode` / `pause` = read_mode / read_pause results the caller already has."""
+def pause_extra(root) -> list[str]:
+    """The names of the PAUSE file's fields the supervisor never writes (it writes since, reason, scope); [] when the file is absent or
+    unreadable. A file that has one is nobody's reflection of the mode (mode_reflection)."""
+    raw = read_json(batch(root) / 'PAUSE', None)
+    return sorted(str(k) for k in raw if k not in ('since', 'reason', 'scope')) if isinstance(raw, dict) else []
+
+
+def mode_reflection(mode: dict, pause: dict | None) -> bool:
+    """Whether a PAUSE file is the supervisor's reflection of the CURRENT pause mode (pipeline_supervisor `desired_pause` + its tick):
+    `reason: "manual <mode>"` for the mode in force, the scope the supervisor writes for that mode and no field the supervisor never
+    writes (`pause['extra']`, from pause_extra). Such a file is the same pause as the mode (one consent covers both); any other file
+    that pauses conversions for a manual reason is an INDEPENDENT pause (final-verify review, row 5)."""
+    if pause is None or mode.get('mode') not in PAUSE_MODES:
+        return False
+    if pause.get('reason') != f'manual {mode["mode"]}' or pause.get('extra'):
+        return False
+    want = ['conversions'] if mode['mode'] == 'pause-conversions' else ['conversions', 'views']
+    return list(pause.get('scope') or []) == want
+
+
+def manual_pauses(root, mode: dict | None = None, pause: dict | None = None) -> list[dict]:
+    """EVERY independent manual pause of conversions now in force, [{"pause_id", "kind": mode | pause, "reason"}]: the pause mode (its
+    pause_id), and a PAUSE file with `conversions` in its scope that is neither the idle gate (a "user active" PAUSE) nor the
+    supervisor's reflection of the current pause mode (mode_reflection). `mode` / `pause` = read_mode / read_pause results the caller
+    already has."""
     mode = read_mode(root) if mode is None else mode
-    if mode['mode'] in PAUSE_MODES:
-        return {'pause_id': mode.get('pause_id') or f'unidentified:{uuid.uuid4().hex}', 'kind': 'mode', 'reason': f'mode {mode["mode"]}'}
     pause = read_pause(root) if pause is None else pause
-    if pause is not None and 'conversions' in (pause.get('scope') or []) and pause.get('reason') not in IDLE_REASONS:
-        return {'pause_id': pause.get('pause_id') or f'unidentified:{uuid.uuid4().hex}', 'kind': 'pause',
-                'reason': str(pause.get('reason') or 'PAUSE file')}
-    return None
+    if pause is not None and 'extra' not in pause:
+        pause = pause | {'extra': pause_extra(root)}            # (kept out of read_pause: its shape is the API's `status.paused`)
+    out = []
+    if mode['mode'] in PAUSE_MODES:
+        out.append({'pause_id': mode.get('pause_id') or f'unidentified:{uuid.uuid4().hex}', 'kind': 'mode', 'reason': f'mode {mode["mode"]}'})
+    if pause is not None and 'conversions' in (pause.get('scope') or []) and pause.get('reason') not in IDLE_REASONS \
+            and not mode_reflection(mode, pause):
+        out.append({'pause_id': pause.get('pause_id') or f'unidentified:{uuid.uuid4().hex}', 'kind': 'pause',
+                    'reason': str(pause.get('reason') or 'PAUSE file')})
+    return out
+
+
+def manual_pause(root, mode: dict | None = None, pause: dict | None = None) -> dict | None:
+    """The MANUAL pause of conversions now in force, {"pause_id", "kind": mode | pause | mode+pause, "reason", "pauses"}, or None. It
+    stands for ALL independent manual pauses (manual_pauses): with one, `pause_id` is that pause's own id; with several it is their ids
+    joined with `+`, so it changes whenever one of them is added, removed or made again (a consent names exactly the set of pauses the
+    user was shown: final-verify review, row 5; `consent_covers` compares it with the pauses in force later)."""
+    pauses = manual_pauses(root, mode, pause)
+    if not pauses:
+        return None
+    for entry in pauses:                                        # ids are joined with `+` below: one that contains it is replaced
+        if ID_JOIN in entry['pause_id']:
+            entry['pause_id'] = 'id:' + hashlib.sha256(entry['pause_id'].encode('utf-8')).hexdigest()[:32]
+    if len(pauses) == 1:
+        return dict(pauses[0]) | {'pauses': pauses}
+    return {'pause_id': ID_JOIN.join(p['pause_id'] for p in pauses), 'kind': '+'.join(p['kind'] for p in pauses),
+            'reason': '; '.join(p['reason'] for p in pauses), 'pauses': pauses}
+
+
+def consent_covers(consent: object, manual: dict | None) -> bool:
+    """Whether a confirmed Run now (`consent` = the `pause_id` the user confirmed, kept as the task's `override_pause`) covers the
+    manual pauses in force (`manual` = manual_pause(...)): EVERY independent pause in force must be one the user was shown. A pause
+    added after the confirmation is not covered (the gate closes again, lane and paid child alike); one that was lifted meanwhile does
+    not take the consent for the others away. False without a consent or without a pause."""
+    if not isinstance(consent, str) or not consent or manual is None:
+        return False
+    seen = set(consent.split(ID_JOIN))
+    return all(p['pause_id'] in seen for p in manual.get('pauses') or [manual])
 
 
 # ---------------------------------------------------------------------------------------------------------------------- presence

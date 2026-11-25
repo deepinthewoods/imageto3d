@@ -36,12 +36,15 @@ create, argv}]}) until it exited, so Kill & retry can drain the whole process tr
 attempt still runs (F14).
 Before every step the gate is checked again. The LAST stdout line is the verdict JSON: {"status": "ok" | "busy" | "waiting" | "failed", ...}.
 
-GATE (identical to conversions): the conversion hold `.codex_jobs/_batch/CONVERT_HOLD` -> wait, never overridden; mode `pause` /
+GATE (identical to conversions): the conversion hold `.codex_jobs/_batch/CONVERT_HOLD` and the conversion drain
+`.codex_jobs/_batch/CONVERT_DRAIN` -> wait, never overridden (final-verify new 1; = paid_gate.file_reason); mode `pause` /
 `pause-conversions`, or a PAUSE file with `conversions` in its scope for a manual reason -> wait; a Run now confirmed while paused stores
-the PAUSE ID it overrode (`override_pause` = the `pause_id` of modes.manual_pause: unique per pause transition, recheck finding 5) and overrides
-only that pause (a new pause needs a new confirmation; an ordinary Retry clears Run now and the override, F4); mode `auto` / `views-run`
--> only when the user is away (idle >= 300 s) and no "user active" PAUSE -> a per-task Run now overrides this idle gate only.
-`gate()['code']`: `held` | `paused` | `user_present` (None when open).
+the PAUSE ID it overrode (`override_pause` = the `pause_id` of modes.manual_pause: unique per pause transition, recheck finding 5; ONE id
+for ALL independent manual pauses in force, final-verify row 5: a manual PAUSE added after the confirmation of a pause mode is a new id)
+and overrides only that (a new pause needs a new confirmation; an ordinary Retry clears Run now and the override, F4); mode `auto` /
+`views-run` -> only when the user is away (idle >= 300 s) and no "user active" PAUSE -> a per-task Run now overrides this idle gate only.
+`gate()['code']`: `held` (hold, or drain with `draining`) | `paused` | `user_present` (None when open). The paid children ask the same
+`gate()` through this file's `gate` sub-command right before every credit-capable click.
 
 HOOKS for the orchestrator / actions (DESIGN_PHASE5.md H.1): `tick`, `plan_starts`, `task_argv` / `TASK_ENV`, `finish_outcome`,
 `record_failure`, `task_wanted`, `run_now`, `cancel_task`, `retry_task`, `active_reason`, `recorded_children` / `clear_children`,
@@ -89,6 +92,7 @@ IDLE_REASONS = modes.IDLE_REASONS  # pipeline_supervisor: the screen-on pauses (
 BUSY_TEXT = 'profile busy'
 TASK_ENV = {'PYTHONUTF8': '1', 'PYTHONUNBUFFERED': '1'}
 HOLD_FILE = 'CONVERT_HOLD'         # = services.HOLD_FILE (DESIGN_PHASE4.md I.1); read here without importing services (psutil)
+DRAIN_FILE = 'CONVERT_DRAIN'       # = services.DRAIN_FILE (DESIGN_PHASE4.md I.10)
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 CHILDREN_DIR = 'monster_lane'
 CREATE_TOLERANCE = 1.0
@@ -351,6 +355,10 @@ def cancel_task(root: Path, task: dict, detail: str = 'manual') -> bool:
         terminal state: success, the durable `cancelled` stands;
       - when the row left the queue another way (it started), only OUR OWN write is taken back, and only while no newer disposition was
         written (the variant's monotonic sequence): an older disposition is never put back over a newer one.
+    Final-verify row 3: the write itself is a COMPARE-AND-SET (`mv.set_disposition(..., only_absent=True)`, under the monster lock):
+    `cancelled` is recorded only while the generation has NO disposition. `task` may be stale (the attempt ran and failed after the
+    client saw the row queued): the `failed` that is recorded then is never overwritten, so there is nothing of ours to take back when
+    the SQLite cancel loses, and the failure survives a rebuilt queue.
     False when the row was not queued."""
     q = queue(root)
     if task['lane'] != LANE:
@@ -358,12 +366,13 @@ def cancel_task(root: Path, task: dict, detail: str = 'manual') -> bool:
     gen = _generation_of(task)
     value = {'state': 'cancelled', 'reason': 'cancelled by the user', 'key': task['key']}
     if task['state'] == 'cancelled':
-        if gen and mv.disposition_of(mv.read_views_json(mv.views_dir(mv.mroot_of(root), gen[0], gen[1])), gen[2]) is None:
-            mv.set_disposition(root, gen[0], gen[1], gen[2], value)
+        now = q.by_key(task['key'])                             # (the snapshot may be stale: only a row that IS cancelled gets its record)
+        if gen and now is not None and now['state'] == 'cancelled':
+            mv.set_disposition(root, gen[0], gen[1], gen[2], value, only_absent=True)
         return True
     if task['state'] != 'queued':
         return False
-    wrote = mv.set_disposition(root, gen[0], gen[1], gen[2], value) if gen else None
+    wrote = mv.set_disposition(root, gen[0], gen[1], gen[2], value, only_absent=True) if gen else None
     try:
         done = q.cancel(task['id'], detail, manual_gen='manual', expect=task_ident(task))
     except taskqueue.Expired as exc:
@@ -476,42 +485,60 @@ def read_hold(root: Path) -> dict | None:
     return value if isinstance(value, dict) else {'reason': 'unreadable CONVERT_HOLD file'}
 
 
+def read_drain(root: Path) -> dict | None:
+    """The conversion drain (CONVERT_DRAIN, services.py I.10) as a dict, None when absent; an unreadable file still drains. Like the
+    hold it closes the lane gate and is never overridden by Run now (final-verify review, new finding 1; = paid_gate.file_reason)."""
+    path = Path(root) / '.codex_jobs' / '_batch' / DRAIN_FILE
+    if not path.exists():
+        return None
+    value = mv.read_json(path, None)
+    return value if isinstance(value, dict) else {'reason': 'unreadable CONVERT_DRAIN file'}
+
+
 def pause_id(root: Path) -> str | None:
-    """The `pause_id` of the manual pause of conversions now in force (modes.manual_pause; None when there is none). A confirmed Run now
-    overrides exactly this pause (finding 5): every pause transition has its own id, also two within one second."""
+    """The `pause_id` of the manual pause(s) of conversions now in force (modes.manual_pause: ONE identity for all independent manual
+    pauses; None when there is none). A confirmed Run now overrides exactly this set (finding 5; final-verify row 5): every pause
+    transition has its own id, also two within one second, and a manual PAUSE added to a pause mode makes a new one."""
     manual = modes.manual_pause(root)
     return manual['pause_id'] if manual else None
 
 
 def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_known: bool = False) -> dict:
-    """Whether a monster conversion step may run now: {open, reason, code, mode, pause, pause_id, paused, pause_reason, hold, idle, away,
-    needs_confirm}. `idle` = the user's idle seconds (None + idle_known=False: read presence.json / GetLastInputInfo). `code`: held |
-    paused | user_present | None. `paused` / `pause_id` / `pause_reason` describe the manual pause in force whatever else closes the gate;
-    `args.override_pause` overrides a manual pause only while it equals `pause_id` (the pause the user confirmed, finding 5)."""
+    """Whether a monster conversion step may run now: {open, reason, code, mode, pause, pause_id, paused, pause_reason, hold, drain,
+    idle, away, needs_confirm}. `idle` = the user's idle seconds (None + idle_known=False: read presence.json / GetLastInputInfo).
+    `code`: held (CONVERT_HOLD, or CONVERT_DRAIN with `draining: true`; neither is ever overridden) | paused | user_present | None.
+    `paused` / `pause_id` / `pause_reason` describe ALL independent manual pauses in force (modes.manual_pause: the pause mode and a
+    separate manual PAUSE file; the supervisor's own reflection of the mode or of the user's activity is not one) whatever else closes
+    the gate; `args.override_pause` (the `pause_id` the user confirmed) overrides them only while EVERY pause in force is in it
+    (modes.consent_covers: finding 5, final-verify row 5). The `gate` sub-command (the paid child's click-time check) evaluates this
+    same function."""
     args = args or {}
     mode_rec = modes.read_mode(root)
     mode = mode_rec['mode']
     pause = modes.read_pause(root)
     hold = read_hold(root)
-    manual = modes.manual_pause(root, mode_rec, pause)
+    drain = read_drain(root)
+    manual = modes.manual_pause(root, mode_rec, pause)      # ALL independent manual pauses in force, as one identity (row 5)
     key = manual['pause_id'] if manual else None
     if idle is None and not idle_known:
         idle, _source = modes.idle_seconds()
     away = idle is not None and idle >= modes.AWAY_AFTER
     run_now = bool(args.get('run_now'))
-    override = isinstance(args.get('override_pause'), str) and key is not None and args['override_pause'] == key
+    override = modes.consent_covers(args.get('override_pause'), manual)   # every pause in force is one the user confirmed
     out = {'open': True, 'reason': None, 'code': None, 'mode': mode, 'pause': pause, 'pause_id': key, 'paused': manual is not None,
-           'pause_reason': manual['reason'] if manual else None, 'hold': hold, 'idle': idle, 'away': away, 'needs_confirm': False}
+           'pause_reason': manual['reason'] if manual else None, 'hold': hold, 'drain': drain, 'idle': idle, 'away': away,
+           'needs_confirm': False}
     if hold is not None:                                   # never overridden: the supervisor is (re)starting or has not ticked yet
         return out | {'open': False, 'code': 'held', 'reason': f'conversions are held (CONVERT_HOLD: {hold.get("reason") or "no reason"}); '
                       'they wait until the running supervisor completes a tick'}
+    if drain is not None:                                  # a drain closes the gate by itself, never overridden (= paid_gate.file_reason)
+        return out | {'open': False, 'code': 'held', 'draining': True,
+                      'reason': f'conversions are being drained (CONVERT_DRAIN: {drain.get("reason") or "no reason"}); they wait until '
+                                'the drain is over'}
     paused_conv = pause is not None and 'conversions' in (pause.get('scope') or [])
     idle_pause = paused_conv and pause.get('reason') in IDLE_REASONS
-    if mode in modes.PAUSE_MODES and not override:
-        return out | {'open': False, 'code': 'paused', 'reason': f'conversions are paused (mode {mode})', 'needs_confirm': True}
-    if paused_conv and not idle_pause and not override:
-        return out | {'open': False, 'code': 'paused', 'reason': f'conversions are paused ({pause.get("reason") or "PAUSE file"})',
-                      'needs_confirm': True}
+    if manual is not None and not override:                # the consent must name exactly the set of manual pauses in force now
+        return out | {'open': False, 'code': 'paused', 'reason': f'conversions are paused ({manual["reason"]})', 'needs_confirm': True}
     if mode in ('auto', 'views-run') and not run_now:
         if idle_pause:
             return out | {'open': False, 'code': 'user_present',
@@ -782,11 +809,18 @@ def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], rec
     error text is returned (None = in line).
     Finding 8: the error entry STORES the actions it could not log ({id, provider_id, action, status, credits, model_id, evidence}), so a
     repair does not depend on the record still being at `record_path` (Reconvert moves it): `stored` = those actions; they are logged
-    even when the record is gone or belongs to another model by now."""
+    even when the record is gone or belongs to another model by now. Final-verify row 8: the actions stored with the path's error
+    entry are merged in by EVERY call (read under the ledger lock), and the entry is cleared only of the ids the ledger carries."""
     rec_text = Path(record_path).as_posix()
     wanted = _merge_actions(rec_text, stored or [], paid_actions(record))
     try:
         with guard.os_lock(Path(root) / guard.APP / 'paid_log.lock'):
+            # final-verify row 8: EVERY reconciliation (not only repair_accounting) merges the actions stored with an unrepaired write
+            # error of this path, read under the ledger lock: an ordinary run after Reconvert moved the record away (record None, or a
+            # new model's record at the path) logs them instead of dropping them with the error entry.
+            errors = _read_errors(root)
+            unrepaired = _stored_actions(errors.get(rec_text))
+            wanted = _merge_actions(rec_text, unrepaired, stored or [], paid_actions(record))
             entries = paid_entries(root)
             last = {e['id']: e for e in entries if isinstance(e.get('id'), str)}
             new = []
@@ -809,10 +843,22 @@ def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], rec
                 with open(path, 'a', encoding='utf-8') as handle:
                     for entry in new:
                         handle.write(json.dumps(entry) + '\n')
-            errors = _read_errors(root)
             if rec_text in errors:
-                errors.pop(rec_text)
-                guard.write_atomic(paid_errors_path(root), mv.dump(errors))
+                # clear only what is ACCOUNTED: a stored action leaves the error once the ledger carries its id (just written, or there
+                # already); the entry goes when none is left AND it had evidence at all (stored actions, or the record of the same
+                # model at the path). An entry without either stays listed (repair_accounting reports it; never cleared silently).
+                info = errors[rec_text] if isinstance(errors[rec_text], dict) else {}
+                ledger = {e['id'] for e in paid_entries(root) if isinstance(e.get('id'), str)}
+                legacy_ok = {a['id'] for a in wanted if a['id'] not in ledger and a['action'] in ('geometry', 'committed') and any(
+                    e.get('record') == rec_text and 'id' not in e and e.get('model_id') == a.get('model_id') for e in entries)}
+                left = [a for a in _merge_actions(rec_text, unrepaired) if a['id'] not in ledger and a['id'] not in legacy_ok]
+                same_model = record is not None and (info.get('model_id') is None or record.get('model_id') == info.get('model_id'))
+                if left:
+                    errors[rec_text] = info | {'actions': left}
+                    guard.write_atomic(paid_errors_path(root), mv.dump(errors))
+                elif unrepaired or same_model:
+                    errors.pop(rec_text)
+                    guard.write_atomic(paid_errors_path(root), mv.dump(errors))
         return None
     except (OSError, guard.Conflict) as exc:
         text = f'the paid log could not be written ({type(exc).__name__}: {exc})'
@@ -1082,9 +1128,9 @@ def _tree_state(path: Path) -> dict:
     if handle is not None:
         pids = job_pids(handle)
         if pids is not None:
+            # every process the job lists is live (a job lists no exited process), also one whose create time cannot be read
             live = [{'pid': pid, 'create': _create_time(pid), 'role': 'job'} for pid in pids]
-            return {'file': True, 'job': True, 'live': [p for p in live if p['create'] is not None], 'incomplete': None,
-                    'set_name': name, 'handle': handle}
+            return {'file': True, 'job': True, 'live': live, 'incomplete': None, 'set_name': name, 'handle': handle}
     recorded = _recorded(value)
     live = [p for p in recorded if _alive(p.get('pid'), p.get('create'))]
     driver = value.get('driver') if isinstance(value.get('driver'), dict) else None
@@ -1108,7 +1154,9 @@ def _hold_text(path: Path, state: dict) -> str | None:
 
 def tree_hold(root: Path, monster: str, variant: str) -> str | None:
     """Why the variant's last attempt still holds its slot (a live process of its tree, or incomplete evidence about the tree), else
-    None. A record whose whole tree is verifiably gone is removed here."""
+    None. A record whose whole tree is verifiably gone is removed here: `_tree_state` asks the attempt's Job Object first (every live
+    process in it, whoever its parent was) and only then the recorded processes, so the record stays, and the survivors are named,
+    while anything of the attempt runs (final-verify row 9)."""
     path = children_path(root, monster, variant)
     state = _tree_state(path)
     text = _hold_text(path, state)
@@ -1275,12 +1323,28 @@ class _Tracker:
                                                'job_error': self.job_error, 'children': self.children,
                                                'descendants': list(self.descendants.values()), 'incomplete': self.incomplete}))
 
+    def _job_members(self) -> list[int] | None:
+        """The OTHER processes in this driver's Job Object now ([] without a job; None when the job cannot be queried). A grandchild
+        whose parent exited is no longer a psutil descendant of the driver, but it is still in the job (final-verify row 9)."""
+        if self._handle is None:
+            return []
+        pids = job_pids(self._handle)
+        return None if pids is None else [pid for pid in pids if pid != os.getpid()]
+
     def _scan(self) -> bool:
-        """Record every descendant of this driver that is not recorded yet. True when something was added."""
+        """Record every descendant of this driver that is not recorded yet: its psutil descendants AND every other process of its Job
+        Object (which also holds the ones whose parent is gone). True when something was added."""
         if psutil is None:
             return False
         added = False
-        for proc in psutil.Process(os.getpid()).children(recursive=True):
+        procs = {proc.pid: proc for proc in psutil.Process(os.getpid()).children(recursive=True)}
+        for pid in self._job_members() or []:
+            if pid not in procs:
+                try:
+                    procs[pid] = psutil.Process(pid)
+                except psutil.Error:
+                    continue
+        for proc in procs.values():
             try:
                 if proc.pid not in self.descendants or abs(self.descendants[proc.pid]['create'] - proc.create_time()) > CREATE_TOLERANCE:
                     self.descendants[proc.pid] = {'pid': proc.pid, 'create': proc.create_time(), 'name': proc.name()}
@@ -1288,6 +1352,26 @@ class _Tracker:
             except psutil.Error:
                 continue
         return added
+
+    def _job_survivors(self) -> str | None:
+        """Final-verify row 9, asked right before the record may be removed: the Job Object is the authority on what of this attempt
+        still runs. Every other live process in it is put on record (pid + create time); returns why the record is NOT complete (the job
+        cannot be queried, or a member cannot be identified), else None."""
+        for _try in range(2):
+            members = self._job_members()
+            if members is None:
+                return 'the job object of the attempt could not be queried when the driver ended'
+            unknown = []
+            for pid in members:
+                created = _create_time(pid)
+                if created is None:
+                    unknown.append(pid)
+                elif pid not in self.descendants or abs((self.descendants[pid].get('create') or 0) - created) > CREATE_TOLERANCE:
+                    self.descendants[pid] = {'pid': pid, 'create': created, 'name': 'job member'}
+            if not unknown:
+                return None
+            time.sleep(0.2)                                     # (a process that is exiting right now leaves the job in a moment)
+        return f'process(es) {", ".join(map(str, unknown[:8]))} of the attempt\'s job object could not be identified'
 
     def _watch(self) -> None:
         while not self._stop.wait(self.WATCH_S):
@@ -1343,7 +1427,9 @@ class _Tracker:
 
     def close(self) -> None:
         """End of the driver run: the record is removed only when the driver sees that nothing of its tree is left; otherwise it stays
-        (with the survivors) and the slot stays held."""
+        (with the survivors) and the slot stays held. The attempt's Job Object is asked BEFORE the record may be unlinked (final-verify
+        row 9): a process that is still in the job (a grandchild whose short-lived parent exited between two watcher samples) is
+        recorded and keeps the record; a job that cannot be queried leaves the record `incomplete`."""
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
@@ -1352,6 +1438,12 @@ class _Tracker:
                 self._scan()
             except Exception as exc:  # noqa: BLE001
                 self.incomplete = self.incomplete or f'descendant tracking failed ({type(exc).__name__}: {exc})'
+            try:
+                problem = self._job_survivors()
+            except Exception as exc:  # noqa: BLE001
+                problem = f'the job object of the attempt could not be checked ({type(exc).__name__}: {exc})'
+            if problem:
+                self.incomplete = self.incomplete or problem
             self.children = [c for c in self.children if _alive(c.get('pid'), c.get('create'))]
             self.descendants = {pid: d for pid, d in self.descendants.items() if _alive(pid, d.get('create'))}
             try:

@@ -392,7 +392,9 @@ This section replaces the two working notes of the phase (`PHASE5_INTEGRATION.md
   write (also for two pauses within one second). `modes.manual_pause(root) -> {pause_id, kind: mode | pause, reason} | None` names the
   manual pause of conversions in force. Exposed in `GET /api/v2/state` `status.pause_id`, the queue's `mode.pause_id` (and
   `mode.mode.pause_id`, `mode.pause.pause_id`), `monsters.gate.pause_id` and `item.conversion.pause_id`. A confirmed Run now must echo
-  it (H.4); `args.override_pause` = that id opens the gate for that pause only.
+  it (H.4); `args.override_pause` = that id opens the gate for that pause only. Final verification (H.12 row 5): `manual_pause` stands
+  for ALL independent manual pauses (mode + a separate manual PAUSE; ids joined with `+`), `modes.consent_covers` decides the override,
+  and `modes.read_pause` keeps its four fields (no `extra` in `status.paused`; `modes.pause_extra` reads the other field names).
 - **F8 paid accounting (lane side).** An action is `confirmed` ONLY when the backend recorded `actions[<kind>].confirmed_at`
   (`monster_lane.advance_evidence`); a cleared intent, an observed stage or an exported record prove nothing (`uncertain`). Per action the
   lane reads `observed_cost` (else `observed_cost_<kind>.credits`), `provider_action_id`, `model_id`; `paid_log.jsonl` entries gain
@@ -444,3 +446,55 @@ This section replaces the two working notes of the phase (`PHASE5_INTEGRATION.md
   descriptor in its place when the view is still planned and missing. This is the APP-side refusal; the runner itself
   (tools/view_batch.py `launch_withdrawn`) still launches a descriptor without a `guard` field, so between two app ticks an unguarded
   descriptor written by hand could start: the app must tick once before the runner is enabled (cut-over order).
+
+### H.12 Final verification, monster app (review_v2_final_verify_20261125: rows 3, 5, 8, 9, 10, 11 and new finding 1; as built)
+Supersedes the H.11 paragraphs of the same number where they differ.
+- **Row 3 dispositions.** `mv.set_disposition(..., only_absent=True)` is a compare-and-set under the monster lock: the write is made
+  only while the generation has NO disposition (`{written: false, conflict: true, previous}` otherwise). **Cancel**
+  (`monster_lane.cancel_task`) writes `cancelled` that way, so a stale Cancel (the client saw the row queued, the attempt ran and
+  failed meanwhile) never replaces the recorded `failed`; it then has no write of its own to take back when the SQLite cancel loses, and
+  a failure recorded AFTER its write still wins through `expect_seq`. An already cancelled row gets its missing record only while the
+  row IS cancelled now. **Spawn failure** (`Orchestrator._spawn`): a monster wrapper that cannot be started is recorded `failed`
+  (`_monster_disposition`) BEFORE its row finishes; when that record cannot be written the row stays `starting` (slot held, intent
+  pending) and the next pass settles it (`_lost`). A rebuilt queue restores both cases as `failed`, never queued.
+- **Row 5 pause identity.** `modes.manual_pauses(root)` lists EVERY independent manual pause of conversions in force: the pause mode,
+  and a PAUSE file with `conversions` in its scope that is neither the idle gate (`IDLE_REASONS`) nor the supervisor's reflection of the
+  CURRENT pause mode (`modes.mode_reflection`: `reason == "manual <mode>"`, the scope the supervisor writes for that mode, no field
+  beyond since / reason / scope: `modes.pause_extra`). `modes.manual_pause(root)` = `{pause_id, kind, reason, pauses}` for the whole
+  set: one pause -> its own id (unchanged), several -> their ids joined with `+` (kind `mode+pause`, the reasons joined with `; `).
+  That `pause_id` is what the client is shown and must echo (`status.pause_id`, `monsters.gate.pause_id`, `item.conversion.pause_id`,
+  409 `confirm`); `args.override_pause` keeps it, and `modes.consent_covers(consent, manual)` opens the gate only while every pause in
+  force is in the confirmed set. So a manual PAUSE added after the confirmation of a pause mode closes the lane (`plan_starts`, the
+  driver's `gated`) and the paid child (`monster_lane.py gate`, the `cmd` of its `IMAGETO3D_PAID_GATE`) alike, and needs a new
+  confirmation; a pause that was lifted does not withdraw the consent for the rest. `modes.read_pause` keeps its shape (`since, reason,
+  scope, pause_id`: it is `status.paused` of GET /api/v2/state); the extra field names are read separately (`pause_extra`).
+- **New 1 drain.** `monster_lane.gate`: `.codex_jobs/_batch/CONVERT_DRAIN` (`read_drain`; an unreadable file still drains) closes the
+  gate with `code: "held"`, `draining: true`, a reason naming CONVERT_DRAIN, `needs_confirm: false`; never overridden by Run now or a
+  confirmed pause (`run_now` answers with a `warning`, like the hold). Same in the plan, the driver's step checks, the `gate` CLI and
+  `paid_gate.file_reason` (the click-time base check). `gate()` also returns `drain`.
+- **Row 8 paid accounting.** `reconcile_paid` reads `paid_log_errors.json` under the ledger lock on EVERY call and merges the actions
+  stored with the path's unrepaired error into what it logs (not only `repair_accounting`), so the driver's ordinary reconciliation
+  after Reconvert moved the record (no record, or another model's record at the path) logs the stored charge. The error entry is
+  cleared only of the ids the ledger carries; it is removed when none is left AND it had evidence (stored actions, or the record of
+  the same model); an entry without either stays listed.
+- **Row 9 process tree.** `_Tracker.close` asks the attempt's Job Object before the children file may be removed
+  (`_job_survivors`): every other live process in the job is put on record (`descendants`: pid + create time) and keeps the file; a job
+  that cannot be queried, or a member that cannot be identified, leaves it `incomplete`. `_scan` (watcher, add, remove, close) also
+  lists the job's members, so a grandchild whose parent exited between two samples is recorded. `_tree_state` counts every pid the job
+  lists as live. `tree_hold` therefore names the survivors and the slot stays held until they are gone (or drained by Kill & retry).
+- **Row 10 approve what is on screen.** monster3d.js fetches the GLB itself (`cache: no-store`), hashes those bytes (SubtleCrypto
+  SHA-256) and shows exactly them (a blob URL); `applied = {level, url, sha (computed), expected (item lods[level].sha256)}`. Approve is
+  enabled only when `sha === expected` and sends the COMPUTED hash (`data-sha` on the button); a mismatch shows "changed on disk",
+  re-reads the item once and stays off. Server: `mv.fresh_sha256` (the file is read and hashed on every call) certifies
+  `approval_problem` (Completed), `reduce_status(deep=True)` (approve) and `item.lods[].sha256`; `mv.file_sha256` (size + mtime
+  cache) is a hint only and certifies nothing. `/mfiles/` URLs are versioned `?v=<mtime_ns>-<size>` (`monsters._url`, `mv.murl`;
+  microseconds for the cached concept scans).
+- **Row 11 journals.** `mv.read_journal` validates the FULL operation-specific record (`journal_record_problem`) before recovery
+  touches either file: both: `variant`, `tmp` (`.v2_pick_<variant>_<8 hex>`), `names_entry` (non-empty object), `names_prev` (null or
+  object, present); pick: `folder`, `key`, `origin`, `state_entry` (stage approved, this variant), `names_entry.was == key`,
+  `names_prev` null; import: `names_entry.imported`. An incomplete journal is `guard.Unreadable` exactly like a torn one: nothing is
+  replaced, renamed or deleted, the tick reports it, picks / imports of the monster are refused, and the variant it names (every
+  variant of the monster when it names none) is a read-only damaged card and item (`journal_blocks`, checked in `variant_raws` and
+  in `_variant_paths` before every variant mutation).
+- Tests: test_phase5.py `FinalVerify*` (one class per row). Fixture flows: `flows6.mjs` (real digests; a model whose bytes are not the
+  described file cannot be approved).

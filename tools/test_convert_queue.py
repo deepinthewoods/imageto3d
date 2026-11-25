@@ -595,10 +595,38 @@ class OwnerTests(Base):
         self.namespace('{broken')
         self.assertIsNone(cq.read_namespace(self.root))
         self.assertFalse(cq.owner_allows(self.root, 'a_gnome--1', {'parent_set': 'a'}, ['a', 'a_gnome'])[0])   # cannot be verified
-        self.assertTrue(cq.owner_allows(self.root, 'a--1', {}, ['a'])[0])
+        self.assertFalse(cq.owner_allows(self.root, 'a--1', {}, ['a'])[0])              # nothing is authorised while it is unreadable
+
+    def test_a_namespace_needs_both_maps(self):
+        """Final verification row 2: a missing or mistyped map is unreadable, never an empty map."""
+        job = self.stage('cape_human_male--abcdef', parent='cape_human_male')           # an independent set's job
+        sets = {'cape', 'cape_human_male'}
+        for text in ('{"sets": {"cape": "x"}}', '{"families": {"cape_human_male": "cape"}}', '{}', '[]', '{"sets": [], "families": {}}',
+                     '{"sets": {"cape": "x"}, "families": []}', '{"sets": {"cape": "x"}, "families": {"cape_human_male": 7}}',
+                     '{"sets": {"": "x"}, "families": {}}'):
+            self.namespace(text)
+            self.assertIsNone(cq.read_namespace(self.root), text)
+            ok, reason = cq.owner_allows(self.root, job.name, {'parent_set': 'cape_human_male'}, sets)
+            self.assertFalse(ok, text)
+            self.assertIn('unreadable', reason)
+            self.assertEqual(cq.next_job(sets), (None, False), text)
+        self.namespace('{"sets": {}, "families": {}}')                                  # both maps, empty: readable, the record decides
+        self.assertEqual(cq.read_namespace(self.root), ({}, {}))
+        self.assertEqual(cq.next_job(sets), (job, True))
+
+    def test_a_parentless_family_job_never_passes_an_unreadable_namespace(self):
+        """Final verification row 2: with invalid JSON a parentless family job passed despite `!cape`."""
+        self.stage('cape_human_male--fedcba')                                           # no parent_set
+        sets = {'cape', 'cape_human_male', '!cape'}
+        self.namespace(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
+        self.assertEqual(cq.next_job(sets), (None, False))                              # readable: its owner cape is excluded
+        self.namespace('{"sets": {"cape": ')
+        self.assertFalse(cq.owner_allows(self.root, 'cape_human_male--fedcba', {}, sets)[0])
+        self.assertEqual(cq.next_job(sets), (None, False))
+        self.assertTrue(any('OWNER cape_human_male--fedcba' in l and 'unreadable' in l for l in self.events()), self.events())
 
     def test_an_owned_job_is_taken(self):
-        job = self.stage('cape_human_male--abcdef', parent='cape')
+        job = self.stage('cape_human_male--fedcba', parent='cape')
         self.namespace(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
         self.assertEqual(cq.next_job({'cape', 'cape_human_male'}), (job, True))
 

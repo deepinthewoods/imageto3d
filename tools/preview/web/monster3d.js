@@ -9,6 +9,10 @@
 // Recheck before cut-over (finding 10): Approve is enabled only for the level the viewer SUCCESSFULLY loaded and applied; the digest sent
 // is the one bound to that loaded URL (`applied`). While a level loads, after a failed load (the stale mesh is cleared) and when the
 // selector shows another level than the applied one, Approve is disabled.
+// Final verification (row 10): the digest is bound to the BYTES ON SCREEN. The modal fetches the GLB itself (no HTTP cache), hashes those
+// bytes (SubtleCrypto SHA-256) and hands exactly them to the viewer (a blob URL); Approve is enabled only when that hash equals the
+// item's `lods[level].sha256` (hashed by the server from the file), and the hash the modal COMPUTED is what Approve sends. A model
+// whose bytes are not the ones the item describes shows `model changed` and offers a reload; it can never be approved by metadata.
 import { api } from './api.js';
 import { createViewer } from './viewer.js';
 import { refresh } from './state.js';
@@ -20,6 +24,16 @@ import { confirmDialog } from './confirm.js';   // PHASE 5
 import { carry } from './model3d.js';
 
 const LODS = ['0p8', '0p6', '0p4', '0p2', '0p1'];
+
+/** The bytes behind a model URL, fetched past every cache, and their SHA-256 (lower-case hex). */
+async function fetchModel(url) {
+  const response = await fetch(url, { cache: 'no-store' });
+  if (!response.ok) throw new Error(`HTTP ${response.status}`);
+  const bytes = await response.arrayBuffer();
+  if (!globalThis.crypto?.subtle) throw new Error('this browser cannot hash the model (no SubtleCrypto)');
+  const digest = new Uint8Array(await globalThis.crypto.subtle.digest('SHA-256', bytes));
+  return { bytes, sha: Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('') };
+}
 
 function sidePanel(item) {
   const side = h('div', { class: 'monster-side' });
@@ -93,9 +107,11 @@ export async function showMonster3d(modal, host) {
   fillSelect(lodSelect, levels.map(level => [level, `${lodLabel(level)} · ${faceText(lods[level].faces).replace(' faces', '')}`]),
     item.lod && lods[item.lod] ? item.lod : (lods['0p4'] ? '0p4' : levels[0]));
   let saved = item.lod && lods[item.lod] ? item.lod : null;
-  // what is ON SCREEN: {level, url, sha} of the last load the viewer applied; null while loading and after a failed load. Approve vouches
-  // for exactly this (the digest belongs to the loaded URL), never for a level that was merely selected.
+  // what is ON SCREEN: {level, url, sha, expected} of the last load the viewer applied; null while loading and after a failed load.
+  // `sha` is the SHA-256 this modal computed from the bytes it gave the viewer, `expected` the item's digest of that level. Approve
+  // vouches for exactly these bytes, never for a level that was merely selected or for a digest read from metadata.
   let applied = null;
+  let rereadOnce = false;            // a digest mismatch re-reads the item once, never in a loop
   let approveButton = null;
 
   /** Why Approve cannot be pressed now (null = it can). */
@@ -103,6 +119,8 @@ export async function showMonster3d(modal, host) {
     if (!applied) return 'The model is not loaded';
     if (applied.level !== lodSelect.value) return 'The level on screen is not the selected one';
     if (!applied.sha) return 'This level has no digest; reload';
+    if (!applied.expected) return 'The server gave no digest for this level; reload';
+    if (applied.sha !== applied.expected) return 'The model on screen is not the file the server describes (it changed); reload it';
     return null;
   }
 
@@ -112,6 +130,7 @@ export async function showMonster3d(modal, host) {
     approveButton.disabled = !!block;
     approveButton.title = block || 'Approve this level (A): the monster moves to Completed';
     approveButton.dataset.loaded = applied ? applied.level : '';
+    approveButton.dataset.sha = applied?.sha || '';            // the digest of the bytes on screen (what Approve sends)
   }
 
   function sync() {
@@ -127,19 +146,37 @@ export async function showMonster3d(modal, host) {
   async function show() {
     const mine = ++shown;
     const level = lodSelect.value;
-    const target = { level, url: lods[level].url, sha: lods[level]?.sha256 || null };   // the URL and the digest that belongs to it
+    // `sha` is filled from the bytes this modal fetches; `expected` is the server's digest of the level's file
+    const target = { level, url: lods[level].url, sha: null, expected: lods[level]?.sha256 || null };
     applied = null;                  // nothing is vouched for while another level loads
     sync();
     message.hidden = false;
     message.dataset.state = 'loading';
     message.textContent = 'Loading...';
     try {
-      const result = await viewer.load(target.url, { view: viewer.hasModel ? null : carry.view });
+      const model = await fetchModel(target.url);          // the bytes are fetched and hashed HERE, then shown from memory
+      if (mine !== shown) return;
+      target.sha = model.sha;
+      const blobUrl = URL.createObjectURL(new Blob([model.bytes], { type: 'model/gltf-binary' }));
+      let result;
+      try {
+        result = await viewer.load(blobUrl, { view: viewer.hasModel ? null : carry.view });
+      } finally {
+        URL.revokeObjectURL(blobUrl);
+      }
       if (mine !== shown) return;
       if (result.applied) {
         applied = target;
-        message.hidden = true;
-        message.dataset.state = '';
+        const differs = !!target.expected && target.sha !== target.expected;
+        message.hidden = !differs;
+        message.dataset.state = differs ? 'changed' : '';
+        if (differs) message.textContent = 'This model changed on disk after the page read it. Approve is off until the model on screen is the one the server describes.';
+        if (differs && !rereadOnce) {      // read the item again ONCE (its digest is hashed from the file now) and load the level again
+          rereadOnce = true;
+          reloadModel();
+          return;
+        }
+        if (!differs) rereadOnce = false;
       }
     } catch (error) {
       if (mine !== shown) return;

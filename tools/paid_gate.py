@@ -47,7 +47,8 @@ def _read_json(path: Path):
 
 
 def file_reason(root, override_pause: bool = False) -> str | None:
-    """Why the CONVERT_HOLD / PAUSE files of `root` close the gate, else None. A PAUSE without a readable scope covers conversions."""
+    """Why the CONVERT_HOLD / CONVERT_DRAIN / PAUSE files of `root` close the gate, else None (hold and drain are never overridable).
+    A PAUSE without a readable scope covers conversions."""
     batch = Path(root) / '.codex_jobs' / '_batch'
     hold = batch / 'CONVERT_HOLD'
     if hold.exists():
@@ -57,6 +58,8 @@ def file_reason(root, override_pause: bool = False) -> str | None:
             data = {}
         reason = data.get('reason') if isinstance(data, dict) else None
         return f'conversions are held (CONVERT_HOLD: {reason or "no reason"})'
+    if (batch / 'CONVERT_DRAIN').exists():   # a drain closes the gate by itself, never overridable (final-verify review, new 1)
+        return 'conversions are being drained (CONVERT_DRAIN)'
     if not override_pause:
         pause = batch / 'PAUSE'
         if pause.exists():

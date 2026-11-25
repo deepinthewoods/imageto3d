@@ -26,7 +26,7 @@ $IMAGETO3D_TRIPO_PROFILE_WAIT seconds, default 600, then exits 75 "Tripo browser
 
 Browser lifetime (recheck-before-cutover finding 18): the reservation is a byte lock of the python HOLDER, which spawns node and
 waits for it; when the holder dies the kernel frees the lock although node / Firefox may still have the profile open. So
-studio.mjs registers itself right after `verify` (`verify --register-pid <node pid>` writes `<profile parent>/<profile
+studio.mjs registers itself through the reservation it was given (`verify --register-pid <node pid>` writes `<profile parent>/<profile
 name>.imageto3d.pid` = {pid, create_time, registered}; it prints the path) and removes that file only after its command ended
 normally (the browser context closed). Every acquirer checks it after taking the byte lock (`profile_users`): a registered node
 that still runs (same pid AND create time), or, when it is gone, any Firefox process started with `-profile <this profile>`,
@@ -34,9 +34,17 @@ keeps the profile BUSY until it exits (polled like a held lock: `wait` / TripoBr
 process is gone and that no Firefox uses is stale and is removed. Process facts come from psutil (always present on Windows:
 portable.py needs it), else /proc on Linux; where neither exists a pid file cannot be checked and counts as busy (fail closed).
 
-Both are the OS byte lock of claim_lock.py (claim_lock.try_lock: msvcrt.locking of the byte at 1<<20 on Windows, fcntl.flock
+Handshake (final-verify row 18): checking a reservation and publishing the pid are ONE step, serialized with acquisition by a third
+byte lock, `<profile parent>/<profile name>.imageto3d.handshake.lock` (held for milliseconds only). An acquirer takes the
+reservation's byte lock, voids the previous holder's token, looks for users and writes its own one-time token all under the
+handshake lock; `verify --register-pid` (register_browser) checks the token against the live reservation file and writes the pid
+file under the same lock; a holder that ends clears its token under it. So a child whose holder is gone can never register
+after a replacement took the profile: it is refused (its token is void), or it registered first and the replacement sees it as a
+user and waits.
+
+All three are the OS byte lock of claim_lock.py (claim_lock.try_lock: msvcrt.locking of the byte at 1<<20 on Windows, fcntl.flock
 elsewhere), freed by the kernel when the holder dies; the files are never deleted. Lock order is always checkout lock, then
-profile reservation (`run` takes only the reservation), so no two holders wait on each other. The holder writes `pid <pid> since
+profile reservation, then (briefly) the handshake lock (`run` takes only the last two), so no two holders wait on each other. The holder writes `pid <pid> since
 <time> ...` at the start of each file (informational, plus the token in the profile file).
 """
 from __future__ import annotations
@@ -75,6 +83,8 @@ PROFILE_WAIT_S = 600
 EXIT_BUSY = 75                                     # `run`: the reservation stayed busy
 BROWSER_NAMES = ('firefox',)                       # process-name prefixes of a browser that may still hold the profile
 CREATE_TOLERANCE_S = 1.0                           # a registered pid is the same process when its create time matches this closely
+HANDSHAKE_WAIT_S = 10.0                            # longest wait for the handshake lock (its holders keep it for milliseconds)
+HANDSHAKE_POLL_S = 0.02
 
 
 class TripoBrowserBusy(Exception):
@@ -126,6 +136,12 @@ def browser_pid_path(profile=None) -> Path:
     return real.parent / f'{real.name}.imageto3d.pid'
 
 
+def handshake_lock_path(profile=None) -> Path:
+    """The handshake lock of a profile: `<parent>/<name>.imageto3d.handshake.lock` of its RESOLVED path (module docstring)."""
+    real = resolved_profile(profile)
+    return real.parent / f'{real.name}.imageto3d.handshake.lock'
+
+
 def _psutil():
     try:
         import psutil
@@ -175,8 +191,27 @@ def _processes():
     return out
 
 
-def register_browser(profile, pid) -> Path:
-    """Record that process `pid` (studio.mjs's node) is about to open `profile`; atomic. Returns the pid file."""
+class ReservationRefused(ValueError):
+    """register_browser: the reservation named by lock / token is not the live one of the profile (the text says why)."""
+
+
+def register_browser(profile, pid, lock, token) -> Path:
+    """The handshake of a studio.mjs child (final-verify row 18): under the handshake lock, check that `lock` / `token` are the
+    reservation of `profile` that is held right now, and only then record process `pid` as the profile's user. Returns the pid
+    file; ReservationRefused when the reservation is not (or no longer) the live one, e.g. its holder ended and a replacement
+    took the profile: nothing is written then. ValueError when `pid` is no process."""
+    with _handshake(profile) as held:
+        if not held:
+            raise ReservationRefused('the reservation handshake is busy (another process is acquiring or registering)')
+        problem = _verify_now(profile, lock, token)
+        if problem:
+            raise ReservationRefused(problem)
+        return _record_browser(profile, pid)
+
+
+def _record_browser(profile, pid) -> Path:
+    """Write the pid file: process `pid` (studio.mjs's node) is about to open `profile`; atomic. Returns the pid file. No
+    reservation check: callers go through register_browser (tests use it to stage an orphan)."""
     path = browser_pid_path(profile)
     created = _create_time(pid)
     if created is None:
@@ -249,22 +284,6 @@ def profile_users(profile=None) -> list:
     return users
 
 
-def _drain_users(profile, deadline, announce):
-    """After the byte lock is ours: wait until no orphaned node / Firefox uses the profile; TripoBrowserBusy past `deadline`."""
-    announced = False
-    while True:
-        users = profile_users(profile)
-        if not users:
-            return
-        text = f'Tripo browser busy (profile still in use: {"; ".join(users)})'
-        if deadline is not None and time.monotonic() >= deadline:
-            raise TripoBrowserBusy(text)
-        if not announced:
-            (announce or (lambda t: print(t, file=sys.stderr, flush=True)))(f'{text}; waiting')
-            announced = True
-        time.sleep(POLL_S if deadline is None else min(POLL_S, max(0.05, deadline - time.monotonic())))
-
-
 def _open(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     return os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o666), 'r+b')
@@ -281,6 +300,26 @@ def _acquire(handle, deadline, describe, announce):
             (announce or (lambda t: print(t, file=sys.stderr, flush=True)))(text)
             announced = True
         time.sleep(POLL_S if deadline is None else min(POLL_S, max(0.05, deadline - time.monotonic())))
+
+
+@contextmanager
+def _handshake(profile, wait=HANDSHAKE_WAIT_S):
+    """Hold the handshake lock of `profile` for the block; yields True when it is held, False when it stayed busy for `wait`
+    seconds (the caller decides: an acquirer tries again, a registration is refused)."""
+    handle = _open(handshake_lock_path(profile))
+    try:
+        end = time.monotonic() + max(0.0, float(wait))
+        held = try_lock(handle)
+        while not held and time.monotonic() < end:
+            time.sleep(HANDSHAKE_POLL_S)
+            held = try_lock(handle)
+        try:
+            yield held
+        finally:
+            if held:
+                release_lock(handle)
+    finally:
+        handle.close()
 
 
 def _write(handle, text):
@@ -303,22 +342,55 @@ def _clear(handle):
 def profile_reservation(profile=None, what='studio.mjs', wait=None, announce=None, deadline=None):
     """Hold the reservation of `profile` (default: the one studio.mjs opens) for the block; yields the child environment
     {PROFILE_LOCK_ENV: path, PROFILE_TOKEN_ENV: token}. `wait` / `deadline` as tripo_browser_lock. With the byte lock taken,
-    a node / Firefox a dead holder left on the profile is waited for as well (profile_users; finding 18)."""
+    a node / Firefox a dead holder left on the profile is waited for as well (profile_users; finding 18).
+
+    Acquisition is one handshake (final-verify row 18; module docstring): each attempt runs under the handshake lock, where the
+    byte lock is taken, the previous holder's token is voided at once, the users are looked up and this holder's one-time token
+    is written; the token is cleared under the same lock when the block ends."""
     path = profile_lock_path(profile)
     if deadline is None and wait is not None:
         deadline = time.monotonic() + float(wait)
+    say = announce or (lambda t: print(t, file=sys.stderr, flush=True))
     handle = _open(path)
+    locked = False
     try:
-        _acquire(handle, deadline, lambda: _first_line(path), announce)
+        token, announced = None, set()
+        while token is None:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            with _handshake(profile, HANDSHAKE_WAIT_S if remaining is None else min(HANDSHAKE_WAIT_S, max(1.0, remaining))) as held:
+                if not held:
+                    kind, text = 'handshake', 'Tripo browser busy (the profile reservation handshake is in use)'
+                else:
+                    if not locked:
+                        described = _first_line(path)             # the current holder, read before a successful take clears it
+                        locked = try_lock(handle)
+                        if locked:
+                            _clear(handle)                        # the previous holder's token is void from here on
+                    if not locked:
+                        kind, text = 'lock', f'Tripo browser busy (held by {described or "another process"})'
+                    else:
+                        users = profile_users(profile)
+                        if users:
+                            kind, text = 'users', f'Tripo browser busy (profile still in use: {"; ".join(users)})'
+                        else:
+                            token = secrets.token_hex(16)
+                            _write(handle, f'pid {os.getpid()} since {time.strftime("%Y-%m-%dT%H:%M:%S")} token {token} {what}\n')
+            if token is not None:
+                break
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TripoBrowserBusy(text)
+            if kind not in announced:
+                say(f'{text}; waiting')
+                announced.add(kind)
+            time.sleep(POLL_S if deadline is None else min(POLL_S, max(0.05, deadline - time.monotonic())))
         try:
-            _drain_users(profile, deadline, announce)
-            token = secrets.token_hex(16)
-            _write(handle, f'pid {os.getpid()} since {time.strftime("%Y-%m-%dT%H:%M:%S")} token {token} {what}\n')
             yield {PROFILE_LOCK_ENV: str(path), PROFILE_TOKEN_ENV: token}
         finally:
-            _clear(handle)
-            release_lock(handle)
+            with _handshake(profile):                             # best effort: a registration in progress finishes first
+                _clear(handle)
     finally:
+        if locked:
+            release_lock(handle)
         handle.close()
 
 
@@ -344,7 +416,16 @@ def tripo_browser_lock(root, what='studio.mjs', wait=None, announce=None, profil
 
 
 def verify(profile, lock, token) -> str | None:
-    """None when `lock` / `token` name a reservation of `profile` that is held right now, else why not."""
+    """None when `lock` / `token` name a reservation of `profile` that is held right now, else why not. A look only: the answer
+    can be stale a moment later, so a pid is never published on it (register_browser checks and records in one handshake)."""
+    with _handshake(profile) as held:
+        if not held:
+            return 'the reservation handshake is busy (another process is acquiring or registering)'
+        return _verify_now(profile, lock, token)
+
+
+def _verify_now(profile, lock, token) -> str | None:
+    """verify() itself; the caller holds the handshake lock, so no acquirer changes the reservation meanwhile."""
     if not lock or not token:
         return 'no reservation in the environment'
     expected = profile_lock_path(profile)
@@ -380,8 +461,8 @@ def main(argv=None) -> int:
     p.add_argument('--profile')
     p.add_argument('--lock', default='')
     p.add_argument('--token', default='')
-    p.add_argument('--register-pid', type=int, help='on success record this process (studio.mjs) as the profile\'s user and '
-                                                    'print the pid file path')
+    p.add_argument('--register-pid', type=int, help='check and, in the same handshake, record this process (studio.mjs) as the '
+                                                    'profile\'s user; prints the pid file path')
     p = sub.add_parser('users', help='list an orphaned node / Firefox still on --profile (exit 0 = none, 1 = some)')
     p.add_argument('--profile')
     args = parser.parse_args(argv)
@@ -391,16 +472,20 @@ def main(argv=None) -> int:
             print(user, flush=True)
         return 1 if users else 0
     if args.command == 'verify':
-        problem = verify(args.profile, args.lock, args.token)
-        if problem:
-            print(problem, flush=True)
-            return 1
-        if args.register_pid is not None:
-            try:
-                print(register_browser(args.profile, args.register_pid), flush=True)
-            except (OSError, ValueError) as error:
-                print(f'cannot register pid {args.register_pid} for the profile: {error}', flush=True)
+        if args.register_pid is None:
+            problem = verify(args.profile, args.lock, args.token)
+            if problem:
+                print(problem, flush=True)
                 return 1
+            return 0
+        try:                                      # check and publish in one handshake with acquisition (final-verify row 18)
+            print(register_browser(args.profile, args.register_pid, args.lock, args.token), flush=True)
+        except ReservationRefused as error:
+            print(error, flush=True)
+            return 1
+        except (OSError, ValueError) as error:
+            print(f'cannot register pid {args.register_pid} for the profile: {error}', flush=True)
+            return 1
         return 0
     cmd = args.cmd[1:] if args.cmd[:1] == ['--'] else args.cmd
     if not cmd:

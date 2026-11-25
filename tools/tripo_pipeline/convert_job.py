@@ -380,13 +380,29 @@ def wait_for_child_gate(key, step, child_env):
 # Several queue workers may convert different modules of one job at once: each module is claimed with a lock
 # file, and the job record is only ever read-modified-written under an exclusive lock (portable.file_lock: flock on
 # Linux; on Windows a sidecar `<record>.lock` byte lock that readers take exclusively too).
+def record_root(path):
+    """The checkout whose `.codex_jobs/_batch/record_locks/` carries the lock sidecar of the job record `path` (final-verify
+    review, test isolation): ROOT while the record lies under it (every real job; a test that patched ROOT), else the root the
+    record itself belongs to, `<root>/<stage>/<job>/<record>`. So a caller that works on another root (convert_queue and the v2
+    app in their test fixtures, which import this module with the real ROOT) never opens a lock sidecar in this checkout, and
+    readers and writers of one record still agree on the sidecar."""
+    resolved = Path(path).resolve()
+    try:
+        resolved.relative_to(Path(ROOT).resolve())
+        return ROOT
+    except ValueError:
+        pass
+    parents = resolved.parents
+    return parents[2] if len(parents) > 2 else parents[-1]
+
+
 def read_record(path):
-    with portable.file_lock(path, exclusive=False, sidecar=True, root=ROOT):   # the sidecar of THIS root (a temp root in tests)
+    with portable.file_lock(path, exclusive=False, sidecar=True, root=record_root(path)):   # the sidecar of the record's own root
         return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 
 
 def update_record(path, change):
-    with portable.file_lock(path, exclusive=True, sidecar=True, root=ROOT):
+    with portable.file_lock(path, exclusive=True, sidecar=True, root=record_root(path)):
         record = json.loads(Path(path).read_text(encoding='utf-8-sig'))
         change(record)
         Path(path).write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')

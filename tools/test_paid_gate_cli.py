@@ -84,3 +84,15 @@ class GateTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def test_a_drain_alone_closes_the_gate_even_with_a_pause_override(tmp_path):
+    """Final-verify review, new finding 1: CONVERT_DRAIN without CONVERT_HOLD still closes the click-time gate."""
+    import paid_gate as g
+    batch = tmp_path / '.codex_jobs' / '_batch'
+    batch.mkdir(parents=True)
+    (batch / 'CONVERT_DRAIN').write_text('{}')
+    env = g.env_for(tmp_path, override_pause=True)
+    assert 'CONVERT_DRAIN' in (g.closed_reason(env) or '')
+    (batch / 'CONVERT_DRAIN').unlink()
+    assert g.closed_reason(env) is None

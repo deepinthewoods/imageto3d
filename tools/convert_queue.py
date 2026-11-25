@@ -63,7 +63,9 @@ does not count the exit (it restores the count an older worker wrote).
 Recorded owner (pre-cut-over review finding 2): a set id on the list authorizes a job only when the job's recorded owner agrees
 (owner_allows): a job whose record names `parent_set` X is taken only when X is on the list and, where the preview app recorded
 whose id the job's prefix is (.codex_jobs/_app/set_namespace.json), that owner is X; a job without `parent_set` whose prefix was
-written as a family id of set S needs S on the list. A refused job is reported once (`OWNER <job>: ...`) and left alone.
+written as a family id of set S needs S on the list. While set_namespace.json exists but is unreadable (not JSON, or not BOTH
+maps `sets` and `families` with the right types) no job is authorised at all. A refused job is reported once
+(`OWNER <job>: ...`) and left alone.
 
 Events (stdout and .codex_jobs/_batch/convert_events.log): CONVERT, CONVERTED, PARTIAL, FAILED, DEFERRED, OWNER, BALANCE, IDLE, FINISH,
 PAUSED.
@@ -331,7 +333,10 @@ def listed(set_id, sets):
 
 def read_namespace(root):
     """The preview app's record of whose a listed id is (`.codex_jobs/_app/set_namespace.json`, tools/preview/v2/convert_list.py):
-    ({set id: ...}, {family id: parent set}); ({}, {}) when the file does not exist; None when it exists but cannot be read."""
+    ({set id: ...}, {family id: parent set}); ({}, {}) when the file does not exist; None when it exists but is UNREADABLE: it
+    cannot be read, is not JSON, or is not an object that holds BOTH maps with the right types (`sets`: {set id: ...} and
+    `families`: {family id: set id}, every key and every family owner a non-empty string). A missing map is never read as an
+    empty one (final verification row 2): that would silently drop every recorded owner."""
     path = Path(root) / '.codex_jobs' / '_app' / 'set_namespace.json'
     try:
         raw = json.loads(path.read_text(encoding='utf-8-sig'))
@@ -339,32 +344,39 @@ def read_namespace(root):
         return {}, {}
     except (OSError, ValueError):
         return None
-    if not isinstance(raw, dict) or not isinstance(raw.get('sets', {}), dict) or not isinstance(raw.get('families', {}), dict):
+    if not isinstance(raw, dict):
         return None
-    return raw.get('sets', {}), {k: v for k, v in raw.get('families', {}).items() if isinstance(v, str)}
+    sets, families = raw.get('sets'), raw.get('families')
+    if not isinstance(sets, dict) or not isinstance(families, dict):
+        return None
+    if not all(isinstance(k, str) and k for k in sets) \
+            or not all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in families.items()):
+        return None
+    return dict(sets), dict(families)
 
 
 def owner_allows(root, job_name, record, sets):
     """(ok, reason): the dispatch check of the job's RECORDED owner (pre-cut-over review finding 2). `sets` = the convert list's
     patterns; the caller already knows that the job's own prefix is listed. A listed id authorizes the job only when:
+      - the namespace is readable (read_namespace is not None). While the existing ownership data is unreadable NO job is
+        authorised, with or without `parent_set` (final verification row 2): whose id the prefix is cannot be known, so a
+        parentless family job would otherwise pass although its owner is excluded from the list. A namespace file that does not
+        exist is not unreadable (no preview app record: the list and the record alone decide);
       - the record names `parent_set` X: X is listed, and the namespace's owner of the job's prefix (itself when it was approved
-        as a set, the set it was written for as a family id), when recorded, is X; with an unreadable namespace the owner cannot
-        be verified and the job waits;
+        as a set, the set it was written for as a family id), when recorded, is X;
       - the record names no parent: when the prefix was written as a family id of S, S is listed (else the list alone decides).
     Read-only."""
     prefix = job_name.split('--')[0]
     parent = record.get('parent_set') if isinstance(record, dict) else None
+    if parent is not None and (not isinstance(parent, str) or not parent):
+        return False, 'its record has an invalid parent_set'
     namespace = read_namespace(root)
-    owner = None
-    if namespace:
-        owner = prefix if prefix in namespace[0] else namespace[1].get(prefix)
+    if namespace is None:
+        return False, f'set_namespace.json is unreadable: the owner of {prefix} cannot be verified'
+    owner = prefix if prefix in namespace[0] else namespace[1].get(prefix)
     if parent is not None:
-        if not isinstance(parent, str) or not parent:
-            return False, 'its record has an invalid parent_set'
         if not listed(parent, sets):
             return False, f'its record names the set {parent}, which is not on the convert list'
-        if namespace is None:
-            return False, 'set_namespace.json is unreadable: the owner its record names cannot be verified'
         if owner and owner != parent:
             return False, f'its record names the set {parent}, but {prefix} is on the convert list for the set {owner}'
         return True, f'owner {parent}'

@@ -14,7 +14,7 @@ import { ago, badge, blockRepeat, button, h, pretty } from './util.js';
 const NAMES = ['front', 'left', 'back', 'right'];
 const STEPS = ['submit', 'preview', 'collect', 'reduce'];
 const WAITING = { paused: 'paused', user_present: 'you are at the PC', browser_busy: 'the Hyper3D browser is busy',
-  held: 'conversions are held until the supervisor runs (CONVERT_HOLD)' };
+  held: 'conversions are held until the supervisor runs (CONVERT_HOLD) or its drain is over (CONVERT_DRAIN)' };
 const TASK_TONE = { queued: 'info', running: 'info', done: 'ok', failed: 'error' };
 const POLL_ACTIVE_MS = 4000;
 const POLL_IDLE_MS = 10000;

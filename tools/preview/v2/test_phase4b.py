@@ -1784,6 +1784,76 @@ class CutoverDrainTest(TempRoot):
         self.assertEqual(services.read_suspensions(self.root), [])
         self.assertEqual(services.begin_management(self.root)[1:], [])
 
+    # ------------------------------------------------------------------------------- final verification, new finding 2
+    def denied_process(self, pid, times):
+        """psutil.Process whose command line of `pid` cannot be inspected `times` times (None: never), as a patch."""
+        left = [times]
+
+        class Denied(psutil.Process):
+            def cmdline(self):
+                if self.pid == pid and (left[0] is None or left[0] > 0):
+                    left[0] = None if left[0] is None else left[0] - 1
+                    raise psutil.AccessDenied(pid)
+                return super().cmdline()
+        return mock.patch.object(services.psutil, 'Process', Denied)
+
+    def test_n2_a_transient_inspection_failure_keeps_the_suspension_and_the_next_pass_resumes(self):
+        os.remove(self.root / 'tools/tripo_pipeline/convert_job.py')
+        old = self.legacy()
+        inst = self.running('convert')[0]
+        services._note_suspension(self.root, 'convert', inst)                        # the manager died between suspend and resume
+        psutil.Process(old.pid).suspend()
+        self.addCleanup(lambda: psutil.Process(old.pid).resume() if psutil.pid_exists(old.pid) else None)
+        with self.denied_process(old.pid, 1):                                        # the reviewer's fake: AccessDenied once
+            events = services.begin_management(self.root)
+            kept = services.read_suspensions(self.root)
+            self.assertEqual([(i['pid'], i['retries']) for i in kept], [(old.pid, 1)], events)     # NOT forgotten
+            self.assertIn('AccessDenied', kept[0]['last_error'])
+            self.assertTrue(any(f'pid {old.pid}' in e and 'tried again' in e for e in events), events)
+            self.assertFalse(any('not touched' in e for e in events), events)        # never declared a stranger either
+            self.assertEqual(psutil.Process(old.pid).status(), psutil.STATUS_STOPPED)
+            events = services.tick(self.root)['events']                              # the next pass tries again
+        self.assertTrue(any(f'pid {old.pid} was left suspended' in e and 'resumed' in e for e in events), events)
+        self.assertNotEqual(psutil.Process(old.pid).status(), psutil.STATUS_STOPPED)
+        self.assertEqual(services.read_suspensions(self.root), [])
+
+    def test_n2_an_indeterminate_entry_is_retried_until_the_process_exits(self):
+        os.remove(self.root / 'tools/tripo_pipeline/convert_job.py')
+        old = self.legacy()
+        inst = self.running('convert')[0]
+        services._note_suspension(self.root, 'convert', inst)
+        psutil.Process(old.pid).suspend()
+        with self.denied_process(old.pid, None):
+            first = services.recover_suspensions(self.root)
+            second = services.recover_suspensions(self.root)
+            self.assertEqual(len(first), 1, first)
+            self.assertEqual(second, [])                                             # reported once, retried silently
+            self.assertEqual([(i['pid'], i['retries']) for i in services.read_suspensions(self.root)], [(old.pid, 2)])
+            self.assertEqual(psutil.Process(old.pid).status(), psutil.STATUS_STOPPED)   # never signalled while unverified
+            old.kill()
+            old.wait(10)
+            self.assertEqual(services.recover_suspensions(self.root), [])            # exit is established: the entry goes
+        self.assertEqual(services.read_suspensions(self.root), [])
+        self.assertFalse(services.suspensions_path(self.root).exists())
+
+    def test_n2_a_reused_pid_is_dropped_and_a_failed_resume_is_kept(self):
+        os.remove(self.root / 'tools/tripo_pipeline/convert_job.py')
+        old = self.legacy()
+        inst = self.running('convert')[0]
+        services._note_suspension(self.root, 'convert', {'pid': old.pid, 'create_time': inst['create_time'] - 500})   # another process had it
+        self.assertEqual(services.recover_suspensions(self.root), [])
+        self.assertEqual(services.read_suspensions(self.root), [])
+        services._note_suspension(self.root, 'convert', inst)
+        psutil.Process(old.pid).suspend()
+        with mock.patch.object(psutil.Process, 'resume', side_effect=psutil.AccessDenied(old.pid)):
+            events = services.recover_suspensions(self.root)
+        self.assertTrue(any('could not be resumed' in e for e in events), events)
+        self.assertEqual([i['pid'] for i in services.read_suspensions(self.root)], [old.pid])
+        events = services.tick(self.root)['events']
+        self.assertTrue(any('resumed' in e for e in events), events)
+        self.assertNotEqual(psutil.Process(old.pid).status(), psutil.STATUS_STOPPED)
+        self.assertEqual(services.read_suspensions(self.root), [])
+
 
 class CutoverSupervisorTest(TempRoot):
     """Finding 7 (a failed supervisor stop delivery) and finding 20 (a restart's terminal outcome)."""
@@ -1849,6 +1919,53 @@ class CutoverSupervisorTest(TempRoot):
         done = result['completed']
         self.assertEqual([(d['request'], d['ok'], d['action']) for d in done], [(7, False, 'stop')])
         self.assertIn('not delivered', done[0]['text'])
+        self.assertEqual(services.read_record(self.root, 'supervisor')['stop_delivery']['state'], 'failed')
+        self.wait_for(lambda: self.hold() is None or 'released' in ' '.join(services.tick(self.root)['events']), what='the release')
+        self.assertIsNone(self.hold())
+        self.assertIsNone(old.poll())
+
+    # ---------------------------------------------------------------------------------------- final verification, row 7
+    def test_v7_a_cleanup_interrupted_between_the_two_old_writes_is_replayed_at_manager_start(self):
+        """The reviewer's state: the record says `failed` with nothing pending, the hold still names the healthy supervisor."""
+        old = self.supervisor()
+        failed = subprocess.CompletedProcess([], 1, '', 'boom')
+        with mock.patch.object(services.subprocess, 'run', return_value=failed), \
+                mock.patch.object(services, 'withdraw_retiring', return_value=False), self.assertRaises(services.ServiceError):
+            services.stop(self.root, 'supervisor', wait=0.5)                          # ... and the manager died before the withdrawal
+        rec = services.read_record(self.root, 'supervisor')
+        self.assertEqual((rec['stop_delivery']['state'], rec['stop_requested']), ('failed', None))
+        self.assertEqual([r['pid'] for r in self.hold()['retiring']], [old.pid])
+        self.assertIn('outgoing', services.release_blocker(self.root, self.sup()))    # stuck for ever without the replay
+        events = services.begin_management(self.root)                                 # the manager starts again
+        self.assertTrue(any('withdrawal' in e and f'pid {old.pid}' in e for e in events), events)
+        self.assertNotIn('retiring', self.hold())
+        self.assertIsNone(services.release_blocker(self.root, self.sup()))
+        self.wait_for(lambda: 'conversion hold released' in ' '.join(services.tick(self.root)['events']), what='the healthy supervisor tick')
+        self.assertIsNone(self.hold())
+        self.assertIsNone(old.poll())
+        self.assertEqual(services.begin_management(self.root)[1:], [])                # nothing left to replay
+
+    def test_v7_the_withdrawal_comes_first_so_an_interruption_leaves_a_guarded_pending_stop(self):
+        old = self.supervisor()
+        failed = subprocess.CompletedProcess([], 1, '', 'boom')
+        real = services.write_record
+
+        def crash(root, name, rec):
+            if name == 'supervisor' and (rec.get('stop_delivery') or {}).get('state') == 'failed':
+                raise KeyboardInterrupt('the manager dies between the two writes')
+            return real(root, name, rec)
+        with mock.patch.object(services.subprocess, 'run', return_value=failed), mock.patch.object(services, 'write_record', crash), \
+                self.assertRaises(KeyboardInterrupt):
+            services.stop(self.root, 'supervisor', wait=0.5, request=9)
+        rec = services.read_record(self.root, 'supervisor')
+        self.assertTrue(rec['stop_requested'])                                        # the request record still guards the release ...
+        self.assertEqual(rec['stop_delivery']['state'], 'requested')
+        self.assertNotIn('retiring', self.hold())                                     # ... and the designation is already withdrawn
+        self.assertIn('still pending', services.release_blocker(self.root, self.sup()))
+        services.begin_management(self.root)                                          # manager restart
+        self.assertFalse(any('released' in e for e in services.tick(self.root)['events']))
+        result = services.tick(self.root, now=time.time() + services.STOP_DELIVERY_GRACE + 5)     # the reconcile completes the cleanup
+        self.assertEqual([(d['request'], d['ok']) for d in result['completed']], [(9, False)])
         self.assertEqual(services.read_record(self.root, 'supervisor')['stop_delivery']['state'], 'failed')
         self.wait_for(lambda: self.hold() is None or 'released' in ' '.join(services.tick(self.root)['events']), what='the release')
         self.assertIsNone(self.hold())
@@ -1999,6 +2116,56 @@ class CutoverNamespaceTest(V2Case):
         self.assertEqual((status, body['code']), (409, 'namespace'), body)
         self.assertTrue((self.root / 'concepts/cape').is_dir())
 
+    def test_v2_a_namespace_without_both_maps_is_unreadable_for_registration_and_dispatch(self):
+        """Final verification row 2, first case: a namespace missing `families` authorized an independent cape_human_male."""
+        import convert_queue
+        self.staged(parent='cape_human_male')                                         # an independent set's job
+        convert_list.list_path(self.root).parent.mkdir(parents=True, exist_ok=True)
+        convert_list.list_path(self.root).write_text('cape\ncape_human_male\n', encoding='utf-8')
+        pats = convert_list.patterns(self.root)
+        path = convert_list.namespace_path(self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        job = 'cape_human_male--abcdef123456'
+        for broken in ('{"sets": {"cape": "x"}}', '{"families": {"cape_human_male": "cape"}}', '{"sets": [], "families": {}}',
+                       '{"sets": {"cape": "x"}, "families": null}', '{"sets": {"cape": "x"}, "families": {"cape_human_male": 7}}', '{}'):
+            with self.subTest(namespace=broken):
+                path.write_text(broken, encoding='utf-8')
+                before = self.lines()
+                with self.assertRaises(convert_list.NamespaceUnreadable):
+                    convert_list.add_sets(self.root, ['hood'])                        # registration refused ...
+                self.assertEqual((path.read_text(encoding='utf-8'), self.lines()), (broken, before))     # ... nothing written or replaced
+                self.assertIn('set_namespace.json', convert_list.namespace_conflict(self.root, 'hood'))
+                self.assertIsNone(convert_queue.read_namespace(self.root))
+                for record in ({'parent_set': 'cape_human_male'}, {'parent_set': 'cape'}, {}):
+                    ok, reason = convert_queue.owner_allows(self.root, job, record, pats)
+                    self.assertFalse(ok, (record, reason))                            # ... and no family job is dispatched
+                    self.assertIn('unreadable', reason)
+                self.assertEqual(convert_list.eligible_jobs(self.root), [])
+                self.assertEqual([(h['job'], h['reason']) for h in convert_list.held_jobs(self.root)], [(job, 'owner')])
+
+    def test_v2_a_parentless_family_job_never_passes_an_unreadable_namespace(self):
+        """Final verification row 2, second case: invalid JSON, a parentless family job passed despite `!cape`."""
+        import convert_queue
+        self.staged()                                                                 # cape_human_male--..., no parent_set
+        convert_list.list_path(self.root).parent.mkdir(parents=True, exist_ok=True)
+        convert_list.list_path(self.root).write_text('cape\ncape_human_male\n!cape\n', encoding='utf-8')
+        convert_list.namespace_path(self.root).parent.mkdir(parents=True, exist_ok=True)
+        convert_list.namespace_path(self.root).write_text(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
+        pats = convert_list.patterns(self.root)
+        job = 'cape_human_male--abcdef123456'
+        self.assertFalse(convert_queue.owner_allows(self.root, job, {}, pats)[0])     # readable: its owner cape is excluded
+        convert_list.namespace_path(self.root).write_text('{"sets": {"cape": ', encoding='utf-8')
+        ok, reason = convert_queue.owner_allows(self.root, job, {}, pats)
+        self.assertFalse(ok)
+        self.assertIn('unreadable', reason)
+        self.assertEqual(convert_list.eligible_jobs(self.root), [])
+        with mock.patch.object(convert_queue, 'ROOT', self.root), mock.patch.object(convert_queue, 'LOCKS', self.root / '.codex_jobs/_batch/convert_locks'), \
+                mock.patch.object(convert_queue, 'EVENTS', self.root / '.codex_jobs/_batch/convert_events.log'), \
+                mock.patch.object(convert_queue, '_OWNER_REPORTED', set()), mock.patch('builtins.print'):
+            self.assertEqual(convert_queue.next_job(set(pats)), (None, False))        # the worker's own loop leaves it alone
+        self.assertIn(f'OWNER {job}: not converted: set_namespace.json is unreadable',
+                      (self.root / '.codex_jobs/_batch/convert_events.log').read_text(encoding='utf-8'))
+
     def test_f2_the_recorded_owner_is_verified_at_dispatch(self):
         """A convert list that already carries the family id (written before this fix, or by hand) authorizes only the owner's job."""
         import convert_queue
@@ -2033,6 +2200,95 @@ class CutoverNamespaceTest(V2Case):
             convert_list.namespace_path(self.root).write_text(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
             self.assertEqual(convert_queue.next_job(set(pats)), (None, False))
         self.assertIn(f'OWNER {job}: not converted', (self.root / '.codex_jobs/_batch/convert_events.log').read_text(encoding='utf-8'))
+
+
+class CutoverCheckerTest(TempRoot):
+    """Final verification, new finding 3: CUTOVER.md's rollback check sees EVERY convert worker (any `--worker N`), each by its code age.
+    The script is extracted from the document exactly as the runbook writes it and run on a temp root."""
+
+    def setUp(self):
+        super().setUp()
+        text = (HERE / 'CUTOVER.md').read_text(encoding='utf-8')
+        start = text.index("[IO.File]::WriteAllText($check, @'\n") + len("[IO.File]::WriteAllText($check, @'\n")
+        self.script = self.root / '_checker' / 'imageto3d_cutover_check.py'
+        self.script.parent.mkdir()
+        self.script.write_text(text[start:text.index("\n'@)", start)] + '\n', encoding='utf-8')
+        for source in list(HERE.glob('*.py')) + [TOOLS / 'tripo_pipeline' / 'claim_lock.py']:   # the checker imports <root>/tools/preview/v2/services.py
+            if source.name.startswith('test_'):
+                continue
+            target = self.root / 'tools' / source.relative_to(TOOLS)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+
+    def check(self, what):
+        run = subprocess.run([sys.executable, '-X', 'utf8', str(self.script), str(self.root), what], capture_output=True, text=True,
+                             encoding='utf-8', errors='replace', timeout=120)
+        return run.returncode, run.stdout + run.stderr
+
+    def assert_safe(self):
+        """`rollback` answers SAFE (the fake supervisor rewrites its tick file every 50 ms: a read that collides with the replace is tried again)."""
+        for _ in range(4):
+            code, out = self.check('rollback')
+            if code == 0:
+                break
+        self.assertEqual((code, out.startswith('SAFE')), (0, True), out)
+
+    def left_hold(self):
+        """A hold a stopped v2 server left behind, and one healthy supervisor that ticked after it."""
+        self.spawn('supervisor')
+        hold = services.write_hold(self.root, 'preview app manager start')
+        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
+        dead.wait(30)
+        hold.update(owner_pid=dead.pid, owner_create_time=1.0)                        # its owner is gone
+        services.hold_path(self.root).write_text(json.dumps(hold), encoding='utf-8')
+        sup = self.running('supervisor')[0]
+        self.wait_for(lambda: services.supervisor_ticked(self.root, sup, hold['since_unix']), what='a tick after the hold')
+
+    def worker(self, number):
+        proc = subprocess.Popen([sys.executable, 'tools/convert_queue.py', '--sets-file', 'x.txt', '--worker', str(number)], cwd=str(self.root),
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.popens.append(proc)
+        self.wait_for(lambda: (self.root / '.codex_jobs/_app/fake_convert_queue.args').exists(), what='the worker to start')
+        return proc
+
+    def code_written(self, when):
+        os.utime(self.root / 'tools/convert_queue.py', (when, when))
+
+    def test_n3_a_live_legacy_worker_of_any_number_refuses_the_rollback(self):
+        self.left_hold()
+        self.assert_safe()              # the baseline: nothing outstanding
+        two = self.worker(2)                                                          # the reviewer's fake live legacy worker 2
+        self.assertEqual(self.running('convert'), [])                                 # the manager's own scan never sees worker 2
+        self.code_written(time.time() + 60)                                           # convert_queue.py was updated after it started
+        code, out = self.check('rollback')
+        self.assertEqual(code, 1, out)
+        self.assertTrue(out.startswith('REFUSED'), out)
+        self.assertIn(f'a convert worker of older code still runs [{two.pid}]', out)
+        self.assertTrue(services.hold_path(self.root).exists())                       # read-only
+        code, out = self.check('drained')
+        self.assertEqual(code, 1, out)
+        self.assertIn(f'convert_queue.py: [{two.pid}]', out)                          # the same enumeration as the drain check
+        self.code_written(psutil.Process(two.pid).create_time() - 600)                # the very worker, now on current code: age is per worker
+        self.assert_safe()
+
+    def test_n3_every_worker_is_tested_not_only_the_first(self):
+        self.left_hold()
+        one, seven = self.worker(1), self.worker(7)
+        self.wait_for(lambda: self.running('convert'), what='worker 1')
+        self.code_written(time.time() + 60)
+        code, out = self.check('rollback')
+        self.assertEqual(code, 1, out)
+        line = next(l for l in out.splitlines() if 'older code' in l)
+        self.assertIn(str(one.pid), line)
+        self.assertIn(str(seven.pid), line)
+        one.kill()
+        one.wait(10)
+        code, out = self.check('rollback')                                            # worker 1 gone: worker 7 alone still refuses
+        self.assertEqual(code, 1, out)
+        self.assertIn(f'still runs [{seven.pid}]', out)
+        seven.kill()
+        seven.wait(10)
+        self.assert_safe()
 
 
 if __name__ == '__main__':

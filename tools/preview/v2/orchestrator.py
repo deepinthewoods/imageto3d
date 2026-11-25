@@ -1086,7 +1086,8 @@ class Orchestrator:
 
     def _spawn(self, task: dict) -> bool:
         """Commit the attempt (queued -> starting, token, attempt paths), write its task file and start the detached wrapper. A start that fails
-        fails the attempt (no retry). False when the row was no longer queued."""
+        fails the attempt (no retry; a monster conversion's failure is persisted as its disposition first). False when the row was no
+        longer queued."""
         attempt = task['attempts'] + 1
         while attempt_paths(self.logs, task['id'], attempt)['spec'].exists():     # (a manual retry resets the count: files stay unique)
             attempt += 1
@@ -1109,7 +1110,13 @@ class Orchestrator:
             proc = subprocess.Popen([sys.executable, str(RUN_TASK), str(paths['spec']), '--token', token], stdin=subprocess.DEVNULL,
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, close_fds=True, cwd=str(REPO), **kwargs)
         except Exception as exc:  # noqa: BLE001
-            self.queue.finish(task['id'], token, False, None, f'could not start: {type(exc).__name__}: {exc}')
+            error = f'could not start: {type(exc).__name__}: {exc}'
+            # a monster generation that could not be started is FAILED durably (views.json) before its row finishes, like any other
+            # failure of the lane (final-verify row 3): a rebuilt queue restores it as failed and never queues it again. When that
+            # record cannot be written the row stays `starting` (slot held) and the next pass settles it (`_lost`).
+            if task['lane'] == monster_lane.LANE and not self._monster_disposition(task | {'token': token}, error):
+                return False
+            self.queue.finish(task['id'], token, False, None, error)
             return False
         self._procs = [p for p in self._procs if p.poll() is None] + [proc]
         self._fault('spawned', task)

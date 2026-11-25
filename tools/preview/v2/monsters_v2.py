@@ -282,16 +282,21 @@ def monster_lock(root: Path, monster: str) -> guard.OsLock:
 
 
 def murl(mroot: Path, path: Path, mtime: float | None = None) -> str | None:
-    """`/mfiles/` URL of a regular file under the monster root (the route monsters.resolve_file serves), else None."""
+    """`/mfiles/` URL of a regular file under the monster root (the route monsters.resolve_file serves), else None. The version is
+    the file's modification time in NANOSECONDS plus its size (final-verify row 10: whole seconds let a replaced file keep its URL); with
+    `mtime` (seconds, from a cached folder scan: no extra stat) it is that time in microseconds."""
     try:
         rel = Path(path).relative_to(mroot).as_posix()
         if mtime is None:
             if not Path(path).is_file():
                 return None
-            mtime = Path(path).stat().st_mtime
+            st = Path(path).stat()
+            version = f'{st.st_mtime_ns}-{st.st_size}'
+        else:
+            version = str(int(mtime * 1_000_000))
     except (OSError, ValueError):
         return None
-    return monsters.FILE_PREFIX + quote(rel, safe='/') + f'?v={int(mtime)}'
+    return monsters.FILE_PREFIX + quote(rel, safe='/') + f'?v={version}'
 
 
 def _dirs(path: Path) -> list[str]:
@@ -1007,14 +1012,24 @@ def write_reduce_ok(mdir: Path, frozen: dict) -> dict:
 
 
 def file_sha256(path: Path) -> str | None:
-    """sha256 of a file, cached by size + mtime (the LOD digests of the 3D modal)."""
+    """sha256 of a file, cached by size + mtime: a HINT only (a file replaced by other bytes of the same size with its timestamp put
+    back keeps the cached digest). Nothing is certified with it: see fresh_sha256."""
     value, found = _cached(_SHA_CACHE, path, sha256_file)
     return value if found else None
 
 
+def fresh_sha256(path: Path) -> str | None:
+    """sha256 of the file's bytes as they are NOW (read and hashed on every call; None when it cannot be read). What an approval, the
+    Completed tab and the digest the 3D modal compares its loaded bytes with are certified by (final-verify row 10)."""
+    try:
+        return sha256_file(Path(path))
+    except OSError:
+        return None
+
+
 def reduce_status(mdir: Path, generation: str | None = None, deep: bool = False) -> dict:
     """{ok, legacy, problem} of a variant's reduction (F12). With the lane's record: valid when its generation is `generation` (when given)
-    and every listed file still has its size (and, `deep`, its sha256). Without a record: a variant the lane converts (`generation` given)
+    and every listed file still has its size (and, `deep`, its sha256, hashed from the bytes on disk now: fresh_sha256). Without a record: a variant the lane converts (`generation` given)
     is NOT verified; a legacy result (generation None) is accepted by the explicit compatibility rule manifest + 5 LOD GLBs + materials.json
     and flagged `legacy`."""
     red = Path(mdir) / 'reduced'
@@ -1033,7 +1048,7 @@ def reduce_status(mdir: Path, generation: str | None = None, deep: bool = False)
                 size = path.stat().st_size
             except OSError:
                 return {'ok': False, 'legacy': False, 'problem': f'reduced/{name} is missing'}
-            if not isinstance(meta, dict) or meta.get('size') != size or (deep and file_sha256(path) != meta.get('sha256')):
+            if not isinstance(meta, dict) or meta.get('size') != size or (deep and fresh_sha256(path) != meta.get('sha256')):
                 return {'ok': False, 'legacy': False, 'problem': f'reduced/{name} changed after the reduction was verified'}
         return {'ok': True, 'legacy': False, 'problem': None, 'generation': rec.get('generation')}
     if generation is not None:
@@ -1339,7 +1354,59 @@ def read_journal(root: Path, monster: str) -> dict | None:
         return None
     if j.get('op') not in ('pick', 'import') or canon(str(j.get('monster'))) != canon(monster):
         raise guard.Unreadable(f'{path.name}: not a publication journal of {monster}; check {monster} by hand before removing it')
+    problem = journal_record_problem(j, monster)
+    if problem:
+        raise guard.Unreadable(f'{path.name}: not a complete {j["op"]} journal ({problem}); nothing was changed: check {monster} by hand '
+                               'before removing it')
     return j
+
+
+def journal_record_problem(j: dict, monster: str) -> str | None:
+    """None when `j` is the COMPLETE record of its operation, as pick / import_pick write it (final-verify row 11). Recovery replaces
+    variant_names.json entries, renames folders and rewrites concept states from these fields, so every one of them is checked BEFORE
+    either file is touched; a parseable journal with a missing or malformed field is as unusable as a torn one.
+      both:   variant (a valid variant name), tmp (`.v2_pick_<variant>_<8 hex>`, a plain name), names_entry (a non-empty object: the
+              record recovery publishes), names_prev (present: null or the object it restores);
+      pick:   folder, key (`codex<N>`), origin (a stage a pick starts from), state_entry (an object: stage approved, this variant),
+              names_entry.was = key, names_prev null;
+      import: names_entry.imported (the import stamp)."""
+    op = j.get('op')
+    if op not in ('pick', 'import'):
+        return f'unknown operation {op!r}'
+    if not isinstance(j.get('monster'), str) or canon(j['monster']) != canon(monster):
+        return f'it does not name {monster}'
+    try:
+        variant = check_variant(j.get('variant'))
+    except ValueError:
+        return f'invalid variant {j.get("variant")!r}'
+    tmp = j.get('tmp')
+    if not isinstance(tmp, str) or not re.fullmatch(re.escape(f'.v2_pick_{variant}_') + r'[0-9a-f]{8}', tmp):
+        return f'invalid tmp {tmp!r}'
+    entry = j.get('names_entry')
+    if not isinstance(entry, dict) or not entry:
+        return 'names_entry (the variant_names.json record to publish) is missing'
+    if 'names_prev' not in j or not (j['names_prev'] is None or isinstance(j['names_prev'], dict)):
+        return 'names_prev (the variant_names.json record to restore: null or an object) is missing'
+    if op == 'pick':
+        try:
+            safe_part(j.get('folder'), 'concept folder')
+        except ValueError:
+            return f'invalid folder {j.get("folder")!r}'
+        key = j.get('key')
+        if not isinstance(key, str) or not KEY.fullmatch(key):
+            return f'invalid key {key!r}'
+        if j.get('origin') not in CONCEPT_VERBS['approve']:
+            return f'invalid origin {j.get("origin")!r}'
+        state_entry = j.get('state_entry')
+        if not isinstance(state_entry, dict) or state_entry.get('stage') != 'approved' or state_entry.get('variant') != variant:
+            return 'state_entry (the concept state to publish: stage approved, this variant) is missing'
+        if entry.get('was') != key:
+            return 'names_entry is not the record of this concept'
+        if j['names_prev'] is not None:
+            return 'a pick has no earlier names entry to restore'
+    elif not isinstance(entry.get('imported'), str) or not entry['imported']:
+        return 'names_entry is not an import record (no `imported` stamp)'
+    return None
 
 
 def journal_problem(root: Path, monster: str) -> str | None:
@@ -1349,6 +1416,21 @@ def journal_problem(root: Path, monster: str) -> str | None:
     except guard.Unreadable as exc:
         return str(exc)
     return None
+
+
+def journal_blocks(root: Path, monster: str, variant: str, problem: str | None = None) -> str | None:
+    """Why the monster's publication journal makes `variant` READ-ONLY (final-verify row 11), else None: the journal cannot be used
+    (unreadable, or not the complete record of its operation) and it names this variant, or does not say which variant it is about.
+    Such a journal is never completed, rolled back or removed by v2; the variant is a damaged card until it is repaired by hand.
+    `problem` = journal_problem(root, monster) when the caller has it."""
+    problem = journal_problem(root, monster) if problem is None else problem
+    if not problem:
+        return None
+    raw = read_json(journal_path(root, monster), None)
+    named = raw.get('variant') if isinstance(raw, dict) else None
+    if isinstance(named, str) and VARIANT.fullmatch(named) and named != variant:
+        return None
+    return problem
 
 
 def _write_journal(root: Path, monster: str, data: dict) -> None:
@@ -1858,6 +1940,9 @@ def _variant_paths(root: Path, item_id: str) -> tuple[Path, str, str, Path, Path
     vdir, mdir = views_dir(mroot, monster, variant), models_dir(mroot, monster, variant)
     contained(mroot, vdir, mdir)
     damage_check(mroot, mdir)
+    blocked = journal_blocks(root, monster, variant)             # an unusable publication journal about this variant (row 11)
+    if blocked:
+        raise guard.Unreadable(blocked)
     return mroot, monster, variant, vdir, mdir
 
 
@@ -2309,13 +2394,17 @@ def disposition_seq(vj: dict | None) -> int:
     return max([e['seq'] for e in entries if isinstance(e, dict) and isinstance(e.get('seq'), int)] or [0])
 
 
-def set_disposition(root: Path, monster: str, variant: str, generation: str, value: dict | None, expect_seq: int | None = None) -> dict:
+def set_disposition(root: Path, monster: str, variant: str, generation: str, value: dict | None, expect_seq: int | None = None,
+                    only_absent: bool = False) -> dict:
     """Write (value) or clear (None) the disposition of a frozen generation under the monster lock, as ONE read-compare-write (finding 3).
     Every change bumps the variant's monotonic counter `conversion_seq`, and an entry carries the `seq` it was written with.
       - writing the state the generation already has changes nothing (an identical terminal transition is idempotent);
       - `expect_seq`: the change is made only while the counter still has that value, so undoing one's own write can never put an older
-        disposition over a newer one (`stale: true` otherwise).
-    Returns {previous, seq (the counter now), written, same?, stale?, missing? (the variant has no views.json: nothing to record)}."""
+        disposition over a newer one (`stale: true` otherwise);
+      - `only_absent` (a write): made only while the generation has NO disposition; one of another state stays (`conflict: true`,
+        `previous` = it). This is the Cancel's compare-and-set (final-verify row 3): a stale Cancel never replaces a recorded failure.
+    Returns {previous, seq (the counter now), written, same?, stale?, conflict?, missing? (the variant has no views.json: nothing to
+    record)}."""
     mroot = mroot_of(root)
     monster, variant = safe_part(monster, 'monster'), check_variant(variant)
     if not isinstance(generation, str) or not GENERATION.fullmatch(generation):
@@ -2340,6 +2429,8 @@ def set_disposition(root: Path, monster: str, variant: str, generation: str, val
         else:
             if isinstance(previous, dict) and previous.get('state') == value['state']:
                 return {'previous': previous, 'seq': seq, 'written': False, 'same': True}
+            if only_absent and previous is not None:
+                return {'previous': previous, 'seq': seq, 'written': False, 'conflict': True}
             conv[generation] = {k: v for k, v in value.items() if k not in ('seq', 'time')} | {'time': now(), 'seq': seq + 1}
         seq += 1
         vj['conversion'], vj['conversion_seq'] = conv, seq
@@ -2663,7 +2754,8 @@ def importable_raws(mroot: Path) -> list[dict]:
 def approval_problem(mdir: Path, choice: dict, generation: str | None, legacy: bool) -> str | None:
     """None when an approval (chosen_lod.json `approved: true`) still certifies what is on disk (finding 10): the file of its level has the
     sha256 the user approved and the approval was made for the current choice of views. An approval without a digest is accepted only for a
-    legacy reduction (approved before v2 recorded digests)."""
+    legacy reduction (approved before v2 recorded digests). The file is HASHED on every call (fresh_sha256), never taken from the
+    size + mtime cache: other bytes of the same size with the timestamp restored are not the approved model (final-verify row 10)."""
     lod = choice.get('lod')
     if lod not in LOD_LEVELS:
         return 'the approval names no level'
@@ -2672,7 +2764,7 @@ def approval_problem(mdir: Path, choice: dict, generation: str | None, legacy: b
         return None if legacy else 'the approval carries no model digest; unapprove and approve the model you see'
     if 'generation' in choice and choice.get('generation') != generation:
         return 'the approval was made for another choice of views'
-    actual = file_sha256(Path(mdir) / 'reduced' / f'lod_error_{lod}.glb')
+    actual = fresh_sha256(Path(mdir) / 'reduced' / f'lod_error_{lod}.glb')
     if actual != digest:
         return f'reduced/lod_error_{lod}.glb is not the model that was approved (it changed after the approval)'
     return None
@@ -2716,7 +2808,19 @@ def variant_raws(root: Path) -> list[dict]:
                             'lods': {}, 'image': murl(mroot, views_dir(mroot, monster, variant) / 'front.png'),
                             'stage_hint': '3d' if (folder / 'models' / variant / 'reduced').is_dir() else 'approved',
                             'damaged': f'{type(exc).__name__}: {exc}'})
-    return out + importable_raws(mroot)
+    out += importable_raws(mroot)
+    # a publication journal that cannot be used (final-verify row 11) makes the variant it is about a read-only damaged card
+    problems: dict[str, str | None] = {}
+    for n, raw in enumerate(out):
+        monster, variant = raw.get('monster'), raw.get('variant')
+        if raw.get('damaged') or not isinstance(monster, str) or not isinstance(variant, str):
+            continue
+        if monster not in problems:
+            problems[monster] = journal_problem(root, monster)
+        blocked = journal_blocks(root, monster, variant, problems[monster]) if problems[monster] else None
+        if blocked:
+            out[n] = raw | {'damaged': f'Unreadable: {blocked}', 'stage_hint': monster_stage(raw)}
+    return out
 
 
 def variant_cards(root: Path) -> dict[str, list[dict]]:
@@ -2816,7 +2920,8 @@ def _variant_item(root: Path, mroot: Path, monster: str, variant: str, raw: dict
     rec = read_variant_names(mroot, monster)['variants'].get(variant)
     phase = 'manual' if raw.get('manual') else 'import' if importing else views_phase(root, mroot, monster, variant, vj, states)
     lib = library_info(mroot, monster)
-    lods = {lv: dict(info) | {'sha256': file_sha256(mdir / 'reduced' / f'lod_error_{lv}.glb')}
+    # the digest the 3D modal compares the bytes it LOADED with (monster3d.js): hashed from the file now, not from the cache (row 10)
+    lods = {lv: dict(info) | {'sha256': fresh_sha256(mdir / 'reduced' / f'lod_error_{lv}.glb')}
             for lv, info in (raw.get('lods') or {}).items()}
     generation = frozen_digest((vj or {}).get('frozen'))
     reduce = reduce_status(mdir, generation) if raw.get('lods') else None

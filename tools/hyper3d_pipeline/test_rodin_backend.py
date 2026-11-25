@@ -1109,6 +1109,96 @@ class RecheckTests(unittest.TestCase):
         (upload / 'back.png').unlink()
         self.assertEqual(len(rb.verify_upload_inputs(self.out)), 2)
 
+    # -- final-verify row 14: the writer checks every final destination and never writes through an existing entry
+    def victim(self):
+        """A read-only file OUTSIDE the output dir that a linked destination would redirect the overwrite to."""
+        outside = self.root / 'outside'
+        outside.mkdir(exist_ok=True)
+        path = outside / 'victim.png'
+        path.write_bytes(b'not a view: must survive')
+        os.chmod(path, 0o444)
+        self.addCleanup(lambda: os.chmod(path, 0o666) if path.exists() else None)
+        return path
+
+    def assert_refused(self, victim, pattern):
+        session = FakeSession(self.out)
+        with self.assertRaisesRegex(rb.Stop, pattern):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertEqual(victim.read_bytes(), b'not a view: must survive')
+        self.assertFalse(os.access(victim, os.W_OK))                            # its read-only bit was not cleared either
+        self.assertFalse((self.out / rb.RECORD).exists())
+        self.assertFalse(session.calls)                                         # nothing was opened or uploaded
+
+    def test_a_hard_linked_destination_is_refused_and_the_outside_file_is_untouched(self):
+        victim = self.victim()
+        upload = self.out / rb.UPLOAD_DIR
+        upload.mkdir(parents=True)
+        os.link(victim, upload / 'front.png')                                   # the same file under the destination name
+        self.assert_refused(victim, 'hard-linked to another file')
+        self.assertEqual(sorted(p.name for p in upload.iterdir()), ['front.png'])   # no view was written, no temp file left
+
+    def test_a_symlinked_destination_is_refused_and_not_followed(self):
+        victim = self.victim()
+        upload = self.out / rb.UPLOAD_DIR
+        upload.mkdir(parents=True)
+        try:
+            os.symlink(victim, upload / 'back.png')
+        except (OSError, NotImplementedError) as error:
+            self.skipTest(f'cannot create a symlink here ({error})')
+        self.assert_refused(victim, 'is a link, junction or not a regular file')
+        self.assertTrue(os.path.islink(upload / 'back.png'))
+
+    def test_an_upload_folder_that_is_a_link_or_junction_is_refused(self):
+        victim = self.victim()
+        self.out.mkdir(parents=True)
+        link = self.out / rb.UPLOAD_DIR
+        if os.name == 'nt':
+            import _winapi
+            _winapi.CreateJunction(str(victim.parent), str(link))
+        else:
+            os.symlink(victim.parent, link, target_is_directory=True)
+        self.addCleanup(lambda: os.rmdir(link) if os.name == 'nt' else os.unlink(link))
+        self.assert_refused(victim, 'not a plain folder of the output')
+        self.assertEqual([p.name for p in victim.parent.iterdir()], ['victim.png'])   # nothing was written through the junction
+
+    def test_a_destination_that_is_a_folder_or_not_a_bare_name_is_refused(self):
+        upload = self.out / rb.UPLOAD_DIR
+        (upload / 'front.png').mkdir(parents=True)
+        with self.assertRaisesRegex(rb.Stop, 'not a regular file'):
+            rb.snapshot_inputs({'views_dir': self.views, 'images': ['front.png'], 'uploaded': ['front.png']}, self.out)
+        for name in ('../escaped.png', 'sub/front.png', '..', ''):
+            with self.assertRaisesRegex(rb.Stop, 'not a plain file name'):
+                rb.snapshot_inputs({'views_dir': self.views, 'images': [name], 'uploaded': [name]}, self.out)
+        self.assertFalse((self.out / 'escaped.png').exists())
+
+    def test_an_own_read_only_snapshot_is_replaced_by_a_new_file_not_written_in_place(self):
+        upload = self.out / rb.UPLOAD_DIR
+        upload.mkdir(parents=True)
+        old = upload / 'front.png'
+        old.write_bytes(b'an earlier snapshot')
+        os.chmod(old, 0o444)
+        keep = self.root / 'kept_handle.png'
+        before = os.stat(old)
+        plan = {'views_dir': self.views, 'images': list(CONFIG['view_order']), 'uploaded': list(CONFIG['view_order'])}
+        target, inputs = rb.snapshot_inputs(plan, self.out)
+        self.assertEqual(target, upload)
+        after = os.stat(old)
+        self.assertNotEqual((before.st_ino, before.st_size), (after.st_ino, after.st_size))   # a new file took the name
+        self.assertEqual(old.read_bytes(), (self.views / 'front.png').read_bytes())
+        self.assertEqual([i['name'] for i in inputs], list(CONFIG['view_order']))
+        for item in inputs:
+            self.assertEqual(item['sha256'], rb.sha256_file(self.views / item['name']))
+            self.assertEqual(item['size'], (self.views / item['name']).stat().st_size)
+            self.assertFalse(os.access(upload / item['name'], os.W_OK))
+        self.assertEqual(sorted(p.name for p in upload.iterdir()), sorted(CONFIG['view_order']))   # no temp file left
+        self.assertFalse(keep.exists())
+        # a stale marker of the snapshot's own is removed although it is read-only
+        marker = upload / 'views_omitted.json'
+        marker.write_text('{}')
+        os.chmod(marker, 0o444)
+        rb.snapshot_inputs(plan, self.out)
+        self.assertFalse(marker.exists())
+
     def test_a_copy_changed_before_the_upload_stops_the_submit_before_anything_is_sent(self):
         tamper = self.tamper
 
@@ -1197,6 +1287,9 @@ class DispatchTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         root = Path(temp.name)
+        profile = mock.patch.dict(os.environ, {'XDG_DATA_HOME': str(root / 'xdg')})   # a temp Tripo profile reservation: the
+        profile.start()                                                              # tripo run never opens the real profile's locks
+        self.addCleanup(profile.stop)
         job = root / 'processing' / 's--j'
         make_views(job / 'human_male' / 'outfit')
         (job / '.tripo-job.json').write_text(json.dumps(

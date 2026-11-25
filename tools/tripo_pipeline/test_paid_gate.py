@@ -477,7 +477,7 @@ class BrowserLifetimeTests(unittest.TestCase):
 
     def test_a_registered_node_that_outlived_its_holder_keeps_the_profile_busy_until_it_exits(self):
         node = self.sleeper()
-        self.assertEqual(tbl.register_browser(self.profile, node.pid), self.pid_file)
+        self.assertEqual(tbl._record_browser(self.profile, node.pid), self.pid_file)
         data = json.loads(self.pid_file.read_text())
         self.assertEqual(data['pid'], node.pid)
         self.assertIsInstance(data['create_time'], float)
@@ -495,14 +495,14 @@ class BrowserLifetimeTests(unittest.TestCase):
 
     def test_the_waiter_gets_the_profile_as_soon_as_the_orphan_exits(self):
         node = self.sleeper()
-        tbl.register_browser(self.profile, node.pid)
+        tbl._record_browser(self.profile, node.pid)
         threading.Timer(0.5, lambda: self.stop(node)).start()
         with mock.patch.object(tbl, 'POLL_S', 0.1):
             self.assertTrue(self.acquire(wait=30))
 
     def test_a_reused_pid_is_not_mistaken_for_the_registered_process(self):
         other = self.sleeper()
-        tbl.register_browser(self.profile, other.pid)
+        tbl._record_browser(self.profile, other.pid)
         data = json.loads(self.pid_file.read_text())
         data['create_time'] -= 3600                                  # the registered process started an hour before this one
         self.pid_file.write_text(json.dumps(data))
@@ -511,7 +511,7 @@ class BrowserLifetimeTests(unittest.TestCase):
 
     def test_a_firefox_left_on_the_profile_by_a_dead_node_keeps_it_busy(self):
         node = self.sleeper()
-        tbl.register_browser(self.profile, node.pid)
+        tbl._record_browser(self.profile, node.pid)
         self.stop(node)                                              # node is gone, its browser is not
         with mock.patch.object(tbl, 'BROWSER_NAMES', ('python',)):   # the stand-in "browser" is a python process
             browser = self.sleeper('-no-remote', '-profile', str(self.profile))
@@ -534,7 +534,7 @@ class BrowserLifetimeTests(unittest.TestCase):
 
     def test_a_pid_file_that_cannot_be_checked_fails_closed(self):
         node = self.sleeper()
-        tbl.register_browser(self.profile, node.pid)
+        tbl._record_browser(self.profile, node.pid)
         with mock.patch.object(tbl, '_create_time', return_value='unknown'):
             self.assertIn('cannot check it', tbl.profile_users(self.profile)[0])
         self.stop(node)
@@ -547,14 +547,14 @@ class BrowserLifetimeTests(unittest.TestCase):
 
     def test_unregister_only_removes_the_callers_own_registration(self):
         node = self.sleeper()
-        tbl.register_browser(self.profile, node.pid)
+        tbl._record_browser(self.profile, node.pid)
         self.assertFalse(tbl.unregister_browser(self.profile, node.pid + 1))
         self.assertTrue(self.pid_file.exists())
         self.assertTrue(tbl.unregister_browser(self.profile, node.pid))
         self.assertFalse(tbl.unregister_browser(self.profile, node.pid))
         with self.assertRaises(ValueError):
             dead = subprocess.run([sys.executable, '-c', 'import os; print(os.getpid())'], capture_output=True, text=True)
-            tbl.register_browser(self.profile, int(dead.stdout))
+            tbl._record_browser(self.profile, int(dead.stdout))
 
     def test_verify_registers_only_a_valid_reservation(self):
         node = self.sleeper()
@@ -608,6 +608,91 @@ class BrowserLifetimeTests(unittest.TestCase):
         again = subprocess.run([sys.executable, str(LOCK_TOOL), 'run', '--profile', str(self.profile), '--wait', '5', '--',
                                 sys.executable, '-c', 'print("ran")'], capture_output=True, text=True, timeout=60)
         self.assertEqual((again.returncode, again.stdout.strip()), (0, 'ran'), again.stderr)
+
+    def test_registration_is_one_handshake_with_acquisition_the_reviewers_sequence(self):
+        """Final-verify row 18: the old verifier passed, its holder exited, a replacement acquired the profile; the old verifier
+        must not register any more (python API and the command studio.mjs runs)."""
+        node = self.sleeper()
+        old = tbl.profile_reservation(self.profile, what='old holder')
+        env = old.__enter__()
+        lock, token = env[tbl.PROFILE_LOCK_ENV], env[tbl.PROFILE_TOKEN_ENV]
+        self.assertIsNone(tbl.verify(self.profile, lock, token))            # the old verifier passed
+        old.__exit__(None, None, None)                                      # its holder exited
+        with tbl.profile_reservation(self.profile, what='replacement', wait=0) as fresh:   # a replacement acquired the profile
+            self.assertNotEqual(fresh[tbl.PROFILE_TOKEN_ENV], token)
+            with self.assertRaisesRegex(tbl.ReservationRefused, 'another token'):
+                tbl.register_browser(self.profile, node.pid, lock, token)
+            run = subprocess.run([sys.executable, str(LOCK_TOOL), 'verify', '--profile', str(self.profile), '--lock', lock,
+                                  '--token', token, '--register-pid', str(node.pid)], capture_output=True, text=True, timeout=60)
+            self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+            self.assertIn('another token', run.stdout)
+            self.assertFalse(self.pid_file.exists())                        # nothing was published
+            # the replacement's own child registers through the reservation that is live now
+            self.assertEqual(tbl.register_browser(self.profile, node.pid, fresh[tbl.PROFILE_LOCK_ENV], fresh[tbl.PROFILE_TOKEN_ENV]),
+                             self.pid_file)
+        with self.assertRaisesRegex(tbl.ReservationRefused, 'another token|not held'):   # ended: its token is void too
+            tbl.register_browser(self.profile, node.pid, fresh[tbl.PROFILE_LOCK_ENV], fresh[tbl.PROFILE_TOKEN_ENV])
+
+    def test_a_killed_holders_token_is_void_once_a_replacement_holds_the_lock(self):
+        """A holder that is KILLED never clears its token. The replacement voids it the moment it takes the byte lock, even while
+        it still waits for an orphan to leave the profile, so the dead holder's child cannot register behind it."""
+        child_code = ('import os, time\nprint(os.environ["%s"], os.environ["%s"], flush=True)\ntime.sleep(120)\n'
+                      % (tbl.PROFILE_LOCK_ENV, tbl.PROFILE_TOKEN_ENV))
+        holder = subprocess.Popen([sys.executable, str(LOCK_TOOL), 'run', '--profile', str(self.profile), '--', sys.executable, '-c',
+                                   child_code], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.kill(), holder.wait(), holder.stdout.close()))
+        lock, token = holder.stdout.readline().split()[:2]
+        self.assertIsNone(tbl.verify(self.profile, lock, token))            # valid while the holder lives
+        orphan, late = self.sleeper(), self.sleeper()
+        tbl._record_browser(self.profile, orphan.pid)                       # something still on the profile
+        holder.kill()
+        holder.wait()
+        self.assertIn(f'token {token} ', self.profile_lock_text())          # killed: the token is still in the file
+        entered, done = threading.Event(), threading.Event()
+
+        def replacement():
+            with mock.patch.object(tbl, 'POLL_S', 0.05):
+                with tbl.profile_reservation(self.profile, what='replacement', wait=30, announce=lambda text: entered.set()):
+                    done.wait(20)
+
+        thread = threading.Thread(target=replacement, daemon=True)
+        thread.start()
+        self.assertTrue(entered.wait(20))                                   # it holds the byte lock and waits for the orphan
+        with self.assertRaisesRegex(tbl.ReservationRefused, 'another token'):
+            tbl.register_browser(self.profile, late.pid, lock, token)       # the dead holder's child: refused already
+        self.assertEqual(json.loads(self.pid_file.read_text())['pid'], orphan.pid)
+        self.stop(orphan)
+        deadline = time.monotonic() + 20
+        while ' replacement' not in self.profile_lock_text() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertIn(' replacement', self.profile_lock_text())             # the replacement finished acquiring
+        with self.assertRaises(tbl.ReservationRefused):
+            tbl.register_browser(self.profile, late.pid, lock, token)
+        self.assertFalse(self.pid_file.exists())
+        done.set()
+        thread.join(20)
+
+    def profile_lock_text(self):
+        return tbl.profile_lock_path(self.profile).read_text(encoding='utf-8', errors='replace')
+
+    def test_acquisition_and_registration_exclude_each_other(self):
+        """While a handshake is under way (here: held by the test) nobody acquires, registers or gets a `valid` answer."""
+        node = self.sleeper()
+        with tbl.profile_reservation(self.profile) as env:
+            with mock.patch.object(tbl, 'HANDSHAKE_WAIT_S', 0.2):
+                with tbl._handshake(self.profile) as held:
+                    self.assertTrue(held)
+                    with self.assertRaisesRegex(tbl.ReservationRefused, 'handshake is busy'):
+                        tbl.register_browser(self.profile, node.pid, env[tbl.PROFILE_LOCK_ENV], env[tbl.PROFILE_TOKEN_ENV])
+                    self.assertIn('handshake is busy', tbl.verify(self.profile, env[tbl.PROFILE_LOCK_ENV], env[tbl.PROFILE_TOKEN_ENV]))
+                    self.assertFalse(self.pid_file.exists())
+        with tbl._handshake(self.profile):
+            started = time.monotonic()
+            with self.assertRaisesRegex(tbl.TripoBrowserBusy, 'handshake'):
+                self.acquire(wait=0)
+            self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(self.acquire(wait=0))
+        self.assertEqual(tbl.handshake_lock_path(self.profile).name, f'{tbl.PROFILE_NAME}.imageto3d.handshake.lock')
 
     def test_studio_mjs_registers_itself_and_unregisters_only_after_a_normal_end(self):
         text = STUDIO.read_text(encoding='utf-8')
@@ -708,6 +793,60 @@ class DrainTests(Root):
             convert_job.wait_for_gate('human_male/outfit', 'a new submission')
         self.assertEqual(len(sleeps), 3)
         self.assertNotIn('deferred', json.loads(self.record.read_text()))
+
+    def test_a_drain_alone_stops_the_final_check_before_the_child_and_the_child_gate(self):
+        """Final-verify new finding 1: with ONLY CONVERT_DRAIN (the hold is gone) no paid child is started; a step that was past
+        the outer check when the drain began is stopped by the check under the browser lock and leaves with DRAIN_EXIT."""
+        self.drain()
+        self.assertIn('CONVERT_DRAIN', convert_job.paid_gate.closed_reason(convert_job.gate_env()))   # the child's own gate
+        with mock.patch.object(convert_job.subprocess, 'run', side_effect=AssertionError('a paid child was started')), \
+                mock.patch('builtins.print'), self.assertRaises(SystemExit) as left:
+            convert_job.run_studio(['node', 'studio.mjs', 'submit'], 'human_male/outfit', 'a new Tripo submission', paid=True)
+        self.assertEqual(left.exception.code, convert_job.DRAIN_EXIT)
+        (self.batch / 'CONVERT_DRAIN').unlink()
+        real_gate, looks = convert_job.conversion_gate, []
+
+        def gate():                                       # open at the outer wait; the drain begins before the final check
+            looks.append(1)
+            if len(looks) == 2:
+                self.drain()
+            return real_gate()
+        with mock.patch.object(convert_job, 'conversion_gate', gate), \
+                mock.patch.object(convert_job.subprocess, 'run', side_effect=AssertionError('a paid child was started')), \
+                mock.patch('builtins.print'), self.assertRaises(SystemExit) as left:
+            convert_job.run_studio(['node', 'studio.mjs', 'submit'], 'human_male/outfit', 'a new Tripo submission', paid=True)
+        self.assertEqual(left.exception.code, convert_job.DRAIN_EXIT)
+        self.assertEqual(len(self.exits()), 2)
+        # a child that stopped at its click gate (exit 4) because of the drain alone: the parent leaves too, it never respawns
+        env = dict(os.environ, **convert_job.paid_gate.env_for(self.root))
+        with mock.patch('builtins.print'), self.assertRaises(SystemExit) as left:
+            convert_job.wait_for_child_gate('human_male/outfit', 'a new Tripo submission', env)
+        self.assertEqual(left.exception.code, convert_job.DRAIN_EXIT)
+        with mock.patch.object(convert_job.subprocess, 'run', side_effect=AssertionError('a paid child was started')), \
+                mock.patch('builtins.print'), self.assertRaises(SystemExit) as left:
+            convert_job.run_paid_child(['python', 'rodin_backend.py', 'collect'], 'human_male/outfit', 'a paid Hyper3D collect', paid=True)
+        self.assertEqual(left.exception.code, convert_job.DRAIN_EXIT)
+
+    def test_record_locks_follow_the_records_own_root_when_the_caller_works_elsewhere(self):
+        """Final-verify test isolation: convert_queue / the v2 app import this module with the real ROOT and work on a fixture
+        root; the lock sidecar of a fixture record must be in the fixture root, never in the checkout convert_job was imported
+        from. Here `checkout` stands for that import root."""
+        checkout = self.root / 'checkout'
+        (checkout / 'processing' / 'own--1').mkdir(parents=True)
+        own = checkout / 'processing' / 'own--1' / '.tripo-job.json'
+        own.write_text('{}')
+        with mock.patch.object(convert_job, 'ROOT', checkout), mock.patch.object(convert_job.portable, 'ROOT', checkout):
+            self.assertEqual(convert_job.record_root(own), checkout)                          # a job of this checkout
+            self.assertEqual(convert_job.record_root(self.record), self.root)                 # a fixture job elsewhere
+            convert_job.update_record(self.record, lambda r: r.__setitem__('y', 2))
+            self.assertEqual(convert_job.read_record(self.record)['y'], 2)
+            convert_job.update_record(own, lambda r: r.__setitem__('z', 3))
+            if os.name == 'nt':
+                self.assertEqual([p.name for p in (checkout / '.codex_jobs' / '_batch' / 'record_locks').iterdir()],
+                                 ['own--1__.tripo-job.json.lock'])
+                self.assertTrue(convert_job.portable.record_lock_path(self.record, self.root).is_file())
+            else:
+                self.assertFalse((checkout / '.codex_jobs').exists())
 
     def test_record_locks_stay_in_the_root_of_the_job(self):
         convert_job.update_record(self.record, lambda r: r.__setitem__('x', 1))
