@@ -57,6 +57,28 @@ class QueueError(RuntimeError):
     """The queue database cannot be written right now (damaged or busy); the decisions stay valid, the orchestrator reconstructs the work."""
 
 
+class Expired(Exception):
+    """The row is not the task the caller displayed any more (recheck-before-cutover finding 4): another key, or another frozen generation.
+    Raised INSIDE the transaction of the state change, which is rolled back; the HTTP layer answers 409 `changed`."""
+
+
+def check_identity(row, expect: dict | None) -> None:
+    """`expect` = {"key", "generation"?} the client displayed: the row must carry that key and (when given) that `args.frozen_sha`.
+    Row numbers are reassigned by a rebuilt database, so an id alone never identifies a task (finding 4). Expired otherwise."""
+    if expect is None:
+        return
+    if row is None or row['key'] != expect.get('key'):
+        raise Expired(f'the task is not {expect.get("key")!r} any more')
+    generation = expect.get('generation')
+    if generation is not None:
+        try:
+            args = json.loads(row['args'] or '{}')
+        except ValueError:
+            args = None
+        if not isinstance(args, dict) or args.get('frozen_sha') != generation:
+            raise Expired(f'the task {expect.get("key")!r} belongs to another choice of views now')
+
+
 def db_path(root: Path) -> Path:
     return Path(root) / APP / DB_NAME
 
@@ -362,6 +384,13 @@ class TaskQueue:
             return cursor.rowcount == 1
         return self._tx(work)
 
+    def note_active(self, task_id: int, token: str | None, error: str) -> bool:
+        """Orchestrator only: an active attempt that cannot be settled yet (the monster lane: the durable record of its failure could not be
+        written, finding 3) keeps its state and slot; the reason is shown as its error."""
+        placeholders = ','.join('?' * len(ACTIVE))
+        return self._run(f'UPDATE tasks SET error=?, updated=? WHERE id=? AND token IS ? AND state IN ({placeholders})',
+                         (error, time.time(), task_id, token, *ACTIVE)) == 1
+
     def set_builder(self, task_id: int, token: str | None, pid: int | None, create_time: float | None) -> None:
         self._run('UPDATE tasks SET builder_pid=?, builder_create=?, updated=? WHERE id=? AND token IS ?', (pid, create_time, time.time(), task_id, token))
 
@@ -420,14 +449,16 @@ class TaskQueue:
             return True
         return self._tx(work)
 
-    def retry(self, task_id: int, approval_gen: str | None = None) -> bool:
+    def retry(self, task_id: int, approval_gen: str | None = None, expect: dict | None = None) -> bool:
         """A failed or cancelled task goes back to queued with a fresh attempts count (the Retry button; it clears a manual cancel). False when it
         is in another state. `approval_gen` (when given) re-tags the row for that approval. An ordinary Retry also clears a monster row's Run now
-        and its pause override (`args.run_now` / `args.override_pause`, phase 5 review F4): they belonged to the earlier attempt."""
+        and its pause override (`args.run_now` / `args.override_pause`, phase 5 review F4): they belonged to the earlier attempt. `expect`: the
+        identity the client displayed, compared in this transaction (check_identity; Expired)."""
         now = time.time()
 
         def work(conn):
-            row = conn.execute('SELECT state, args FROM tasks WHERE id=?', (task_id,)).fetchone()
+            row = conn.execute('SELECT state, args, key FROM tasks WHERE id=?', (task_id,)).fetchone()
+            check_identity(row, expect)
             if row is None:
                 raise ValueError(f'unknown task {task_id}')
             if row['state'] not in ('failed', 'cancelled'):
@@ -447,14 +478,16 @@ class TaskQueue:
             return True
         return self._tx(work)
 
-    def mark_run_now(self, task_id: int, override_pause: str | None = None, detail: str = '') -> bool:
+    def mark_run_now(self, task_id: int, override_pause: str | None = None, detail: str = '', expect: dict | None = None) -> bool:
         """Run now (Queue tab / Approved modal, monster lane): a QUEUED task gets `args.run_now` and its backoff is cleared. `override_pause` = the
-        key of the manual pause the user confirmed it for (monster_lane.pause_key; phase 5 review F4): stored as `args.override_pause`, which
-        overrides only that pause; without one an earlier override is dropped. False when the task is not queued (any more)."""
+        `pause_id` of the manual pause the user confirmed it for (modes.manual_pause; finding 5): stored as `args.override_pause`, which
+        overrides only that pause; without one an earlier override is dropped. False when the task is not queued (any more). `expect`: the
+        identity the client displayed, compared in this transaction (check_identity; Expired)."""
         now = time.time()
 
         def work(conn):
-            row = conn.execute('SELECT args, state FROM tasks WHERE id=?', (task_id,)).fetchone()
+            row = conn.execute('SELECT args, state, key FROM tasks WHERE id=?', (task_id,)).fetchone()
+            check_identity(row, expect)
             if row is None or row['state'] != 'queued':
                 return False
             args = json.loads(row['args'] or '{}')
@@ -467,13 +500,15 @@ class TaskQueue:
             return True
         return self._tx(work)
 
-    def cancel(self, task_id: int, detail: str = '', manual_gen: str | None = None) -> bool:
+    def cancel(self, task_id: int, detail: str = '', manual_gen: str | None = None, expect: dict | None = None) -> bool:
         """A queued task is cancelled; a running one cannot be cancelled (Kill & retry stops it). False when not queued. `manual_gen` (the Queue's
-        Cancel button): the approval generation the user cancelled it for, kept in `cancel_gen` so reconcile never puts it back (re-check R8)."""
+        Cancel button): the approval generation the user cancelled it for, kept in `cancel_gen` so reconcile never puts it back (re-check R8).
+        `expect`: the identity the client displayed, compared in this transaction (check_identity; Expired)."""
         now = time.time()
 
         def work(conn):
-            row = conn.execute('SELECT state FROM tasks WHERE id=?', (task_id,)).fetchone()
+            row = conn.execute('SELECT state, args, key FROM tasks WHERE id=?', (task_id,)).fetchone()
+            check_identity(row, expect)
             if row is None:
                 raise ValueError(f'unknown task {task_id}')
             if row['state'] != 'queued':

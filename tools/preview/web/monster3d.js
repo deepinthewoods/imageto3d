@@ -6,6 +6,9 @@
 // Phase 5 review fixes: Approve sends the LOD AND the sha256 of the model as displayed ({lod, glb_sha256}; 409 `changed` = the model
 // changed since the modal loaded it: it is loaded again); Reconvert sends the exact ticked files and the views revision the user saw
 // ({files, views_rev, confirm}); a `damaged` reduction is read-only (the error, no buttons); a `legacy` one carries a badge.
+// Recheck before cut-over (finding 10): Approve is enabled only for the level the viewer SUCCESSFULLY loaded and applied; the digest sent
+// is the one bound to that loaded URL (`applied`). While a level loads, after a failed load (the stale mesh is cleared) and when the
+// selector shows another level than the applied one, Approve is disabled.
 import { api } from './api.js';
 import { createViewer } from './viewer.js';
 import { refresh } from './state.js';
@@ -90,7 +93,26 @@ export async function showMonster3d(modal, host) {
   fillSelect(lodSelect, levels.map(level => [level, `${lodLabel(level)} · ${faceText(lods[level].faces).replace(' faces', '')}`]),
     item.lod && lods[item.lod] ? item.lod : (lods['0p4'] ? '0p4' : levels[0]));
   let saved = item.lod && lods[item.lod] ? item.lod : null;
-  const shownSha = {};              // level -> the sha256 of the model this modal asked the viewer to show (what Approve vouches for)
+  // what is ON SCREEN: {level, url, sha} of the last load the viewer applied; null while loading and after a failed load. Approve vouches
+  // for exactly this (the digest belongs to the loaded URL), never for a level that was merely selected.
+  let applied = null;
+  let approveButton = null;
+
+  /** Why Approve cannot be pressed now (null = it can). */
+  function approveBlock() {
+    if (!applied) return 'The model is not loaded';
+    if (applied.level !== lodSelect.value) return 'The level on screen is not the selected one';
+    if (!applied.sha) return 'This level has no digest; reload';
+    return null;
+  }
+
+  function syncApprove() {
+    if (!approveButton) return;
+    const block = approveBlock();
+    approveButton.disabled = !!block;
+    approveButton.title = block || 'Approve this level (A): the monster moves to Completed';
+    approveButton.dataset.loaded = applied ? applied.level : '';
+  }
 
   function sync() {
     const faces = lods[lodSelect.value]?.faces;
@@ -99,20 +121,34 @@ export async function showMonster3d(modal, host) {
     facesText.classList.toggle('unsaved', saved !== lodSelect.value);
     saveButton.hidden = locked || saved === lodSelect.value;
     if (locked) { facesText.textContent = faces != null ? faceText(faces) : ''; facesText.classList.remove('unsaved'); }
+    syncApprove();
   }
 
   async function show() {
     const mine = ++shown;
-    shownSha[lodSelect.value] = lods[lodSelect.value]?.sha256 || null;
+    const level = lodSelect.value;
+    const target = { level, url: lods[level].url, sha: lods[level]?.sha256 || null };   // the URL and the digest that belongs to it
+    applied = null;                  // nothing is vouched for while another level loads
     sync();
     message.hidden = false;
+    message.dataset.state = 'loading';
     message.textContent = 'Loading...';
     try {
-      const result = await viewer.load(lods[lodSelect.value].url, { view: viewer.hasModel ? null : carry.view });
-      if (mine === shown && result.applied) message.hidden = true;
+      const result = await viewer.load(target.url, { view: viewer.hasModel ? null : carry.view });
+      if (mine !== shown) return;
+      if (result.applied) {
+        applied = target;
+        message.hidden = true;
+        message.dataset.state = '';
+      }
     } catch (error) {
-      if (mine === shown) message.textContent = `Model not loaded: ${error.message}`;
+      if (mine !== shown) return;
+      applied = null;
+      try { viewer.clear?.(); } catch { /* the message says it */ }      // never leave another level's mesh under this selection
+      message.dataset.state = 'failed';
+      message.textContent = `Model not loaded: ${error.message}. Approve is off until this level is on screen.`;
     }
+    if (host.isCurrent()) sync();
   }
 
   async function choose(level, { alreadyShown = false } = {}) {
@@ -144,7 +180,7 @@ export async function showMonster3d(modal, host) {
     const keep = lods[lodSelect.value] ? lodSelect.value : (item.lod && lods[item.lod] ? item.lod : levels[0]);
     fillSelect(lodSelect, levels.map(level => [level, `${lodLabel(level)} · ${faceText(lods[level].faces).replace(' faces', '')}`]), keep);
     saved = item.lod && lods[item.lod] ? item.lod : null;
-    for (const key of Object.keys(shownSha)) delete shownSha[key];
+    applied = null;
     show();
     refresh().catch(() => {});
   }
@@ -157,11 +193,12 @@ export async function showMonster3d(modal, host) {
 
   async function askApprove() {
     if (!canApprove || asking || !host.isCurrent()) return;
+    const block = approveBlock();
+    if (block) { toast(`Not approved: ${block}`); return; }
     asking = true;
     try {
-      // the level AND the digest of the model on screen, captured now: what the user confirms is what the server is asked to approve
-      const level = lodSelect.value;
-      const sha = shownSha[level] || lods[level]?.sha256 || null;
+      // the level AND the digest of the model the viewer applied, captured now: what the user confirms is what the server is asked to approve
+      const { level, sha } = applied;
       const ok = await confirmDialog({
         title: `Approve ${name}?`,
         lines: [`LOD ${lodLabel(level)} (${faceText(lods[level].faces)}) becomes the approved level and ${name} moves to Completed.`,
@@ -171,7 +208,7 @@ export async function showMonster3d(modal, host) {
       });
       if (!ok || !host.isCurrent()) return;
       await host.actThenAdvance(card, 'approve', {
-        args: { lod: level, ...(sha ? { glb_sha256: sha } : {}) }, subject: `${name} (LOD ${lodLabel(level)})`, quiet: true,
+        args: { lod: level, glb_sha256: sha }, subject: `${name} (LOD ${lodLabel(level)})`, quiet: true,
         onError: error => {
           if (!error.conflict) return;
           toast(conflictMessage(error, 'model'), { ms: 6000 });
@@ -223,9 +260,10 @@ export async function showMonster3d(modal, host) {
   }
 
   if (canApprove) {
-    const approve = button('Approve', askApprove, 'primary', 'Approve this level (A): the monster moves to Completed');
-    approve.dataset.action = 'approve';
-    approveSlot.append(approve);
+    approveButton = button('Approve', askApprove, 'primary', 'Approve this level (A): the monster moves to Completed');
+    approveButton.dataset.action = 'approve';
+    approveSlot.append(approveButton);
+    syncApprove();
   }
   if (stage === 'completed' || item.approved === true) {
     const unapprove = button('Unapprove', () => host.actThenAdvance(card, 'unapprove', { subject: name }), '', 'Clear the approval: the monster goes back to 3D');

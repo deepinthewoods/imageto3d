@@ -1465,19 +1465,32 @@ def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
     if data['op'] == 'rebuild_stale':
         return rebuild_stale(root)
     if data['op'] == 'run_now':
-        # a monster conversion: overrides the idle gate; while paused by hand 409 `confirm` until the client sends confirm: true
-        result = monster_lane.run_now(root, data.get('id'), data.get('confirm') is True)
-        _log_op(root, 'run_now', f'task {data.get("id")}' + (' (override pause)' if result.get('override_pause') else ''))
+        # a monster conversion (recheck findings 4, 5): the task is the one the client displayed (`key` + `generation`, `id` a hint);
+        # overrides the idle gate; while paused by hand 409 `confirm` (with `pause_id`) until the client sends confirm: true + that pause_id
+        result = monster_lane.run_now(root, data.get('id'), data.get('confirm') is True, data.get('key'), data.get('generation'),
+                                      data.get('pause_id'))
+        _log_op(root, 'run_now', f'task {result.get("id")} {result.get("key")}' + (' (override pause)' if result.get('override_pause') else ''))
         catalog.invalidate()
         return result
     task_id = data.get('id')
+    queue = taskqueue.for_root(root)
+    key = data.get('key')
+    monster_row = None
+    if isinstance(key, str) and key.startswith(f'{monster_lane.LANE}:') and data['op'] in ('retry', 'cancel'):
+        # recheck finding 4: a monster row is addressed by the key + frozen generation the client displayed; the row number is a hint only
+        monster_row = monster_lane.resolve_task(root, task_id, key, data.get('generation'))
+        task_id = monster_row['id']
     if isinstance(task_id, bool) or not isinstance(task_id, int):
         raise ValueError('id (a task number) is required')
-    queue = taskqueue.for_root(root)
-    task = queue.get(task_id)
+    task = monster_row or queue.get(task_id)
     if task is None:
         raise catalog.NotFound(f'Unknown task {task_id}')
     op = data['op']
+    if task['lane'] == monster_lane.LANE and monster_row is None and op in ('retry', 'cancel'):
+        raise ValueError('key and generation are required for a monster conversion task: the task the client displayed (a row number '
+                         'alone does not identify it)')
+    if key is not None and task['key'] != key:                 # any lane: the row is not the task the client displayed any more
+        raise guard.Changed(f'task {task_id} is not the task you were shown any more; reload the queue', changes=[f'task {task_id}'])
     gen = task_gen(root, task)
     if op == 'retry':
         if task['state'] in ('failed', 'cancelled') and (not task_approved(root, task) or
@@ -1485,14 +1498,14 @@ def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
             raise ValueError(f'task {task_id} belongs to an approval that was withdrawn or changed; approve the set again instead')
         if task['lane'] == monster_lane.LANE:
             # monster (phase 5 review F4): the generation's persisted disposition is cleared first, Run now and its override are dropped
-            done = monster_lane.retry_task(root, task_id)
+            done = monster_lane.retry_task(root, task)
         else:
             done = queue.retry(task_id, approval_gen=gen if task['lane'] == 'layers' else None)
     elif op == 'cancel':
         # a MANUAL cancel holds for the current approval generation: reconcile never queues it again (re-check R8)
         if task['lane'] == monster_lane.LANE:
             # monster (phase 5 review F4): `cancelled` is persisted in the variant's views.json first, so a rebuilt queue never revives it
-            done = monster_lane.cancel_task(root, task_id, 'manual')
+            done = monster_lane.cancel_task(root, task, 'manual')
         else:
             done = queue.cancel(task_id, 'manual', manual_gen=(gen or 'manual') if task['lane'] == 'layers' else 'manual')
     else:

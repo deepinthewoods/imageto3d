@@ -37,16 +37,22 @@ changed since it was read is not launched now (back to `pending`, the next scan 
 `"guard": {"file": "<abs path of a JSON file>", "key": "<field>", "value": <expected>}`: when that file is missing or unreadable or
 its `key` is not `value`, the task becomes `cancelled` (reason `guard: withdrawn`) and nothing is spawned.
 
-Output validation (phase 5 review finding 17): a task may carry `"validate": "rgba_png"` and `"provenance": ["<name>.json", ...]`
-(paths relative to the directory of the task's FIRST output, or absolute). A finished attempt then counts as done only when every
-output decodes as a PNG (Pillow) in mode RGBA with at least 1% fully transparent and at least 1% fully opaque pixels, and every
-provenance file exists and parses as JSON. Otherwise the attempt fails (RETRY / FAILED within max_attempts, the status `error` and
-the event name each file and reason) and the outputs are set aside as `<name>.invalid-<time>` (a bad provenance file too) so the
-retry generates them again: an invalid output never counts as done. Before a validated task is launched, an existing output
-that fails the image checks is set aside the same way.
+Output validation (phase 5 review finding 17; recheck-before-cutover finding 15): a task may carry `"validate": "rgba_png"` and
+`"provenance": ["<name>.json", ...]` (paths relative to the directory of the task's FIRST output, or absolute). The rules are the
+ones of tools/png_check.py, the ONE technical validator the preview app uses too: a finished attempt counts as done only when
+every output decodes as a PNG (Pillow) in mode RGBA with at least 1% fully transparent and at least 1% fully opaque pixels, and
+every provenance file exists and parses as a JSON OBJECT.
+- An invalid IMAGE fails the attempt (RETRY / FAILED within max_attempts, the status `error` and the event name each file and
+  reason); the invalid outputs (and a bad provenance file) are set aside as `<name>.invalid-<time>` so the retry generates them
+  again: an invalid output never counts as done. Before a validated task is launched, an existing output that fails the image
+  checks is set aside the same way.
+- Valid images with a missing / invalid PROVENANCE are NOT regenerated: only an unusable provenance file is set aside, the images
+  stay, and the task becomes `failed` with `reason: "provenance"` (the status `error` names the files; event FAILED ...: provenance).
+  It is repaired without a new image: once every provenance file is a JSON object again (the app's 'repair provenance', or a
+  hand-written record) and the images still pass, the runner's next scan marks the task `done` (event REPAIRED).
 
 Events (stdout and .codex_jobs/_batch/events.log): DONE <task> ok|flags=..., RETRY, FAILED, LIMIT until <time>, IDLE, PAUSED,
-START, ADOPT, RESET, CANCELLED, CHANGED, INVALID.
+START, ADOPT, RESET, CANCELLED, CHANGED, INVALID, REPAIRED.
 """
 import argparse
 import json
@@ -60,6 +66,8 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import png_check  # noqa: E402  the one technical view validator (shared with the preview app; finding 15)
 MONSTERS_ENV = 'IMAGETO3D_MONSTERS'   # as tools/preview/monsters.py: the monster pipeline root (tests use a temp one)
 LAUNCHERS = ('imageto3d', 'monsters')
 BATCH = ROOT / '.codex_jobs' / '_batch'
@@ -601,38 +609,13 @@ def job_alive(job, status, root=None):
 
 
 VALIDATORS = ('rgba_png',)
-MIN_SHARE = 0.01   # validate rgba_png: at least this share of fully transparent AND of fully opaque pixels
+MIN_SHARE = png_check.MIN_SHARE   # validate rgba_png: at least this share of fully transparent AND of fully opaque pixels
+PROVENANCE_REASON = 'provenance'  # status `reason` of a task whose images are valid but whose provenance record is not
 
 
 def png_problem(path):
-    """None when `path` is a decodable RGBA PNG with at least MIN_SHARE fully transparent and MIN_SHARE fully opaque pixels, else
-    why not (validate "rgba_png")."""
-    try:
-        from PIL import Image
-    except ImportError:   # fail closed: an image that cannot be checked does not count as done
-        return 'cannot validate: Pillow is not installed for the runner\'s python'
-    try:
-        with Image.open(path) as image:
-            image.load()
-            fmt, mode, size = image.format, image.mode, image.size
-            histogram = image.getchannel('A').histogram() if mode == 'RGBA' else None
-    except FileNotFoundError:
-        return 'missing'
-    except Exception as error:   # noqa: BLE001  truncated / not an image / decoder error
-        return f'does not decode ({type(error).__name__}: {str(error)[:120]})'
-    if fmt != 'PNG':
-        return f'not a PNG ({fmt})'
-    if mode != 'RGBA':
-        return f'mode {mode}, not RGBA'
-    total = size[0] * size[1]
-    if not total:
-        return 'empty image'
-    clear, opaque = histogram[0] / total, histogram[255] / total
-    if clear < MIN_SHARE:
-        return f'only {clear:.2%} fully transparent pixels (at least {MIN_SHARE:.0%} needed)'
-    if opaque < MIN_SHARE:
-        return f'only {opaque:.2%} fully opaque pixels (at least {MIN_SHARE:.0%} needed)'
-    return None
+    """None when `path` passes png_check.png_problem (validate "rgba_png"), else why not."""
+    return png_check.png_problem(path)
 
 
 def provenance_paths(task):
@@ -642,7 +625,8 @@ def provenance_paths(task):
 
 
 def validation_problems(task):
-    """[(path, reason)] of a finished task's outputs / provenance that fail its `validate` / `provenance` rules ([] = valid)."""
+    """[(path, reason)] of a finished task's outputs / provenance that fail its `validate` / `provenance` rules ([] = valid).
+    The rules are png_check's (image: png_problem; provenance: provenance_problem = exists and is a JSON OBJECT)."""
     problems = []
     rule = task.get('validate')
     if rule and rule not in VALIDATORS:
@@ -653,14 +637,15 @@ def validation_problems(task):
             if reason:
                 problems.append((Path(out), reason))
     for path in provenance_paths(task):
-        if not path.is_file():
-            problems.append((path, 'provenance missing'))
-            continue
-        try:
-            json.loads(path.read_text(encoding='utf-8-sig'))
-        except (OSError, ValueError) as error:
-            problems.append((path, f'provenance is not readable JSON ({type(error).__name__})'))
+        reason = png_check.provenance_problem(path)
+        if reason:
+            problems.append((path, reason))
     return problems
+
+
+def provenance_only(task, problems):
+    """True when every problem is a provenance file's: the images themselves are usable, so nothing is generated again."""
+    return png_check.provenance_only(problems, provenance_paths(task))
 
 
 def set_aside(path, stamp):
@@ -675,12 +660,11 @@ def set_aside(path, stamp):
 
 
 def reject_outputs(task, problems):
-    """Set aside what failed validation so a retry generates it again: the failing files; when only provenance failed, the
-    task's outputs as well (an image without its record is regenerated with one). Returns the names set aside."""
+    """Set aside the files that failed validation (kept as `<name>.invalid-<stamp>`) so a retry generates the images again.
+    A valid image is never set aside: when only provenance failed (provenance_only) just the unusable provenance files move and
+    the images stay for the provenance repair. Returns the names set aside."""
     stamp = datetime.now().strftime('%Y%m%dT%H%M%S')
     bad = {p for p, _ in problems if p is not None}
-    if any(reason.startswith('provenance') for _, reason in problems):
-        bad |= {Path(o) for o in task['outputs']}
     moved = []
     for path in sorted(bad):
         if path.is_file():
@@ -689,6 +673,31 @@ def reject_outputs(task, problems):
             except OSError:
                 pass
     return moved
+
+
+def complete(task, status, name, word='DONE'):
+    """Mark a task with valid outputs done: framing flags are recorded and reported, never acted on."""
+    for key in ('error', 'reason'):
+        status.pop(key, None)
+    flags = {}
+    for base, out in task['checks']:
+        check = subprocess.run([sys.executable, str(ROOT / 'tools/check_framing.py'), check_base(base, out), out],
+                               capture_output=True, text=True, cwd=ROOT)
+        flags[Path(out).name] = [l.strip() for l in check.stdout.splitlines()
+                                 if l.strip().startswith('-')] if check.returncode else []
+    status['state'], status['checks'] = 'done', flags
+    bad = {k: v for k, v in flags.items() if v}
+    emit(f'{word} {name}: ' + (f'flags={json.dumps(bad)}' if bad else 'ok'))
+
+
+def provenance_repaired(task, status):
+    """A task that failed for its provenance only (reason PROVENANCE_REASON) and now validates: every provenance file is a JSON
+    object again (cheap check first) and the images still pass."""
+    if status.get('state') != 'failed' or status.get('reason') != PROVENANCE_REASON:
+        return False
+    if any(png_check.provenance_problem(path) for path in provenance_paths(task)):
+        return False
+    return not validation_problems(task)
 
 
 def describe(problems):
@@ -710,6 +719,8 @@ def launch_withdrawn(task):
         return 'pending', 'task descriptor changed since it was read'
     guard = fresh.get('guard')
     if guard is None:
+        if fresh.get('launcher') == 'monsters':   # every app-published monster task carries its pick guard (recheck review, row 10)
+            return 'cancelled', 'guard: missing (a monster task without its pick guard is never launched)'
         return None
     if not (isinstance(guard, dict) and isinstance(guard.get('file'), str) and guard['file'] and isinstance(guard.get('key'), str)
             and 'value' in guard):
@@ -822,6 +833,10 @@ def _run_loop(args):
                     for t in tasks}
         for task in tasks:
             name, status = task['name'], statuses[task['name']]
+            if provenance_repaired(task, status):   # finding 15: the record was repaired, the good image was never regenerated
+                complete(task, status, name, word='REPAIRED')
+                save(STATUS / f'{name}.json', status)
+                continue
             if status['state'] != 'running':
                 continue
             job = status['jobs'][-1]['job']
@@ -851,21 +866,19 @@ def _run_loop(args):
             elif (task.get('validate') or task.get('provenance')) and (problems := validation_problems(task)):
                 moved = reject_outputs(task, problems)
                 status['attempts'] += 1
-                status['state'] = 'failed' if status['attempts'] >= task['max_attempts'] else 'pending'
                 status['error'] = describe(problems)
-                emit(f'{"FAILED" if status["state"] == "failed" else "RETRY"} {name}: invalid output ({status["error"]}; job {job}, '
-                     f'exit {exit_code})' + (f'; set aside {moved}' if moved else ''))
+                if provenance_only(task, problems):
+                    # the images are good: never regenerated for a record (finding 15). Terminal until the provenance is repaired.
+                    status['state'], status['reason'] = 'failed', PROVENANCE_REASON
+                    emit(f'FAILED {name}: provenance ({status["error"]}; job {job}, exit {exit_code}); the image(s) are kept'
+                         + (f'; set aside {moved}' if moved else ''))
+                else:
+                    status.pop('reason', None)
+                    status['state'] = 'failed' if status['attempts'] >= task['max_attempts'] else 'pending'
+                    emit(f'{"FAILED" if status["state"] == "failed" else "RETRY"} {name}: invalid output ({status["error"]}; job {job}, '
+                         f'exit {exit_code})' + (f'; set aside {moved}' if moved else ''))
             else:
-                status.pop('error', None)
-                flags = {}
-                for base, out in task['checks']:
-                    check = subprocess.run([sys.executable, str(ROOT / 'tools/check_framing.py'), check_base(base, out), out],
-                                           capture_output=True, text=True, cwd=ROOT)
-                    flags[Path(out).name] = [l.strip() for l in check.stdout.splitlines()
-                                             if l.strip().startswith('-')] if check.returncode else []
-                status['state'], status['checks'] = 'done', flags
-                bad = {k: v for k, v in flags.items() if v}
-                emit(f'DONE {name}: ' + (f'flags={json.dumps(bad)}' if bad else 'ok'))
+                complete(task, status, name)
             save(STATUS / f'{name}.json', status)
         running = [t for t in tasks if statuses[t['name']]['state'] == 'running']
         cache = {}

@@ -41,6 +41,30 @@ convert_job.py of this checkout runs and its last event in convert_events.log (s
 CONVERT, it is suspended, re-verified idle while frozen and only then terminated. An older view runner (no launch reservation) is stopped the
 same way, only while it launches nothing (I.9). A pending stop that ends in a tick is reported in the tick's `completed` with its request id.
 
+Legacy worker drain, second half (DESIGN_PHASE4.md I.10; pre-cut-over review finding 1): stopping intake (the hold) is separate from draining
+a job. After the hold the manager writes `.codex_jobs/_batch/CONVERT_DRAIN` = {since, since_unix, reason, owner_pid, worker: {pid,
+create_time}}: a convert_job.py that is BLOCKED at its paid gate (it keeps `gate_wait/<pid>.json`; nothing paid in flight) releases its module
+lock, marks the module `deferred` and exits 76, recording that in `drain_exits/`; the current convert_queue.py takes no job while the file
+exists and never counts exit 76. The drain then waits until no convert_job.py runs and the worker sleeps (frozen_stop as before). An older
+worker that keeps taking jobs (it does not know the hold, or counts exit 76 as a failure and tries the next job) is frozen and terminated
+while it has NO child and its last event is one after which it only picks the next job (DRAIN_SAFE_EVENTS: never CONVERTED / FINISH /
+OFFLOAD / an exit announcement, after which it moves sets). When the drain ends (settle_drain) the failure counts an older worker wrote for
+those exits are restored (`<job>.fails` back to max(the lowest count before, now - exits); logged in `convert_drain.log` and the convert
+record's `drain_restored`), the job locks naming the terminated worker are removed and CONVERT_DRAIN is deleted. PAUSE is never touched.
+
+Suspension record (phase-4 row 6 residual): frozen_stop writes `.codex_jobs/_app/services/suspensions.json` = {"items": [{pid, create_time,
+service, time, terminated}]} BEFORE it suspends a process and removes the entry once the process is resumed or gone. begin_management
+(recover_suspensions) resumes every recorded process that still runs as this checkout's service and is still suspended (a manager that
+crashed in between), and drops the entries of processes that are gone.
+
+Supervisor stop delivery (finding 7): the supervisor record carries `stop_delivery` = {state: requested -> delivered | failed, ...}. A stop
+command that fails, or a pending stop whose `supervisor.stop` file is gone while the same supervisor still runs (after STOP_DELIVERY_GRACE),
+is NON-DELIVERY: the stop request is withdrawn, the supervisor is taken out of the hold's `retiring` generations (the hold keeps its
+`since`), and the healthy supervisor's next tick releases the hold again.
+
+Restart outcome (finding 20): a restart's `completed` entry (and the stop() result) is terminal only once the replacement is identified
+(`replacement` = {pid, create_time}, ok true) or the start failed / is blocked (ok false with the reason).
+
 Crash restart: an enabled service that vanished (without a stop request) is restarted after 60 s, after a second quick failure after 5 min,
 after a third it is HELD ("restart failed 3 times") until Start is pressed. A run that stays up for STABLE_AFTER resets the count. The convert
 worker's own idle exit (its log says `exiting`) is not a failure: it is restarted when convert_list.eligible_jobs finds work it would take.
@@ -81,6 +105,13 @@ TICK_FILE = 'supervisor_tick.json'
 STALE_HOLD_S = 600.0          # a hold whose owner died this long ago may be replaced by a new manager's own hold (I.1)
 SLEEP_EVENTS = ('PAUSED', 'IDLE', 'LOW DISK')
 MANAGED_WORKER = 1
+DRAIN_FILE = 'CONVERT_DRAIN'  # I.10: gate-waiting convert_job.py processes leave (exit DRAIN_EXIT) while it exists; written after the hold
+DRAIN_EXIT = 76               # = tools/tripo_pipeline/convert_job.py DRAIN_EXIT
+DRAIN_SETTLE = 20.0           # how long a frozen cycling worker's leaving child (at the gate, or just started) is waited for
+DRAIN_YOUNG = 10.0            # a child this young has not reached its first gate check yet
+# events after which a worker only releases the job and picks the next one (never CONVERTED / FINISH / OFFLOAD / STOP / "exiting": it moves sets)
+DRAIN_SAFE_EVENTS = SLEEP_EVENTS + ('CONVERT ', 'FAILED', 'DEFERRED', 'SHARED', 'HOLD', 'BALANCE', 'PARTIAL', 'OWNER')
+STOP_DELIVERY_GRACE = 15.0    # a pending supervisor stop whose stop file is gone this long while the supervisor still runs was not delivered
 _LOCK = threading.RLock()
 
 
@@ -578,6 +609,46 @@ def assert_hold(root, reason: str, *, renew: bool = False, now: float | None = N
     return None
 
 
+def withdraw_retiring(root, inst: dict) -> bool:
+    """Take the supervisor `inst` out of the hold's `retiring` generations (finding 7: its stop was never delivered, so it is still the
+    intended generation). The hold keeps its owner, reason and `since`, so a tick that supervisor completed after it releases the hold. A
+    live other owner's hold is never touched. True when the hold was rewritten."""
+    hold = read_hold(root)
+    if hold is None or _foreign_live(hold):
+        return False
+    before = _retiring(hold)
+    keep = [r for r in before if not _same_process(r, inst)]
+    if len(keep) == len(before):
+        return False
+    new = dict(hold)
+    if keep:
+        new['retiring'] = keep
+    else:
+        new.pop('retiring', None)
+    guard.write_atomic(hold_path(root), (json.dumps(new, indent=2) + '\n').encode('utf-8'))
+    return True
+
+
+def supervisor_stop_file(root) -> Path:
+    """`supervisor.stop`: written by `pipeline_supervisor.py stop`, removed by the supervisor at the very end of its exit."""
+    return batch(root) / 'supervisor.stop'
+
+
+def _stop_delivered(root, inst: dict) -> bool:
+    """The stop reached the supervisor `inst`: its stop file exists (it exits through its normal path) or the process is already gone."""
+    return supervisor_stop_file(root).exists() or not _process_alive(inst['pid'], inst['create_time'])
+
+
+def _stop_not_delivered(root, rec: dict, inst: dict, why: str, now: float) -> None:
+    """Non-delivery of a supervisor stop is established (finding 7): withdraw the request and the `retiring` designation, record why."""
+    rec.update(stop_requested=None, then_start=False, stop_note=None,
+               stop_delivery={'state': 'failed', 'time': now, 'pid': inst['pid'], 'create_time': inst['create_time'], 'why': why[:300]})
+    rec.pop('pause_backup', None)             # the supervisor did not exit: its PAUSE file was never removed
+    rec.pop('restart_request', None)
+    write_record(root, 'supervisor', rec)
+    withdraw_retiring(root, inst)
+
+
 def supervisor_tick(root) -> dict | None:
     raw = read_json(batch(root) / TICK_FILE)
     return raw if isinstance(raw, dict) else None
@@ -638,7 +709,13 @@ def begin_management(root) -> list[str]:
     owner is replaced (whatever its age: ours keeps the hold continuous), a live other owner's hold is left alone."""
     with _LOCK:
         text = assert_hold(root, 'preview app manager start', renew=True)
-    return [text] if text else []
+        events = [text] if text else []
+        try:                                   # after the hold: what a manager that crashed left behind (row 6 residual, I.10)
+            events += recover_suspensions(root)
+            events += settle_drain(root)
+        except Exception as error:  # noqa: BLE001  (never keeps the hold from being reported)
+            events.append(f'recovery at manager start failed: {type(error).__name__}: {error}')
+    return events
 
 
 def hold_state(root) -> dict | None:
@@ -820,6 +897,76 @@ def legacy_worker(root, inst: dict) -> bool:
     return '.stopping' not in text or inst['create_time'] < mtime
 
 
+# ------------------------------------------------------------------------------------------------ suspension record (row 6 residual)
+
+def suspensions_path(root) -> Path:
+    return records_dir(root) / 'suspensions.json'
+
+
+def read_suspensions(root) -> list[dict]:
+    raw = read_json(suspensions_path(root))
+    items = raw.get('items') if isinstance(raw, dict) else None
+    return [i for i in items if isinstance(i, dict) and isinstance(i.get('pid'), int)] if isinstance(items, list) else []
+
+
+def _write_suspensions(root, items: list[dict]) -> None:
+    path = suspensions_path(root)
+    if not items:
+        path.unlink(missing_ok=True)
+        return
+    guard.write_atomic(path, (json.dumps({'items': items}, indent=2) + '\n').encode('utf-8'))
+
+
+def _note_suspension(root, service: str, inst: dict, terminated: bool = False) -> None:
+    """Persist that `inst` is about to be suspended by this manager (or, `terminated`, that a terminate was sent while it was frozen)."""
+    items = [i for i in read_suspensions(root) if not _same_process(i, inst)]
+    items.append({'pid': inst['pid'], 'create_time': inst['create_time'], 'service': service, 'time': time.time(), 'terminated': terminated,
+                  'owner_pid': os.getpid()})
+    _write_suspensions(root, items)
+
+
+def _clear_suspension(root, inst: dict) -> None:
+    try:
+        items = read_suspensions(root)
+        keep = [i for i in items if not _same_process(i, inst)]
+        if len(keep) != len(items):
+            _write_suspensions(root, keep)
+    except OSError:
+        pass
+
+
+def recover_suspensions(root) -> list[str]:
+    """Resume what a crashed manager left suspended (phase-4 row 6 residual): every recorded process that still runs with the recorded create
+    time, is still this checkout's service (verified_handle) and is still suspended is resumed; an entry whose process is gone (terminated,
+    or exited) is dropped; a pid that now is something else is never touched. Returns event texts."""
+    events, keep = [], []
+    with _LOCK:
+        items = read_suspensions(root)
+        for item in items:
+            svc = {**SERVICES, **PROBES}.get(item.get('service'))
+            inst = {'pid': item['pid'], 'create_time': item.get('create_time') or 0.0}
+            if svc is None or not _process_alive(item['pid'], item.get('create_time')):
+                continue                                              # gone (terminated or exited), or not a known service: forget it
+            proc = verified_handle(root, svc, inst)
+            if proc is None:
+                events.append(f'{svc.name}: pid {item["pid"]} was recorded as suspended but is no longer this checkout\'s {svc.name}; not touched')
+                continue
+            try:
+                if proc.status() != psutil.STATUS_STOPPED:
+                    continue                                          # it runs: nothing to do
+                proc.resume()
+                events.append(f'{svc.name}: pid {item["pid"]} was left suspended by an earlier manager; resumed'
+                              + (' (a stop was already sent to it)' if item.get('terminated') else ''))
+            except psutil.NoSuchProcess:
+                continue
+            except psutil.Error as error:
+                keep.append(item)
+                events.append(f'{svc.name}: pid {item["pid"]} is still suspended and could not be resumed ({type(error).__name__})')
+        if len(keep) != len(items):
+            _write_suspensions(root, keep)
+    return events
+
+
 def _event_time(line: str, now: float) -> float | None:
     """The time of a convert_events.log line (`MM-DD HH:MM:SS ...`, the current year; a date in the future belongs to the previous year)."""
     try:
@@ -831,9 +978,9 @@ def _event_time(line: str, now: float) -> float | None:
     return stamp.timestamp()
 
 
-def worker_sleeping(root, inst: dict, now: float | None = None, worker: int = MANAGED_WORKER) -> bool:
-    """The legacy-stop rule of I.2: the worker's last event (since it started) is PAUSED / IDLE / LOW DISK, after its last CONVERT, and it is
-    not an exit announcement (an exiting worker runs finish / offload)."""
+def worker_last_event(root, inst: dict, now: float | None = None, worker: int = MANAGED_WORKER) -> str | None:
+    """The text of the worker's last line in convert_events.log since it started (without the time and the worker tag); None when it wrote
+    nothing since then or the last line cannot be read."""
     now = time.time() if now is None else now
     tag = '' if worker == 1 else f'[w{worker}] '
     for line in reversed(tail_lines(batch(root) / SERVICES['convert'].events_log, 200, 262144)):
@@ -845,9 +992,16 @@ def worker_sleeping(root, inst: dict, now: float | None = None, worker: int = MA
         body = body[len(tag):]
         stamp = _event_time(line, now)
         if stamp is None or stamp < inst['create_time'] - 2:
-            return False                          # nothing from this worker since it started (or an unreadable line): not proven asleep
-        return body.startswith(SLEEP_EVENTS) and 'exiting' not in body
-    return False
+            return None                           # nothing from this worker since it started (or an unreadable line)
+        return body
+    return None
+
+
+def worker_sleeping(root, inst: dict, now: float | None = None, worker: int = MANAGED_WORKER) -> bool:
+    """The legacy-stop rule of I.2: the worker's last event (since it started) is PAUSED / IDLE / LOW DISK, after its last CONVERT, and it is
+    not an exit announcement (an exiting worker runs finish / offload). Nothing since it started = not proven asleep."""
+    body = worker_last_event(root, inst, now, worker)
+    return body is not None and body.startswith(SLEEP_EVENTS) and 'exiting' not in body
 
 
 def frozen_stop(root, svc: Service, inst: dict, check) -> tuple[bool, str | None]:
@@ -855,6 +1009,8 @@ def frozen_stop(root, svc: Service, inst: dict, check) -> tuple[bool, str | None
     SUSPENDED first, so it cannot wake between the check and the signal; `check(proc)` then inspects the frozen process (its children, the
     files that would show work in flight) and returns a problem text or None. With a problem the process is resumed untouched and (False,
     problem) comes back; without one it is terminated while still frozen (resumed afterwards, so a POSIX SIGTERM is delivered) and waited for.
+    The suspension is PERSISTED first (suspensions.json: pid, create time, time; row 6 residual) and the entry is removed once the process
+    is resumed or gone, so a manager that crashes in between leaves a record the next manager start resumes (recover_suspensions).
     Returns (gone, problem)."""
     proc = verified_handle(root, svc, inst)
     if proc is None:
@@ -862,10 +1018,16 @@ def frozen_stop(root, svc: Service, inst: dict, check) -> tuple[bool, str | None
             raise ServiceError(f'process {inst["pid"]} is no longer the {svc.name} service; nothing stopped')
         return True, None
     try:
+        _note_suspension(root, svc.name, inst)
+    except OSError as error:
+        return False, f'the suspension could not be recorded ({type(error).__name__}: {error}), so it is not suspended; waiting'
+    try:
         proc.suspend()
     except psutil.NoSuchProcess:
+        _clear_suspension(root, inst)
         return True, None
     except psutil.Error as error:
+        _clear_suspension(root, inst)
         return False, f'it could not be suspended to verify that it is idle ({type(error).__name__}); waiting'
     terminated = False
     try:
@@ -878,15 +1040,24 @@ def frozen_stop(root, svc: Service, inst: dict, check) -> tuple[bool, str | None
         if problem:
             return False, problem
         try:
+            try:
+                _note_suspension(root, svc.name, inst, terminated=True)
+            except OSError:
+                pass
             proc.terminate()
             terminated = True
         except psutil.NoSuchProcess:
             return True, None
     finally:
+        resumed = True
         try:
             proc.resume()
-        except psutil.Error:
+        except psutil.NoSuchProcess:
             pass
+        except psutil.Error:
+            resumed = False                      # the record stays: the next manager start tries again
+        if resumed:
+            _clear_suspension(root, inst)
     try:
         proc.wait(10.0)
         return True, None
@@ -927,11 +1098,215 @@ def _worker_idle_problem(root, proc, inst: dict) -> str | None:
     return None
 
 
+# ------------------------------------------------------------------------------------------------------- conversion drain (I.10)
+
+def drain_path(root) -> Path:
+    return batch(root) / DRAIN_FILE
+
+
+def read_drain(root) -> dict | None:
+    """The CONVERT_DRAIN file as a dict, None when absent ({} fields when unreadable: it still drains)."""
+    path = drain_path(root)
+    if not path.exists():
+        return None
+    raw = read_json(path)
+    return raw if isinstance(raw, dict) else {'reason': 'unreadable CONVERT_DRAIN file'}
+
+
+def write_drain(root, inst: dict, now: float | None = None) -> dict:
+    """Ask the convert_job.py processes blocked at the paid gate to leave (I.10). Written only AFTER the conversion hold."""
+    now = time.time() if now is None else now
+    drain = {'since': datetime.fromtimestamp(now).isoformat(timespec='milliseconds'), 'since_unix': now, 'reason': 'legacy convert worker drain',
+             'owner_pid': os.getpid(), 'owner_create_time': _my_create_time(), 'worker': _ident(inst)}
+    guard.write_atomic(drain_path(root), (json.dumps(drain, indent=2) + '\n').encode('utf-8'))
+    return drain
+
+
+def _stale_file(path: Path, age: float = 60.0) -> bool:
+    try:
+        return time.time() - path.stat().st_mtime > age
+    except OSError:
+        return False
+
+
+def gate_waiters(root, clean: bool = True) -> list[dict]:
+    """convert_job.py processes of this root that are blocked at the paid gate right now (`gate_wait/<pid>.json`, kept by the process while
+    it waits): [{pid, create_time, job, module, step, since}]. With `clean` a file naming a process that no longer runs is removed."""
+    out = []
+    for path in sorted((batch(root) / 'gate_wait').glob('*.json')):
+        raw = read_json(path)
+        if not isinstance(raw, dict):
+            if clean and _stale_file(path):
+                path.unlink(missing_ok=True)
+            continue
+        if not _process_alive(raw.get('pid'), raw.get('create_time')):
+            if clean:
+                path.unlink(missing_ok=True)
+            continue
+        out.append({k: raw.get(k) for k in ('pid', 'create_time', 'job', 'module', 'step', 'since')})
+    return out
+
+
+def drain_exits(root) -> list[dict]:
+    """The exits convert_job.py recorded when it left the gate for a drain (`drain_exits/*.json`), each with its `path`."""
+    out = []
+    for path in sorted((batch(root) / 'drain_exits').glob('*.json')):
+        raw = read_json(path)
+        if isinstance(raw, dict):
+            out.append(raw | {'path': path})
+        elif _stale_file(path):
+            path.unlink(missing_ok=True)
+    return out
+
+
+def _plain_count(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def settle_drain_exits(root, now: float | None = None) -> list[dict]:
+    """Consume the recorded drain exits whose process is gone and restore the failure counts an OLDER worker wrote for them (it counts any
+    non-zero exit; the current convert_queue.py marks its children `parent_aware` and counts nothing). Per job: `<job>.fails` goes back to
+    max(the lowest `fails_before` of those exits, the count now - their number), never up, and the file is removed at 0. Returns one entry
+    per job {job, exits, counted, modules, fails_from?, fails_to?}; every entry is appended to `convert_drain.log`."""
+    now = time.time() if now is None else now
+    by_job: dict[str, list[dict]] = {}
+    done = []
+    for item in drain_exits(root):
+        if _process_alive(item.get('pid'), item.get('create_time')):
+            continue                                                   # still on its way out
+        done.append(item['path'])
+        job = item.get('job')
+        if isinstance(job, str) and '--' in job and Path(job).name == job:
+            by_job.setdefault(job, []).append(item)
+    restored = []
+    locks = batch(root) / 'convert_locks'
+    for job, items in sorted(by_job.items()):
+        counted = [i for i in items if not i.get('parent_aware') and _plain_count(i.get('fails_before'))]
+        entry = {'job': job, 'exits': len(items), 'counted': len(counted), 'modules': sorted({str(i.get('module')) for i in items})}
+        if counted:
+            path = locks / f'{job}.fails'
+            try:
+                current = int(path.read_text(encoding='utf-8').strip())
+            except FileNotFoundError:
+                current = 0
+            except (OSError, ValueError):
+                current = None
+                entry['problem'] = 'the failure count could not be read; not restored'
+            if current is not None:
+                target = max(min(i['fails_before'] for i in counted), current - len(counted))
+                if target < current:
+                    if target <= 0:
+                        path.unlink(missing_ok=True)
+                    else:
+                        guard.write_atomic(path, str(target).encode('utf-8'))
+                    entry.update(fails_from=current, fails_to=target)
+        restored.append(entry)
+    if restored:
+        try:
+            with open(batch(root) / 'convert_drain.log', 'a', encoding='utf-8') as handle:
+                for entry in restored:
+                    handle.write(json.dumps({'time': iso(now)} | entry) + '\n')
+        except OSError:
+            pass
+    for path in done:
+        path.unlink(missing_ok=True)
+    return restored
+
+
+def settle_drain(root, now: float | None = None) -> list[str]:
+    """End a conversion drain that is no longer pending (the drained worker is gone, or the convert record carries no legacy stop any more):
+    restore the failure counts of its drain exits (settle_drain_exits), remove the job locks naming the drained worker once it is gone, delete
+    CONVERT_DRAIN and record what was restored (`drain_restored` / `drain_finished` of the convert record). While the drain is pending
+    nothing is touched. Returns event texts."""
+    now = time.time() if now is None else now
+    with _LOCK:
+        drain = read_drain(root)
+        conv = read_record(root, 'convert')
+        if drain is not None and conv.get('stop_requested') and conv.get('drain_hold'):
+            return []
+        folder = batch(root) / 'drain_exits'
+        if drain is None and not (folder.is_dir() and any(folder.glob('*.json'))):
+            return []
+        events = []
+        restored = settle_drain_exits(root, now)
+        worker = drain.get('worker') if isinstance(drain, dict) and isinstance(drain.get('worker'), dict) else None
+        unlocked = []
+        if worker and isinstance(worker.get('pid'), int) and not _process_alive(worker['pid'], None):
+            for job in _locks_naming(root, worker['pid']):
+                (batch(root) / 'convert_locks' / f'{job}.lock').unlink(missing_ok=True)
+                unlocked.append(job)
+        for entry in restored:
+            if 'fails_to' in entry:
+                events.append(f'convert: failure count of {entry["job"]} restored {entry["fails_from"]} -> {entry["fails_to"]} '
+                              f'({entry["counted"]} drain exit(s) the older worker counted as failures)')
+            elif entry.get('problem'):
+                events.append(f'convert: drain exit of {entry["job"]}: {entry["problem"]}')
+        if unlocked:
+            events.append(f'convert: removed the job lock(s) of the stopped older worker: {", ".join(unlocked)}')
+        if drain is not None:
+            drain_path(root).unlink(missing_ok=True)
+            deferred = sum(e['exits'] for e in restored)
+            events.append(f'conversion drain finished: CONVERT_DRAIN removed ({deferred} deferred convert_job exit(s))')
+        if restored or unlocked or drain is not None:
+            conv = read_record(root, 'convert')
+            conv.update(drain_restored=restored, drain_unlocked=unlocked, drain_finished=now)
+            write_record(root, 'convert', conv)
+    return events
+
+
+def drain_state(root) -> dict | None:
+    """`drain` of the status: the CONVERT_DRAIN file plus the convert_job.py processes waiting at the paid gate (they leave by themselves)."""
+    drain = read_drain(root)
+    if drain is None:
+        return None
+    worker = drain.get('worker') if isinstance(drain.get('worker'), dict) else {}
+    return {'since': drain.get('since'), 'reason': drain.get('reason'), 'worker_pid': worker.get('pid'), 'gate_waiters': gate_waiters(root, clean=False),
+            'message': 'an older convert worker is being drained: convert_job.py processes blocked at the paid gate leave (deferred, not failed)'}
+
+
+def _cycling(root, inst: dict, since: float | None) -> bool:
+    """The drained worker keeps taking jobs: a convert_job.py left the gate for this drain although its parent is not a current worker (the
+    older worker launched it after intake was stopped, or will count its exit and try the next job)."""
+    for item in drain_exits(root):
+        stamp = item.get('time')
+        if not item.get('parent_aware') and isinstance(stamp, (int, float)) and (since is None or stamp >= since - 1):
+            return True
+    return False
+
+
+def _drain_idle_problem(root, proc, inst: dict) -> str | None:
+    """The frozen CYCLING legacy worker can be terminated: it has no child (a child that waits at the paid gate, or that just started and
+    will reach the gate, is waited for up to DRAIN_SETTLE: frozen, the worker cannot start another) and its last event since it started is
+    one after which it only releases the job and picks the next (DRAIN_SAFE_EVENTS; never while it finishes / offloads a set)."""
+    deadline = time.monotonic() + DRAIN_SETTLE
+    while True:
+        kids = proc.children(recursive=True)
+        if not kids:
+            break
+        waiting = {w['pid'] for w in gate_waiters(root)}
+        now = time.time()
+        young = True
+        for kid in kids:
+            try:
+                young = young and now - kid.create_time() < DRAIN_YOUNG
+            except psutil.Error:
+                continue
+        if not (young or any(k.pid in waiting for k in kids)) or time.monotonic() >= deadline:
+            return f'an older worker: it has a child process (pid {kids[0].pid}) that is not leaving the paid gate; waiting'
+        time.sleep(0.2)
+    body = worker_last_event(root, inst, time.time())
+    if body is None or not body.startswith(DRAIN_SAFE_EVENTS) or 'exiting' in body:
+        return 'an older worker: its last event is not one after which it only picks the next job (it may be finishing a set); waiting'
+    return None
+
+
 def _convert_stop_step(root, svc: Service, inst: dict, rec: dict, now: float) -> tuple[bool, str]:
     """One step of a pending convert stop: (gone, message). Writes / renews the stop file naming the process. A legacy worker (I.2, phase 5
-    review row 6) is drained in this order: the conversion hold FIRST (dispatch is quiesced: a hold-aware worker starts nothing, and every
-    convert_job.py started from the current code waits before its paid steps; the hold stays while the drain is pending, `drain_hold`), then
-    wait until it sleeps, then frozen_stop: suspended, re-verified idle, only then terminated. Never kills anything else."""
+    review row 6, I.10) is drained in this order: the conversion hold FIRST (intake is stopped: a hold-aware worker starts nothing, and every
+    convert_job.py started from the current code waits before its paid steps; the hold stays while the drain is pending, `drain_hold`), THEN
+    CONVERT_DRAIN (the convert_job.py processes blocked at the paid gate leave by themselves: deferred, lock released, exit 76), then wait
+    until no convert_job.py runs and the worker sleeps, then frozen_stop: suspended, re-verified idle, only then terminated. A worker that
+    keeps taking jobs meanwhile (_cycling) is frozen and terminated while it has no child (_drain_idle_problem). Never kills anything else."""
     if not _names(worker_stop_path(root), inst):
         write_worker_stop(root, inst, rec.get('stop_request_id') or iso(rec.get('stop_requested')), now)
     if _names(worker_stopping_path(root), inst):
@@ -944,17 +1319,33 @@ def _convert_stop_step(root, svc: Service, inst: dict, rec: dict, now: float) ->
             write_record(root, 'convert', current)
         if read_hold(root) is None:
             return False, 'an older worker: the conversion hold could not be written; it is not stopped'
+        drain = read_drain(root)
+        if drain is None or not _same_process(drain.get('worker') if isinstance(drain.get('worker'), dict) else {}, inst):
+            drain = write_drain(root, inst, now)          # after the hold: intake is stopped first, then the gate-waiters are asked to leave
+        waiting = {w['pid'] for w in gate_waiters(root)}
         jobs = convert_job_running(root)
+        working = [j for j in jobs if j['pid'] not in waiting]
+        if not jobs and worker_sleeping(root, inst, now):
+            gone, problem = frozen_stop(root, svc, inst, lambda proc: _worker_idle_problem(root, proc, inst))
+            if gone:
+                return True, 'the older worker was asleep (verified while suspended): stopped by its verified PID'
+            return False, problem or 'the older worker did not exit yet'
+        if _cycling(root, inst, _hold_time(drain)):
+            gone, problem = frozen_stop(root, svc, inst, lambda proc: _drain_idle_problem(root, proc, inst))
+            if gone:
+                return True, ('the older worker kept taking jobs during the drain: stopped by its verified PID while it had no child '
+                              '(verified while suspended)')
+            return False, problem or 'the older worker did not exit yet'
+        if working:
+            return False, (f'an older worker without the stop file: it is stopped only while it sleeps; convert_job.py (pid {working[0]["pid"]}) '
+                           'runs now (conversions are held meanwhile'
+                           + (f'; {len(jobs) - len(working)} more wait at the paid gate and leave by themselves' if len(jobs) > len(working) else '')
+                           + ')')
         if jobs:
-            return False, (f'an older worker without the stop file: it is stopped only while it sleeps; convert_job.py (pid {jobs[0]["pid"]}) '
-                           'runs now (conversions are held meanwhile)')
-        if not worker_sleeping(root, inst, now):
-            return False, ('an older worker without the stop file: waiting until its event log says it sleeps (PAUSED / IDLE / LOW DISK); '
-                           'conversions are held meanwhile')
-        gone, problem = frozen_stop(root, svc, inst, lambda proc: _worker_idle_problem(root, proc, inst))
-        if gone:
-            return True, 'the older worker was asleep (verified while suspended): stopped by its verified PID'
-        return False, problem or 'the older worker did not exit yet'
+            return False, (f'an older worker without the stop file: {len(jobs)} convert_job.py process(es) blocked at the paid gate are leaving '
+                           '(CONVERT_DRAIN: deferred, not failed); conversions are held meanwhile')
+        return False, ('an older worker without the stop file: waiting until its event log says it sleeps (PAUSED / IDLE / LOW DISK); '
+                       'conversions are held meanwhile')
     return False, 'stop requested; waiting for the worker to acknowledge it (convert_worker1.stopping)'
 
 
@@ -1045,7 +1436,10 @@ def stop(root, name: str, *, wait: float = 5.0, force: bool = False, then_start:
             rec.update(running=False, user_stopped=not then_start, stop_requested=None)
             write_record(root, name, rec)
             if then_start:
-                return {'ok': True, 'pending': False, 'message': f'{name} was not running; started', 'status': start(root, name, settings)}
+                status_ = start(root, name, settings)
+                new = read_record(root, name)
+                return {'ok': True, 'pending': False, 'message': f'{name} was not running; started as pid {new.get("pid")}', 'status': status_,
+                        'replacement': {'pid': new.get('pid'), 'create_time': new.get('create_time')}}
             return {'ok': True, 'pending': False, 'message': f'{name} is not running', 'status': status_one(root, svc, settings)}
         inst = found[0]
         if not (rec.get('pid') == inst['pid'] and abs((rec.get('create_time') or 0) - inst['create_time']) < CREATE_TIME_TOLERANCE):
@@ -1053,6 +1447,9 @@ def stop(root, name: str, *, wait: float = 5.0, force: bool = False, then_start:
         if name == 'convert' and force and convert_job_running(root):
             raise ServiceError('refused: convert_job.py is running; the worker can only stop gracefully after it')
         rec.update(stop_requested=now, then_start=then_start, stop_request_id=request)
+        rec.pop('restart_request', None)
+        if name == 'supervisor':                 # finding 7: the delivery of the stop is persisted (requested -> delivered | failed)
+            rec['stop_delivery'] = {'state': 'requested', 'time': now, 'pid': inst['pid'], 'create_time': inst['create_time']}
         pause_file = batch(root) / 'PAUSE'
         if name == 'supervisor' and then_start and pause_file.exists():
             try:
@@ -1063,12 +1460,23 @@ def stop(root, name: str, *, wait: float = 5.0, force: bool = False, then_start:
         pending, message = False, f'{name} stopped'
         if name == 'supervisor':
             assert_hold(root, 'supervisor ' + ('restart' if then_start else 'stop'), renew=True, now=now, retiring=inst)
-            run = subprocess.run([sys.executable, '-X', 'utf8', '-u', svc.script, 'stop'], cwd=str(root), capture_output=True, text=True,
-                                 encoding='utf-8', errors='replace', timeout=60, creationflags=NO_WINDOW)
-            if run.returncode != 0:
-                rec.update(stop_requested=None, then_start=False)
-                write_record(root, name, rec)
-                raise ServiceError(f'supervisor stop failed: {(run.stderr or run.stdout).strip()[:300]}')
+            failure = None
+            try:
+                run = subprocess.run([sys.executable, '-X', 'utf8', '-u', svc.script, 'stop'], cwd=str(root), capture_output=True, text=True,
+                                     encoding='utf-8', errors='replace', timeout=60, creationflags=NO_WINDOW)
+                if run.returncode != 0:
+                    failure = (run.stderr or run.stdout or '').strip()[:300] or f'exit {run.returncode}'
+            except (OSError, subprocess.SubprocessError) as error:
+                failure = f'{type(error).__name__}: {error}'[:300]
+            if failure is not None and not _stop_delivered(root, inst):
+                # non-delivery is established: the command failed, no stop file exists and the supervisor still runs. It stays the intended
+                # generation: the request and the `retiring` designation are withdrawn, so its ticks release the hold again (finding 7)
+                _stop_not_delivered(root, rec, inst, failure, time.time())
+                raise ServiceError(f'supervisor stop failed: {failure} (the stop was not delivered: the supervisor keeps running and the '
+                                   'conversion hold is released by its next tick)')
+            rec['stop_delivery'] = {'state': 'delivered' if _stop_delivered(root, inst) else 'unconfirmed', 'time': time.time(),
+                                    'pid': inst['pid'], 'create_time': inst['create_time'], 'note': failure}
+            write_record(root, name, rec)
             gone = _wait_gone(root, name, wait, inst)
             pending, message = not gone, ('supervisor stopped' if gone else 'stop requested; the supervisor exits within a few seconds')
         elif name == 'views':
@@ -1087,7 +1495,7 @@ def stop(root, name: str, *, wait: float = 5.0, force: bool = False, then_start:
                 if not gone:
                     gone, message = _convert_stop_step(root, svc, inst, rec, time.time())
             if gone:
-                message = 'convert worker stopped'
+                message = f'convert worker stopped: {message}' if 'older worker' in message else 'convert worker stopped'
             pending = not gone
             if pending:
                 rec = read_record(root, name)
@@ -1099,8 +1507,16 @@ def stop(root, name: str, *, wait: float = 5.0, force: bool = False, then_start:
             after = read_record(root, name)
             _restore_pause(root, after)
             _finish_stop(root, name, after, time.time())
+            if name == 'convert':
+                drained = settle_drain(root)      # a legacy drain that just ended: failure counts restored, CONVERT_DRAIN removed (I.10)
+                if drained:
+                    message += ' (' + '; '.join(drained) + ')'
             if then_start:
-                return {'ok': True, 'pending': False, 'message': message + '; restarting', 'status': start(root, name, settings)}
+                # finding 20: the outcome is terminal only with the replacement identified; start() raises ServiceError when it fails / is blocked
+                status_ = start(root, name, settings)
+                new = read_record(root, name)
+                return {'ok': True, 'pending': False, 'message': f'{message}; restarted as pid {new.get("pid")}', 'status': status_,
+                        'replacement': {'pid': new.get('pid'), 'create_time': new.get('create_time')}}
         return {'ok': True, 'pending': pending, 'message': message, 'status': status_one(root, svc, settings)}
 
 
@@ -1147,11 +1563,12 @@ def has_work(root) -> bool:
     return bool(convert_list.eligible_jobs(root))
 
 
-def _completed(ctx: dict, name: str, request, then_start: bool, text: str) -> None:
+def _completed(ctx: dict, name: str, request, then_start: bool, text: str, ok: bool = True, replacement: dict | None = None) -> None:
     """Record the end of a pending stop / restart for the tick's `completed` list (phase 5 review row 18): the service request id the stop
-    carried (`stop_request_id`), so the manager can give the request its terminal outcome."""
-    ctx.setdefault('completed', []).append({'name': name, 'request': request, 'action': 'restart' if then_start else 'stop', 'ok': True,
-                                            'pending': False, 'text': text})
+    carried (`stop_request_id`), so the manager can give the request its terminal outcome. A restart ends only with its replacement
+    identified (`replacement` = {pid, create_time}, ok true) or with the reason it was not started (ok false); finding 20."""
+    ctx.setdefault('completed', []).append({'name': name, 'request': request, 'action': 'restart' if then_start else 'stop', 'ok': bool(ok),
+                                            'pending': False, 'text': text, 'replacement': replacement})
 
 
 def _tick_one(root, svc: Service, found: list[dict], settings: dict, now: float, ctx: dict) -> list[str]:
@@ -1178,6 +1595,18 @@ def _tick_one(root, svc: Service, found: list[dict], settings: dict, now: float,
             rec.update(fails=0, error=None)
         if name == 'convert':
             rec['convert_jobs'] = [j['pid'] for j in convert_job_running(root)]
+        if name == 'supervisor' and rec.get('stop_requested') and not supervisor_stop_file(root).exists() \
+                and now - float(rec['stop_requested']) > STOP_DELIVERY_GRACE:
+            # finding 7 (reconcile): the stop is pending for this very supervisor, but its stop file is gone and it still runs: the request
+            # never reached it (or was removed). It is withdrawn; this supervisor stays the intended generation.
+            request, then_start = rec.get('stop_request_id'), bool(rec.get('then_start'))
+            _stop_not_delivered(root, rec, inst, 'the stop file is gone and the supervisor still runs', now)
+            text = (f'supervisor: the stop was not delivered (pid {inst["pid"]} still runs and no stop request is left); the request is '
+                    'withdrawn and its ticks release the conversion hold again')
+            events.append(text)
+            _completed(ctx, name, request, then_start, text, ok=False)
+            rec = read_record(root, name)
+        stopped = False
         if name in ('convert', 'views') and rec.get('stop_requested'):
             write_record(root, name, rec)
             try:
@@ -1197,24 +1626,26 @@ def _tick_one(root, svc: Service, found: list[dict], settings: dict, now: float,
                            stop_note=None)
                 if name == 'convert':
                     _clean_worker_files(root)
-                started = []
-                if then_start:
-                    write_record(root, name, rec)
-                    started = _start(root, svc, rec, settings, now, 'restart')
-                    events += started
-                    rec = read_record(root, name)
-                _completed(ctx, name, request, then_start, '; '.join([text] + started))
-        write_record(root, name, rec)
-        return events
-    # nothing runs
+                if then_start:      # finding 20: the restart is terminal only after the start checks below identified the replacement
+                    rec['restart_request'] = {'id': request, 'text': text}
+                else:
+                    _completed(ctx, name, request, False, text)
+                stopped = True
+        if not stopped:
+            write_record(root, name, rec)
+            return events
+    # nothing runs (any more)
     rec['duplicates'] = []
     if rec.get('running'):
         rec.update(running=False, exited_at=now)
         if rec.get('stop_requested'):
-            rec.update(user_stopped=not rec.get('then_start'), stop_requested=None, idle_exit=False, stop_note=None, drain_hold=False)
+            request, then_start = rec.get('stop_request_id'), bool(rec.get('then_start'))
+            rec.update(user_stopped=not then_start, stop_requested=None, idle_exit=False, stop_note=None, drain_hold=False)
             events.append(f'{name}: stopped')
-            _completed(ctx, name, rec.get('stop_request_id'), bool(rec.get('then_start')),
-                       f'{name}: stopped' + ('; restarting' if rec.get('then_start') else ''))
+            if then_start:
+                rec['restart_request'] = {'id': request, 'text': f'{name}: stopped'}
+            else:
+                _completed(ctx, name, request, False, f'{name}: stopped')
         elif _idle_exit(root, svc, rec):
             rec.update(idle_exit=True)
             events.append(f'{name}: exited (idle, nothing staged)')
@@ -1223,11 +1654,13 @@ def _tick_one(root, svc: Service, found: list[dict], settings: dict, now: float,
             events += _backoff_or_hold(rec, now, 'exited unexpectedly' + (f' ({last})' if last else ''))
     enabled = bool(settings['services'].get(name, True))
     restart_now = bool(rec.get('then_start'))
+    pending_restart = rec.get('restart_request') if isinstance(rec.get('restart_request'), dict) else None
     reason = None
-    if rec.get('held') or rec.get('user_stopped') or not enabled:
-        pass
-    elif restart_now:
+    if restart_now:                # an explicit Restart starts the service like Start does (also when it is disabled or was held)
         reason = 'restart'
+        rec.update(held=False, user_stopped=False, next_restart=None)
+    elif rec.get('held') or rec.get('user_stopped') or not enabled:
+        pass
     elif rec.get('idle_exit'):
         if has_work(root):
             reason = 'work appeared'
@@ -1247,30 +1680,42 @@ def _tick_one(root, svc: Service, found: list[dict], settings: dict, now: float,
         if blocked != rec.get('blocked'):
             events.append(f'{name}: {blocked}')
         rec['blocked'] = blocked
+        if pending_restart and reason == 'restart':       # terminal: the replacement was not started (it starts once the blocker is gone)
+            rec.pop('restart_request', None)
+            _completed(ctx, name, pending_restart.get('id'), True, f'{pending_restart.get("text")}; restart blocked: {blocked}', ok=False)
         write_record(root, name, rec)
         return events
     rec['blocked'] = None
     if reason:
+        rec.pop('restart_request', None)
         write_record(root, name, rec)
-        events += _start(root, svc, rec, settings, now, reason)
+        started, inst, error = _start(root, svc, rec, settings, now, reason)
+        events += started
+        if pending_restart and reason == 'restart':
+            if inst is not None:
+                _completed(ctx, name, pending_restart.get('id'), True, '; '.join([str(pending_restart.get('text'))] + started),
+                           replacement={'pid': inst['pid'], 'create_time': inst['create_time']})
+            else:
+                _completed(ctx, name, pending_restart.get('id'), True, f'{pending_restart.get("text")}; restart failed: {error}', ok=False)
         return events
     write_record(root, name, rec)
     return events
 
 
-def _start(root, svc: Service, rec: dict, settings: dict, now: float, reason: str) -> list[str]:
-    """Spawn `svc` for the tick (crash restart, missing service, pending restart) and record it."""
+def _start(root, svc: Service, rec: dict, settings: dict, now: float, reason: str) -> tuple[list[str], dict | None, str | None]:
+    """Spawn `svc` for the tick (crash restart, missing service, pending restart) and record it: (events, the new instance {pid,
+    create_time, cmdline} or None, the error text when it could not start)."""
     _restore_pause(root, rec)
     try:
         inst = _spawn(root, svc, settings)
     except OSError as error:
         events = _backoff_or_hold(rec, now, f'could not start: {error}')
         write_record(root, svc.name, rec)
-        return events
+        return events, None, f'could not start: {error}'
     new = _fresh_record(inst, False, {**rec, 'idle_exit': False, 'next_restart': None})
     new['last_seen'] = now
     write_record(root, svc.name, new)
-    return [f'{svc.name}: started pid {inst["pid"]} ({reason})']
+    return [f'{svc.name}: started pid {inst["pid"]} ({reason})'], inst, None
 
 
 def tick(root, settings: dict | None = None, now: float | None = None) -> dict:
@@ -1305,6 +1750,7 @@ def tick(root, settings: dict | None = None, now: float | None = None) -> dict:
             _clean_worker_files(root)
             if not read_record(root, 'convert').get('stop_requested'):
                 (batch(root) / 'convert_worker.stop').unlink(missing_ok=True)   # the old shared marker: never written any more (F6)
+            events += settle_drain(root, now)        # a legacy drain that ended in this pass (I.10); nothing while one is pending
             text = release_hold(root, sup)
             if text:
                 events.append(text)
@@ -1383,4 +1829,5 @@ def status(root, settings: dict | None = None, now: float | None = None, lines: 
     if health.get('error'):
         errors.append(f'settings: {health["error"]}' + ('; no service is started until it is fixed' if health.get('hold_starts')
                                                         else '; the last valid settings are used'))
-    return {'services': services, 'convert_jobs': jobs, 'errors': errors, 'hold': hold_state(root), 'settings': health}
+    return {'services': services, 'convert_jobs': jobs, 'errors': errors, 'hold': hold_state(root), 'drain': drain_state(root),
+            'settings': health}

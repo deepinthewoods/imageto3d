@@ -474,13 +474,18 @@ def monster_folder(root: Path, monster_id: str) -> Path:
 
 def write_monster_lod(root: Path, monster_id: str, lod: object) -> dict:
     """Monster LOD pick: same record as monsters.write_choice, but under a per-variant cross-process lock, a unique temp file and the
-    Windows replace retry. An approved monster keeps its level (LodLocked)."""
+    Windows replace retry. An approved monster keeps its level (LodLocked). chosen_lod.json is read strictly (guard.Unreadable)."""
     m = serve.monsters
     if lod not in m.LOD_LEVELS:
         raise ValueError('Invalid LOD')
     folder = monster_folder(root, monster_id)
+    import monsters_v2                                         # (lazy: monsters_v2 never imports decisions)
+    monsters_v2.contained(m.monsters_root(root), folder / LOCKNAME, folder / m.CHOICE, folder / 'reduced' / f'lod_error_{lod}.glb')
     with guard.os_lock(folder / LOCKNAME):
-        record = m._read(folder / m.CHOICE)
+        # STRICT reads (recheck finding 11): a malformed chosen_lod.json or reconvert journal is 409 `unreadable` and stays as it is
+        # (the tolerant legacy reader treated it as empty and this write then replaced it)
+        monsters_v2.read_reconvert_journal(folder)
+        record = monsters_v2.read_choice(folder)
         if record.get('approved') is True:
             raise LodLocked('approved; send it back to 3D first')
         if not (folder / 'reduced' / f'lod_error_{lod}.glb').is_file():

@@ -592,8 +592,9 @@ class Orchestrator:
                 self.queue.finish(task['id'], task.get('token'), True, result)
             elif outcome['outcome'] == 'requeue':          # "Hyper3D profile busy" (5 min) or the gate closed during the run (1 min)
                 self.queue.requeue(task['id'], task.get('token'), outcome['error'], outcome['delay'])
-            else:                                          # never retried automatically: Retry resumes from the record
-                self._monster_disposition(task, outcome['error'])
+            elif self._monster_disposition(task, outcome['error']):
+                # never retried automatically: Retry resumes from the record. The row fails only AFTER its failure is durably recorded
+                # (recheck finding 3); otherwise it stays active (slot held) and this pass is repeated at the next tick.
                 self.queue.finish(task['id'], task.get('token'), False, result, outcome['error'])
             catalog.invalidate()
             return
@@ -615,89 +616,130 @@ class Orchestrator:
         if task['attempts'] < task['max_attempts'] and self._approved(task):
             self.queue.requeue(task['id'], task.get('token'), error, BACKOFF)
         else:
-            if task['lane'] == monster_lane.LANE:
-                self._monster_disposition(task, error)
+            if task['lane'] == monster_lane.LANE and not self._monster_disposition(task, error):
+                return                                         # not recorded yet: the row is not finished (recheck finding 3)
             self.queue.finish(task['id'], task.get('token'), False, None, error)
 
     # ------------------------------------------------------------------------------------------- monster lane (phase 5 review)
-    def _monster_disposition(self, task: dict, error: str | None) -> None:
-        """F4: the failure of a monster generation is persisted in its views.json BEFORE the row fails (a rebuilt queue never revives it)."""
+    def _monster_disposition(self, task: dict, error: str | None) -> bool:
+        """F4 / recheck finding 3: the failure of a monster generation is persisted in its views.json BEFORE the row fails (a rebuilt
+        queue never revives it). False when that record could NOT be written: the caller must not finish the row. The intent then stays
+        on disk as outstanding work (monster_lane.persist_disposition), is written again at every tick, blocks any re-queueing of the
+        generation, and the reason is shown on the row and in the orchestrator errors."""
         try:
             monster_lane.record_failure(self.root, task, error)
-        except Exception as exc:  # noqa: BLE001  (the row still fails; the error is shown)
-            self.errors = (self.errors + [f'monster disposition of task {task["id"]}: {type(exc).__name__}: {exc}'])[-20:]
+            return True
+        except Exception as exc:  # noqa: BLE001
+            text = (f'monster disposition of task {task["id"]}: the failure ({str(error)[:120]}) could not be recorded '
+                    f'({type(exc).__name__}: {exc}); the task is not finished until it is')
+            if text not in self.errors:
+                self.errors = (self.errors + [text])[-20:]
+            try:
+                self.queue.note_active(task['id'], task.get('token'), text[:500])
+            except taskqueue.QueueError:
+                pass
+            return False
 
     def _monster_tree_hold(self, task: dict, now: float) -> str | None:
-        """F14: while a recorded child of the variant's driver (collector, reducer, Blender, browser) still runs, the attempt keeps its slot,
-        whatever its wrapper, builder or receipt say: 'orphaned' / 'alive' (a Kill & retry drains the tree first). None: no live child, the
-        normal settlement applies."""
+        """F14 / recheck finding 9: while a process of the attempt's tree still runs (its Job Object, else the recorded driver, children
+        and descendants), or the evidence about that tree is incomplete, the attempt keeps its slot, whatever its wrapper, builder or
+        receipt say: 'orphaned' / 'alive' (a Kill & retry drains the tree first). Looking at the tree here is also what makes this
+        process take a handle of the attempt's job (ownership through the driver's exit). None: nothing holds it, the normal settlement
+        applies."""
         args = task.get('args') if isinstance(task.get('args'), dict) else {}
         try:
-            kids = monster_lane.live_children(self.root, str(args.get('monster')), str(args.get('variant')))
+            state = monster_lane.tree_state(self.root, str(args.get('monster')), str(args.get('variant')))
         except Exception:  # noqa: BLE001
             return None
-        if not kids:
+        if not state['live'] and not state['incomplete']:
             return None
         if task.get('kill_requested'):
             return self._kill(task)
+        if state['incomplete'] and not state['live']:
+            text = f'task {task["id"]}: the process tree of its attempt is not fully known ({state["incomplete"]}); the slot stays held'
+            if text not in self.notes:
+                self.notes.append(text)
         if task['state'] == 'running' and not same_process(task, now):
             if self.queue.mark_orphan(task['id'], task.get('token')):
-                self.notes.append(f'task {task["id"]}: its driver is gone but a child process still runs (orphan; the slot stays taken)')
+                self.notes.append(f'task {task["id"]}: its driver is gone but a process of its tree still runs (orphan; the slot stays taken)')
                 return 'orphaned'
         return 'alive' if task['state'] in ('running', 'orphan') else None
 
-    def _monster_tree(self, task: dict, builder: tuple) -> list:
-        """F14: the process tree of a monster attempt, collected BEFORE anything is killed: every descendant (psutil, recursive) of the
-        builder and the wrapper (each only when it is still the recorded process), and every recorded live child of the variant's drivers with
-        its own descendants. The builder and wrapper themselves are not in the list (_kill terminates them after their checks)."""
-        if psutil is None:
-            return []
+    def _ownership(self, pid: int | None, created: float | None, marks: list[str]) -> str:
+        """Recheck finding 9, BEFORE anything is enumerated or signalled: 'gone' (not running, or the pid belongs to a later process now),
+        'verified' (alive with the recorded create time and command line) or 'unverified' (alive, identity not proven: e.g. no recorded
+        create time)."""
+        if not pid or not pid_alive(pid):
+            return 'gone'
+        actual = create_time(pid)
+        if created is not None and actual is not None and abs(actual - created) > CREATE_TIME_TOLERANCE:
+            return 'gone'
+        if self._verified(pid, created, marks):
+            return 'verified'
+        deadline = time.monotonic() + 3.0                       # (a process that is exiting right now cannot be inspected: wait for it)
+        while time.monotonic() < deadline and pid_alive(pid):
+            time.sleep(0.1)
+        if not pid_alive(pid):
+            return 'gone'
+        return 'verified' if self._verified(pid, created, marks) else 'unverified'
+
+    def _kill_monster(self, task: dict, builder: tuple, argv: list) -> str:
+        """Kill & retry of a monster attempt (recheck finding 9). Order:
+          1. OWNERSHIP: the wrapper and the builder (driver) must each be gone or verified (pid + recorded create time + command line). One
+             that is alive but unverified means NOTHING is enumerated or signalled: 'kill_failed', the slot stays held, the reason is shown.
+          2. the tree is planned (monster_lane.tree_plan): the attempt's Job Object when this process holds it, else only processes whose
+             identity is proven; a recorded process without a create time blocks every signal too.
+          3. builder and wrapper are stopped, the tree is drained and confirmed gone (monster_lane.drain_tree). A survivor, or evidence
+             that is not the whole tree, is 'kill_failed' as well (slot kept)."""
         args = task.get('args') if isinstance(task.get('args'), dict) else {}
         monster, variant = str(args.get('monster')), str(args.get('variant'))
-        procs: dict[int, object] = {}
+        roles = (('builder', builder[0], builder[1], argv),
+                 ('wrapper', task.get('pid'), task.get('pid_create'), [task.get('token')] if task.get('token') else [str(RUN_TASK)]))
+        problems, killed, roots = [], [], []
+        for role, pid, created, marks in roles:
+            owned = self._ownership(pid, created, marks)
+            if owned == 'unverified':
+                problems.append(f'{role} {pid} could not be verified')
+            elif owned == 'verified':
+                roots.append((pid, created))
+        plan = None
+        if not problems:
+            try:
+                plan = monster_lane.tree_plan(self.root, monster, variant, roots)
+                problems += plan['blocking']
+            except Exception as exc:  # noqa: BLE001
+                problems.append(f'the process tree could not be read ({type(exc).__name__}: {exc})')
+        if problems:
+            detail = ('Kill & retry did not signal anything: ' + '; '.join(problems) +
+                      ' (ownership of the attempt is not proven; the worker slot stays taken)')
+            self.queue.kill_failed(task['id'], task.get('token'), detail)
+            self.notes.append(f'task {task["id"]}: {detail}')
+            return 'kill_failed'
+        for role, pid, created, marks in roles:
+            outcome = self._terminate(pid, created, marks)
+            if outcome == 'killed':
+                killed.append(f'{role} {pid}')
+            elif outcome != 'gone':
+                problems.append(f'{role} {pid} {"could not be verified (not touched)" if outcome == "unverified" else "is still running after the kill"}')
+        drained = monster_lane.drain_tree(self.root, monster, variant, plan, KILL_WAIT)
+        problems += drained['problems']
+        if drained['killed']:
+            killed.append(f'{drained["killed"]} process(es) of its tree')
+        return self._kill_outcome(task, killed, problems)
 
-        def collect(pid, created) -> None:
-            if not pid or not pid_alive(pid):
-                return
-            actual = create_time(pid)
-            if created is not None and actual is not None and abs(actual - created) > CREATE_TIME_TOLERANCE:
-                return
-            try:
-                root_proc = psutil.Process(pid)
-                for proc in [root_proc] + root_proc.children(recursive=True):
-                    procs.setdefault(proc.pid, proc)
-            except psutil.Error:
-                pass
-        collect(*builder)
-        collect(task.get('pid'), task.get('pid_create'))
-        for child in monster_lane.recorded_children(self.root, monster, variant)['children']:
-            if monster_lane._alive(child.get('pid'), child.get('create')):
-                collect(child.get('pid'), child.get('create'))
-        own = {p for p in (builder[0], task.get('pid')) if p}
-        return [p for pid, p in procs.items() if pid not in own]
-
-    def _drain_monster_tree(self, task: dict, tree: list, problems: list[str], killed: list[str]) -> None:
-        """Kill every process of `tree` (after the builder and wrapper were stopped, so nothing spawns a new step) and wait for each to be gone.
-        A survivor is a problem (kill_failed: the slot stays taken). When all are gone, the variant's children record is cleared."""
-        args = task.get('args') if isinstance(task.get('args'), dict) else {}
-        monster, variant = str(args.get('monster')), str(args.get('variant'))
-        for proc in reversed(tree):                             # deepest first (children lists are breadth-first)
-            try:
-                proc.kill()
-            except psutil.NoSuchProcess:
-                pass
-            except psutil.Error as exc:
-                problems.append(f'child {proc.pid} could not be killed ({exc})')
-        _gone, alive = psutil.wait_procs(tree, timeout=KILL_WAIT) if tree else ([], [])
-        for proc in alive:
-            problems.append(f'child {proc.pid} is still running after the kill')
-        if tree and not alive:
-            killed.append(f'{len(tree)} child process(es)')
-        if not alive:
-            try:
-                monster_lane.clear_children(self.root, monster, variant)
-            except OSError:
-                pass
+    def _kill_outcome(self, task: dict, killed: list[str], problems: list[str]) -> str:
+        if problems:
+            detail = 'Kill & retry could not stop the attempt: ' + '; '.join(problems) + ' (the worker slot stays taken)'
+            self.queue.kill_failed(task['id'], task.get('token'), detail)
+            self.notes.append(f'task {task["id"]}: {detail}')
+            return 'kill_failed'
+        detail = 'killed by the user (Kill & retry)' + (f': {", ".join(killed)}' if killed else ': no matching process was running')
+        if self._approved(task):
+            self.queue.requeue(task['id'], task.get('token'), detail, 0.0, reset=True)
+        else:
+            self.queue.finish(task['id'], task.get('token'), False, None, detail + '; the approval was withdrawn, not retried')
+        self.notes.append(f'task {task["id"]}: {detail}')
+        return 'killed'
 
     def _verified(self, pid: int | None, recorded_create: float | None, must_contain: list[str]) -> bool:
         """`pid` is alive, has the recorded create time and its command line contains every string of `must_contain`."""
@@ -753,8 +795,8 @@ class Orchestrator:
             builder_pid, builder_create = claim['builder_pid'], claim.get('builder_create')
         else:
             builder_pid, builder_create = task.get('builder_pid'), task.get('builder_create')
-        # a monster attempt: its whole process tree is collected first and drained after the builder / wrapper (phase 5 review F14)
-        tree = self._monster_tree(task, (builder_pid, builder_create)) if task['lane'] == monster_lane.LANE else None
+        if task['lane'] == monster_lane.LANE:                  # ownership first, then the whole tree (recheck finding 9)
+            return self._kill_monster(task, (builder_pid, builder_create), argv)
         for role, pid, created, marks in (('builder', builder_pid, builder_create, argv),
                                           ('wrapper', task.get('pid'), task.get('pid_create'), [task.get('token')] if task.get('token') else [str(RUN_TASK)])):
             outcome = self._terminate(pid, created, marks)
@@ -762,20 +804,7 @@ class Orchestrator:
                 killed.append(f'{role} {pid}')
             elif outcome != 'gone':
                 problems.append(f'{role} {pid} {"could not be verified (not touched)" if outcome == "unverified" else "is still running after the kill"}')
-        if tree is not None:
-            self._drain_monster_tree(task, tree, problems, killed)
-        if problems:
-            detail = 'Kill & retry could not stop the attempt: ' + '; '.join(problems) + ' (the worker slot stays taken)'
-            self.queue.kill_failed(task['id'], task.get('token'), detail)
-            self.notes.append(f'task {task["id"]}: {detail}')
-            return 'kill_failed'
-        detail = 'killed by the user (Kill & retry)' + (f': {", ".join(killed)}' if killed else ': no matching process was running')
-        if self._approved(task):
-            self.queue.requeue(task['id'], task.get('token'), detail, 0.0, reset=True)
-        else:
-            self.queue.finish(task['id'], task.get('token'), False, None, detail + '; the approval was withdrawn, not retried')
-        self.notes.append(f'task {task["id"]}: {detail}')
-        return 'killed'
+        return self._kill_outcome(task, killed, problems)
 
     # ---------------------------------------------------------------------------------------------------------- reconcile
     def _db_identity(self) -> tuple | None:
@@ -1264,10 +1293,13 @@ class ServiceManager:
             ok, pending, message = False, False, str(exc)
         except Exception as exc:  # noqa: BLE001
             ok, pending, message = False, False, f'{type(exc).__name__}: {exc}'
+        old_pid = None
+        if ok and pending and isinstance(outcome.get('status'), dict):
+            old_pid = outcome['status'].get('pid')       # the instance being stopped: a restart ends only with ANOTHER one identified
         self._refresh(settings)              # first: whoever sees the outcome event also sees the status it produced
         if ok and pending:
             with self.cond:
-                self.outstanding[req['id']] = dict(req) | {'pending_since': time.time()}
+                self.outstanding[req['id']] = dict(req) | {'pending_since': time.time(), 'old_pid': old_pid}
         self._event('request', f'{action} {name}: {message}', request=req['id'], name=name, action=action, ok=ok, pending=pending)
 
     def _refresh(self, settings: dict | None = None) -> None:
@@ -1301,7 +1333,9 @@ class ServiceManager:
 
     def _settle_outstanding(self) -> None:
         """An outstanding request whose service shows no pending stop any more (it ended without a matching tick record: adopted anew, stopped
-        by hand, a record from another server) gets its terminal outcome from the status."""
+        by hand, a record from another server) gets its terminal outcome from the status. A RESTART is successful only when the status
+        identifies a replacement (running, a pid other than the stopped instance's); any other end state is its failure with the reason
+        (pre-cut-over review finding 20)."""
         statuses = self.statuses or {}
         with self.cond:
             waiting = list(self.outstanding.values())
@@ -1309,7 +1343,11 @@ class ServiceManager:
             status = statuses.get(req['name'])
             if isinstance(status, dict) and not status.get('stop_pending'):
                 detail = status.get('state') or 'unknown'
-                self._resolve(req['id'], True, f'{req["action"]} {req["name"]}: finished ({detail}'
+                ok = True
+                if req['action'] == 'restart':
+                    ok = detail == 'running' and status.get('pid') is not None and status.get('pid') != req.get('old_pid')
+                    detail = f'replacement pid {status.get("pid")}' if ok else f'not restarted: {detail}'
+                self._resolve(req['id'], ok, f'{req["action"]} {req["name"]}: finished ({detail}'
                               + (f': {status["message"]}' if status.get('message') else '') + ')')
 
     def begin(self) -> bool:
@@ -1455,7 +1493,8 @@ def task_view(task: dict, now: float, stall_minutes: int = DEFAULTS['build_stall
             'max_attempts': task['max_attempts'], 'started': started, 'finished': finished,
             'elapsed': round((finished or now) - started, 1) if started else None, 'error': task.get('error'),
             'log_tail': log_tail(task) if shows_log else '', 'err_tail': log_tail(task, 400, 'err') if task['state'] in ('running', 'failed') else '',
-            'key': task['key'], 'stalled': stalled(task, now, stall_minutes), 'last_output': last_output(task) if task['state'] in taskqueue.ACTIVE else None,
+            'key': task['key'], 'generation': (task.get('args') or {}).get('frozen_sha') if task['lane'] == monster_lane.LANE else None,
+            'stalled': stalled(task, now, stall_minutes), 'last_output': last_output(task) if task['state'] in taskqueue.ACTIVE else None,
             'kill_requested': bool(task.get('kill_requested')), 'orphan': task['state'] == 'orphan',
             'token': task.get('token') if task['state'] in taskqueue.ACTIVE else None}
 

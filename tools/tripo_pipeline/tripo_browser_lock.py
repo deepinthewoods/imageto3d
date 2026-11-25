@@ -17,10 +17,22 @@ balance check, an older convert worker), it re-runs itself under this module's `
 every entry point is covered:
 
     python tools/tripo_pipeline/tripo_browser_lock.py run --profile <dir> [--wait S] -- node tools/tripo_pipeline/studio.mjs ...
-    python tools/tripo_pipeline/tripo_browser_lock.py verify --profile <dir> --lock <path> --token <token>   (exit 0 = valid)
+    python tools/tripo_pipeline/tripo_browser_lock.py verify --profile <dir> --lock <path> --token <token> [--register-pid N]
+                                                                                                         (exit 0 = valid)
+    python tools/tripo_pipeline/tripo_browser_lock.py users --profile <dir>     (exit 1 + lines: an orphan still uses it)
 
 A manual run is simply `node tools/tripo_pipeline/studio.mjs balance` (it reserves the profile itself, waiting up to
 $IMAGETO3D_TRIPO_PROFILE_WAIT seconds, default 600, then exits 75 "Tripo browser busy").
+
+Browser lifetime (recheck-before-cutover finding 18): the reservation is a byte lock of the python HOLDER, which spawns node and
+waits for it; when the holder dies the kernel frees the lock although node / Firefox may still have the profile open. So
+studio.mjs registers itself right after `verify` (`verify --register-pid <node pid>` writes `<profile parent>/<profile
+name>.imageto3d.pid` = {pid, create_time, registered}; it prints the path) and removes that file only after its command ended
+normally (the browser context closed). Every acquirer checks it after taking the byte lock (`profile_users`): a registered node
+that still runs (same pid AND create time), or, when it is gone, any Firefox process started with `-profile <this profile>`,
+keeps the profile BUSY until it exits (polled like a held lock: `wait` / TripoBrowserBusy, exit 75 from `run`). A pid file whose
+process is gone and that no Firefox uses is stale and is removed. Process facts come from psutil (always present on Windows:
+portable.py needs it), else /proc on Linux; where neither exists a pid file cannot be checked and counts as busy (fail closed).
 
 Both are the OS byte lock of claim_lock.py (claim_lock.try_lock: msvcrt.locking of the byte at 1<<20 on Windows, fcntl.flock
 elsewhere), freed by the kernel when the holder dies; the files are never deleted. Lock order is always checkout lock, then
@@ -32,6 +44,7 @@ from __future__ import annotations
 import argparse
 from contextlib import contextmanager
 import importlib.util
+import json
 import os
 from pathlib import Path
 import secrets
@@ -60,6 +73,8 @@ PROFILE_TOKEN_ENV = 'IMAGETO3D_TRIPO_PROFILE_TOKEN'
 PROFILE_WAIT_ENV = 'IMAGETO3D_TRIPO_PROFILE_WAIT'  # `run`: seconds to wait for a busy reservation (default PROFILE_WAIT_S)
 PROFILE_WAIT_S = 600
 EXIT_BUSY = 75                                     # `run`: the reservation stayed busy
+BROWSER_NAMES = ('firefox',)                       # process-name prefixes of a browser that may still hold the profile
+CREATE_TOLERANCE_S = 1.0                           # a registered pid is the same process when its create time matches this closely
 
 
 class TripoBrowserBusy(Exception):
@@ -105,6 +120,151 @@ def _same_path(a, b) -> bool:
     return os.path.normcase(os.path.realpath(str(a))) == os.path.normcase(os.path.realpath(str(b)))
 
 
+def browser_pid_path(profile=None) -> Path:
+    """Where studio.mjs registers the node process that opens `profile`: `<parent>/<name>.imageto3d.pid` of its RESOLVED path."""
+    real = resolved_profile(profile)
+    return real.parent / f'{real.name}.imageto3d.pid'
+
+
+def _psutil():
+    try:
+        import psutil
+        return psutil
+    except ImportError:
+        return None
+
+
+def _create_time(pid):
+    """The process's start identity (psutil create_time; else Linux /proc starttime ticks); None when the process is gone;
+    'unknown' when this python cannot tell (no psutil, no /proc)."""
+    psutil = _psutil()
+    if psutil is not None:
+        try:
+            return float(psutil.Process(int(pid)).create_time())
+        except (psutil.NoSuchProcess, ValueError):
+            return None
+        except psutil.Error:               # access denied: it exists, its start time is not ours to read
+            return 'unknown'
+    stat = Path(f'/proc/{int(pid)}/stat')
+    if not Path('/proc/self/stat').exists():
+        return 'unknown'
+    try:
+        return float(stat.read_text().rsplit(')', 1)[1].split()[19])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _processes():
+    """[(pid, name, [args])] of the running processes, or None when they cannot be listed here."""
+    psutil = _psutil()
+    if psutil is not None:
+        out = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            out.append((proc.info['pid'], proc.info['name'] or '', list(proc.info['cmdline'] or ())))
+        return out
+    if not Path('/proc/self/stat').exists():
+        return None
+    out = []
+    for entry in Path('/proc').iterdir():
+        if entry.name.isdigit():
+            try:
+                args = [a for a in (entry / 'cmdline').read_bytes().decode('utf-8', 'replace').split('\0') if a]
+            except OSError:
+                continue
+            out.append((int(entry.name), os.path.basename(args[0]) if args else '', args))
+    return out
+
+
+def register_browser(profile, pid) -> Path:
+    """Record that process `pid` (studio.mjs's node) is about to open `profile`; atomic. Returns the pid file."""
+    path = browser_pid_path(profile)
+    created = _create_time(pid)
+    if created is None:
+        raise ValueError(f'no process {pid}')
+    temp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    temp.write_text(json.dumps({'pid': int(pid), 'create_time': None if created == 'unknown' else created,
+                                'registered': time.strftime('%Y-%m-%dT%H:%M:%S'), 'profile': str(resolved_profile(profile))}) + '\n',
+                    encoding='utf-8')
+    os.replace(temp, path)
+    return path
+
+
+def unregister_browser(profile, pid=None) -> bool:
+    """Remove the pid file of `profile` (only when it names `pid`, if given). True when a file was removed."""
+    path = browser_pid_path(profile)
+    if pid is not None:
+        try:
+            if json.loads(path.read_text(encoding='utf-8')).get('pid') != int(pid):
+                return False
+        except (OSError, ValueError, AttributeError):
+            return False
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def profile_users(profile=None) -> list:
+    """Who still has `profile` open although no holder keeps its reservation (finding 18), as texts; [] = nobody. Looked at only
+    when a pid file exists (studio.mjs removes it after a normal end): the registered node when it still runs (same pid and
+    create time), else every browser process (BROWSER_NAMES) started with `-profile <this profile>`. A stale pid file (its
+    process gone, no such browser) is removed. A pid file that cannot be read or checked here counts as a user (fail closed)."""
+    path = browser_pid_path(profile)
+    try:
+        text = path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return []
+    except OSError as error:
+        return [f'unreadable {path.name} ({type(error).__name__})']
+    try:
+        data = json.loads(text)
+        pid = int(data['pid'])
+        recorded = data.get('create_time')
+    except (ValueError, KeyError, TypeError):
+        data, pid, recorded = None, None, None      # half-written or damaged: fall through to the browser scan
+    if pid is not None:
+        created = _create_time(pid)
+        if created == 'unknown':
+            return [f'node pid {pid} (registered in {path.name}; this python cannot check it: install psutil or delete the file '
+                    f'once no node / Firefox uses the profile)']
+        if created is not None and (not isinstance(recorded, (int, float)) or abs(created - recorded) <= CREATE_TOLERANCE_S):
+            return [f'node pid {pid} left by a holder that is gone']
+    processes = _processes()
+    if processes is None:
+        return [f'{path.name} exists and the processes cannot be listed here']
+    real = resolved_profile(profile)
+    users = []
+    for other, name, args in processes:
+        if not name.lower().startswith(BROWSER_NAMES):
+            continue
+        if any(flag in ('-profile', '--profile') and _same_path(value, real) for flag, value in zip(args, args[1:])):
+            users.append(f'{name} pid {other} still on the profile')
+    if not users:
+        try:
+            if path.read_text(encoding='utf-8') == text:      # not re-registered meanwhile
+                path.unlink()
+        except OSError:
+            pass
+    return users
+
+
+def _drain_users(profile, deadline, announce):
+    """After the byte lock is ours: wait until no orphaned node / Firefox uses the profile; TripoBrowserBusy past `deadline`."""
+    announced = False
+    while True:
+        users = profile_users(profile)
+        if not users:
+            return
+        text = f'Tripo browser busy (profile still in use: {"; ".join(users)})'
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TripoBrowserBusy(text)
+        if not announced:
+            (announce or (lambda t: print(t, file=sys.stderr, flush=True)))(f'{text}; waiting')
+            announced = True
+        time.sleep(POLL_S if deadline is None else min(POLL_S, max(0.05, deadline - time.monotonic())))
+
+
 def _open(path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     return os.fdopen(os.open(path, os.O_RDWR | os.O_CREAT, 0o666), 'r+b')
@@ -142,15 +302,17 @@ def _clear(handle):
 @contextmanager
 def profile_reservation(profile=None, what='studio.mjs', wait=None, announce=None, deadline=None):
     """Hold the reservation of `profile` (default: the one studio.mjs opens) for the block; yields the child environment
-    {PROFILE_LOCK_ENV: path, PROFILE_TOKEN_ENV: token}. `wait` / `deadline` as tripo_browser_lock."""
+    {PROFILE_LOCK_ENV: path, PROFILE_TOKEN_ENV: token}. `wait` / `deadline` as tripo_browser_lock. With the byte lock taken,
+    a node / Firefox a dead holder left on the profile is waited for as well (profile_users; finding 18)."""
     path = profile_lock_path(profile)
     if deadline is None and wait is not None:
         deadline = time.monotonic() + float(wait)
     handle = _open(path)
     try:
         _acquire(handle, deadline, lambda: _first_line(path), announce)
-        token = secrets.token_hex(16)
         try:
+            _drain_users(profile, deadline, announce)
+            token = secrets.token_hex(16)
             _write(handle, f'pid {os.getpid()} since {time.strftime("%Y-%m-%dT%H:%M:%S")} token {token} {what}\n')
             yield {PROFILE_LOCK_ENV: str(path), PROFILE_TOKEN_ENV: token}
         finally:
@@ -218,12 +380,27 @@ def main(argv=None) -> int:
     p.add_argument('--profile')
     p.add_argument('--lock', default='')
     p.add_argument('--token', default='')
+    p.add_argument('--register-pid', type=int, help='on success record this process (studio.mjs) as the profile\'s user and '
+                                                    'print the pid file path')
+    p = sub.add_parser('users', help='list an orphaned node / Firefox still on --profile (exit 0 = none, 1 = some)')
+    p.add_argument('--profile')
     args = parser.parse_args(argv)
+    if args.command == 'users':
+        users = profile_users(args.profile)
+        for user in users:
+            print(user, flush=True)
+        return 1 if users else 0
     if args.command == 'verify':
         problem = verify(args.profile, args.lock, args.token)
         if problem:
             print(problem, flush=True)
             return 1
+        if args.register_pid is not None:
+            try:
+                print(register_browser(args.profile, args.register_pid), flush=True)
+            except (OSError, ValueError) as error:
+                print(f'cannot register pid {args.register_pid} for the profile: {error}', flush=True)
+                return 1
         return 0
     cmd = args.cmd[1:] if args.cmd[:1] == ['--'] else args.cmd
     if not cmd:

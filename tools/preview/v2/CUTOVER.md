@@ -98,22 +98,43 @@ until step 6: no paid step of the current code runs meanwhile.
 The live convert worker (and any `convert_job.py` it started) predates CONVERT_HOLD: it only honours PAUSE, which the old supervisor removes
 when it exits. It must be gone before step 6.
 
+Stopping intake and draining a job are two separate things (DESIGN_PHASE4 I.10). The old worker launches whatever `convert_job.py` is on
+disk, so a child it started after the code update is CURRENT code: it waits at its paid gate for the very hold the drain keeps. Such a child
+is asked to leave; it is never waited for (that was a deadlock) and never killed.
+
 Press **Stop** on convert in the Queue tab (not Restart: the new worker is started in step 7). The manager:
 1. writes / keeps the conversion hold FIRST (`drain_hold` in `.codex_jobs/_app/services/convert.json`; no supervisor tick releases the hold
-   while the drain is pending), so every `convert_job.py` started from now on (current code) waits before its paid steps;
-2. writes `convert_worker1.stop` naming the worker's pid and creation time (an old worker does not read it);
-3. on every tick: waits until no `convert_job.py` of this checkout runs AND the worker's last event in `convert_events.log` (since it started)
-   is `PAUSED`, `IDLE` or `LOW DISK` after its last `CONVERT`;
-4. then SUSPENDS the worker, checks again while it is frozen (no child process, no `convert_job.py`, no job lock naming it, still asleep in
-   its log) and only then terminates it; if anything shows it woke up it is resumed untouched and the stop stays pending. It is never killed
-   on a timeout. With the current `pause-conversions` mode the worker sleeps in PAUSED, so this normally completes within a tick or two.
+   while the drain is pending): intake is stopped, every `convert_job.py` of the current code waits before its paid steps;
+2. THEN writes `.codex_jobs/_batch/CONVERT_DRAIN`: every `convert_job.py` that is blocked at its paid gate (it is listed in
+   `.codex_jobs/_batch/gate_wait/<pid>.json`; nothing paid in flight) releases its module lock, marks the module `deferred` in the job record
+   and exits 76 within about 15 s, leaving a note in `.codex_jobs/_batch/drain_exits/`. Nothing is counted as a failure by current code;
+3. writes `convert_worker1.stop` naming the worker's pid and creation time (an old worker does not read it);
+4. on every tick: waits until no `convert_job.py` of this checkout runs AND the worker's last event in `convert_events.log` (since it started)
+   is `PAUSED`, `IDLE` or `LOW DISK` after its last `CONVERT`; then SUSPENDS the worker (the suspension is recorded first in
+   `.codex_jobs/_app/services/suspensions.json`, so a manager restart resumes it), checks again while it is frozen (no child process, no
+   `convert_job.py`, no job lock naming it, still asleep in its log) and only then terminates it; if anything shows it woke up it is resumed
+   untouched and the stop stays pending. It is never killed on a timeout;
+5. an old worker that KEEPS TAKING JOBS (it does not sleep on the hold, or it counts the exit 76 of step 2 as a failure and tries the next
+   job) cannot do paid work: each child it starts only reaches the gate and leaves. It is suspended and terminated while it has NO child
+   process and its last event is one after which it only picks the next job (`CONVERT`, `FAILED`, `PAUSED`, `IDLE`, ...; never while it
+   finishes or offloads a set). A child doing real work (a collect / reduction in flight) is always waited for;
+6. when the worker is gone: restores the `.codex_jobs/_batch/convert_locks/<job>.fails` counts the old worker wrote for the exits of
+   step 2 (listed in the Queue event log, `.codex_jobs/_batch/convert_drain.log` and `drain_restored` of the convert record), removes the
+   job locks naming the stopped worker and deletes `CONVERT_DRAIN`. `PAUSE` (your pause mode) is never touched in any step.
 
-A `convert_job.py` that is running when you press Stop is old code in flight: let it finish by itself (never kill it). Then confirm the drain
-with the script, repeating until it succeeds:
+With the current `pause-conversions` mode the worker sleeps in PAUSED and this normally completes within a tick or two. A `convert_job.py`
+that is past its gate when you press Stop (a conversion in flight) finishes by itself: never kill it. The same goes for a `convert_job.py`
+that was started BEFORE the code was updated (it writes no `gate_wait` file and cannot leave for the drain): check before step 2 that none
+runs (`Invoke-Check drained` lists them); if one does, let it finish before the cut-over. Then confirm the drain with the script,
+repeating until it succeeds:
 
 ```powershell
-Invoke-Check drained          # hold: present; convert_job.py: []; convert_queue.py: []   (exit 0)
+Invoke-Check drained          # hold: present; drain: none; convert_job.py: []; convert_queue.py: []; suspended: []   (exit 0)
 ```
+
+`drain: pending` means the manager is still at steps 4 / 5 (see the convert service's message in the Queue tab); `gate waiters` in its
+output are leaving by themselves. A job whose module shows `deferred` in its `.tripo-job.json` simply continues when the new worker (step 7)
+takes it; no credit was spent for it and its failure count is what it was before.
 
 A worker the user started by hand with `--worker N` (N > 1) is not managed by v2: `drained` lists it too; stop it through its own stop file
 (`convert_worker<N>.stop`) or wait until it is idle and stop it by hand with the same care before going on.
@@ -159,8 +180,25 @@ Start-Process -FilePath python -WorkingDirectory $repo -WindowStyle Hidden `
   -RedirectStandardOutput "$logs\preview_win.out.log" -RedirectStandardError "$logs\preview_win.err.log"
 ```
 
-Stopping v2 never stops a service. A conversion hold v2 left behind (`.codex_jobs/_batch/CONVERT_HOLD`) keeps conversions waiting: once the
-supervisor runs and has ticked, delete it by hand (its `owner_pid` is the stopped v2 server). The old site reads the same folders; v2 decision
+Stopping v2 never stops a service. A conversion hold v2 left behind (`.codex_jobs/_batch/CONVERT_HOLD`) keeps conversions waiting. Do NOT
+delete it on sight. First ask the script whether it is safe (it changes nothing):
+
+```powershell
+Invoke-Check rollback         # exit 0 only when the hold may be removed by hand; otherwise it says what is outstanding
+```
+
+It refuses while any of these holds, and names it:
+- a drain is outstanding: `CONVERT_DRAIN` exists, the convert record still has a pending legacy stop (`drain_hold`), a recorded suspended
+  process (`suspensions.json`) still exists, or a `convert_job.py` / an old-code `convert_queue.py` of this checkout still runs. Finish
+  step 4 with v2 running (start v2 again as in step 2: at start it resumes anything a stopped manager left suspended and finishes or
+  continues the drain), or wait for those processes to exit by themselves. If v2 will not be started again and NO convert worker runs,
+  `CONVERT_DRAIN` may be deleted by hand together with the hold; with an old worker still running it must stay;
+- the running supervisor is not the intended generation: no supervisor runs, more than one runs, the one that runs is named in the hold's
+  `retiring` list or has a stop pending in `.codex_jobs/_app/services/supervisor.json` (a stop was sent to it: wait until it exits and start
+  the supervisor again), or it has not completed a tick since the hold was written (`supervisor_tick.json` names another pid or an earlier
+  time; the pre-cut-over supervisor code writes no tick file at all: restart it on the current code first).
+
+Only when `rollback` exits 0 delete `.codex_jobs/_batch/CONVERT_HOLD` (its `owner_pid` is the stopped v2 server). The old site reads the same folders; v2 decision
 files (`pipeline_v2.json`, `.codex_jobs/_app/`) are ignored by it. Convert-list lines v2 appended to `.codex_jobs/_batch/convert_sets.txt` are
 exact set ids (never wildcards) and stay; remove them by hand if unwanted. If the Queue tab had **stopped** a service on purpose, start it again
 by hand with the commands in DESIGN_PHASE4.md section A.
@@ -237,12 +275,54 @@ if what == 'stop-listener':                # stop-listener <port> <script>: exac
     if listeners(port):
         sys.exit(f'port {port} still has a listener')
     print(f'stopped pid {pids[0]} ({rel}); port {port} is free')
-elif what == 'drained':                    # the old paid work is gone: hold present, no convert_job.py, no convert worker of this checkout
+elif what == 'drained':                    # the old paid work is gone: hold present, drain finished, no convert_job.py, no convert worker
     hold = services.read_hold(repo)
     jobs = running('tools/tripo_pipeline/convert_job.py')
     workers = running('tools/convert_queue.py')
-    print(f'hold: {"present" if hold is not None else "MISSING"}; convert_job.py: {[p.pid for p in jobs]}; convert_queue.py: {[p.pid for p in workers]}')
-    sys.exit(0 if hold is not None and not jobs and not workers else 1)
+    conv = services.read_record(repo, 'convert')
+    pending = services.read_drain(repo) is not None or bool(conv.get('stop_requested') and conv.get('drain_hold'))
+    frozen = [i['pid'] for i in services.read_suspensions(repo) if psutil.pid_exists(i['pid'])]
+    waiters = [w['pid'] for w in services.gate_waiters(repo, clean=False)]
+    print(f'hold: {"present" if hold is not None else "MISSING"}; drain: {"pending" if pending else "none"}; gate waiters: {waiters}; '
+          f'convert_job.py: {[p.pid for p in jobs]}; convert_queue.py: {[p.pid for p in workers]}; suspended: {frozen}')
+    sys.exit(0 if hold is not None and not pending and not jobs and not workers and not frozen else 1)
+elif what == 'rollback':                   # read-only: may a conversion hold left by a stopped v2 be removed by hand?
+    hold = services.read_hold(repo)
+    if hold is None:
+        print('no CONVERT_HOLD: nothing to remove')
+        sys.exit(0)
+    why = []
+    if services._process_alive(hold.get('owner_pid'), hold.get('owner_create_time')):
+        why.append(f'its owner (pid {hold.get("owner_pid")}) still runs: that server manages the hold')
+    conv = services.read_record(repo, 'convert')
+    if services.read_drain(repo) is not None:
+        why.append('a drain is outstanding: CONVERT_DRAIN exists')
+    if conv.get('stop_requested') and conv.get('drain_hold'):
+        why.append('a drain is outstanding: the convert record has a pending legacy stop')
+    frozen = [i['pid'] for i in services.read_suspensions(repo) if psutil.pid_exists(i['pid'])]
+    if frozen:
+        why.append(f'a recorded suspended process still exists {frozen}: start v2 again, it resumes it')
+    jobs = [p.pid for p in running('tools/tripo_pipeline/convert_job.py')]
+    if jobs:
+        why.append(f'convert_job.py still runs {jobs}')
+    old = [w['pid'] for w in services.scan(repo, ['convert'])['convert'] if services.legacy_worker(repo, w)]
+    if old:
+        why.append(f'a convert worker of older code still runs {old}')
+    sups = services.scan(repo, ['supervisor'])['supervisor']
+    if len(sups) != 1:
+        why.append(f'{len(sups)} supervisors run; exactly one, of the intended generation, is needed')
+    else:
+        sup = sups[0]
+        if any(services._same_process(r, sup) for r in services._retiring(hold)):
+            why.append(f'supervisor pid {sup["pid"]} is an outgoing generation (a stop was sent to it)')
+        rec = services.read_record(repo, 'supervisor')
+        if rec.get('stop_requested') and services._same_process(rec, sup):
+            why.append(f'a stop of supervisor pid {sup["pid"]} is still pending')
+        if not services.supervisor_ticked(repo, sup, services._hold_time(hold)):
+            why.append(f'supervisor pid {sup["pid"]} has not completed a tick since the hold was written')
+    print('SAFE: the supervisor is the intended generation and ticked after the hold; no drain is outstanding. CONVERT_HOLD may be deleted.'
+          if not why else 'KEEP the hold:\n  - ' + '\n  - '.join(why))
+    sys.exit(1 if why else 0)
 elif what == 'views':                      # exactly one view runner, a current one (launch reservation, holds view_runner.lock)
     runners = services.scan(repo, ['views'])['views']
     old = [r['pid'] for r in runners if services.legacy_runner(repo, r)]

@@ -634,8 +634,10 @@ class FlowTests(unittest.TestCase):
         with self.assertRaises(KeyboardInterrupt):
             rb.collect(self.out, config=CONFIG, expected_costs=expected, allow_paid=True, accept_preview=True,
                        session_factory=lambda: session)
-        with self.assertRaisesRegex(rb.Stop, 'already submitted'):
+        with self.assertRaisesRegex(rb.Stop, 'geometry intent is unresolved .* needs review'):   # recheck finding 8
             self.collect(['geometry_preview'], costs=costs, expected=expected, allow_paid=True, accept_preview=True)
+        self.assertFalse([c for c in FakeSession.log if c[0] == 'click'])
+        self.assertEqual(self.record()['pending_action'], 'geometry')
 
     def test_bad_export_blocks_status(self):
         self.do_submit()
@@ -868,6 +870,308 @@ class Phase5Tests(unittest.TestCase):
             os.environ.pop(rb.paid_gate.ENV)
             session = FakeSession(self.out, stages=['geometry_preview', 'export_ready'], costs=self.paid_costs())
             self.collect(session)
+        self.assertIn(('click', 'geometry'), session.calls)
+
+
+class RecheckTests(unittest.TestCase):
+    """Recheck-before-cutover findings 8 (a paid intent is confirmed only by an advanced stage), 12 (bind moves a positively
+    identified free preview to `submitted` in one write) and 13 (the final upload copies are read-only and re-verified)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.views = make_views(self.root / 'views')
+        self.out = self.root / 'out'
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(rb.paid_gate.ENV, None)                 # a manual run: no gate
+
+    def record(self):
+        return json.loads((self.out / rb.RECORD).read_text())
+
+    def wipe(self):
+        """Delete the output folder; its upload copies are read-only (finding 13), which Windows refuses to delete as they are."""
+        def unlock(function, path, _info):
+            os.chmod(path, 0o666)
+            function(path)
+        shutil.rmtree(self.out, onerror=unlock)
+
+    def events(self):
+        return [json.loads(line)['event'] for line in (self.out / 'events.jsonl').read_text().splitlines()]
+
+    def submit(self, **kw):
+        session = FakeSession(self.out, **kw)
+        rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        return session
+
+    def collect(self, session):
+        return rb.collect(self.out, config=CONFIG, allow_paid=True, accept_preview=True, session_factory=lambda: session)
+
+    COSTS = {'geometry': 0.5, 'material_generate': None, 'material_confirm': None}
+
+    def crashed_after_the_geometry_intent(self):
+        """A collect that died between the geometry intent and (maybe) its click."""
+        self.submit()
+        session = FakeSession(self.out, stages=['geometry_preview'], costs=self.COSTS)
+        session.click = lambda kind: (_ for _ in ()).throw(KeyboardInterrupt())
+        with self.assertRaises(KeyboardInterrupt):
+            self.collect(session)
+        self.assertEqual(self.record()['pending_action'], 'geometry')
+
+    # -- finding 8
+    def test_the_same_stage_never_clears_a_pending_geometry_intent(self):
+        self.crashed_after_the_geometry_intent()
+        class Previewing(FakeSession):
+            def dump_geometry_panel(self, label):
+                return 'panel'
+        rb.preview(self.out, config=CONFIG, session_factory=lambda: Previewing(self.out, stages=['geometry_preview']))
+        data = self.record()                                    # the reviewer's case: preview used to clear it
+        self.assertEqual(data['pending_action'], 'geometry')
+        self.assertEqual((data['paid_review']['action'], data['paid_review']['stage']), ('geometry', 'geometry_preview'))
+        self.assertNotIn('confirmed_at', data['actions']['geometry'])
+        rb.inspect_only(self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out))
+        self.assertEqual(self.record()['pending_action'], 'geometry')
+        session = FakeSession(self.out, stages=['geometry_preview'], costs=self.COSTS)
+        with self.assertRaisesRegex(rb.Stop, 'needs review'):
+            self.collect(session)
+        self.assertFalse([c for c in session.calls if c[0] == 'click'])          # never re-clicked automatically
+        self.assertNotIn(('select_mesh_mode', 'Best Quality'), session.calls)
+        data = self.record()
+        self.assertEqual((data['pending_action'], data['status']), ('geometry', 'submitted'))
+        self.assertNotIn('confirmed_at', data['actions']['geometry'])
+
+    def test_an_advanced_stage_confirms_the_action_with_its_cost_and_ids(self):
+        self.crashed_after_the_geometry_intent()
+
+        class Later(FakeSession):
+            def read_balance(self):
+                return 99.5
+
+            def provider_action_id(self, kind):
+                return f'act-{kind}'
+        session = Later(self.out, stages=['material_ready', 'material_preview', 'export_ready'], costs=self.COSTS)
+        self.collect(session)
+        data = self.record()
+        entry = data['actions']['geometry']
+        self.assertEqual((entry['observed_cost'], entry['stage_before'], entry['stage_after'], entry['confirmed_by']),
+                         (0.5, 'geometry_preview', 'material_ready', 'stage_advanced'))
+        self.assertEqual((entry['balance_before'], entry['balance_after'], entry['balance_delta']), (100.0, 99.5, 0.5))
+        self.assertEqual((entry['provider_action_id'], entry['model_id']), ('act-geometry', MODEL))
+        self.assertIn('confirmed_at', entry)
+        self.assertEqual((data['pending_action'], data['paid_review'], data['status']), (None, None, 'exported'))
+        self.assertEqual([c[1] for c in session.calls if c[0] == 'click'], ['material_generate', 'material_confirm'])   # geometry not repeated
+        for kind in ('material_generate', 'material_confirm'):
+            self.assertIn('confirmed_at', data['actions'][kind], kind)
+            self.assertIsNone(data['actions'][kind]['observed_cost'], kind)
+
+    def test_a_normal_collect_confirms_every_paid_action_and_records_no_id_it_cannot_see(self):
+        self.submit()
+        session = FakeSession(self.out, stages=['geometry_preview', 'material_ready', 'material_preview', 'export_ready'], costs=self.COSTS)
+        self.collect(session)
+        data = self.record()
+        self.assertEqual([data['actions'][k]['stage_after'] for k in rb.COST_KINDS], ['material_ready', 'material_preview', 'export_ready'])
+        self.assertEqual([data['actions'][k]['provider_action_id'] for k in rb.COST_KINDS], [None, None, None])
+        self.assertEqual(self.events().count('paid_action_confirmed'), 3)
+        self.assertNotIn('confirmed_at', data['actions']['free_preview'])        # the free preview is not a paid action
+
+    def test_observed_rules(self):
+        self.submit()
+        record = rb.Record(self.out / rb.RECORD)
+        self.assertIsNone(record.observed('geometry_preview'))                   # nothing pending
+        for kind, same, later in (('geometry', 'geometry_preview', 'export_ready'),
+                                  ('material_generate', 'material_ready', 'material_preview'),
+                                  ('material_confirm', 'material_preview', 'export_ready')):
+            record.intent(kind, observed_cost=1)
+            self.assertEqual(record.observed(same), kind)                        # same stage: pending
+            self.assertEqual(record.observed('unknown'), kind)                   # an unknown stage proves nothing
+            if kind != 'geometry':
+                self.assertEqual(record.observed('geometry_preview'), kind)      # an earlier stage neither
+            self.assertEqual(record.data['pending_action'], kind)
+            self.assertIsNone(record.observed(later))
+            self.assertEqual((record.data['pending_action'], record.data['actions'][kind]['stage_after']), (None, later))
+
+    def test_an_unidentified_free_preview_is_not_cleared_by_a_stage(self):
+        self.submit(url=None)
+        record = rb.Record(self.out / rb.RECORD)
+        self.assertEqual(record.observed('export_ready'), 'free_preview')
+        self.assertEqual(self.record()['pending_action'], 'free_preview')
+
+    # -- finding 12
+    def test_bind_moves_a_recovered_free_preview_to_submitted_and_collect_accepts_it(self):
+        self.submit(url=None)                                                    # the reviewer's case: a free submit, URL missed
+        self.assertEqual(self.record()['status'], 'submission_needs_review')
+        before = len(self.events())
+        rb.bind(self.out, URL)
+        data = self.record()
+        self.assertEqual((data['status'], data['pending_action'], data['model_id'], data['submitted_by']), ('submitted', None, MODEL, 'bind'))
+        self.assertEqual(data['actions']['free_preview']['resolved_by'], 'bind')
+        self.assertEqual(self.events()[before:], ['model_linked'])               # ONE record write: link + intent + status
+        session = FakeSession(self.out, stages=['geometry_preview', 'export_ready'], costs=self.COSTS)
+        self.collect(session)                                                    # collectable now
+        self.assertEqual(self.record()['status'], 'exported')
+
+    def test_the_normal_submit_binds_and_sets_the_status_in_one_write(self):
+        self.submit()
+        events = self.events()
+        self.assertEqual(events[events.index('submission_clicked') + 1:], ['model_linked'])
+        self.assertEqual((self.record()['status'], self.record()['pending_action']), ('submitted', None))
+
+    def stored(self, **changes):
+        path = self.out / rb.RECORD
+        data = json.loads(path.read_text())
+        data.update(changes)
+        path.write_text(json.dumps(data))
+        return data
+
+    def test_records_left_behind_by_the_old_bind_and_by_a_crash_are_recovered_on_load(self):
+        # the pre-fix bind: pending cleared, free preview resolved for this model, status left at needs_review
+        self.submit()
+        self.stored(status='submission_needs_review')
+        session = FakeSession(self.out, stages=['export_ready'])
+        rb.collect(self.out, config=CONFIG, session_factory=lambda: session)   # refused before the fix (status needs_review)
+        self.assertEqual(self.record()['status'], 'exported')
+        # a crash between the old two writes: bound, intent still pending, status submission_attempted
+        self.wipe()
+        self.submit()
+        data = self.stored(status='submission_attempted', pending_action='free_preview')
+        data['actions']['free_preview'] = {'intent_at': 'x'}
+        self.stored(actions=data['actions'])
+        rb.inspect_only(self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out))
+        data = self.record()
+        self.assertEqual((data['status'], data['pending_action'], data['actions']['free_preview']['resolved_by']), ('submitted', None, 'inspect'))
+
+    def test_a_click_whose_status_write_was_lost_is_recovered_by_bind_only_while_the_intent_is_pending(self):
+        self.submit(url=None)
+        self.stored(status='ready_to_submit')                                    # intent written, crash before 'submission_clicked'
+        rb.bind(self.out, URL)
+        self.assertEqual(self.record()['status'], 'submitted')
+        self.wipe()
+        self.submit()
+        self.stored(status='ready_to_submit')                                    # no pending intent: not the same situation
+        rb.bind(self.out, URL)
+        self.assertEqual(self.record()['status'], 'ready_to_submit')
+
+    def test_ambiguous_and_paid_intents_stay_protected(self):
+        # a paid intent pending: bind links the model but neither resolves nor moves the status
+        self.submit(url=None)
+        self.stored(pending_action='geometry')
+        rb.bind(self.out, URL)
+        data = self.record()
+        self.assertEqual((data['status'], data['pending_action'], data['model_id']), ('submission_needs_review', 'geometry', MODEL))
+        self.assertNotIn('done_at', data['actions']['free_preview'])
+        # no free-preview intent at all (ambiguous): the status stays
+        self.wipe()
+        self.submit(url=None)
+        self.stored(pending_action=None, actions={})
+        rb.bind(self.out, URL)
+        self.assertEqual(self.record()['status'], 'submission_needs_review')
+        # a free preview resolved for ANOTHER model: the status stays
+        self.wipe()
+        self.submit()
+        other = MODEL.replace('e169', 'f000')
+        self.stored(status='submission_needs_review', actions={'free_preview': {'intent_at': 'x', 'done_at': 'y', 'model_id': other}})
+        rb.inspect_only(self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out))
+        self.assertEqual(self.record()['status'], 'submission_needs_review')
+        # a different model than the bound one is still refused
+        with self.assertRaises(ValueError):
+            rb.bind(self.out, f'{rb.BASE}/{other}')
+        # other statuses are never moved
+        for status in ('preparing', 'dry_run', 'not_submitted', 'export_needs_review', 'exported'):
+            self.stored(status=status, actions={'free_preview': {'intent_at': 'x', 'done_at': 'y', 'model_id': MODEL}})
+            rb.bind(self.out, URL)
+            self.assertEqual(self.record()['status'], status)
+
+    # -- finding 13
+    def tamper(self, name='front.png'):
+        path = self.out / rb.UPLOAD_DIR / name
+        os.chmod(path, 0o666)
+        path.write_bytes(path.read_bytes() + b'tampered')
+
+    def test_the_upload_copies_are_read_only_and_verified(self):
+        self.submit()
+        upload = self.out / rb.UPLOAD_DIR
+        for name in CONFIG['view_order']:
+            self.assertFalse(os.access(upload / name, os.W_OK), name)
+            with self.assertRaises(PermissionError):
+                (upload / name).write_bytes(b'x')
+        self.assertEqual(rb.verify_upload_inputs(rb.Record(self.out / rb.RECORD)), [])
+        self.assertEqual(rb.verify_upload_inputs(self.out), [])
+        self.assertEqual(rb.verify_upload_inputs(self.out / rb.RECORD), [])
+        self.assertEqual(rb.verify_upload_inputs(self.record()), [])
+        self.assertIsNone(rb.verify_upload_inputs({'status': 'submitted'}))      # a record from before the field: unknown
+        self.tamper()
+        problems = rb.verify_upload_inputs(self.out)
+        self.assertEqual(len(problems), 1)
+        self.assertIn('front.png', problems[0])
+        os.chmod(upload / 'back.png', 0o666)
+        (upload / 'back.png').unlink()
+        self.assertEqual(len(rb.verify_upload_inputs(self.out)), 2)
+
+    def test_a_copy_changed_before_the_upload_stops_the_submit_before_anything_is_sent(self):
+        tamper = self.tamper
+
+        class Tampering(FakeSession):
+            def open_workspace(self):
+                tamper()                                                         # after the hash, before the upload
+                super().open_workspace()
+        session = Tampering(self.out)
+        with self.assertRaisesRegex(rb.Stop, 'upload copies changed after they were hashed'):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertFalse([c for c in session.calls if c[0] in ('prepare_multiview', 'click_free_preview')])
+        self.assertFalse((self.out / rb.RECORD).exists())                        # set aside: nothing was generated
+        self.submit()                                                            # a re-run replaces the read-only snapshot
+        self.assertEqual((self.record()['status'], rb.verify_upload_inputs(self.out)), ('submitted', []))
+
+    def test_a_copy_changed_during_the_upload_stops_before_the_click(self):
+        tamper = self.tamper
+
+        class Tampering(FakeSession):
+            def prepare_multiview(self, paths, config):
+                super().prepare_multiview(paths, config)
+                tamper()
+        session = Tampering(self.out)
+        with self.assertRaisesRegex(rb.Stop, 'changed during the upload'):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertNotIn(('click_free_preview',), session.calls)
+
+    def test_collect_stops_before_the_paid_click_when_the_uploaded_evidence_differs(self):
+        self.submit()
+        self.tamper('back.png')
+        session = FakeSession(self.out, stages=['geometry_preview'], costs=self.COSTS)
+        with self.assertRaisesRegex(rb.Stop, 'upload inputs differ from the recorded submission before geometry'):
+            self.collect(session)
+        self.assertFalse([c for c in session.calls if c[0] == 'click'])
+        self.assertNotIn(('select_mesh_mode', 'Best Quality'), session.calls)
+        data = self.record()
+        self.assertEqual((data['pending_action'], list(data['actions'])), (None, ['free_preview']))   # no paid intent written
+        self.assertIn('back.png', data['inputs_problems'][0])
+        self.assertNotIn('credits_committed', data)
+
+    def test_a_copy_changed_while_the_cost_is_read_stops_before_the_intent(self):
+        self.submit()
+        tamper = self.tamper
+
+        class Late(FakeSession):
+            def read_cost(self, kind):
+                tamper()
+                return super().read_cost(kind)
+        session = Late(self.out, stages=['geometry_preview'], costs=self.COSTS)
+        with self.assertRaisesRegex(rb.Stop, 'upload inputs differ'):
+            self.collect(session)
+        self.assertFalse([c for c in session.calls if c[0] == 'click'])
+        self.assertEqual(list(self.record()['actions']), ['free_preview'])
+
+    def test_a_record_without_recorded_inputs_still_collects(self):
+        self.submit()
+        path = self.out / rb.RECORD
+        data = json.loads(path.read_text())
+        del data['inputs']
+        path.write_text(json.dumps(data))
+        self.tamper()                                                            # unknown inputs: nothing to compare
+        session = FakeSession(self.out, stages=['geometry_preview', 'export_ready'], costs=self.COSTS)
+        self.collect(session)
         self.assertIn(('click', 'geometry'), session.calls)
 
 

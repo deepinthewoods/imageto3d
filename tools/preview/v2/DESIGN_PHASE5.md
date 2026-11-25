@@ -207,15 +207,18 @@ This section replaces the two working notes of the phase (`PHASE5_INTEGRATION.md
   reduced/: nothing was paid), which replaces the frozen list; the old task is then cancelled by the lane.
 
 ### H.4 Queue
-- `POST /api/v2/queue {op: "run_now", id, confirm?}`: a queued monster task (a failed / cancelled one is queued again first, while still
-  wanted) gets `run_now`; it overrides the idle gate. While conversions are paused by hand (mode `pause` / `pause-conversions`, or a
-  manual PAUSE with scope conversions) the answer is **409 `code: "confirm"`** with the question as `error`; the client asks and sends
-  `confirm: true`, which also sets `override_pause`. The conversion hold is never overridden: the answer is 200 with a `warning`, and the
-  task starts when the hold lifts. Logged as queue event `op`.
-- `retry` / `cancel` of a monster row work as for layer rows (`task_approved` = the lane's check). `view_retry {name}` accepts
-  `mviews--...` names.
+- `POST /api/v2/queue {op: "run_now", id, key, generation, confirm?, pause_id?}` (H.11 F4 / F5): the task is the one the client
+  DISPLAYED (`key` + frozen `generation`; `id` is a hint only; 400 without them, **409 `changed`** when that identity is gone). A queued
+  monster task (a failed / cancelled one is queued again first, while still wanted) gets `run_now`; it overrides the idle gate. While
+  conversions are paused by hand (mode `pause` / `pause-conversions`, or a manual PAUSE with scope conversions) the answer is **409
+  `code: "confirm"`** with the question as `error` and the pause in force as `pause_id`; the client asks and sends `confirm: true` AND
+  that `pause_id`, which becomes `args.override_pause` (an echoed id that is not the pause in force is answered 409 `confirm` again). The
+  conversion hold is never overridden: the answer is 200 with a `warning`, and the task starts when the hold lifts. Logged as queue
+  event `op`.
+- `retry` / `cancel` of a monster row need `key` + `generation` too (same rule; `task_approved` = the lane's check); for a row of
+  another lane a `key`, when sent, must be the row's (409 `changed`). `view_retry {name}` accepts `mviews--...` names.
 - `GET /api/v2/queue` `monsters` = `monster_lane.lane_status`: `{lane, limit: 1, gate: {open, reason, code, mode, idle, away,
-  needs_confirm}, totals: {state: n}, paid: {count, credits, recent}, hold}`. Rows of the lane: `set` = `monster:<M>/<v>`, `unit` =
+  needs_confirm, paused, pause_id, pause_reason}, totals: {state: n}, paid: {count, credits, recent}, hold}`. Rows of the lane: `set` = `monster:<M>/<v>`, `unit` =
   `convert`; a queued row has **Run now** in the Queue tab, and the tab shows one "Monster conversions" line (gate, counts, paid).
 
 ### H.5 Lane gate and outcomes (E, as built)
@@ -284,9 +287,9 @@ This section replaces the two working notes of the phase (`PHASE5_INTEGRATION.md
   Run now of a failed / cancelled row) clears it first. `tick` looks each frozen generation up by its EXACT key (`TaskQueue.by_key`;
   `TaskQueue.enqueue_once` never revives a cancelled / failed row); no row + a disposition = the row is restored in that terminal state
   (`TaskQueue.restore_terminal`), never queued; a queued row of a generation with a disposition is cancelled by the plan. Run now's
-  override is the KEY of the confirmed pause (`monster_lane.pause_key`: mode + its `since`, else the manual PAUSE's `since` + reason), kept
-  as `args.override_pause`; a different pause needs a new confirmation; `TaskQueue.retry` clears `run_now` and the override. The run_now
-  answer carries `pause_key`.
+  override is the `pause_id` of the confirmed pause (superseded key scheme: see H.11 F5), kept as `args.override_pause`; a different
+  pause needs a new confirmation; `TaskQueue.retry` clears `run_now` and the override. The run_now answer carries `pause_id`.
+  Superseded in part by H.11 F3 (idempotent transitions, the disposition sequence, outstanding writes) and F4 (task identity).
 - **F5 paid accounting.** `paid_log.jsonl` entries are per provider action: `{time, kind: hyper3d, id: "hyper3d:<model id>:<action>",
   action, status: confirmed | uncertain, credits (the OBSERVED cost, null when not observed; never assumed), monster, variant, views,
   record, model_id}`; actions observed at cost 0 are not logged. confirmed = the backend observed the next stage (its intent was cleared);
@@ -361,3 +364,83 @@ This section replaces the two working notes of the phase (`PHASE5_INTEGRATION.md
   invalid output: the invalid file and its record are renamed `<file>.invalid-<time>` and the task goes back to pending. The Codex job
   prompt no longer asks for a framing inspection or redraw (a technical format check only).
 - **F18 Run now first.** The plan considers every queued row of the lane, Run now rows first (then priority, id).
+
+### H.11 Recheck before cut-over, monster app (review_v2_recheck_cutover_20261125: findings 3, 4, 5, 8, 9, 10, 11, 14, 15, phase 5 row 10; as built)
+- **F3 dispositions.** views.json `conversion[<generation>] = {state: cancelled | failed, reason, key, time, seq}` plus the variant's
+  monotonic counter `conversion_seq`; every entry is validated (`views_problem` / `disposition_problem`: a 12-hex generation, a state of
+  the two; anything else makes views.json unreadable = a damaged read-only card, nothing queued). `mv.set_disposition(root, monster,
+  variant, generation, value | None, expect_seq=None) -> {previous, seq, written, same?, stale?, missing?}` is one read-compare-write
+  under the monster lock: writing the state a generation already has changes nothing (idempotent); `expect_seq` makes an undo
+  conditional on nothing newer having been written. **Cancel** (`monster_lane.cancel_task(root, task)`): an already cancelled row is
+  success (and the durable `cancelled` is written when missing); when the SQLite cancel finds the row no longer queued, a row that is
+  `cancelled` by now (the dispatcher saw the disposition first) is success too, otherwise only the Cancel's OWN write is taken back
+  (`expect_seq`), never an older disposition put back. **Retry** restores nothing unless the row turned out to be another task
+  (`taskqueue.Expired`). **Failures**: `monster_lane.record_failure` RAISES when the record cannot be written; the durable intent is
+  written first to `.codex_jobs/_app/monster_lane/<variant key>.disposition.json` `{pending: {<generation>: {state, value, time,
+  error}}}` (`persist_disposition`) and removed only once views.json carries it. While it is pending: the orchestrator does NOT finish
+  the row (`_monster_disposition` -> False; the row stays active with the reason as its error, `TaskQueue.note_active`; the pass is
+  repeated every tick), `tick` writes it again (`repair_dispositions`), never queues or restores that generation (an error line per
+  tick), the plan starts nothing for it, and the item shows `conversion.disposition_pending` + an error, the card a badge.
+- **F4 task identity.** A queue row id is a hint. Run now / Retry / Cancel of a monster task carry `key` (`monster_convert:<M>/<v>:<generation>`)
+  and `generation`; `monster_lane.resolve_task` finds the row by key (409 `changed` when it is gone or its `args.frozen_sha` differs;
+  400 without them) and every state change compares the identity again INSIDE its transaction (`TaskQueue.cancel / retry /
+  mark_run_now(..., expect={key, generation})`, `taskqueue.check_identity`, `taskqueue.Expired` -> 409 `changed`). Exposed as `key` +
+  `generation` on the queue rows (`generation` null for other lanes) and on `item.conversion`; queue.js and monster_views.js send them.
+- **F5 pause identity.** Every pause transition has a unique `pause_id`: `modes.write_mode` stores a fresh uuid4 in
+  `supervisor_mode.json` (`{mode, since, pause_id}`) on every write; a mode file or PAUSE file written by somebody else (the supervisor,
+  its `mode` command) carries none and gets `file:<digest of inode, creation / modification time in ns, size, bytes>` = one id per
+  write (also for two pauses within one second). `modes.manual_pause(root) -> {pause_id, kind: mode | pause, reason} | None` names the
+  manual pause of conversions in force. Exposed in `GET /api/v2/state` `status.pause_id`, the queue's `mode.pause_id` (and
+  `mode.mode.pause_id`, `mode.pause.pause_id`), `monsters.gate.pause_id` and `item.conversion.pause_id`. A confirmed Run now must echo
+  it (H.4); `args.override_pause` = that id opens the gate for that pause only.
+- **F8 paid accounting (lane side).** An action is `confirmed` ONLY when the backend recorded `actions[<kind>].confirmed_at`
+  (`monster_lane.advance_evidence`); a cleared intent, an observed stage or an exported record prove nothing (`uncertain`). Per action the
+  lane reads `observed_cost` (else `observed_cost_<kind>.credits`), `provider_action_id`, `model_id`; `paid_log.jsonl` entries gain
+  `provider_id` and `evidence`. An unconfirmed click keeps `pending_action` (the lane refuses to resume it) and the item shows
+  `conversion.record.paid_review`. A paid-log write error stores the actions it could not log in `paid_log_errors.json`
+  (`actions: [{id, provider_id, action, status, credits, model_id, evidence}]`, `model_id`), so `repair_accounting` logs them even after
+  Reconvert moved the record, and never mixes in another model's record found at that path; an error whose record is gone and that
+  carries no stored action stays listed. Before a paid collect the lane also re-hashes the final upload copies
+  (`rodin_backend.verify_upload_inputs`; a difference = verdict failed `check`).
+- **F9 process tree.** The driver process (`monster_lane.py run`, `run_conversion(own_process=True)`) creates a named Windows Job
+  Object (`Local\imageto3d-mlane-<variant key>-<uuid>`, default limits: KILL_ON_JOB_CLOSE off) and assigns ITSELF before starting any
+  child, so every descendant is in the job. The children file (`<variant key>.children.json`, schema 2) records `driver`, `job`,
+  `children` (written BEFORE each spawn: `reserve`; a spawn that cannot be recorded is not made), `descendants` (every descendant as it
+  appears, a 0.5 s watcher) and `incomplete` (why the record may not be the whole tree). The orchestrator opens the job by name the
+  first time it looks at the tree (every tick, `_monster_tree_hold` / the plan) and keeps the handle, so it owns the tree through the
+  driver's exit: `tree_state -> {job, live, incomplete}` (the job's pids when it holds the handle, else the recorded processes). The slot
+  is held while anything of the tree lives OR the evidence is incomplete after the driver is gone (`tree_hold`; visible as the waiting
+  reason / a note; cleared by hand after checking). Kill & retry (`Orchestrator._kill_monster`): 1. ownership of wrapper and builder
+  (`_ownership`: gone | verified by pid + recorded create time + command line | unverified) BEFORE anything is enumerated or signalled;
+  unverified = no signal at all, `kill_failed`, slot kept; 2. `tree_plan`: the job, else only processes proven by pid + create time
+  (a recorded live process without a create time blocks every signal); 3. builder, wrapper, then `drain_tree` (TerminateJobObject or
+  kill + wait); a survivor or incomplete evidence = `kill_failed`.
+- **F10 approve what is on screen.** monster3d.js keeps `applied = {level, url, sha}` of the last load the viewer APPLIED; Approve
+  (button and key A) is enabled only when that level is the selected one and has a digest; while loading and after a failed load (the
+  stale mesh is cleared) it is disabled. Server: an approved variant is Completed only while `approval_problem` is None: the chosen
+  LOD's file still has `chosen_lod.json` `glb_sha256` and its `generation` is the current one (an approval without a digest counts only
+  for a legacy reduction); otherwise it is shown in 3D with `approved, but not verified (...)` and Unapprove.
+- **F11 strict reads.** `mv.read_strict` (None only for a missing file). The publication journal (`read_journal`), the reconvert journal
+  (`read_reconvert_journal`, shape-checked) and chosen_lod.json (`read_choice`; also in `decisions.write_monster_lod`) are read strictly
+  on every mutation path; `_variant_paths` runs `damage_check` first. A malformed file is 409 `unreadable`, is never overwritten or
+  removed (`_write_journal` refuses an existing file), and makes the variant a read-only damaged card (a monster with a damaged pick
+  journal: its concept cards lose their actions and carry a `damaged: ...` badge).
+- **F14 nested containment.** `mv.contained` is called again immediately before use for: the driver's `hyper3d/`, its record, the input
+  snapshot `inputs_<generation>/` (and its temp folder and files), the backend's `upload_inputs/`, `reduced/` + `v2_reduce_ok.json`
+  (`_drive.unsafe`, before submit, collect, reduce and the verification); Reconvert's lock, journal and every move source / destination;
+  the recovery of a reconvert journal (before its lock file is opened, and per move); 3D approve's lock, choice file and LOD file;
+  Retry / Repair renames. A link or junction on the way = refused (verdict failed `check` / 400).
+- **F15 one validator, repair, one terminal rule.** `mv.png_problem` = `png_check.png_problem`, provenance =
+  `png_check.provenance_problem` (freeze, convert, Retry, the ticks). View items gain `repair: "provenance" | null`: a valid image whose
+  record is missing / not a JSON object is repaired by verb `view_repair {view}` (the record is written again from the task
+  descriptor's `prompt`, else the last job's `prompt.md`, else v2's prompt for the view; `repaired: {...}` says so; an unusable record is
+  renamed `.invalid-<time>`; the image is not touched) and `view_retry` refuses it. The runner then marks its
+  `failed` / `reason: provenance` task done itself. `view_waiting` is the one terminal-state rule of the item phase AND the unattended
+  freeze: a task of the variant is terminal, or there is no descriptor and a valid view exists.
+- **Row 10 old descriptors.** `variant_descriptors` finds every descriptor of a variant (current names, the older undigested
+  `mviews--<monster slug>--<variant>--<view>` names, and any descriptor whose `monster` / `variant` fields name it); withdraw checks
+  and renames them all. `reconcile_descriptors` (every tick, before the lane dispatches anything) renames a monster descriptor that has
+  no guard or an old name to `<name>.json.unguarded-<time>` unless it is launching / running (reported), and writes the current guarded
+  descriptor in its place when the view is still planned and missing. This is the APP-side refusal; the runner itself
+  (tools/view_batch.py `launch_withdrawn`) still launches a descriptor without a `guard` field, so between two app ticks an unguarded
+  descriptor written by hand could start: the app must tick once before the runner is enabled (cut-over order).

@@ -384,3 +384,74 @@ These names and semantics are fixed. Both the daemon-side fixes and the v2-side 
   job_name) -> (bool, reason)` (imported lazily, `worker_predicate`); without it, its copy of the rule: a free module AND (no live job-lock
   holder, or in processing/ another worker's convert_job holds one of its modules). A held job lock with every module free is no work. Each
   entry adds `reason`.
+
+### I.10 As built: pre-cut-over review (review_v2_recheck_cutover_20261125 findings 1, 2, 7, 20 and the phase-4 row 6 residual)
+
+**Drain without a deadlock (finding 1).** Stopping intake and draining a job are separate. Files, all under `.codex_jobs/_batch/`:
+
+| File | Writer | Meaning |
+|---|---|---|
+| `CONVERT_HOLD` | manager | intake stopped (I.1); written FIRST |
+| `CONVERT_DRAIN` = {since, since_unix, reason, owner_pid, owner_create_time, worker: {pid, create_time}} | manager (`services.write_drain`), only after the hold | gate-waiters leave; the file alone also closes the gate (`convert_job.conversion_gate`, `convert_queue.conversions_blocked`) |
+| `gate_wait/<pid>.json` = {pid, create_time, job, module, step, since} | `convert_job.py` while it is blocked in `wait_for_gate` / `wait_for_child_gate` | nothing paid in flight in that process; removed when it leaves the gate |
+| `drain_exits/<pid>_<ms>.json` = {pid, create_time, ppid, job, module, step, reason, time, fails_before, parent_aware, lock_released} | `convert_job.leave_for_drain` | one drain exit; consumed by `services.settle_drain_exits` |
+| `convert_drain.log` (JSON lines) | manager | what was restored per job |
+
+- `convert_job.py`: blocked at the gate with `CONVERT_DRAIN` present, it releases the module lock it holds, writes
+  `deferred.<race>/<module>` = {time, step, reason, pid} into the job record (no state change; removed when the module converts), records the
+  exit and exits **76** (`DRAIN_EXIT`; 75 is a busy Tripo browser profile). A process past its gate is never affected.
+- `convert_queue.py` (current): sets `$IMAGETO3D_DRAIN_AWARE` for its children, reports exit 76 as `DEFERRED <job>` (no `.fails`, no
+  fallback backend, no balance re-read) and starts nothing while `CONVERT_DRAIN` exists.
+- Manager (`services._convert_stop_step`, legacy worker): hold, then drain file, then per tick
+  1. no `convert_job.py` runs and the worker sleeps -> `frozen_stop` with the strict check of I.9 (unchanged);
+  2. else, when the worker keeps taking jobs (`_cycling`: a drain exit of a child whose parent is not drain-aware) -> `frozen_stop` with
+     `_drain_idle_problem`: frozen, its children are waited for while they are leaving (at the gate, or younger than `DRAIN_YOUNG`; at most
+     `DRAIN_SETTLE`), it must have NO child and its last event must be in `DRAIN_SAFE_EVENTS` (PAUSED / IDLE / LOW DISK / `CONVERT ` /
+     FAILED / DEFERRED / SHARED / HOLD / BALANCE / PARTIAL / OWNER; never CONVERTED / FINISH / OFFLOAD / an exit announcement, after which
+     the worker moves sets in-process). A child doing real work makes it resume and wait;
+  3. else wait (the message says whether a job works or gate-waiters are leaving).
+- `services.settle_drain` (end of every tick, end of `stop()`, `begin_management`): once the drain is no longer pending it restores
+  `<job>.fails` for the exits an older worker counted (`max(lowest fails_before, now - exits)`, never up, file removed at 0; exits of
+  drain-aware parents restore nothing), removes the job locks naming the drained worker when it is gone, deletes `CONVERT_DRAIN` and records
+  `drain_restored` / `drain_unlocked` / `drain_finished` in the convert record. `status()['drain']` shows a pending drain and its gate-waiters.
+  PAUSE is never read or written by any of this.
+- Known limit: a convert_job.py process started from code older than this section (no gate_wait record, no drain exit) cannot acknowledge
+  the drain: while one runs the drain waits for it as before (message: convert_job.py runs now) and it is never killed. At the cut-over none
+  runs (the old worker sleeps in PAUSED); every child the old worker starts afterwards is current code.
+- Known limit: a cycling worker frozen in the instant between a child's exit 0 and its own `CONVERTED` line is terminated before its
+  `finish()`; the next worker's `finish_sets` pass moves the set.
+
+**Suspension record (row 6 residual).** `frozen_stop` writes `.codex_jobs/_app/services/suspensions.json` = {items: [{pid, create_time,
+service, time, terminated, owner_pid}]} before `suspend()`, marks `terminated` before `terminate()`, and removes the entry once the process is
+resumed or gone (a failed record write means it is not suspended). `begin_management` -> `recover_suspensions`: an entry whose process still
+runs as this checkout's service (`verified_handle`) and is still suspended is resumed (also one a terminate was already sent to, so a POSIX
+SIGTERM is delivered); a dead process's entry is dropped; a pid that is something else is never touched.
+
+**Registered ownership (finding 2).** `convert_list.add_sets` now does everything under `convert_sets.lock`: `read_namespace_strict`
+(`NamespaceUnreadable` when set_namespace.json exists but is not `{"sets": {...}, "families": {id: set}}`: nothing is written, the file is
+never replaced; `namespace_conflict` refuses the approval with the same text), then `id_claims` over processing_views, multiview_ready,
+processing, completed, failed, held_conversions and `models/<id>`. A family id (or a release's `extra` job prefix) already used there is
+written for set S only when `claim_problem` finds it provably S's: the job record says `"parent_set": "S"`, or the id is already registered
+as S's family id. A record naming another parent (itself included) = an independent set: skipped / approval refused. No recorded parent, or
+a `models/<id>` folder no job record accounts for = AMBIGUOUS: skipped / approval refused, never guessed from the suffix (to adopt such a
+legacy job, add `parent_set` to its `.tripo-job.json`). Dispatch: `convert_queue.owner_allows(root, job, record, patterns)` (called from
+`next_job` through `owner_ok`, and by `convert_list.pending_jobs` / `eligible_jobs` / `held_jobs` reason `owner` with `detail`, and
+`progress` `held_kind: owner`): a job with `parent_set` X needs X on the list and, when the namespace records an owner of the job's prefix,
+that owner must be X (an unreadable namespace = cannot be verified = not dispatched); a job without `parent_set` whose prefix is registered
+as a family id of S needs S on the list. The worker reports a refusal once: `OWNER <job>: not converted: ...`.
+
+**Supervisor stop delivery (finding 7).** The supervisor record carries `stop_delivery` = {state: requested | delivered | unconfirmed |
+failed, time, pid, create_time, why?}. `requested` is saved before the hold names the supervisor in `retiring` and before the stop command
+runs. The command failing (non-zero exit, timeout, cannot run) with no `supervisor.stop` file and the supervisor still alive is
+NON-DELIVERY (`_stop_not_delivered`): the request is withdrawn (`stop_requested`, `then_start`, `pause_backup`), the supervisor is taken out
+of the hold's `retiring` (`withdraw_retiring`; owner, reason and `since` kept) and the call fails with a ServiceError; that supervisor's next
+tick releases the hold. A failed command whose stop file exists counts as delivered. The tick reconciles a pending stop too: the same
+supervisor still running with no stop file `STOP_DELIVERY_GRACE` (15 s) after the request is non-delivery as well (`completed` entry with
+ok false for the request).
+
+**Restart outcome (finding 20).** `services.stop(then_start=True)` returns `replacement` = {pid, create_time} or raises. In the tick a
+finished stop with a pending restart no longer reports at once: the record keeps `restart_request` = {id, text} until the start decision of
+the same pass, and the `completed` entry is `ok: true` with `replacement` (after `_start` returned the new instance), or `ok: false` with
+`restart failed: ...` / `restart blocked: ...` (it still starts by itself once the blocker is gone). A pending Restart starts the service like
+Start does, also when it is disabled or was held. `ServiceManager._settle_outstanding` resolves a restart as ok only when the status shows a
+running instance with another pid than the stopped one.

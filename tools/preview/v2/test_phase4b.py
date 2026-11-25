@@ -420,7 +420,8 @@ class QueueOpsTest(V2Case):
         for key in ('tasks', 'workers', 'services', 'mode', 'credits', 'disk', 'views', 'conversions', 'holds', 'settings'):
             self.assertIn(key, queue)
         self.assertGreater(queue['disk']['free'], 0)
-        self.assertEqual(set(queue['mode']), {'mode', 'pause', 'idle_seconds', 'idle_source', 'away', 'supervisor_running', 'supervisor_pid', 'warning'})
+        self.assertEqual(set(queue['mode']) - {'pause_id'},
+                         {'mode', 'pause', 'idle_seconds', 'idle_source', 'away', 'supervisor_running', 'supervisor_pid', 'warning'})
         self.assertEqual(set(queue['conversions']), {'current', 'events_tail', 'fails', 'held', 'excludes', 'max_tries'})
         self.assertEqual(queue['settings'], settings.DEFAULTS)
 
@@ -576,13 +577,16 @@ class ProgressTest(V2Case):
 
     def test_state_status_summary(self):
         _s, state = self.get('/api/v2/state')
-        self.assertEqual(state['status'], {'mode': {'mode': 'auto', 'since': None, 'label': state['status']['mode']['label']}, 'paused': False,
-                                           'services': None, 'queue_health': None, 'pause_reason': None, 'services_problems': None})
+        status = {k: v for k, v in state['status'].items() if k != 'pause_id'}       # (pause_id: the pause identity, review finding 5)
+        status['mode'] = {k: v for k, v in status['mode'].items() if k != 'pause_id'}
+        self.assertEqual(status, {'mode': {'mode': 'auto', 'since': None, 'label': state['status']['mode']['label']}, 'paused': False,
+                                  'services': None, 'queue_health': None, 'pause_reason': None, 'services_problems': None})
         self.batch()
         (self.root / '.codex_jobs/_batch/PAUSE').write_text(json.dumps({'since': 'x', 'reason': 'manual: pause-conversions', 'scope': ['conversions']}))
         self.assertEqual(self.post('/api/v2/queue', {'op': 'mode', 'mode': 'pause-conversions'})[0], 200)
         _s, state = self.get('/api/v2/state')
-        self.assertEqual((state['status']['mode']['mode'], state['status']['mode']['label'], state['status']['paused']),
+        paused = {k: v for k, v in state['status']['paused'].items() if k != 'pause_id'}
+        self.assertEqual((state['status']['mode']['mode'], state['status']['mode']['label'], paused),
                          ('pause-conversions', 'Pause conversions', {'since': 'x', 'reason': 'manual: pause-conversions', 'scope': ['conversions']}))
 
     def test_settings_problems_and_release_shapes(self):
@@ -927,7 +931,14 @@ class ReviewActionsTest(V2Case):
         self.assertEqual([j['job'] for j in convert_list.pending_jobs(self.root)], ['plate_01--a1b2c3d4e5f6'])
         self.assertFalse(any('*' in line for line in self.lines()))
         # a race-suffixed staged job belongs to its base set (catalog.job_set); a part of the suffix does not
-        self.job('cape', 'c1b2c3d4e5f6', 'multiview_ready', units=(('dwarf_male', 'outfit'),), suffix='_dwarf_male', state='ready_for_tripo')
+        # (pre-cut-over review finding 2: only when the job RECORDS that set as its parent; a job without one is ambiguous and skipped)
+        self.job('hood', 'd1b2c3d4e5f6', 'multiview_ready', units=(('dwarf_male', 'outfit'),), suffix='_dwarf_male', state='ready_for_tripo')
+        status, body = self.op(op='release', set='hood')
+        self.assertEqual(status, 200, body)
+        self.assertNotIn('hood_dwarf_male', body['added'])
+        self.assertIn('ambiguous', body['skipped']['hood'][0]['reason'])
+        self.job('cape', 'c1b2c3d4e5f6', 'multiview_ready', units=(('dwarf_male', 'outfit'),), suffix='_dwarf_male', state='ready_for_tripo',
+                 extra={'parent_set': 'cape'})
         self.assertEqual(self.op(op='release', set='cape_dwarf')[0], 404)
         status, body = self.op(op='release', set='cape')
         self.assertEqual(status, 200, body)
@@ -1516,6 +1527,512 @@ class Phase5ActionsTest(V2Case):
         self.assertEqual(self.act('concepts:hood', 'approve')[0], 200)
         self.assertEqual(self.act('approved:hood', 'unapprove')[0], 200)
         self.assertIsNone(convert_list.namespace_conflict(self.root, 'hood'))          # its own family ids never block it
+
+
+# ------------------------------------------------------------------------------- pre-cut-over review (DESIGN_PHASE4.md I.10)
+
+REAL_CONVERT_JOB = TOOLS / 'tripo_pipeline' / 'convert_job.py'
+# A convert_job.py of the temp root that runs the REAL gate code (wait_for_gate, the module lock, the job record) against that root: it claims
+# its module lock, then blocks at the paid gate; with ctl {"work": true} it never reaches the gate (work in flight).
+GATE_JOB = '''
+import importlib.util, json, pathlib, sys, time
+real = pathlib.Path(%r)
+sys.path.insert(0, str(real.parent))
+spec = importlib.util.spec_from_file_location('real_convert_job', real)
+cj = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cj)
+root = pathlib.Path.cwd()
+cj.ROOT, cj.GATE_POLL = root, 0.2
+job = sys.argv[1]
+record = root / 'processing' / job / '.tripo-job.json'
+lock = root / 'models' / 's' / 'abc123' / '.module_locks' / 'human_male__outfit.lock'
+cj._RUN.update(job=job, record=record if record.exists() else None, lock=None)
+ctl = root / '.codex_jobs' / '_app' / 'fake_gate_job.json'
+if ctl.exists() and json.loads(ctl.read_text()).get('work'):
+    time.sleep(600)
+assert cj.claim_module(lock)
+cj._RUN['lock'] = lock
+cj.wait_for_gate('human_male/outfit', 'a new submission')
+time.sleep(600)
+''' % str(REAL_CONVERT_JOB)
+# An OLDER convert worker: it knows neither CONVERT_HOLD nor the stop file, counts every non-zero child exit in <job>.fails and takes the job
+# again at once (it never stops cycling by itself).
+CYCLING_WORKER = '''
+import datetime, os, pathlib, subprocess, sys, time
+root = pathlib.Path.cwd()
+batch = root / '.codex_jobs' / '_batch'
+locks = batch / 'convert_locks'
+locks.mkdir(parents=True, exist_ok=True)
+JOB = 's--abc123'
+
+def event(text):
+    with open(batch / 'convert_events.log', 'a') as handle:
+        handle.write(f'{datetime.datetime.now():%m-%d %H:%M:%S} {text}\\n')
+while True:
+    (locks / f'{JOB}.lock').write_text(str(os.getpid()))
+    event(f'CONVERT {JOB}')
+    code = subprocess.run([sys.executable, 'tools/tripo_pipeline/convert_job.py', JOB]).returncode
+    fails = locks / f'{JOB}.fails'
+    if code:
+        fails.write_text(str((int(fails.read_text()) if fails.exists() else 0) + 1))
+        event(f'FAILED {JOB}: convert_job exit {code}')
+    (locks / f'{JOB}.lock').unlink()
+    time.sleep(0.05)
+'''
+
+
+class CutoverDrainTest(TempRoot):
+    """Finding 1 (the drain never deadlocks on a child blocked at the paid gate) and the row 6 residual (the persisted suspension)."""
+    popen, hold = ReviewServicesTest.popen, ReviewServicesTest.hold
+    event, children, kill_children = Phase5ServicesTest.event, Phase5ServicesTest.children, Phase5ServicesTest.kill_children
+    JOB = 's--abc123'
+
+    def setUp(self):
+        super().setUp()
+        self.batch = self.root / '.codex_jobs/_batch'
+        (self.root / 'tools/tripo_pipeline/convert_job.py').write_text(GATE_JOB, encoding='utf-8')
+        folder = self.root / 'processing' / self.JOB
+        folder.mkdir(parents=True)
+        self.record = folder / '.tripo-job.json'
+        self.record.write_text(json.dumps({'set': 's', 'job_id': 'abc123', 'state': 'ready', 'modules': [{'race_gender': 'human_male', 'module': 'outfit'}]}))
+        self.module_lock = self.root / 'models/s/abc123/.module_locks/human_male__outfit.lock'
+        self.pause = self.batch / 'PAUSE'
+        self.pause_text = json.dumps({'since': 'x', 'reason': 'manual pause-conversions', 'scope': ['conversions']})
+        self.pause.write_text(self.pause_text)                                       # the user's pause: it must survive the whole drain
+        self.fails = self.batch / 'convert_locks' / f'{self.JOB}.fails'
+
+    def legacy(self, script=None, **ctl):
+        settings.save(self.root, CONVERT_ONLY)
+        path = self.root / 'tools/convert_queue.py'
+        if script:
+            path.write_text(script, encoding='utf-8')
+        services.begin_management(self.root)                                         # the hold exists before the worker runs (I.1)
+        self.ctl('convert_queue', {'ignore_stop': True} | ctl)
+        old = self.spawn('convert')
+        self.addCleanup(self.kill_children, old.pid)
+        os.utime(path, (time.time() + 600, time.time() + 600))                       # it runs code older than the file
+        return old
+
+    def waiters(self):
+        return services.gate_waiters(self.root)
+
+    def drain_until_gone(self, timeout=90.0):
+        events, end = [], time.monotonic() + timeout
+        while self.running('convert'):
+            self.assertLess(time.monotonic(), end, f'the drain did not finish: {events[-6:]}')
+            events += services.tick(self.root)['events']
+            time.sleep(0.3)
+        return events + services.tick(self.root)['events']
+
+    def check_drained(self):
+        self.assertEqual(self.running('convert'), [])
+        self.assertEqual(self.running('convert_job'), [])                            # the gate-waiter left by itself
+        self.assertFalse(services.drain_path(self.root).exists())                    # CONVERT_DRAIN removed when the drain completed
+        self.assertEqual(self.pause.read_text(), self.pause_text)                    # the user's pause was never touched
+        self.assertTrue(self.hold())                                                 # no supervisor ticked: conversions stay held
+        self.assertFalse(self.module_lock.exists())                                  # no module lock left behind
+        self.assertEqual(list((self.batch / 'convert_locks').glob('*.lock')), [])    # and no job lock
+        self.assertFalse(self.fails.exists())                                        # no failure counted
+        self.assertEqual(list((self.batch / 'drain_exits').glob('*.json')), [])
+        self.assertEqual(list((self.batch / 'gate_wait').glob('*.json')), [])
+        self.assertFalse(services.suspensions_path(self.root).exists())
+        rec = services.read_record(self.root, 'convert')
+        self.assertFalse(rec.get('drain_hold'))
+        self.assertIsNone(services.release_blocker(self.root, None))
+        deferred = json.loads(self.record.read_text())['deferred']['human_male/outfit']
+        self.assertIn('CONVERT_HOLD', deferred['reason'])
+        return rec
+
+    def test_f1_a_child_blocked_at_the_paid_gate_never_deadlocks_the_drain(self):
+        """The reviewer's reproduction: the legacy worker's child (current code) waits for the very hold the drain keeps."""
+        old = self.legacy(child=['tools/tripo_pipeline/convert_job.py', self.JOB])
+        self.wait_for(self.waiters, what='the child at the paid gate')
+        self.assertEqual((self.waiters()[0]['job'], self.waiters()[0]['module']), (self.JOB, 'human_male/outfit'))
+        self.assertTrue(self.module_lock.exists())
+        services.tick(self.root)
+        self.event('CONVERT ' + self.JOB)
+        seen = []
+        real = services.write_drain
+
+        def spy(root, inst, now=None):
+            seen.append((self.hold(), [w['job'] for w in self.waiters()], inst['pid']))
+            return real(root, inst, now)
+        with mock.patch.object(services, 'write_drain', side_effect=spy):
+            result = services.stop(self.root, 'convert', wait=0.5)
+            events = [result['message']] + self.drain_until_gone()
+        self.assertEqual(len(seen), 1)
+        hold, waiting, worker = seen[0]
+        self.assertTrue(hold and hold['owner_pid'] == os.getpid())                   # CONVERT_HOLD first, then CONVERT_DRAIN
+        self.assertEqual((waiting, worker), ([self.JOB], old.pid))                   # the child was blocked at the gate when the drain began
+        self.assertTrue(any('CONVERT_DRAIN removed' in e for e in events), events)
+        old.wait(10)
+        rec = self.check_drained()
+        self.assertEqual([(r['job'], r['exits']) for r in rec['drain_restored']], [(self.JOB, 1)])       # recorded which job left
+        self.assertIn(self.JOB, (self.batch / 'convert_drain.log').read_text())
+
+    def test_f1_the_count_an_older_worker_wrote_for_a_drain_exit_is_restored(self):
+        old = self.legacy(child=['tools/tripo_pipeline/convert_job.py', self.JOB])
+        self.wait_for(self.waiters, what='the child at the paid gate')
+        services.tick(self.root)
+        services.write_drain(self.root, self.running('convert')[0])                  # (the drain began: the gate-waiter leaves)
+        self.wait_for(lambda: not self.running('convert_job'), what='the gate-waiter to leave')
+        exits = services.drain_exits(self.root)
+        self.assertEqual([(e['job'], e['fails_before'], e['parent_aware'], e['lock_released']) for e in exits], [(self.JOB, 0, False, True)])
+        self.fails.parent.mkdir(parents=True, exist_ok=True)
+        self.fails.write_text('1')                                                   # the older worker counted the non-zero exit ...
+        self.event(f'FAILED {self.JOB}: convert_job exit {services.DRAIN_EXIT}')
+        self.event('PAUSED (CONVERT_HOLD: preview app manager start); not starting conversions')         # ... and sleeps on the hold
+        result = services.stop(self.root, 'convert', wait=0.5)
+        events = [result['message']] + self.drain_until_gone()
+        self.assertTrue(any('restored 1 -> 0' in e for e in events), events)
+        old.wait(10)
+        rec = self.check_drained()
+        self.assertEqual([(r['job'], r['fails_from'], r['fails_to']) for r in rec['drain_restored']], [(self.JOB, 1, 0)])
+
+    def test_f1_a_worker_that_keeps_cycling_is_frozen_and_stopped_while_it_has_no_child(self):
+        old = self.legacy(script=CYCLING_WORKER)
+        self.wait_for(self.waiters, what='the child at the paid gate')
+        services.tick(self.root)
+        events = [services.stop(self.root, 'convert', wait=0.5)['message']] + self.drain_until_gone()
+        self.assertTrue(any('kept taking jobs' in e for e in events), events)
+        old.wait(10)
+        rec = self.check_drained()
+        self.assertTrue(all(r.get('fails_to', 0) == 0 for r in rec['drain_restored']), rec['drain_restored'])
+
+    def test_f1_work_in_flight_is_never_interrupted(self):
+        """A child that is not at the gate (a conversion in flight) keeps the drain waiting: nothing is frozen for good, nothing killed."""
+        self.ctl('gate_job', {'work': True})
+        old = self.legacy(child=['tools/tripo_pipeline/convert_job.py', self.JOB])
+        self.wait_for(lambda: self.running('convert_job'), what='the working child')
+        services.tick(self.root)
+        self.event('CONVERT ' + self.JOB)
+        result = services.stop(self.root, 'convert', wait=0.5)
+        self.assertTrue(result['pending'])
+        self.assertIn('runs now', result['message'])
+        for _ in range(2):
+            services.tick(self.root)
+        self.assertEqual([i['pid'] for i in self.running('convert')], [old.pid])
+        self.assertEqual(len(self.running('convert_job')), 1)
+        self.assertNotEqual(psutil.Process(old.pid).status(), psutil.STATUS_STOPPED)
+        self.assertTrue(services.drain_path(self.root).exists())
+
+    def test_f1_a_stale_drain_file_is_removed_at_manager_start(self):
+        services.write_drain(self.root, {'pid': 999999, 'create_time': 1.0})
+        lock = self.batch / 'convert_locks' / f'{self.JOB}.lock'
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text('999999')
+        events = services.begin_management(self.root)
+        self.assertTrue(any('CONVERT_DRAIN removed' in e for e in events), events)
+        self.assertFalse(services.drain_path(self.root).exists())
+        self.assertFalse(lock.exists())
+
+    def test_f1_restoring_never_raises_a_count_and_ignores_aware_parents(self):
+        folder = self.batch / 'drain_exits'
+        folder.mkdir()
+        self.fails.parent.mkdir(parents=True, exist_ok=True)
+        base = {'pid': 999999, 'create_time': 1.0, 'job': self.JOB, 'module': 'human_male/outfit', 'time': time.time()}
+        (folder / 'a.json').write_text(json.dumps(base | {'fails_before': 1, 'parent_aware': False}))
+        (folder / 'b.json').write_text(json.dumps(base | {'fails_before': 2, 'parent_aware': False}))
+        (folder / 'c.json').write_text(json.dumps(base | {'fails_before': 2, 'parent_aware': True}))       # a current worker: counted nothing
+        (folder / 'd.json').write_text(json.dumps(base | {'job': 't--manual', 'fails_before': 2, 'parent_aware': False}))   # run by hand
+        (self.fails.parent / 't--manual.fails').write_text('2')
+        self.fails.write_text('3')
+        restored = {r['job']: r for r in services.settle_drain_exits(self.root)}
+        self.assertEqual((restored[self.JOB]['fails_from'], restored[self.JOB]['fails_to'], restored[self.JOB]['counted']), (3, 1, 2))
+        self.assertEqual(self.fails.read_text(), '1')
+        self.assertNotIn('fails_to', restored['t--manual'])                          # nobody counted it: never below what it was before
+        self.assertEqual((self.fails.parent / 't--manual.fails').read_text(), '2')
+        self.assertEqual(list(folder.glob('*.json')), [])
+
+    # ----------------------------------------------------------------------------------------------------- row 6 residual
+    def test_row6_the_suspension_is_persisted_before_and_cleared_after(self):
+        os.remove(self.root / 'tools/tripo_pipeline/convert_job.py')
+        old = self.legacy()
+        services.tick(self.root)
+        self.event('IDLE: no staged job; waiting')
+        seen = []
+
+        def check(proc):
+            seen.append((proc.status(), services.read_suspensions(self.root)))
+            return 'not now'
+        gone, problem = services.frozen_stop(self.root, services.SERVICES['convert'], self.running('convert')[0], check)
+        self.assertEqual((gone, problem), (False, 'not now'))
+        status, items = seen[0]
+        self.assertEqual(status, psutil.STATUS_STOPPED)
+        self.assertEqual([(i['pid'], i['service'], i['terminated']) for i in items], [(old.pid, 'convert', False)])
+        self.assertAlmostEqual(items[0]['create_time'], psutil.Process(old.pid).create_time(), delta=1.5)
+        self.assertEqual(services.read_suspensions(self.root), [])                   # resumed: the record is gone
+        self.assertNotEqual(psutil.Process(old.pid).status(), psutil.STATUS_STOPPED)
+
+    def test_row6_a_manager_start_resumes_what_a_crashed_manager_left_suspended(self):
+        os.remove(self.root / 'tools/tripo_pipeline/convert_job.py')
+        old = self.legacy()
+        inst = self.running('convert')[0]
+        other = self.popen(*SLEEP_CHILD)                                             # not a service of this checkout
+        stranger = {'pid': other.pid, 'create_time': psutil.Process(other.pid).create_time()}
+        services._note_suspension(self.root, 'convert', inst)                        # the manager died between suspend and resume
+        services._note_suspension(self.root, 'convert', stranger)
+        services._note_suspension(self.root, 'convert', {'pid': 999999, 'create_time': 1.0})       # terminated meanwhile
+        psutil.Process(old.pid).suspend()
+        psutil.Process(other.pid).suspend()
+        self.addCleanup(lambda: psutil.Process(other.pid).resume() if psutil.pid_exists(other.pid) else None)
+        events = services.begin_management(self.root)
+        self.assertTrue(any(f'pid {old.pid} was left suspended' in e and 'resumed' in e for e in events), events)
+        self.assertNotEqual(psutil.Process(old.pid).status(), psutil.STATUS_STOPPED)
+        self.assertEqual(psutil.Process(other.pid).status(), psutil.STATUS_STOPPED)   # never touched: it is not this checkout's service
+        self.assertTrue(any(f'pid {other.pid}' in e and 'not touched' in e for e in events), events)
+        self.assertEqual(services.read_suspensions(self.root), [])
+        self.assertEqual(services.begin_management(self.root)[1:], [])
+
+
+class CutoverSupervisorTest(TempRoot):
+    """Finding 7 (a failed supervisor stop delivery) and finding 20 (a restart's terminal outcome)."""
+    hold, sup = ReviewServicesTest.hold, ReviewServicesTest.sup
+
+    def supervisor(self):
+        settings.save(self.root, SUPERVISOR_ONLY)
+        old = self.spawn('supervisor')
+        services.begin_management(self.root)
+        self.wait_for(lambda: 'conversion hold released' in ' '.join(services.tick(self.root)['events']), what='the first release')
+        return old
+
+    def test_f7_a_failed_stop_command_withdraws_the_retiring_designation(self):
+        old = self.supervisor()
+        failed = subprocess.CompletedProcess([], 1, '', 'boom: the stop command crashed')
+        with mock.patch.object(services.subprocess, 'run', return_value=failed), self.assertRaises(services.ServiceError) as caught:
+            services.stop(self.root, 'supervisor', wait=0.5)
+        self.assertIn('not delivered', str(caught.exception))
+        rec = services.read_record(self.root, 'supervisor')
+        self.assertEqual((rec['stop_delivery']['state'], rec['stop_requested'], rec['then_start']), ('failed', None, False))
+        self.assertIn('boom', rec['stop_delivery']['why'])
+        self.assertTrue(self.hold())                                                  # the hold written before the stop is still there ...
+        self.assertNotIn('retiring', self.hold())                                     # ... but this supervisor is no outgoing generation
+        self.assertIsNone(services.release_blocker(self.root, self.sup()))
+        self.wait_for(lambda: 'conversion hold released' in ' '.join(services.tick(self.root)['events']), what='the healthy supervisor tick')
+        self.assertIsNone(self.hold())
+        self.assertIsNone(old.poll())
+        self.assertEqual(services.status(self.root)['services']['supervisor']['state'], 'running')
+
+    def test_f7_a_stop_command_that_cannot_run_is_non_delivery_too(self):
+        self.supervisor()
+        with mock.patch.object(services.subprocess, 'run', side_effect=subprocess.TimeoutExpired(['x'], 60)), \
+                self.assertRaises(services.ServiceError):
+            services.restart(self.root, 'supervisor', wait=0.5)
+        self.assertEqual(services.read_record(self.root, 'supervisor')['stop_delivery']['state'], 'failed')
+        self.assertNotIn('retiring', self.hold())
+
+    def test_f7_a_failed_command_whose_stop_file_exists_was_delivered(self):
+        old = self.supervisor()
+        self.ctl('pipeline_supervisor', {'ignore_stop': True})
+
+        def run(cmd, **kwargs):
+            services.supervisor_stop_file(self.root).write_text('stop')               # it wrote the request, then failed
+            return subprocess.CompletedProcess(cmd, 1, '', 'late failure')
+        with mock.patch.object(services.subprocess, 'run', side_effect=run):
+            result = services.stop(self.root, 'supervisor', wait=0.5)
+        self.assertTrue(result['pending'])
+        self.assertEqual(services.read_record(self.root, 'supervisor')['stop_delivery']['state'], 'delivered')
+        self.assertEqual([r['pid'] for r in self.hold()['retiring']], [old.pid])       # still the outgoing generation
+        services.tick(self.root, now=time.time() + 60)
+        self.assertTrue(self.hold())
+
+    def test_f7_a_pending_stop_that_never_reached_the_supervisor_is_reconciled(self):
+        old = self.supervisor()
+        answered = subprocess.CompletedProcess([], 0, 'supervisor: not running', '')    # exit 0, but nothing was requested
+        with mock.patch.object(services.subprocess, 'run', return_value=answered):
+            result = services.stop(self.root, 'supervisor', wait=0.5, request=7)
+        self.assertTrue(result['pending'])
+        self.assertEqual(services.read_record(self.root, 'supervisor')['stop_delivery']['state'], 'unconfirmed')
+        self.assertFalse(any('released' in e for e in services.tick(self.root)['events']))      # inside the grace: still the outgoing one
+        self.assertEqual([r['pid'] for r in self.hold()['retiring']], [old.pid])
+        result = services.tick(self.root, now=time.time() + services.STOP_DELIVERY_GRACE + 5)
+        done = result['completed']
+        self.assertEqual([(d['request'], d['ok'], d['action']) for d in done], [(7, False, 'stop')])
+        self.assertIn('not delivered', done[0]['text'])
+        self.assertEqual(services.read_record(self.root, 'supervisor')['stop_delivery']['state'], 'failed')
+        self.wait_for(lambda: self.hold() is None or 'released' in ' '.join(services.tick(self.root)['events']), what='the release')
+        self.assertIsNone(self.hold())
+        self.assertIsNone(old.poll())
+
+    # ------------------------------------------------------------------------------------------------------------ finding 20
+    def pending_restart(self):
+        settings.save(self.root, CONVERT_ONLY)
+        worker = self.spawn('convert')
+        self.ctl('convert_queue', {'busy': True})
+        services.tick(self.root)
+        result = services.restart(self.root, 'convert', wait=0.5, request=11)
+        self.assertTrue(result['pending'])
+        self.assertNotIn('replacement', result)
+        self.ctl('convert_queue', {})
+        worker.wait(15)
+        return worker
+
+    def test_f20_a_restart_ends_with_the_replacement_identified(self):
+        worker = self.pending_restart()
+        done = services.tick(self.root)['completed']
+        self.assertEqual([(d['request'], d['action'], d['ok']) for d in done], [(11, 'restart', True)])
+        new = self.running('convert')[0]
+        self.assertNotEqual(new['pid'], worker.pid)
+        self.assertEqual(done[0]['replacement']['pid'], new['pid'])
+        self.assertAlmostEqual(done[0]['replacement']['create_time'], new['create_time'], delta=1.5)
+        self.assertIn(f'started pid {new["pid"]}', done[0]['text'])
+
+    def test_f20_a_restart_whose_start_fails_reports_the_failure(self):
+        self.pending_restart()
+        with mock.patch.object(services, '_spawn', side_effect=OSError('no interpreter')):
+            done = services.tick(self.root)['completed']
+        self.assertEqual([(d['request'], d['ok'], d['replacement']) for d in done], [(11, False, None)])
+        self.assertIn('restart failed: could not start: no interpreter', done[0]['text'])
+
+    def test_f20_a_blocked_restart_reports_the_blocker(self):
+        self.pending_restart()
+        with mock.patch.object(services, '_start_blocker', return_value='an instance might run'):
+            result = services.tick(self.root)
+        done = result['completed']
+        self.assertEqual([(d['request'], d['ok']) for d in done], [(11, False)])
+        self.assertIn('restart blocked: an instance might run', done[0]['text'])
+        self.assertEqual(self.running('convert'), [])
+        self.assertEqual(services.tick(self.root)['completed'], [])                   # reported once; it starts when the blocker is gone
+        self.assertEqual(len(self.running('convert')), 1)
+
+    def test_f20_an_immediate_restart_names_its_replacement_or_fails(self):
+        settings.save(self.root, CONVERT_ONLY)
+        worker = self.spawn('convert')
+        services.tick(self.root)
+        result = services.restart(self.root, 'convert', wait=10)
+        self.assertFalse(result['pending'])
+        self.assertEqual(result['replacement']['pid'], self.running('convert')[0]['pid'])
+        self.assertNotEqual(result['replacement']['pid'], worker.pid)
+        with mock.patch.object(services, '_spawn', side_effect=OSError('no interpreter')), self.assertRaises(services.ServiceError):
+            services.restart(self.root, 'convert', wait=10)
+
+    def test_f20_the_manager_never_reports_a_restart_done_without_a_replacement(self):
+        manager = orchestrator.ServiceManager(self.root, tick=lambda root, s: {'services': {}, 'events': [], 'completed': []})
+        base = {'name': 'convert', 'action': 'restart', 'time': time.time(), 'old_pid': 4242}
+
+        def settle(status):
+            manager.events = []
+            manager.outstanding = {5: dict(base, id=5)}
+            manager.statuses = {'convert': status}
+            manager._settle_outstanding()
+            return [(e['ok'], e['pending'], e['text']) for e in manager.events]
+        self.assertEqual(settle({'state': 'stopping', 'stop_pending': True, 'pid': 4242}), [])
+        (ok, pending, text), = settle({'state': 'waiting', 'stop_pending': False, 'pid': None, 'message': 'x is held'})
+        self.assertEqual((ok, pending), (False, False))
+        self.assertIn('not restarted', text)
+        self.assertFalse(settle({'state': 'running', 'stop_pending': False, 'pid': 4242})[0][0])     # the old instance: not a replacement
+        ok, pending, text = settle({'state': 'running', 'stop_pending': False, 'pid': 4343})[0]
+        self.assertTrue(ok)
+        self.assertIn('replacement pid 4343', text)
+
+
+class CutoverNamespaceTest(V2Case):
+    """Finding 2: existing job / model ownership is checked under the registration lock and again at dispatch."""
+
+    def lines(self):
+        path = self.root / '.codex_jobs/_batch/convert_sets.txt'
+        return path.read_text(encoding='utf-8').splitlines() if path.exists() else []
+
+    def staged(self, parent=None, job_id='abcdef123456', suffix='_human_male'):
+        return self.job('cape', job_id, 'multiview_ready', suffix=suffix, state='ready_for_tripo',
+                        extra={'parent_set': parent} if parent else None)
+
+    def test_f2_the_reviewers_case_an_independent_staged_job_is_never_authorized(self):
+        self.staged(parent='cape_human_male')                                         # its record names itself as its set
+        self.concept('cape')
+        status, body = self.act('concepts:cape', 'approve')
+        self.assertEqual((status, body['code']), (409, 'namespace'), body)
+        self.assertIn('names itself as its set', body['error'])
+        self.assertEqual(self.lines(), [])
+        added = convert_list.add_sets(self.root, ['cape'])                            # the registration itself (e.g. Release) skips it too
+        self.assertEqual(added['added'], ['cape', 'cape_dwarf_male'])
+        self.assertEqual([s['id'] for s in added['skipped']['cape']], ['cape_human_male'])
+        self.assertIsNone(convert_list.owner_of(self.root, 'cape_human_male'))
+        self.assertEqual(convert_list.pending_jobs(self.root), [])
+        self.assertEqual(convert_list.eligible_jobs(self.root), [])
+
+    def test_f2_ownership_must_be_provable(self):
+        self.staged()                                                                 # no recorded parent: ambiguous
+        added = convert_list.add_sets(self.root, ['cape'])
+        self.assertIn('ambiguous', added['skipped']['cape'][0]['reason'])
+        self.assertIn('ambiguous', convert_list.namespace_conflict(self.root, 'cape'))
+        self.staged(parent='hood', job_id='bbbbbb123456', suffix='_dwarf_male')       # another set's job
+        self.assertEqual([s['id'] for s in convert_list.add_sets(self.root, ['cape'])['skipped']['cape']], ['cape_dwarf_male', 'cape_human_male'])
+        # cape_dwarf_male was written before hood's job appeared: the line stays (nothing is ever removed), the dispatch check refuses the job
+        self.assertEqual(self.lines(), ['cape', 'cape_dwarf_male'])
+        self.assertEqual(convert_list.pending_jobs(self.root), [])
+        self.assertEqual([(h['job'], h['reason']) for h in convert_list.held_jobs(self.root)],
+                         [('cape_dwarf_male--bbbbbb123456', 'owner'), ('cape_human_male--abcdef123456', 'unlisted')])
+
+    def test_f2_a_job_that_records_this_set_as_its_parent_is_accepted(self):
+        self.staged(parent='cape')
+        self.concept('cape')
+        status, result = self.act('concepts:cape', 'approve')
+        self.assertEqual(status, 200, result)
+        self.assertEqual(result['convert_list']['added'], fam('cape'))
+        self.assertEqual([j['job'] for j in convert_list.pending_jobs(self.root)], ['cape_human_male--abcdef123456'])
+        self.assertEqual(convert_list.held_jobs(self.root), [])
+
+    def test_f2_a_model_folder_without_a_job_record_is_ambiguous(self):
+        (self.root / 'models/cape_dwarf_male/aaaaaa111111').mkdir(parents=True)
+        added = convert_list.add_sets(self.root, ['cape'])
+        self.assertEqual([s['id'] for s in added['skipped']['cape']], ['cape_dwarf_male'])
+        self.assertIn('models/cape_dwarf_male', added['skipped']['cape'][0]['reason'])
+        for stage in ('completed', 'failed', 'held_conversions', 'processing', 'processing_views'):   # every job stage is looked at
+            self.job('wrap', 'cccccc123456', stage, suffix='_human_male', extra={'parent_set': 'other'})
+            self.assertIn(f'{stage}/wrap_human_male--cccccc123456', convert_list.namespace_conflict(self.root, 'wrap'), stage)
+            shutil.rmtree(self.root / stage / 'wrap_human_male--cccccc123456')
+
+    def test_f2_an_unreadable_namespace_blocks_registration_and_is_never_replaced(self):
+        convert_list.add_sets(self.root, ['hood'])
+        path = convert_list.namespace_path(self.root)
+        for broken in ('{"sets": {"hood": ', '[1, 2]', '{"sets": {}, "families": {"a b": "hood"}}'):
+            path.write_text(broken, encoding='utf-8')
+            before = self.lines()
+            with self.assertRaises(convert_list.NamespaceUnreadable):
+                convert_list.add_sets(self.root, ['cape'])
+            self.assertEqual(path.read_text(encoding='utf-8'), broken)                # not replaced
+            self.assertEqual(self.lines(), before)                                    # nothing written to the convert list either
+            self.assertIn('set_namespace.json', convert_list.namespace_conflict(self.root, 'cape'))
+        self.concept('cape')
+        status, body = self.act('concepts:cape', 'approve')
+        self.assertEqual((status, body['code']), (409, 'namespace'), body)
+        self.assertTrue((self.root / 'concepts/cape').is_dir())
+
+    def test_f2_the_recorded_owner_is_verified_at_dispatch(self):
+        """A convert list that already carries the family id (written before this fix, or by hand) authorizes only the owner's job."""
+        import convert_queue
+        self.staged(parent='cape_human_male')
+        convert_list.list_path(self.root).parent.mkdir(parents=True, exist_ok=True)
+        convert_list.list_path(self.root).write_text('cape\ncape_human_male\n', encoding='utf-8')
+        convert_list.namespace_path(self.root).write_text(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
+        pats = convert_list.patterns(self.root)
+        job = 'cape_human_male--abcdef123456'
+        ok, reason = convert_queue.owner_allows(self.root, job, {'parent_set': 'cape_human_male'}, pats)
+        self.assertFalse(ok)
+        self.assertIn('for the set cape', reason)
+        self.assertEqual(convert_list.pending_jobs(self.root), [])
+        self.assertEqual(convert_list.eligible_jobs(self.root), [])
+        held = convert_list.held_jobs(self.root)
+        self.assertEqual([(h['job'], h['reason']) for h in held], [(job, 'owner')])
+        self.assertIn('for the set cape', held[0]['detail'])
+        self.assertTrue(convert_queue.owner_allows(self.root, job, {'parent_set': 'cape'}, pats)[0])              # cape's own job
+        self.assertTrue(convert_queue.owner_allows(self.root, job, {}, pats)[0])                                  # registered as cape's
+        self.assertFalse(convert_queue.owner_allows(self.root, job, {'parent_set': 'hood'}, pats)[0])             # hood is not listed
+        self.assertFalse(convert_queue.owner_allows(self.root, job, {}, ['cape_human_male'])[0])                  # its owner cape is not listed
+        self.assertTrue(convert_queue.owner_allows(self.root, 'solo--a1', {'parent_set': 'solo'}, ['solo'])[0])   # names itself, own id listed
+        self.assertTrue(convert_queue.owner_allows(self.root, 'solo--a1', {}, ['solo'])[0])
+        convert_list.namespace_path(self.root).write_text('{broken', encoding='utf-8')
+        ok, reason = convert_queue.owner_allows(self.root, job, {'parent_set': 'cape'}, pats)
+        self.assertFalse(ok)
+        self.assertIn('unreadable', reason)
+        # the worker's own loop applies it
+        with mock.patch.object(convert_queue, 'ROOT', self.root), mock.patch.object(convert_queue, 'LOCKS', self.root / '.codex_jobs/_batch/convert_locks'), \
+                mock.patch.object(convert_queue, 'EVENTS', self.root / '.codex_jobs/_batch/convert_events.log'), \
+                mock.patch.object(convert_queue, '_OWNER_REPORTED', set()), mock.patch('builtins.print'):
+            convert_list.namespace_path(self.root).write_text(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
+            self.assertEqual(convert_queue.next_job(set(pats)), (None, False))
+        self.assertIn(f'OWNER {job}: not converted', (self.root / '.codex_jobs/_batch/convert_events.log').read_text(encoding='utf-8'))
 
 
 if __name__ == '__main__':

@@ -62,8 +62,20 @@ class Base(unittest.TestCase):
         task = {'name': name, 'priority': 3, 'prompt': f'{out.as_posix()}\nDraw it from the left.',
                 'refs': [(self.monsters / 'front.png').as_posix()], 'outputs': [out.as_posix()], 'checks': [],
                 'max_attempts': 2, **extra}
+        if task.get('launcher') == 'monsters' and 'guard' not in task:   # app-published monster tasks always carry their pick guard
+            guard_file = self.monsters / 'guards' / f'{name}.json'
+            guard_file.parent.mkdir(parents=True, exist_ok=True)
+            if not guard_file.exists():
+                guard_file.write_text(json.dumps({'pick_gen': 'g1'}))
+            task['guard'] = {'file': guard_file.as_posix(), 'key': 'pick_gen', 'value': 'g1'}
         view_batch.save(self.batch / 'tasks' / f'{name}.json', task)
         return task, out
+
+    def test_a_monster_task_without_a_guard_is_never_launched(self):
+        task, _out = self.task('unguarded', launcher='monsters', guard=None)
+        task.pop('guard')
+        view_batch.save(self.batch / 'tasks' / 'unguarded.json', task)
+        self.assertEqual(view_batch.launch_withdrawn(task)[0], 'cancelled')
 
     def status(self, name='m-left'):
         return json.loads((self.batch / 'status' / f'{name}.json').read_text())
@@ -423,7 +435,7 @@ class ValidationTests(Base):
 
     def test_invalid_images_fail_the_attempt_and_are_set_aside(self):
         cases = (('fully opaque', dict(clear=0.0, opaque=1.0), 'fully transparent'),
-                 ('fully transparent', dict(clear=1.0, opaque=0.0), 'fully opaque'),
+                 ('fully transparent', dict(clear=1.0, opaque=0.0), 'solid pixels'),
                  ('RGB', dict(mode='RGB'), 'mode RGB, not RGBA'))
         for label, kw, reason in cases:
             for path in list((self.batch / 'status').glob('*.json')):
@@ -450,16 +462,72 @@ class ValidationTests(Base):
         self.assertIn('left.png: does not decode', error)
         self.assertIn('left.prompts.json: provenance missing', error)
 
-    def test_missing_provenance_alone_regenerates_the_image(self):
+    def test_missing_provenance_alone_keeps_the_image_and_fails_with_reason_provenance(self):
+        """Recheck finding 15: a good image is never regenerated for its record."""
+        _, out = self.finished()
+        self.image(out)
+        launched = []
+        self.run_once(popen=lambda cmd, **k: launched.append(cmd) or mock.Mock())
+        status = self.status()
+        self.assertEqual((status['state'], status['reason'], status['attempts'], status['error']),
+                         ('failed', 'provenance', 1, 'left.prompts.json: provenance missing'))
+        self.assertTrue(out.exists())                                        # the image stays
+        self.assertEqual(list(out.parent.glob('left.png.invalid-*')), [])
+        self.assertEqual(launched, [])                                       # and no new image job is started for it
+
+    def test_only_an_unusable_provenance_file_is_set_aside_and_it_must_be_a_json_object(self):
+        for text, reason in (('{broken', 'provenance is not readable JSON (JSONDecodeError)'),
+                             ('["a list"]', 'provenance is not a JSON object'), ('"text"', 'provenance is not a JSON object')):
+            for path in list((self.batch / 'status').glob('*.json')):
+                path.unlink()
+            shutil.rmtree(self.monsters / '.codex_jobs', ignore_errors=True)
+            shutil.rmtree(self.monsters / 'pipeline', ignore_errors=True)
+            task, out = self.finished()
+            self.image(out)
+            self.provenance(out, text)
+            self.assertEqual([r for _, r in view_batch.validation_problems(task)], [reason], text)
+            self.run_once(popen=lambda cmd, **k: mock.Mock())
+            status = self.status()
+            self.assertEqual((status['state'], status['reason'], status['error']), ('failed', 'provenance', f'left.prompts.json: {reason}'), text)
+            self.assertTrue(out.exists(), text)
+            self.assertFalse((out.parent / 'left.prompts.json').exists(), text)
+            self.assertEqual(len(list(out.parent.glob('left.prompts.json.invalid-*'))), 1, text)
+
+    def test_a_repaired_provenance_makes_the_task_done_without_a_new_job(self):
+        _, out = self.finished()
+        self.image(out)
+        before = out.read_bytes()
+        launched = []
+        popen = lambda cmd, **k: launched.append(cmd) or mock.Mock()   # noqa: E731
+        self.run_once(popen=popen)
+        self.assertEqual(self.status()['reason'], 'provenance')
+        self.run_once(popen=popen)                                           # not repaired yet: still failed, nothing launched
+        self.assertEqual((self.status()['state'], launched), ('failed', []))
+        self.provenance(out, '[]')                                           # not an object: not a repair
+        self.run_once(popen=popen)
+        self.assertEqual(self.status()['state'], 'failed')
+        self.provenance(out)                                                 # the app's repair writes a JSON object
+        self.run_once(popen=popen)
+        status = self.status()
+        self.assertEqual((status['state'], launched, out.read_bytes() == before), ('done', [], True))
+        self.assertNotIn('reason', status)
+        self.assertNotIn('error', status)
+
+    def test_a_repaired_record_with_a_now_invalid_image_stays_failed(self):
         _, out = self.finished()
         self.image(out)
         self.run_once(popen=lambda cmd, **k: mock.Mock())
-        status = self.status()
-        self.assertEqual((status['attempts'], status['error']), (1, 'left.prompts.json: provenance missing'))
-        self.assertFalse(out.exists())                                       # an image without its record is generated again
-        self.provenance(out, '{broken')
-        self.assertEqual([r for _, r in view_batch.validation_problems(json.loads((self.batch / 'tasks' / 'm-left.json').read_text()))
-                          if 'provenance' in r], ['provenance is not readable JSON (JSONDecodeError)'])
+        self.provenance(out)
+        self.image(out, clear=0.0, opaque=1.0)
+        self.run_once(popen=lambda cmd, **k: mock.Mock())
+        self.assertEqual((self.status()['state'], self.status()['reason']), ('failed', 'provenance'))
+
+    def test_the_runner_uses_the_shared_validator(self):
+        import png_check
+        self.assertIs(view_batch.png_check, png_check)
+        self.assertEqual(view_batch.MIN_SHARE, png_check.MIN_SHARE)
+        with mock.patch.object(png_check, 'png_problem', return_value='shared rule says no'):
+            self.assertEqual(view_batch.png_problem('anything.png'), 'shared rule says no')
 
     def test_the_attempt_budget_ends_in_failed(self):
         _, out = self.finished(max_attempts=1)

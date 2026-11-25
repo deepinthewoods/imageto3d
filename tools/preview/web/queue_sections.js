@@ -587,10 +587,16 @@ export function createSections({ reload }) {
         ...held.map(j => {
           const working = busy.has(`release:${j.set}`);
           const excluded = j.reason === 'excluded';
+          // `owner`: the job is listed, but the worker's owner check refuses it (its record names another parent set). Release cannot
+          // fix an ownership conflict, so there is no button: the server's `detail` says what the record names.
+          const owner = j.reason === 'owner';
           return h('div', { class: 'q-item held', dataset: { job: j.job, kind: 'held', reason: j.reason } },
-            badge(excluded ? 'held: excluded' : 'held: not in convert list', 'warn'), h('span', { class: 'q-what', text: j.job }),
+            badge(excluded ? 'held: excluded' : owner ? 'held: owner not verified' : 'held: not in convert list', owner ? 'error' : 'warn'),
+            h('span', { class: 'q-what', text: j.job }),
             h('span', { class: 'q-dim', text: `${j.stage}${j.modules_left != null ? ` · ${j.modules_left} module${j.modules_left === 1 ? '' : 's'} left` : ''}` }),
-            excluded
+            owner
+              ? h('span', { class: 'q-dim', dataset: { detail: 'owner' }, text: `${j.detail || 'the job record does not name this set as its owner'} (Release does not help: fix the job's owner by hand)` })
+              : excluded
               ? h('span', { class: 'q-dim', text: `excluded by ${asList(j.exclude).join(', ') || 'a ! line'}: remove that line in convert_sets.txt` })
               : h('span', { class: 'queue-actions' }, keyedButton(`release:${j.set}`, working ? 'Releasing...' : 'Release', () => release(j.set), 'primary',
                 `Add ${j.set} to the convert list`, working)));

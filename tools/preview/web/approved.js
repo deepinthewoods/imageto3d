@@ -114,6 +114,14 @@ export async function showApproved(modal, host) {
         h('span', { text: `Held: this set is not in the convert list, so the conversion worker ignores ${unlisted.length} unit${unlisted.length === 1 ? '' : 's'}.` }),
         release));
     }
+    // `owner`: listed, but the worker's owner check refuses the job (its record names another parent). No Release: it cannot fix that.
+    const owner = live.filter(unit => unit.progress?.held_kind === 'owner');
+    if (owner.length) {
+      const details = [...new Set(owner.map(unit => unit.progress.held_detail).filter(Boolean))];
+      nodes.push(h('div', { class: 'held-block', dataset: { held: 'owner' } },
+        `Held: the owner of ${owner.length} unit${owner.length === 1 ? '' : 's'} is not verified, so the conversion worker will not start ${owner.length === 1 ? 'it' : 'them'}. `
+        + `${details.join('; ') || 'The job record does not name this set as its owner.'} Release does not help: the job's owner has to be fixed by hand.`));
+    }
     if (excluded.length) {
       nodes.push(h('div', { class: 'held-block', dataset: { held: 'excluded' } },
         `Held: ${excluded.length} unit${excluded.length === 1 ? ' is' : 's are'} excluded by a ! line in convert_sets.txt. Release does not help: that line has to be removed by hand.`));

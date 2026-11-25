@@ -10,6 +10,8 @@
     pending_jobs(root) / held_jobs(root)                                   staged jobs the worker will / will not take
     eligible_jobs(root)                                                    listed jobs the worker would really take now (F20, row 20)
     namespace_conflict(root, set_id) / owner_of(root, id)                  the reserved family namespace (phase 5 review row 3)
+    id_claims(root, ids) / claim_problem(set, id, families, claims)        existing jobs / model folders that already use an id (I.10)
+    owner_refusal(root, job, record, patterns)                             the worker's dispatch check of a job's recorded owner (I.10)
 
 Nothing here ever removes or reorders an existing line; `add_sets` only appends (atomic replace of the whole file). It never writes a wildcard
 (phase 4 review F3 / DESIGN_PHASE4.md I.6): a set id `S` (literal, the approval grammar `serve.NAME`) is written as `S`, `S_<race>` for every race
@@ -116,9 +118,20 @@ def family_ids(root, set_id: str, races: list[str] | None = None) -> list[str]:
 # approval) and RECORDED in `.codex_jobs/_app/set_namespace.json` = {"sets": {S: time}, "families": {S_<race>: S}} by add_sets, so the catalog
 # (catalog.job_set) and add_sets know whose a suffixed id is instead of guessing from the suffix.
 
+# Ownership of EXISTING work (pre-cut-over review finding 2, DESIGN_PHASE4.md I.10): under the registration lock add_sets also looks at the
+# job folders of every stage and at models/<id>. A family id `S_<race>` that an existing job / model folder already uses is written for S only
+# when that use is provably S's: the job record names `parent_set: S`, or the id was registered as S's family id before. A record that names
+# another parent (itself included) makes the id an independent set; no recorded parent is AMBIGUOUS and refused (never guessed from the
+# suffix). An unreadable set_namespace.json blocks every registration (NamespaceUnreadable) and is never replaced. The worker checks the
+# recorded owner again at dispatch (tools/convert_queue.py owner_allows; owner_refusal here).
+
 CONCEPT_STAGES = ('concepts', 'provisional', 'approved', 'archive/concepts')
 JOB_STAGES = ('processing_views', 'multiview_ready', 'processing', 'completed', 'failed', 'held_conversions')
 _NS_CACHE: dict[str, tuple] = {}
+
+
+class NamespaceUnreadable(ValueError):
+    """set_namespace.json exists but cannot be read as {"sets": {...}, "families": {...}}: nothing is registered until it is repaired."""
 
 
 def namespace_path(root) -> Path:
@@ -146,6 +159,92 @@ def read_namespace(root) -> dict:
                          and NAME.fullmatch(k) and NAME.fullmatch(v)} if isinstance(raw.get('families'), dict) else {}}
     _NS_CACHE[str(path)] = (stamp, data)
     return data
+
+
+def read_namespace_strict(root) -> dict:
+    """{"sets": {...}, "families": {...}} for a WRITER: empty when the file does not exist; NamespaceUnreadable when it exists but cannot be
+    read, is not JSON or does not have that shape (an entry that is not a set id included). Never cached."""
+    path = namespace_path(root)
+    try:
+        text = path.read_text(encoding='utf-8')
+    except FileNotFoundError:
+        return {'sets': {}, 'families': {}}
+    except OSError as exc:
+        raise NamespaceUnreadable(f'{path.name} cannot be read ({type(exc).__name__}: {exc}); nothing is registered until it is repaired') from None
+    try:
+        raw = json.loads(text)
+    except ValueError as exc:
+        raise NamespaceUnreadable(f'{path.name} is not valid JSON ({exc}); nothing is registered until it is repaired') from None
+    sets, families = (raw.get('sets', {}), raw.get('families', {})) if isinstance(raw, dict) else (None, None)
+    if not isinstance(sets, dict) or not isinstance(families, dict) \
+            or not all(isinstance(k, str) and NAME.fullmatch(k) for k in sets) \
+            or not all(isinstance(k, str) and isinstance(v, str) and NAME.fullmatch(k) and NAME.fullmatch(v) for k, v in families.items()):
+        raise NamespaceUnreadable(f'{path.name} does not hold {{"sets": {{...}}, "families": {{id: set}}}}; nothing is registered until it is '
+                                  'repaired')
+    return {'sets': dict(sets), 'families': dict(families)}
+
+
+def namespace_problem(root) -> str | None:
+    """Why the namespace file blocks registrations (read_namespace_strict), else None."""
+    try:
+        read_namespace_strict(root)
+    except NamespaceUnreadable as exc:
+        return str(exc)
+    return None
+
+
+def _parent_of(record) -> str | None:
+    value = record.get('parent_set') if isinstance(record, dict) else None
+    return value if isinstance(value, str) and NAME.fullmatch(value) else None
+
+
+def id_claims(root, ids) -> dict[str, list[dict]]:
+    """Existing work that already uses each id as its set id: {id: [{where, parent, kind}]}. `kind` job: a job folder `<id>--<job>` in a job
+    stage (processing_views, multiview_ready, processing, completed, failed, held_conversions), `parent` = its record's `parent_set` (None
+    when the record has none or cannot be read). `kind` models: models/<id> holds a job folder no staged job accounts for (or nothing at
+    all): no record, so `parent` is None."""
+    wanted = set(ids)
+    out: dict[str, list[dict]] = {i: [] for i in wanted}
+    seen: dict[str, set] = {i: set() for i in wanted}
+    for stage in JOB_STAGES:
+        try:
+            folders = sorted(p for p in (Path(root) / stage).iterdir() if p.is_dir() and '--' in p.name)
+        except OSError:
+            continue
+        for folder in folders:
+            prefix, _, job_id = folder.name.partition('--')
+            if prefix in wanted:
+                out[prefix].append({'where': f'{stage}/{folder.name}', 'parent': _parent_of(_record(folder)), 'kind': 'job'})
+                seen[prefix].add(job_id)
+    for set_id in sorted(wanted):
+        try:
+            subs = [p.name for p in (Path(root) / 'models' / set_id).iterdir() if p.is_dir() and not p.name.startswith('.')]
+        except OSError:
+            continue
+        if not subs or any(name not in seen[set_id] for name in subs):
+            out[set_id].append({'where': f'models/{set_id}', 'parent': None, 'kind': 'models'})
+    return out
+
+
+def claim_problem(set_id: str, fid: str, families: dict, claims: list[dict]) -> str | None:
+    """Why the id `fid` may not be written to the convert list on behalf of the set `set_id`, given the existing work that uses it
+    (id_claims), else None. Provably `set_id`'s: the job record names `parent_set: set_id`, or `fid` is already registered as `set_id`'s
+    family id (set_namespace.json `families`). Another recorded parent = an independent set; no recorded parent = ambiguous: refused."""
+    for claim in claims:
+        parent = claim['parent']
+        if parent == set_id:
+            continue
+        if parent is not None:
+            whose = 'itself as its set' if parent == fid else f'the set {parent}'
+            return f'{claim["where"]} already uses {fid} and its record names {whose}'
+        if families.get(fid) == set_id:
+            continue
+        if claim['kind'] == 'models':
+            return (f'{claim["where"]} exists and no job record says it belongs to {set_id}: ambiguous ownership (record "parent_set": '
+                    f'"{set_id}" in its job, or keep the two sets apart)')
+        return (f'{claim["where"]} already uses {fid} and records no parent set: ambiguous ownership (add "parent_set": "{set_id}" to its '
+                f'.tripo-job.json if it is {set_id}\'s job)')
+    return None
 
 
 def owner_of(root, set_id: str) -> str | None:
@@ -177,13 +276,27 @@ def namespace_conflict(root, set_id: str, races: list[str] | None = None) -> str
       - `set_id` was written as a family id of another set (set_namespace.json),
       - `set_id` = `<P>_<suffix>` for a race / gnome-family suffix and P is a set (a concept-stage folder, a recorded set, a job's set prefix
         or a models/ folder): its jobs would match P's pre-authorized family entry,
-      - an independent set `<set_id>_<suffix>` exists: approving `set_id` would pre-authorize it as `set_id`'s race job."""
+      - an independent set `<set_id>_<suffix>` exists: approving `set_id` would pre-authorize it as `set_id`'s race job,
+      - (I.10) set_namespace.json is unreadable; an existing job named `<set_id>--*` records another parent set; or a family id
+        `<set_id>_<suffix>` is already used by a job / model folder that is not provably `set_id`'s (claim_problem)."""
     races = base_races(root) if races is None else races
     suffixes = family_suffixes(races)
+    problem = namespace_problem(root)
+    if problem:
+        return problem
     data = read_namespace(root)
     parent = data['families'].get(set_id)
     if parent and parent != set_id:
         return f'{set_id} is reserved: it is the convert-list job id of the set {parent}'
+    family = family_ids(root, set_id, races)
+    claims = id_claims(root, family)
+    for claim in claims[set_id]:
+        if claim['parent'] not in (None, set_id):
+            return f'{claim["where"]} already uses {set_id} as the job id of the set {claim["parent"]}; choose another set id'
+    for fid in family[1:]:
+        problem = claim_problem(set_id, fid, data['families'], claims[fid])
+        if problem:
+            return f'{problem}; approving {set_id} would pre-authorize it'
     known = independent_sets(root) | _folders(root, ('models',))
     for stage in JOB_STAGES:
         try:
@@ -205,9 +318,9 @@ def namespace_conflict(root, set_id: str, races: list[str] | None = None) -> str
     return None
 
 
-def _register(root, set_ids: list[str], families: dict[str, str]) -> None:
-    """Record approved / released sets and the family ids written for them (under the convert-list lock; never removes an entry)."""
-    data = read_namespace(root)
+def _register(root, set_ids: list[str], families: dict[str, str], data: dict) -> None:
+    """Record approved / released sets and the family ids written for them (under the convert-list lock; never removes an entry). `data` =
+    read_namespace_strict taken under that lock: an unreadable file never gets here, so it is never replaced."""
     sets, fams = dict(data['sets']), dict(data['families'])
     changed = False
     for set_id in set_ids:
@@ -225,7 +338,10 @@ def add_sets(root, set_ids, extra=()) -> dict:
     never a wildcard. Under the file lock; an exact line already present (stripped) is not added again. A set an existing `!` exclude matches
     is still written but reported in `excluded` (the worker keeps skipping it; the user decides about the exclude). A family id that is an
     independent set of its own (another set's folder, a recorded set, or another set's recorded family id) is NOT written: it is reported in
-    `skipped` (phase 5 review row 3). The sets and the family ids written are recorded in set_namespace.json.
+    `skipped` (phase 5 review row 3). The same holds, checked UNDER the lock (I.10), for a family id or an `extra` id that an existing job /
+    model folder already uses without being provably this set's (claim_problem: its record names another parent, or none at all). The sets
+    and the family ids written are recorded in set_namespace.json; when that file is unreadable NamespaceUnreadable is raised and nothing is
+    written anywhere.
     Returns {"added": [lines], "present": [lines], "excluded": {set: [patterns]}, "skipped": {set: [{id, reason}]}}."""
     ids = [set_ids] if isinstance(set_ids, str) else list(set_ids)
     extra = [extra] if isinstance(extra, str) else list(extra)
@@ -233,23 +349,45 @@ def add_sets(root, set_ids, extra=()) -> dict:
     if bad:
         raise ValueError(f'invalid set id(s): {bad}')
     races = base_races(root)
-    namespace = read_namespace(root)
-    independent = independent_sets(root)
-    wanted, skipped, owned = {}, {}, {}
-    for set_id in ids:
-        lines = [set_id]
-        for fid in family_ids(root, set_id, races)[1:]:
-            owner = namespace['families'].get(fid)
-            if fid in independent or (owner and owner != set_id):
-                skipped.setdefault(set_id, []).append({'id': fid, 'reason': f'{fid} is ' + (f'a family id of {owner}' if owner and owner != set_id
-                                                                                               else 'a set of its own')})
-                continue
-            lines.append(fid)
-            owned[fid] = set_id
-        wanted[set_id] = lines
     path = list_path(root)
     with guard.os_lock(lock_path(root)):
-        _register(root, ids, owned)
+        namespace = read_namespace_strict(root)            # raises before anything is written
+        independent = _folders(root, CONCEPT_STAGES) | set(namespace['sets'])
+        families = {set_id: family_ids(root, set_id, races) for set_id in ids}
+        claims = id_claims(root, {fid for family in families.values() for fid in family} | set(extra))
+        wanted, skipped, owned = {}, {}, {}
+        for set_id in ids:
+            lines = [set_id]
+            for fid in families[set_id][1:]:
+                owner = namespace['families'].get(fid)
+                if fid in independent or (owner and owner != set_id):
+                    reason = f'{fid} is ' + (f'a family id of {owner}' if owner and owner != set_id else 'a set of its own')
+                else:
+                    reason = claim_problem(set_id, fid, namespace['families'], claims[fid])
+                if reason:
+                    skipped.setdefault(set_id, []).append({'id': fid, 'reason': reason})
+                    continue
+                lines.append(fid)
+                owned[fid] = set_id
+            wanted[set_id] = lines
+        kept_extra = []
+        for line in extra:                                  # the exact prefix of a staged job of the set (release): the same ownership rule
+            if line in ids or any(line in lines for lines in wanted.values()):
+                kept_extra.append(line)
+                continue
+            owner = namespace['families'].get(line) or (line if line in namespace['sets'] else None)
+            reason = None
+            if len(ids) == 1 and owner != ids[0]:
+                reason = (f'{line} is ' + ('a set of its own' if owner == line else f'a family id of {owner}')) if owner \
+                    else claim_problem(ids[0], line, namespace['families'], claims[line])
+            if reason:
+                skipped.setdefault(ids[0], []).append({'id': line, 'reason': reason})
+                continue
+            kept_extra.append(line)
+            if len(ids) == 1 and line not in namespace['sets']:
+                owned.setdefault(line, ids[0])
+        extra = kept_extra
+        _register(root, ids, owned, namespace)
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
@@ -349,10 +487,54 @@ def staged_jobs(root) -> list[dict]:
     return out
 
 
+def owner_check():
+    """`tools/convert_queue.py owner_allows(root, job_name, record, patterns) -> (ok, reason)`: the worker's dispatch check of a job's
+    recorded owner (I.10), imported lazily; None when it is missing (an older convert_queue.py, which does not check either) or cannot be
+    imported."""
+    try:
+        tools = str(HERE.parents[1])
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        import convert_queue  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    fn = getattr(convert_queue, 'owner_allows', None)
+    return fn if callable(fn) else None
+
+
+def owner_refusal(root, job_name: str, record: dict | None, pats: list[str], check=None) -> str | None:
+    """Why the worker leaves a LISTED job alone because of its recorded owner (convert_queue.owner_allows), else None."""
+    check = owner_check() if check is None else check
+    if check is None:
+        return None
+    try:
+        ok, reason = check(Path(root), job_name, record or {}, pats)
+    except Exception as exc:  # noqa: BLE001  (a failing check never makes a job eligible)
+        return f'owner check failed: {type(exc).__name__}: {exc}'
+    return None if ok else str(reason)
+
+
+def _owner_refusals(root, jobs: list[dict], pats: list[str]) -> dict[str, str]:
+    """{job: reason} of the listed jobs the worker's owner check refuses."""
+    check = owner_check()
+    out = {}
+    if check is None:
+        return out
+    for job in jobs:
+        if matches(job['set'], pats):
+            reason = owner_refusal(root, job['job'], _record(Path(root) / job['stage'] / job['job']), pats, check)
+            if reason:
+                out[job['job']] = reason
+    return out
+
+
 def pending_jobs(root) -> list[dict]:
-    """Staged jobs the worker will take (their set matches the list), each with the matching patterns."""
+    """Staged jobs the worker will take (their set matches the list and their recorded owner agrees, I.10), each with the matching
+    patterns."""
     pats = patterns(root)
-    return [{**j, 'allow': allowed_by(j['set'], pats)} for j in staged_jobs(root) if matches(j['set'], pats)]
+    jobs = staged_jobs(root)
+    refused = _owner_refusals(root, jobs, pats)
+    return [{**j, 'allow': allowed_by(j['set'], pats)} for j in jobs if matches(j['set'], pats) and j['job'] not in refused]
 
 
 def worker_predicate():
@@ -417,13 +599,18 @@ def eligible_jobs(root, max_tries: int = MAX_TRIES) -> list[dict]:
 
 
 def held_jobs(root) -> list[dict]:
-    """Staged jobs the worker ignores: set not in the convert list ("held: not in the convert list") or excluded by a `!` pattern.
-    [{job, stage, set, state, modules_left, reason: "unlisted"|"excluded", exclude: [...]}]; Release = `add_sets(root, [set])`
-    (for `excluded` that does not help: the exclude line has to go)."""
+    """Staged jobs the worker ignores: set not in the convert list ("held: not in the convert list"), excluded by a `!` pattern, or listed
+    but refused by the worker's owner check (reason "owner", `detail` = why; I.10).
+    [{job, stage, set, state, modules_left, reason: "unlisted"|"excluded"|"owner", exclude: [...], detail?}]; Release = `add_sets(root,
+    [set])` (for `excluded` that does not help: the exclude line has to go; for `owner` the job record or the namespace has to be fixed)."""
     pats = patterns(root)
+    jobs = staged_jobs(root)
+    refused = _owner_refusals(root, jobs, pats)
     out = []
-    for job in staged_jobs(root):
+    for job in jobs:
         info = status(job['set'], pats)
         if info['state'] != 'listed':
             out.append({**job, 'reason': info['state'], 'exclude': info['exclude']})
+        elif job['job'] in refused:
+            out.append({**job, 'reason': 'owner', 'exclude': [], 'detail': refused[job['job']]})
     return out

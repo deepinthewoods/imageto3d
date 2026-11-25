@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -41,6 +42,9 @@ class Root(unittest.TestCase):
         self.batch = self.root / '.codex_jobs' / '_batch'
         self.batch.mkdir(parents=True)
         patch = mock.patch.object(convert_job, 'ROOT', self.root)
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(convert_job.portable, 'ROOT', self.root)   # record-lock sidecars stay in the temp root
         patch.start()
         self.addCleanup(patch.stop)
         env = mock.patch.dict(os.environ, {'XDG_DATA_HOME': str(self.root / 'xdg')})   # never the real Tripo profile's lock
@@ -434,6 +438,280 @@ class ProfileReservationTests(unittest.TestCase):
         self.assertEqual(run.returncode, tbl.EXIT_BUSY, run.stdout + run.stderr)
         self.assertIn('other checkout convert_job', run.stderr)
         self.assertEqual(run.stdout.strip(), '')
+
+
+class BrowserLifetimeTests(unittest.TestCase):
+    """Recheck-before-cutover finding 18: the reservation must not end while node / Firefox still has the profile open. The
+    holder's byte lock dies with the holder, so studio.mjs registers its pid beside the profile and the next acquirer waits for
+    that process (or a Firefox on the profile) to exit. Stand-in processes only: no node, no browser."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.base = Path(self.temp.name).resolve()
+        self.profile = self.base / 'xdg' / tbl.PROFILE_NAME
+        self.profile.parent.mkdir(parents=True)
+        env = mock.patch.dict(os.environ, {'XDG_DATA_HOME': str(self.base / 'xdg')})
+        env.start()
+        self.addCleanup(env.stop)
+        self.pid_file = tbl.browser_pid_path(self.profile)
+
+    def sleeper(self, *extra):
+        """A stand-in for a surviving node / Firefox process."""
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(120)', *extra])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        return child
+
+    def stop(self, child):
+        child.kill()
+        child.wait()
+
+    def acquire(self, wait=0.3):
+        with tbl.profile_reservation(self.profile, wait=wait, announce=lambda text: None):
+            return True
+
+    def test_the_pid_file_is_beside_the_profile_like_the_lock(self):
+        self.assertEqual(self.pid_file.parent, tbl.profile_lock_path(self.profile).parent)
+        self.assertEqual(self.pid_file.name, f'{tbl.PROFILE_NAME}.imageto3d.pid')
+        self.assertEqual(tbl.browser_pid_path(self.base / 'xdg' / 'x' / '..' / tbl.PROFILE_NAME), self.pid_file)
+
+    def test_a_registered_node_that_outlived_its_holder_keeps_the_profile_busy_until_it_exits(self):
+        node = self.sleeper()
+        self.assertEqual(tbl.register_browser(self.profile, node.pid), self.pid_file)
+        data = json.loads(self.pid_file.read_text())
+        self.assertEqual(data['pid'], node.pid)
+        self.assertIsInstance(data['create_time'], float)
+        started = time.monotonic()
+        with self.assertRaisesRegex(tbl.TripoBrowserBusy, f'node pid {node.pid} left by a holder that is gone'):
+            self.acquire(wait=0.3)                                   # the byte lock is free, the profile is not
+        self.assertLess(time.monotonic() - started, 10)
+        self.assertTrue(self.pid_file.exists())
+        with self.assertRaises(tbl.TripoBrowserBusy):
+            with tbl.tripo_browser_lock(self.base / 'checkout', wait=0, announce=lambda text: None):   # convert_job's entry point
+                pass
+        self.stop(node)
+        self.assertTrue(self.acquire())                              # drained: the next acquirer gets it
+        self.assertFalse(self.pid_file.exists())                     # and the stale file is gone
+
+    def test_the_waiter_gets_the_profile_as_soon_as_the_orphan_exits(self):
+        node = self.sleeper()
+        tbl.register_browser(self.profile, node.pid)
+        threading.Timer(0.5, lambda: self.stop(node)).start()
+        with mock.patch.object(tbl, 'POLL_S', 0.1):
+            self.assertTrue(self.acquire(wait=30))
+
+    def test_a_reused_pid_is_not_mistaken_for_the_registered_process(self):
+        other = self.sleeper()
+        tbl.register_browser(self.profile, other.pid)
+        data = json.loads(self.pid_file.read_text())
+        data['create_time'] -= 3600                                  # the registered process started an hour before this one
+        self.pid_file.write_text(json.dumps(data))
+        self.assertEqual(tbl.profile_users(self.profile), [])
+        self.assertFalse(self.pid_file.exists())
+
+    def test_a_firefox_left_on_the_profile_by_a_dead_node_keeps_it_busy(self):
+        node = self.sleeper()
+        tbl.register_browser(self.profile, node.pid)
+        self.stop(node)                                              # node is gone, its browser is not
+        with mock.patch.object(tbl, 'BROWSER_NAMES', ('python',)):   # the stand-in "browser" is a python process
+            browser = self.sleeper('-no-remote', '-profile', str(self.profile))
+            elsewhere = self.sleeper('-profile', str(self.base / 'another-profile'))
+            users = tbl.profile_users(self.profile)
+            self.assertEqual(len(users), 1, users)
+            self.assertIn(f'pid {browser.pid} still on the profile', users[0])
+            with self.assertRaisesRegex(tbl.TripoBrowserBusy, 'still on the profile'):
+                self.acquire(wait=0.2)
+            self.assertTrue(self.pid_file.exists())
+            self.stop(browser)
+            self.assertTrue(self.acquire())                          # a browser on ANOTHER profile does not count
+            self.assertFalse(self.pid_file.exists())
+            self.assertIsNone(elsewhere.poll())
+
+    def test_without_a_pid_file_nothing_is_scanned(self):
+        with mock.patch.object(tbl, '_processes', side_effect=AssertionError('scanned')):
+            self.assertEqual(tbl.profile_users(self.profile), [])
+            self.assertTrue(self.acquire(wait=0))
+
+    def test_a_pid_file_that_cannot_be_checked_fails_closed(self):
+        node = self.sleeper()
+        tbl.register_browser(self.profile, node.pid)
+        with mock.patch.object(tbl, '_create_time', return_value='unknown'):
+            self.assertIn('cannot check it', tbl.profile_users(self.profile)[0])
+        self.stop(node)
+        with mock.patch.object(tbl, '_processes', return_value=None):
+            self.assertIn('cannot be listed', tbl.profile_users(self.profile)[0])
+        self.assertTrue(self.pid_file.exists())
+        self.pid_file.write_text('{half')                            # damaged: decided by the browser scan
+        self.assertEqual(tbl.profile_users(self.profile), [])
+        self.assertFalse(self.pid_file.exists())
+
+    def test_unregister_only_removes_the_callers_own_registration(self):
+        node = self.sleeper()
+        tbl.register_browser(self.profile, node.pid)
+        self.assertFalse(tbl.unregister_browser(self.profile, node.pid + 1))
+        self.assertTrue(self.pid_file.exists())
+        self.assertTrue(tbl.unregister_browser(self.profile, node.pid))
+        self.assertFalse(tbl.unregister_browser(self.profile, node.pid))
+        with self.assertRaises(ValueError):
+            dead = subprocess.run([sys.executable, '-c', 'import os; print(os.getpid())'], capture_output=True, text=True)
+            tbl.register_browser(self.profile, int(dead.stdout))
+
+    def test_verify_registers_only_a_valid_reservation(self):
+        node = self.sleeper()
+        bad = subprocess.run([sys.executable, str(LOCK_TOOL), 'verify', '--profile', str(self.profile), '--lock',
+                              str(tbl.profile_lock_path(self.profile)), '--token', 'bogus', '--register-pid', str(node.pid)],
+                             capture_output=True, text=True, timeout=60)
+        self.assertEqual(bad.returncode, 1)
+        self.assertFalse(self.pid_file.exists())
+        with tbl.profile_reservation(self.profile) as env:
+            run = subprocess.run([sys.executable, str(LOCK_TOOL), 'verify', '--profile', str(self.profile), '--lock',
+                                  env[tbl.PROFILE_LOCK_ENV], '--token', env[tbl.PROFILE_TOKEN_ENV], '--register-pid', str(node.pid)],
+                                 capture_output=True, text=True, timeout=60)
+            self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+            self.assertEqual(Path(run.stdout.strip().splitlines()[-1]), self.pid_file)   # studio.mjs reads the path from stdout
+            self.assertEqual(json.loads(self.pid_file.read_text())['pid'], node.pid)
+        users = subprocess.run([sys.executable, str(LOCK_TOOL), 'users', '--profile', str(self.profile)], capture_output=True, text=True)
+        self.assertEqual(users.returncode, 1)
+        self.assertIn(f'node pid {node.pid}', users.stdout)
+
+    def test_the_reviewers_case_the_holder_dies_and_its_child_still_runs(self):
+        """`run` (the holder) spawns a child that registers itself like studio.mjs and keeps running; the holder is killed.
+        The kernel frees the byte lock, but the next `run` reports busy until the child exits."""
+        child_code = ('import os, subprocess, sys, time\n'
+                      'r = subprocess.run([sys.executable, sys.argv[1], "verify", "--profile", sys.argv[2], "--lock", os.environ["%s"], '
+                      '"--token", os.environ["%s"], "--register-pid", str(os.getpid())], capture_output=True, text=True)\n'
+                      'print("registered" if r.returncode == 0 else "refused " + r.stdout, os.getpid(), flush=True)\n'
+                      'time.sleep(120)\n' % (tbl.PROFILE_LOCK_ENV, tbl.PROFILE_TOKEN_ENV))
+        holder = subprocess.Popen([sys.executable, str(LOCK_TOOL), 'run', '--profile', str(self.profile), '--', sys.executable, '-c',
+                                   child_code, str(LOCK_TOOL), str(self.profile)], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (holder.kill(), holder.wait(), holder.stdout.close()))
+        word, pid = holder.stdout.readline().split()[:2]
+        self.assertEqual(word, 'registered')
+        child_pid = int(pid)
+        self.addCleanup(lambda: subprocess.run(['taskkill', '/F', '/PID', str(child_pid)] if os.name == 'nt'
+                                               else ['kill', '-9', str(child_pid)], capture_output=True))
+        with self.assertRaises(tbl.TripoBrowserBusy):                # the live holder has it
+            self.acquire(wait=0)
+        holder.kill()                                                # the holder dies; its child (the "node") survives
+        holder.wait()
+        self.assertIsNotNone(tbl._create_time(child_pid))
+        again = subprocess.run([sys.executable, str(LOCK_TOOL), 'run', '--profile', str(self.profile), '--wait', '0.5', '--',
+                                sys.executable, '-c', 'print("ran")'], capture_output=True, text=True, timeout=60)
+        self.assertEqual(again.returncode, tbl.EXIT_BUSY, again.stdout + again.stderr)
+        self.assertNotIn('ran', again.stdout)
+        self.assertIn(f'node pid {child_pid}', again.stderr)
+        subprocess.run(['taskkill', '/F', '/PID', str(child_pid)] if os.name == 'nt' else ['kill', '-9', str(child_pid)],
+                       capture_output=True)
+        deadline = time.monotonic() + 20
+        while tbl._create_time(child_pid) is not None and time.monotonic() < deadline:
+            time.sleep(0.1)
+        again = subprocess.run([sys.executable, str(LOCK_TOOL), 'run', '--profile', str(self.profile), '--wait', '5', '--',
+                                sys.executable, '-c', 'print("ran")'], capture_output=True, text=True, timeout=60)
+        self.assertEqual((again.returncode, again.stdout.strip()), (0, 'ran'), again.stderr)
+
+    def test_studio_mjs_registers_itself_and_unregisters_only_after_a_normal_end(self):
+        text = STUDIO.read_text(encoding='utf-8')
+        self.assertIn("'--register-pid',String(process.pid)", text)
+        self.assertLess(text.index("'--register-pid',String(process.pid)"), text.index('async function openStudio'))   # before any launch
+        tail = text.rstrip().splitlines()
+        self.assertEqual(tail[-1].split('(')[0], 'unregisterBrowser')                # the last statement, after the awaited command
+        self.assertNotIn("process.on('exit'", text)                                  # an error exit keeps the registration
+
+
+class DrainTests(Root):
+    """DESIGN_PHASE4 I.10 (pre-cut-over review finding 1): a process blocked at the paid gate records that, and leaves for a drain."""
+
+    def setUp(self):
+        super().setUp()
+        self.job = self.root / 'processing' / 'set_a--abc'
+        self.job.mkdir(parents=True)
+        self.record = self.job / '.tripo-job.json'
+        self.record.write_text(json.dumps({'set': 'set_a', 'job_id': 'abc', 'modules': []}))
+        self.lock = self.root / 'models' / 'set_a' / 'abc' / '.module_locks' / 'human_male__outfit.lock'
+        run = mock.patch.dict(convert_job._RUN, {'job': 'set_a--abc', 'record': self.record, 'lock': None})
+        run.start()
+        self.addCleanup(run.stop)
+        os.environ.pop(convert_job.DRAIN_AWARE_ENV, None)
+
+    def drain(self):
+        (self.batch / 'CONVERT_DRAIN').write_text(json.dumps({'reason': 'legacy convert worker drain'}))
+
+    def exits(self):
+        return [json.loads(p.read_text()) for p in sorted((self.batch / 'drain_exits').glob('*.json'))]
+
+    def test_the_gate_wait_record_exists_only_while_it_waits(self):
+        self.hold()
+        seen = []
+
+        def sleep(seconds):
+            seen.append(json.loads(convert_job.gate_wait_path().read_text()))
+            (self.batch / 'CONVERT_HOLD').unlink()
+        with mock.patch.object(convert_job.time, 'sleep', sleep), mock.patch('builtins.print'):
+            convert_job.wait_for_gate('human_male/outfit', 'a new submission')
+        self.assertEqual((seen[0]['pid'], seen[0]['job'], seen[0]['module'], seen[0]['step']),
+                         (os.getpid(), 'set_a--abc', 'human_male/outfit', 'a new submission'))
+        self.assertFalse(convert_job.gate_wait_path().exists())
+        self.assertFalse((self.batch / 'drain_exits').exists())                      # no drain: it simply went on
+
+    def test_a_gate_waiter_leaves_for_a_drain_deferred_and_without_its_lock(self):
+        self.hold('legacy convert worker drain')
+        self.assertTrue(convert_job.claim_module(self.lock))
+        convert_job._RUN['lock'] = self.lock
+        (self.batch / 'convert_locks').mkdir()
+        (self.batch / 'convert_locks' / 'set_a--abc.fails').write_text('1')
+
+        def sleep(seconds):
+            self.drain()                                                             # the drain begins while it waits
+        with mock.patch.object(convert_job.time, 'sleep', sleep), mock.patch('builtins.print') as printed, \
+                self.assertRaises(SystemExit) as left:
+            convert_job.wait_for_gate('human_male/outfit', 'a paid Hyper3D collect')
+        self.assertEqual(left.exception.code, convert_job.DRAIN_EXIT)
+        self.assertEqual(convert_job.DRAIN_EXIT, 76)                                 # never 75 (a busy Tripo browser profile)
+        self.assertFalse(self.lock.exists())                                         # module lock released
+        self.assertFalse(convert_job.gate_wait_path().exists())
+        deferred = json.loads(self.record.read_text())['deferred']['human_male/outfit']
+        self.assertEqual((deferred['step'], deferred['pid']), ('a paid Hyper3D collect', os.getpid()))
+        self.assertNotIn('state', json.loads(self.record.read_text()))               # not a failure, no state change
+        (entry,) = self.exits()
+        self.assertEqual((entry['job'], entry['module'], entry['fails_before'], entry['parent_aware'], entry['lock_released']),
+                         ('set_a--abc', 'human_male/outfit', 1, False, True))
+        self.assertTrue(any('DEFERRED' in c.args[0] for c in printed.call_args_list))
+
+    def test_a_drain_alone_closes_the_gate_and_a_current_worker_is_named_aware(self):
+        self.drain()                                                                 # no hold (a stale drain): still no paid step
+        self.assertEqual(convert_job.conversion_gate(), 'CONVERT_DRAIN: legacy convert worker drain')
+        with mock.patch.dict(os.environ, {convert_job.DRAIN_AWARE_ENV: '1'}), mock.patch('builtins.print'), \
+                self.assertRaises(SystemExit) as left:
+            convert_job.wait_for_gate('human_male/outfit', 'a new submission')       # before the module lock is claimed
+        self.assertEqual(left.exception.code, convert_job.DRAIN_EXIT)
+        (entry,) = self.exits()
+        self.assertEqual((entry['parent_aware'], entry['lock_released'], entry['fails_before']), (True, False, 0))
+
+    def test_a_child_stopped_at_the_click_gate_leaves_for_a_drain_too(self):
+        self.hold()
+        self.drain()
+        env = dict(os.environ, **convert_job.paid_gate.env_for(self.root))
+        with mock.patch('builtins.print'), self.assertRaises(SystemExit) as left:
+            convert_job.wait_for_child_gate('human_male/outfit', 'a new Tripo submission', env)
+        self.assertEqual(left.exception.code, convert_job.DRAIN_EXIT)
+        self.assertEqual(len(self.exits()), 1)
+
+    def test_without_a_drain_a_paused_step_keeps_waiting(self):
+        self.pause()                                                                 # the user's pause: wait, never leave
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 3:
+                (self.batch / 'PAUSE').unlink()
+        with mock.patch.object(convert_job.time, 'sleep', sleep), mock.patch('builtins.print'):
+            convert_job.wait_for_gate('human_male/outfit', 'a new submission')
+        self.assertEqual(len(sleeps), 3)
+        self.assertNotIn('deferred', json.loads(self.record.read_text()))
+
+    def test_record_locks_stay_in_the_root_of_the_job(self):
+        convert_job.update_record(self.record, lambda r: r.__setitem__('x', 1))
+        self.assertEqual(convert_job.read_record(self.record)['x'], 1)
 
 
 if __name__ == '__main__':

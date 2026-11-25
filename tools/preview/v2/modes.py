@@ -1,13 +1,19 @@
 """Mode / pause / presence helpers for the Queue tab header (DESIGN_PHASE4.md section C).
 
 Everything reads or writes files of the pipeline supervisor under `<root>/.codex_jobs/_batch/` and takes `root` so tests use a temp root:
-  supervisor_mode.json  {"mode", "since"}  written here (atomic), read by the supervisor every tick
+  supervisor_mode.json  {"mode", "since", "pause_id"}  written here (atomic), read by the supervisor every tick
   PAUSE                 {"since", "reason", "scope"}  written by the supervisor only; read here
   supervisor.lock       single-instance lock of the supervisor, probed read-only like `Supervisor.instance()`
 
 The UI presets differ from the supervisor's mode names: Auto = `views-run`, Pause conversions = `pause-conversions`, Pause all = `pause`,
 Run everything now = `run`. (The supervisor's own `auto` pauses views too while the user is at the PC; the app never writes it, but a
 mode file that holds it is shown as it is.)
+
+PAUSE IDENTITY (recheck-before-cutover finding 5). Every pause transition has a unique `pause_id`: a mode write of this module stores a
+fresh uuid4 in the mode file; a mode file or PAUSE file written by somebody else (the supervisor, its `mode` command) carries none, so its
+id is derived from the file itself (`file:` + a digest of its inode, creation / modification time in ns, size and bytes: every rewrite is
+a new file, hence a new id, also within one second). `manual_pause(root)` names the manual pause of conversions in force; a confirmed
+Run now of the monster lane overrides exactly that `pause_id` and no later pause.
 """
 from __future__ import annotations
 
@@ -15,8 +21,10 @@ from datetime import datetime
 import json
 import os
 from pathlib import Path
+import hashlib
 import sys
 import time
+import uuid
 
 HERE = Path(__file__).resolve().parent
 for _p in (HERE.parent, HERE):
@@ -32,6 +40,8 @@ PRESENCE_FILE = Path('C:/Users/niall/.claude/presence.json')
 PRESENCE_FRESH_S = 30.0
 AWAY_AFTER = 300.0   # = pipeline_supervisor.AWAY_AFTER
 LOCK_OFFSET = 1 << 20   # = pipeline_supervisor.LOCK_OFFSET
+PAUSE_MODES = ('pause', 'pause-conversions')   # the modes that pause conversions by hand
+IDLE_REASONS = ('user active', 'user active (views keep running)')   # pipeline_supervisor: the screen-on pauses (not manual)
 
 
 class ModeError(ValueError):
@@ -51,37 +61,80 @@ def read_json(path: Path, default=None):
 
 # ------------------------------------------------------------------------------------------------------------------------ mode
 
+def file_identity(path: Path) -> str | None:
+    """The identity of one WRITE of a file somebody else owns (finding 5): `file:` + a digest of its inode, creation and modification
+    time (ns), size and bytes. None when the file is absent; a file that exists but cannot be read gets an id that never repeats (so it
+    is never equal to an id a user confirmed)."""
+    path = Path(path)
+    try:
+        st = path.stat()
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        return f'unidentified:{uuid.uuid4().hex}'
+    basis = f'{st.st_ino}:{getattr(st, "st_ctime_ns", 0)}:{st.st_mtime_ns}:{st.st_size}:'.encode('ascii') + raw
+    return 'file:' + hashlib.sha256(basis).hexdigest()[:32]
+
+
 def read_mode(root) -> dict:
-    """{"mode", "since", "label"}; a missing / invalid file means the supervisor's default `auto`."""
-    raw = read_json(batch(root) / 'supervisor_mode.json', {}) or {}
+    """{"mode", "since", "label", "pause_id"}; a missing / invalid file means the supervisor's default `auto`. `pause_id` (None unless
+    the mode pauses conversions) = the id this module wrote with the mode, else the identity of the file's write (file_identity)."""
+    path = batch(root) / 'supervisor_mode.json'
+    raw = read_json(path, {}) or {}
     mode = raw.get('mode') if isinstance(raw, dict) else None
     mode = mode if mode in MODES else 'auto'
     since = raw.get('since') if isinstance(raw, dict) and isinstance(raw.get('since'), str) else None
-    return {'mode': mode, 'since': since, 'label': PRESET_LABELS[mode]}
+    pause_id = None
+    if mode in PAUSE_MODES:
+        stored = raw.get('pause_id') if isinstance(raw, dict) else None
+        pause_id = stored if isinstance(stored, str) and stored else file_identity(path)
+    return {'mode': mode, 'since': since, 'label': PRESET_LABELS[mode], 'pause_id': pause_id}
 
 
 def write_mode(root, mode: str) -> dict:
     """Write the supervisor's mode file (atomic) the way `pipeline_supervisor.py mode <value>` does; `mode` may also be a preset key
-    (`pause_all`, `pause_conversions`, `run_now`, `auto`). Returns read_mode(root)."""
+    (`pause_all`, `pause_conversions`, `run_now`, `auto`). EVERY write carries a fresh uuid4 `pause_id` (finding 5): pausing again, even
+    with the same mode within the same second, is a new pause. Returns read_mode(root)."""
     mode = PRESETS.get(mode, mode)
     if mode not in MODES:
         raise ModeError(f'unknown mode {mode!r}; one of {list(MODES)} or {list(PRESETS)}')
-    data = {'mode': mode, 'since': datetime.now().isoformat(timespec='seconds')}
+    data = {'mode': mode, 'since': datetime.now().isoformat(timespec='seconds'), 'pause_id': uuid.uuid4().hex}
     guard.write_atomic(batch(root) / 'supervisor_mode.json', (json.dumps(data, indent=2) + '\n').encode('utf-8'))
     return read_mode(root)
 
 
 def read_pause(root) -> dict | None:
-    """The PAUSE file as {"since", "reason", "scope": [...]} or None when absent (an unreadable file counts as a pause of everything)."""
+    """The PAUSE file as {"since", "reason", "scope": [...], "pause_id"} or None when absent (an unreadable file counts as a pause of
+    everything). `pause_id` = the file's own `pause_id` when its writer stored one, else the identity of this write (file_identity)."""
     path = batch(root) / 'PAUSE'
     if not path.exists():
         return None
+    ident = file_identity(path)
+    if ident is None:                                         # removed between the two looks
+        return None
     raw = read_json(path, None)
     if not isinstance(raw, dict):
-        return {'since': None, 'reason': 'unreadable PAUSE file', 'scope': ['conversions', 'views']}
+        return {'since': None, 'reason': 'unreadable PAUSE file', 'scope': ['conversions', 'views'], 'pause_id': ident}
     scope = raw.get('scope')
+    stored = raw.get('pause_id')
     return {'since': raw.get('since'), 'reason': raw.get('reason'),
-            'scope': [str(s) for s in scope] if isinstance(scope, list) else ['conversions', 'views']}   # no scope = both (the old file format)
+            'scope': [str(s) for s in scope] if isinstance(scope, list) else ['conversions', 'views'],   # no scope = both (the old file format)
+            'pause_id': stored if isinstance(stored, str) and stored else ident}
+
+
+def manual_pause(root, mode: dict | None = None, pause: dict | None = None) -> dict | None:
+    """The MANUAL pause of conversions now in force, {"pause_id", "kind": mode | pause, "reason"}, or None: a pause mode (its pause_id),
+    else a PAUSE file with `conversions` in its scope for a manual reason (a "user active" PAUSE is the idle gate, not a manual pause).
+    `mode` / `pause` = read_mode / read_pause results the caller already has."""
+    mode = read_mode(root) if mode is None else mode
+    if mode['mode'] in PAUSE_MODES:
+        return {'pause_id': mode.get('pause_id') or f'unidentified:{uuid.uuid4().hex}', 'kind': 'mode', 'reason': f'mode {mode["mode"]}'}
+    pause = read_pause(root) if pause is None else pause
+    if pause is not None and 'conversions' in (pause.get('scope') or []) and pause.get('reason') not in IDLE_REASONS:
+        return {'pause_id': pause.get('pause_id') or f'unidentified:{uuid.uuid4().hex}', 'kind': 'pause',
+                'reason': str(pause.get('reason') or 'PAUSE file')}
+    return None
 
 
 # ---------------------------------------------------------------------------------------------------------------------- presence
@@ -145,13 +198,17 @@ def supervisor_running(root) -> tuple[bool, str]:
 
 
 def snapshot(root, now: float | None = None, presence_file: Path | None = None, supervisor=None) -> dict:
-    """What the Queue tab header shows: the mode (with its UI label), the PAUSE file, the user's idle time and the supervisor state.
+    """What the Queue tab header shows: the mode (with its UI label), the PAUSE file, `pause_id` (manual_pause), the user's idle time and
+    the supervisor state.
     `supervisor` = (running, pid) injected by callers that already probed."""
     idle, source = idle_seconds(now, presence_file)
     running, pid = supervisor if supervisor is not None else supervisor_running(root)
+    mode, pause = read_mode(root), read_pause(root)
+    manual = manual_pause(root, mode, pause)
     return {
-        'mode': read_mode(root),
-        'pause': read_pause(root),
+        'mode': mode,
+        'pause': pause,
+        'pause_id': manual['pause_id'] if manual else None,     # the manual pause of conversions in force (finding 5), else None
         'idle_seconds': idle, 'idle_source': source,
         'away': None if idle is None else idle >= AWAY_AFTER,
         'supervisor_running': running, 'supervisor_pid': pid,

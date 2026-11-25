@@ -24,28 +24,38 @@ const hasFile = view => !!view?.url;
 const waitingText = reason => WAITING[reason] || reason || 'unknown';
 
 /**
- * Run now of a monster conversion task (POST /api/v2/queue {op: run_now, id, confirm?}). `askFirst` (the item says the pipeline is paused)
- * asks before the first request; otherwise a 409 `confirm` (paused by hand) asks then. Resolves the response, or null when the user said no.
- * Errors other than the confirmation are thrown.
+ * Run now of a monster conversion task: POST /api/v2/queue {op: run_now, id, key, generation, confirm?, pause_id?}. `task` = {id, key,
+ * generation} of the task AS DISPLAYED (the server finds it by key + generation; the row number is only a hint; 409 `changed` when that
+ * task is gone). While conversions are paused by hand the server needs the user's yes FOR THAT PAUSE: `confirm: true` plus the
+ * `pause_id` the user was shown. `askFirst` + `pauseId` (the item says it is paused, and by which pause) ask before the first request;
+ * otherwise a 409 `confirm` carries the `pause_id` to ask about. A pause that changed while the dialog was open is asked about again.
+ * Resolves the response, or null when the user said no. Errors other than the confirmation are thrown.
  */
-export async function runNowTask(taskId, { askFirst = false } = {}) {
+export async function runNowTask(task, { askFirst = false, pauseId = null } = {}) {
+  const base = { op: 'run_now', id: task.id, key: task.key, generation: task.generation };
   const ask = async message => confirmDialog({
     title: 'Run now although conversions are paused?',
     lines: [message || 'Conversions were paused by hand. Run now starts this conversion anyway (Hyper3D, paid: 0.5 credits).'],
     confirm: 'Run now',
     danger: true,
   });
-  if (askFirst) {
+  let confirmed = null;              // the pause_id the user said yes to
+  if (askFirst && pauseId) {
     if (!(await ask())) return null;
-    return api.queuePost({ op: 'run_now', id: taskId, confirm: true });
+    confirmed = pauseId;
   }
-  try {
-    return await api.queuePost({ op: 'run_now', id: taskId });
-  } catch (error) {
-    if (error.code !== 'confirm') throw error;
-    if (!(await ask(error.message))) return null;
-    return api.queuePost({ op: 'run_now', id: taskId, confirm: true });
+  for (let round = 0; round < 3; round += 1) {
+    try {
+      return await api.queuePost(confirmed ? { ...base, confirm: true, pause_id: confirmed } : base);
+    } catch (error) {
+      if (error.code !== 'confirm') throw error;
+      const shown = error.body?.pause_id;        // the pause in force now: the one the user is asked about
+      if (!shown) throw error;
+      if (!(await ask(error.message))) return null;
+      confirmed = shown;
+    }
   }
+  throw new Error('the pause kept changing; nothing was started');
 }
 
 export async function showMonsterViews(modal, host) {
@@ -69,7 +79,7 @@ export async function showMonsterViews(modal, host) {
   const views = () => item?.views || [];
   const viewOf = name => views().find(v => v.name === name);
   const importing = () => item?.importable === true;
-  const ticked = view => (view.name in local ? local[view.name] : view.enabled) === true && hasFile(view);
+  const ticked = view => (view.name in local ? local[view.name] : view.enabled) === true && hasFile(view) && view.valid !== false;
   const enabledNames = () => views().filter(ticked).map(v => v.name);
   const enabledFiles = () => views().filter(ticked).map(viewFile);
   const damaged = () => isDamaged(item);
@@ -86,9 +96,13 @@ export async function showMonsterViews(modal, host) {
     const retry = button('Retry', () => retryView(name), '', 'Make this view again');
     retry.dataset.action = 'retry';
     retry.hidden = true;
+    // a good picture whose record (provenance) is missing or broken: the record is written again, the picture is NOT drawn again
+    const repair = button('Repair provenance', () => repairView(name), '', 'Write the missing record of this picture again; the picture itself is kept');
+    repair.dataset.action = 'repair';
+    repair.hidden = true;
     const node = h('figure', { class: 'mv-fig', dataset: { view: name } },
-      holder, h('figcaption', null, h('strong', { text: pretty(name) }), label, state, retry), error);
-    const fig = { node, img, holder, tick, state, error, retry, label, shownUrl: null };
+      holder, h('figcaption', null, h('strong', { text: pretty(name) }), label, state, retry, repair), error);
+    const fig = { node, img, holder, tick, state, error, retry, repair, label, shownUrl: null };
     figs.set(name, fig);
     return fig;
   }
@@ -110,19 +124,27 @@ export async function showMonsterViews(modal, host) {
         : task.state === 'failed' ? 'Failed' : task.state === 'running' ? 'Being drawn...' : 'Waiting in the queue';
       fig.holder.replaceChildren(h('div', { class: 'mv-pending', text }));
     }
-    fig.tick.checked = ticked(view);
-    fig.tick.disabled = !hasFile(view) || importing() || damaged();
-    fig.label.title = importing() ? 'Import the pick first' : hasFile(view) ? 'Use this view for the conversion' : 'The picture does not exist yet';
+    const unusable = hasFile(view) && view.valid === false;       // the picture exists but cannot be used as it is (view.problem)
+    fig.tick.checked = ticked(view) && !unusable;
+    fig.tick.disabled = !hasFile(view) || unusable || importing() || damaged();
+    fig.label.title = importing() ? 'Import the pick first' : unusable ? `Not usable: ${view.problem || 'invalid'}`
+      : hasFile(view) ? 'Use this view for the conversion' : 'The picture does not exist yet';
     const task = view.task;
     const frozenHas = !!item?.frozen && frozenNames().includes(name);
     fig.state.replaceChildren(...[
       task ? badge(task.state === 'running' ? `running${task.attempts ? ` (try ${task.attempts}${task.max_attempts ? `/${task.max_attempts}` : ''})` : ''}` : task.state, TASK_TONE[task.state] || '') : null,
       frozenHas ? badge('frozen', 'ok') : null,
     ].filter(Boolean));
-    fig.error.hidden = !(task?.state === 'failed');
-    fig.error.textContent = task?.state === 'failed' ? `Failed after ${task.attempts ?? '?'} attempt${task.attempts === 1 ? '' : 's'}${task.error ? `: ${task.error}` : ''}` : '';
+    const failedText = task?.state === 'failed' ? `Failed after ${task.attempts ?? '?'} attempt${task.attempts === 1 ? '' : 's'}${task.error ? `: ${task.error}` : ''}` : '';
+    const problemText = view.repair === 'provenance' ? `The picture is good, but its record is not: ${view.problem || 'provenance missing'}. Repair provenance writes the record again (nothing is drawn again).`
+      : unusable ? `Not usable: ${view.problem || 'invalid picture'}` : '';
+    fig.error.hidden = !(failedText || problemText);
+    fig.error.textContent = view.repair === 'provenance' ? problemText : (failedText || problemText);
+    fig.error.dataset.problem = view.repair === 'provenance' ? 'provenance' : unusable ? 'invalid' : '';
     fig.retry.hidden = !view.retry || damaged();
     fig.retry.disabled = retrying.has(name);
+    fig.repair.hidden = view.repair !== 'provenance' || damaged();
+    fig.repair.disabled = retrying.has(name);
     fig.node.classList.toggle('disabled', hasFile(view) && !ticked(view));
   }
 
@@ -155,6 +177,23 @@ export async function showMonsterViews(modal, host) {
       toast(`Drawing the ${name} view again`, { ms: 3000 });
     } catch (error) {
       if (!error.conflict) toast(`Retry failed: ${error.message}`);
+    } finally {
+      retrying.delete(name);
+    }
+    refresh().catch(() => {});
+    await load();
+  }
+
+  /** "Repair provenance": the monster verb `view_repair` (args.view). The picture stays; only its record is written again. */
+  async function repairView(name) {
+    if (viewOf(name)?.repair !== 'provenance' || retrying.has(name)) return;
+    retrying.add(name);
+    syncAll();
+    try {
+      await api.action(card.id, 'view_repair', { args: { view: name } });
+      toast(`The record of the ${name} view was written again; the picture was kept`, { ms: 4000 });
+    } catch (error) {
+      if (!error.conflict) toast(`Repair failed: ${error.message}`);
     } finally {
       retrying.delete(name);
     }
@@ -270,7 +309,9 @@ export async function showMonsterViews(modal, host) {
     runningNow = true;
     draw();
     try {
-      const result = await runNowTask(conversion.task_id, { askFirst: conversion.waiting_reason === 'paused' });
+      // the task and the pause exactly as this dialog shows them: the server refuses (409) when either is something else by now
+      const result = await runNowTask({ id: conversion.task_id, key: conversion.key, generation: conversion.generation },
+        { askFirst: conversion.waiting_reason === 'paused', pauseId: conversion.pause_id });
       if (result) toast(result.warning ? `Run now: ${result.warning}` : 'Conversion starts now', { ms: result.warning ? 8000 : 4000 });
     } catch (error) {
       toast(`Run now failed: ${error.message}`);
@@ -289,7 +330,7 @@ export async function showMonsterViews(modal, host) {
     retryingConversion = true;
     draw();
     try {
-      await api.queueOp('retry', conversion.task_id);
+      await api.queueOp('retry', conversion.task_id, { key: conversion.key, generation: conversion.generation });
       toast('Conversion queued again (it resumes from its record)', { ms: 4000 });
     } catch (error) {
       if (!error.conflict) toast(`Retry failed: ${error.message}`);

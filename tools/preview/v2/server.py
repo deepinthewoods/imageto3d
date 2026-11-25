@@ -160,8 +160,10 @@ def queue_extras(root: Path, ctx: dict) -> dict:
 def status_of(root: Path, ctx: dict) -> dict:
     """`state.status` (DESIGN_PHASE4.md H): the header chip. services_problems is None without --manage-services."""
     manager = ctx.get('services')
-    return progress.status_summary(root, manager.problems() if manager else None, queue_health(root),
-                                   scanned=(manager.last_tick is not None) if manager else None)
+    out = progress.status_summary(root, manager.problems() if manager else None, queue_health(root),
+                                  scanned=(manager.last_tick is not None) if manager else None)
+    manual = modes.manual_pause(root)                           # recheck finding 5: the pause a confirmed monster Run now must echo
+    return out | {'pause_id': manual['pause_id'] if manual else None}
 
 
 # ------------------------------------------------------------------------------------------------------- path containment
@@ -379,7 +381,7 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
                 self.send_json(200, result)
             except guard.Conflict as exc:
                 catalog.invalidate()
-                extra = {k: v for k, v in (getattr(exc, 'extra', None) or {}).items() if k in ('changes', 'file', 'files')}   # `changes` of 409 changed / stale; `file(s)` of a monster 409 missing
+                extra = {k: v for k, v in (getattr(exc, 'extra', None) or {}).items() if k in ('changes', 'file', 'files', 'pause_id')}   # `changes` of 409 changed / stale; `file(s)` of a monster 409 missing; `pause_id` of a monster 409 confirm
                 extra |= {'rev': exc.current} if isinstance(exc, decisions.RevConflict) else {}
                 self.send_json(409, {'ok': False, 'error': str(exc), 'code': exc.code, 'item': self.current_item(body)} | extra)
             except catalog.NotFound as exc:

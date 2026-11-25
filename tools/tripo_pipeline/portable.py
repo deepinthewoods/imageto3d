@@ -3,7 +3,8 @@
 Linux behaviour is exactly what the callers did before (fcntl.flock, /proc/<pid>, pgrep, /usr/local/bin/blender,
 libmeshoptimizer.so, <venv>/bin/python); the Windows branches exist since 2026-11-09:
 
-- file_lock(path, exclusive, sidecar): fcntl.flock on Linux. Windows has no advisory shared lock in msvcrt, so shared requests
+- file_lock(path, exclusive, sidecar, timeout, create, root): fcntl.flock on Linux (timeout / create=False / root: the bounded,
+  non-creating, root-scoped read path of convert_queue.job_eligible; the writers keep the blocking default). Windows has no advisory shared lock in msvcrt, so shared requests
   take the exclusive lock there (every caller holds it only for a short read/modify/write, nothing nests), and the data file is
   never locked itself (msvcrt locks are mandatory and would block readers): a lock file under .codex_jobs/_batch/record_locks/ carries it.
 - pid_alive(pid): /proc on Linux, OpenProcess + GetExitCodeProcess on Windows.
@@ -27,26 +28,75 @@ ROOT = Path(__file__).resolve().parents[2]
 
 # ----------------------------------------------------------------------------------------------- locks
 
-@contextlib.contextmanager
-def file_lock(path, exclusive=True, sidecar=False):
-    """Hold a lock on `path` for the with-block (blocking). `sidecar`: `path` is a data file other processes read and write by
-    themselves (the job record); on Windows the lock then lives in .codex_jobs/_batch/record_locks/. Without it `path` is a pure lock file and is
-    created when missing. Shared locks (exclusive=False) are exclusive on Windows."""
+class LockBusy(OSError):
+    """file_lock(timeout=...) could not take the lock in time (its holder is still at work)."""
+
+
+def record_lock_path(path, root=None):
+    """The Windows sidecar lock file of a data file (the job record): `<root>/.codex_jobs/_batch/record_locks/<folder>__<name>.lock`
+    (root: the checkout whose writers lock it, default this one). It lives outside the data folder (a job folder gets moved between
+    pipeline stages and must stay clean); the name is the folder + file name, which survives that move."""
     path = Path(path)
+    return (ROOT if root is None else Path(root)) / '.codex_jobs' / '_batch' / 'record_locks' / f'{path.resolve().parent.name}__{path.name}.lock'
+
+
+@contextlib.contextmanager
+def file_lock(path, exclusive=True, sidecar=False, timeout=None, create=True, root=None):
+    """Hold a lock on `path` for the with-block. `sidecar`: `path` is a data file other processes read and write by
+    themselves (the job record); on Windows the lock then lives in .codex_jobs/_batch/record_locks/ (record_lock_path). Without it
+    `path` is a pure lock file and is created when missing. Shared locks (exclusive=False) are exclusive on Windows.
+
+    The writers' form is the default: blocking (timeout=None), lock file created when missing, sidecar under this checkout.
+    The read-only probe form (recheck-before-cutover finding 16; convert_queue.job_eligible) is
+    `file_lock(record, exclusive=False, sidecar=True, timeout=S, create=False, root=<root>)`:
+    - timeout: seconds to keep trying, then LockBusy (0 = one attempt);
+    - create=False: nothing is created, not even the record_locks folder; a lock file that does not exist means no writer of
+      that root ever locked this record, so the block runs unlocked;
+    - root: the checkout the record belongs to (its sidecar, not the imported checkout's)."""
+    path = Path(path)
+    deadline = None if timeout is None else time.monotonic() + max(0.0, float(timeout))
+
+    def wait_or_busy():
+        if deadline is not None and time.monotonic() >= deadline:
+            raise LockBusy(f'lock busy: {path}')
+        time.sleep(0.05)
+
     if not WINDOWS:
         import fcntl
-        with open(path, 'r' if sidecar else 'a') as handle:
-            fcntl.flock(handle, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        try:
+            handle = open(path, 'r' if (sidecar or not create) else 'a')
+        except FileNotFoundError:
+            if sidecar or create:
+                raise
+            yield                                     # create=False: no lock file, nobody locks here
+            return
+        with handle:
+            if deadline is None:
+                fcntl.flock(handle, mode)
+            else:
+                while True:
+                    try:
+                        fcntl.flock(handle, mode | fcntl.LOCK_NB)
+                        break
+                    except OSError:
+                        wait_or_busy()
             yield
         return
     import msvcrt
-    # the lock file lives outside the data folder (a job folder gets moved between pipeline stages and must stay clean); the name
-    # is the folder + file name, which survives that move
-    lock_path = (ROOT / '.codex_jobs' / '_batch' / 'record_locks' / f'{path.resolve().parent.name}__{path.name}.lock') if sidecar else path
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = record_lock_path(path, root) if sidecar else path
+    if create:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
     if sidecar and not path.exists():
         raise FileNotFoundError(str(path))        # same error flock's open() raised on Linux
-    with open(lock_path, 'ab') as handle:
+    try:
+        handle = open(lock_path, 'ab' if create else 'r+b')
+    except FileNotFoundError:
+        if create:
+            raise
+        yield                                         # create=False: no lock file, no writer ever locked this record here
+        return
+    with handle:
         fd = handle.fileno()
         while True:
             try:
@@ -54,7 +104,7 @@ def file_lock(path, exclusive=True, sidecar=False):
                 msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
                 break
             except OSError:
-                time.sleep(0.05)
+                wait_or_busy()
         try:
             yield
         finally:

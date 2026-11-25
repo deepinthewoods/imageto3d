@@ -141,6 +141,9 @@ if cmd == 'submit':
         assert (views / name).is_file(), name
     out.mkdir(parents=True, exist_ok=True)
     inputs = [{'name': n, 'sha256': sha(views / n), 'size': (views / n).stat().st_size} for n in files]
+    (out / 'upload_inputs').mkdir(exist_ok=True)
+    for n in files:                              # the final copies the backend uploads (rodin_backend.verify_upload_inputs)
+        (out / 'upload_inputs' / n).write_bytes((views / n).read_bytes())
     if mode == 'other_inputs':
         inputs[0]['sha256'] = '0' * 64
     rec.write_text(json.dumps({'backend': 'hyper3d', 'status': 'submitted', 'model_id': 'm1', 'model_url': 'https://hyper3d.test/m1',
@@ -164,12 +167,17 @@ elif cmd == 'collect':
         print(f'PAID GATE CLOSED: {reason}', file=sys.stderr)
         sys.exit(4)
     if 'geometry' not in data['actions']:
-        data['actions']['geometry'] = {'paid': True}
+        data['actions']['geometry'] = {'paid': True, 'observed_cost': 0.5}
+        if mode != 'unconfirmed_collect':         # the backend saw the paid stage advance (the only proof of a charge)
+            data['actions']['geometry'] |= {'confirmed_at': '2026-11-25T12:00:00', 'confirmed_by': 'stage', 'provider_action_id': None}
+        else:
+            data['pending_action'] = 'geometry'
+            data['paid_review'] = {'action': 'geometry', 'stage': 'geometry_preview', 'at': 'now', 'why': 'the stage did not advance'}
         data['observed_cost_geometry'] = {'credits': 0.5, 'text': '0.5 Credits'}
         data['credits_committed'] = data.get('credits_committed', 0) + 0.5
         with open(mroot / 'paid_clicks.txt', 'a') as paid:
             paid.write('1\n')
-    if mode == 'stop_collect':
+    if mode in ('stop_collect', 'unconfirmed_collect'):
         rec.write_text(json.dumps(data))
         (out / 'before_material_generate.png').write_bytes(b'png')
         print('STOPPED: material_generate: displayed cost 2 does not match 0', file=sys.stderr)
@@ -383,6 +391,21 @@ class MonsterCase(unittest.TestCase):
             guard.write_atomic(self.root / '.codex_jobs/_batch/status' / f'{name}.json',
                                json.dumps({'state': runner_state, 'attempts': 1 if runner_state == 'done' else 2,
                                            'jobs': [{'job': f'{name}-a01'}]}).encode())
+
+    def ident(self, task_id):
+        """{key, generation} of a lane row: what the client displays and every queue op must echo (recheck finding 4)."""
+        row = taskqueue.for_root(self.root).get(task_id)
+        return {'key': row['key'], 'generation': row['args']['frozen_sha']}
+
+    def qop(self, op, task_id, **extra):
+        if extra.get('confirm') and 'pause_id' not in extra:
+            extra['pause_id'] = monster_lane.pause_id(self.root)
+        return actions.queue_op(self.root, {'op': op, 'id': task_id} | self.ident(task_id) | extra)
+
+    def run_now(self, task_id, **extra):
+        if extra.get('confirm') and 'pause_id' not in extra:
+            extra['pause_id'] = monster_lane.pause_id(self.root)
+        return monster_lane.run_now(self.root, task_id, **(self.ident(task_id) | extra))
 
     def pick_rat(self, n=1, unattended=False):
         r = self.act(f'mconcept:Giant Rat/codex{n}', 'approve', unattended=unattended)
@@ -770,8 +793,9 @@ class ViewsTest(MonsterCase):
         item = mv.item(self.root, mid)
         views = {x['name']: x for x in item['views']}
         self.assertEqual((views['left']['valid'], views['left']['retry']), (False, True))
-        self.assertIn('no transparent pixel', views['left']['problem'])
+        self.assertIn('fully transparent', views['left']['problem'])                              # png_check's rule and words
         self.assertIn('provenance', views['right']['problem'])
+        self.assertEqual((views['right']['retry'], views['right']['repair']), (False, 'provenance'))   # a good image is repaired, not redrawn
         self.assertEqual((views['back']['valid'], views['back']['retry']), (True, False))
         self.assertEqual(mv.available_views(mv.views_dir(self.mroot, 'Giant Rat', v)), ['front', 'back'])
         with self.assertRaises(mv.Missing):
@@ -799,9 +823,10 @@ class ViewsTest(MonsterCase):
         with self.assertRaises(ValueError):
             self.convert(mid, ['front.png'], verb='reconvert')                                    # no confirm
         mdir = self.mroot / f'pipeline/Giant Rat/models/{v}'
+        rev = mv.item(self.root, mid)['views_rev']
         (mdir / 'chosen_lod.json').write_text('{not json')
         with self.assertRaises(guard.Unreadable):                                                 # an unreadable choice is never "not approved"
-            self.convert(mid, ['front.png'], verb='reconvert', confirm=True)
+            self.act(mid, 'reconvert', files=['front.png'], views_rev=rev, confirm=True)
         (mdir / 'chosen_lod.json').write_text(json.dumps({'lod': '0p4', 'approved': True}))
         with self.assertRaises(guard.AlreadyApproved):
             self.convert(mid, ['front.png'], verb='reconvert', confirm=True)
@@ -950,7 +975,7 @@ class LaneTest(MonsterCase):
         self.mode(mode='pause-conversions', pause={'reason': 'manual pause-conversions', 'scope': ['conversions']})
         closed = g(self.root, {'run_now': True}, 400, True)
         self.assertEqual((closed['open'], closed['needs_confirm']), (False, True))
-        key = closed['pause_key']
+        key = closed['pause_id']
         self.assertTrue(g(self.root, {'run_now': True, 'override_pause': key}, 10, True)['open'])
         self.assertFalse(g(self.root, {'run_now': True, 'override_pause': True}, 10, True)['open'])   # an unbound override is no override
         self.mode(mode='pause-conversions', since='2026-11-25T11:00:00')                         # a NEW pause
@@ -1092,18 +1117,18 @@ class LaneTest(MonsterCase):
         self.assertEqual((plan['start'], plan['waiting'][task['id']][:7]), ([], 'waiting'))
         plan = monster_lane.plan_starts(self.root, idle=1000, idle_known=True)
         self.assertEqual([t['id'] for t in plan['start']], [task['id']])
-        self.assertTrue(monster_lane.run_now(self.root, task['id'])['run_now'])
+        self.assertTrue(self.run_now(task['id'])['run_now'])
         self.assertEqual([t['id'] for t in monster_lane.plan_starts(self.root, idle=10, idle_known=True)['start']], [task['id']])
         self.mode(mode='pause-conversions')
         with self.assertRaises(monster_lane.ConfirmPaused):
-            monster_lane.run_now(self.root, task['id'])
-        r = monster_lane.run_now(self.root, task['id'], confirm=True)
+            self.run_now(task['id'])
+        r = self.run_now(task['id'], confirm=True)
         self.assertTrue(r['override_pause'])
         self.assertEqual(len(monster_lane.plan_starts(self.root, idle=10, idle_known=True)['start']), 1)
         argv = monster_lane.task_argv(self.root, q.get(task['id']))
         self.assertEqual(argv[3:5], [str(HERE / 'monster_lane.py'), 'run'])
         self.assertIn('--run-now', argv)
-        self.assertEqual(argv[argv.index('--override-pause') + 1], r['pause_key'])
+        self.assertEqual(argv[argv.index('--override-pause') + 1], r['pause_id'])
         vdir = self.mroot / f'pipeline/Giant Rat/views/{v}'
         vj = json.loads((vdir / 'views.json').read_text())
         vj['frozen'] = mv.freeze(vdir, ['front.png'])
@@ -1139,7 +1164,7 @@ class LaneTest(MonsterCase):
 
     def test_end_to_end_through_run_task(self):
         v, task = self.frozen_variant()
-        monster_lane.run_now(self.root, task['id'])
+        self.run_now(task['id'])
         task = taskqueue.for_root(self.root).get(task['id'])
         logs = self.root / '.codex_jobs/_app/logs'
         logs.mkdir(parents=True)
@@ -1214,7 +1239,7 @@ class AccountingTest(MonsterCase):
         (hyper / 'glb_m9.glb').write_bytes(b'glb')
         (hyper / 'studio_submission.json').write_text(json.dumps({
             'backend': 'hyper3d', 'status': 'exported', 'model_id': 'm9', 'model_url': 'https://h/m9', 'pending_action': None,
-            'actions': {'free_preview': {}, 'geometry': {}}, 'observed_cost_geometry': {'credits': 0.5}, 'credits_committed': 0.5,
+            'actions': {'free_preview': {}, 'geometry': {'confirmed_at': 't', 'observed_cost': 0.5}}, 'credits_committed': 0.5,
             'inputs': [{'name': 'front.png', 'sha256': gen['sha256']['front.png'], 'size': 1}], 'images_uploaded': ['front.png']}))
         verdict = monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
         self.assertEqual(verdict['status'], 'ok', verdict)
@@ -1226,17 +1251,28 @@ class AccountingTest(MonsterCase):
     def test_uncertain_intent_is_not_counted_and_never_assumed(self):
         record = {'model_id': 'm2', 'actions': {'geometry': {}}, 'pending_action': 'geometry', 'credits_committed': 0.5}
         self.assertEqual(monster_lane.paid_actions(record), [{'action': 'geometry', 'status': 'uncertain', 'credits': None,
-                                                              'id': 'hyper3d:m2:geometry'}])
+                                                              'id': 'hyper3d:m2:geometry', 'provider_id': None, 'evidence': None,
+                                                              'model_id': 'm2'}])
         self.assertIsNone(monster_lane.reconcile_paid(self.root, 'Giant Rat', 'main', ['front.png'], self.root / 'r.json', record))
         summary = monster_lane.paid_summary(self.root)
         self.assertEqual((summary['count'], summary['credits'], summary['uncertain']['count']), (0, 0, 1))
-        record |= {'pending_action': None, 'observed_cost_geometry': {'credits': 0.5}}
+        # recheck finding 8: a cleared intent, an observed cost, even an exported record prove no charge
+        record |= {'pending_action': None, 'observed_cost_geometry': {'credits': 0.5}, 'status': 'exported', 'stage': 'geometry_preview'}
+        self.assertEqual(monster_lane.paid_actions(record)[0]['status'], 'uncertain')
+        monster_lane.reconcile_paid(self.root, 'Giant Rat', 'main', ['front.png'], self.root / 'r.json', record)
+        summary = monster_lane.paid_summary(self.root)
+        self.assertEqual((summary['count'], summary['uncertain']['count'], summary['uncertain']['credits']), (0, 1, 0.5))
+        # only the backend's confirmation (actions.<kind>.confirmed_at) counts it
+        record['actions'] = {'geometry': {'confirmed_at': '2026-11-25T12:00:00', 'confirmed_by': 'stage', 'provider_action_id': 'pa-7',
+                                          'observed_cost': 0.5}}
         monster_lane.reconcile_paid(self.root, 'Giant Rat', 'main', ['front.png'], self.root / 'r.json', record)
         summary = monster_lane.paid_summary(self.root)
         self.assertEqual((summary['count'], summary['credits'], summary['uncertain']['count']), (1, 0.5, 0))
+        self.assertEqual(monster_lane.paid_entries(self.root)[-1]['provider_id'], 'pa-7')
 
     def test_log_write_error_stays_visible_until_repaired(self):
-        record = {'model_id': 'm3', 'actions': {'geometry': {}}, 'pending_action': None, 'observed_cost_geometry': {'credits': 0.5}}
+        record = {'model_id': 'm3', 'actions': {'geometry': {'confirmed_at': 't', 'provider_action_id': 'pa-3'}}, 'pending_action': None,
+                  'observed_cost_geometry': {'credits': 0.5}}
         rec_path = self.root / 'r3.json'
         rec_path.write_text(json.dumps(record))
         monster_lane.paid_log_path(self.root).mkdir(parents=True)                                 # the log cannot be written
@@ -1260,7 +1296,7 @@ class DispositionTest(MonsterCase):
 
     def test_cancel_survives_a_rebuilt_queue_and_retry_clears_it(self):
         mid, v, task_id = self.frozen()
-        actions.queue_op(self.root, {'op': 'cancel', 'id': task_id})
+        self.qop('cancel', task_id)
         vj = mv.read_views_json(mv.views_dir(self.mroot, 'Giant Rat', v))
         gen = mv.frozen_digest(vj['frozen'])
         self.assertEqual(vj['conversion'][gen]['state'], 'cancelled')
@@ -1275,13 +1311,13 @@ class DispositionTest(MonsterCase):
         self.assertEqual([r['state'] for r in rows], ['cancelled'])
         self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])
         self.assertEqual(mv.item(self.root, mid)['conversion']['state'], 'cancelled')
-        actions.queue_op(self.root, {'op': 'retry', 'id': rows[0]['id']})
+        self.qop('retry', rows[0]['id'])
         self.assertIsNone(mv.disposition_of(mv.read_views_json(mv.views_dir(self.mroot, 'Giant Rat', v)), gen))
         self.assertEqual([t['id'] for t in monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start']], [rows[0]['id']])
 
     def test_exact_key_lookup_beyond_5000_rows(self):
         mid, v, task_id = self.frozen()
-        actions.queue_op(self.root, {'op': 'cancel', 'id': task_id})
+        self.qop('cancel', task_id)
         conn = sqlite3.connect(str(taskqueue.db_path(self.root)))
         now = time.time()
         conn.executemany('INSERT INTO tasks(lane,key,set_name,unit,args,state,priority,created,updated) VALUES (?,?,?,?,?,?,?,?,?)',
@@ -1305,17 +1341,17 @@ class DispositionTest(MonsterCase):
         mid, v, task_id = self.frozen()
         batch = self.root / '.codex_jobs/_batch'
         (batch / 'supervisor_mode.json').write_text(json.dumps({'mode': 'pause-conversions', 'since': 'A'}))
-        r = actions.queue_op(self.root, {'op': 'run_now', 'id': task_id, 'confirm': True})
+        r = self.qop('run_now', task_id, confirm=True)
         q = taskqueue.for_root(self.root)
-        self.assertEqual(q.get(task_id)['args']['override_pause'], r['pause_key'])
+        self.assertEqual(q.get(task_id)['args']['override_pause'], r['pause_id'])
         self.assertEqual(len(monster_lane.plan_starts(self.root, idle=10, idle_known=True)['start']), 1)
-        actions.queue_op(self.root, {'op': 'cancel', 'id': task_id})
+        self.qop('cancel', task_id)
         (batch / 'supervisor_mode.json').write_text(json.dumps({'mode': 'pause-conversions', 'since': 'B'}))   # a new manual pause
-        actions.queue_op(self.root, {'op': 'retry', 'id': task_id})                                # an ordinary retry
+        self.qop('retry', task_id)                                # an ordinary retry
         args = q.get(task_id)['args']
         self.assertEqual((args.get('run_now'), 'override_pause' in args), (False, False))
         self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])
-        self.assertFalse(monster_lane.gate(self.root, {'run_now': True, 'override_pause': r['pause_key']}, 10, True)['open'])
+        self.assertFalse(monster_lane.gate(self.root, {'run_now': True, 'override_pause': r['pause_id']}, 10, True)['open'])
 
 
 class IdentityTest(MonsterCase):
@@ -1586,8 +1622,8 @@ class WiringTest(MonsterCase):
         name = mv.view_task_name('Giant Rat', v, 'back')
         self.assertEqual(actions.queue_op(self.root, {'op': 'view_retry', 'name': name})['state'], 'pending')
         task_id = self.perform(mid, 'convert', files=['front.png'], views_rev=catalog.item(self.root, mid)['views_rev'])['task']
-        actions.queue_op(self.root, {'op': 'cancel', 'id': task_id})
-        out = actions.queue_op(self.root, {'op': 'retry', 'id': task_id})
+        self.qop('cancel', task_id)
+        out = self.qop('retry', task_id)
         self.assertEqual(out['state'], 'queued')
         qs = orchestrator.queue_state(self.root, True)
         self.assertEqual((qs['monsters']['lane'], qs['monsters']['limit'], qs['monsters']['totals']), ('monster_convert', 1, {'queued': 1}))
@@ -1632,10 +1668,18 @@ class WiringTest(MonsterCase):
             status, r2 = call('POST', '/api/v2/action', {'id': mid, 'verb': 'convert', 'args': {'files': ['front.png'], 'views_rev': rev}})
             self.assertEqual((status, r2['code']), (409, 'busy'))
             (self.root / '.codex_jobs/_batch/supervisor_mode.json').write_text(json.dumps({'mode': 'pause-conversions', 'since': 'x'}))
-            status, r3 = call('POST', '/api/v2/queue', {'op': 'run_now', 'id': r['task']})
+            self.assertEqual(call('POST', '/api/v2/queue', {'op': 'run_now', 'id': r['task']})[0], 400)   # a row number alone
+            ident = {'id': r['task']} | self.ident(r['task'])
+            status, r3 = call('POST', '/api/v2/queue', {'op': 'run_now'} | ident)
             self.assertEqual((status, r3['code']), (409, 'confirm'))
-            status, r4 = call('POST', '/api/v2/queue', {'op': 'run_now', 'id': r['task'], 'confirm': True})
+            self.assertEqual(r3['pause_id'], call('GET', '/api/v2/state')[1]['status']['pause_id'])
+            self.assertEqual(r3['pause_id'], call('GET', '/api/v2/queue')[1]['mode']['pause_id'])
+            status, r4 = call('POST', '/api/v2/queue', {'op': 'run_now', 'confirm': True} | ident)
+            self.assertEqual((status, r4['code']), (409, 'confirm'))                               # confirm without the pause it is for
+            status, r4 = call('POST', '/api/v2/queue', {'op': 'run_now', 'confirm': True, 'pause_id': r3['pause_id']} | ident)
             self.assertEqual((status, r4['override_pause']), (200, True))
+            status, r5 = call('POST', '/api/v2/queue', {'op': 'cancel', 'id': r['task'], 'key': ident['key'], 'generation': '0' * 12})
+            self.assertEqual((status, r5['code']), (409, 'changed'))
         finally:
             srv.shutdown()
             srv.server_close()
@@ -1673,7 +1717,7 @@ class OrchestratorLaneTest(MonsterCase):
         self.orch.tick()
         self.assertEqual(self.task(task_id)['state'], 'queued')
         guard.write_atomic(self.root / '.codex_jobs/_batch/CONVERT_HOLD', json.dumps({'since': 'now', 'reason': 'supervisor restart'}).encode())
-        out = actions.queue_op(self.root, {'op': 'run_now', 'id': task_id})
+        out = self.qop('run_now', task_id)
         self.assertIn('CONVERT_HOLD', out['warning'])
         self.orch.tick()
         self.assertEqual(self.task(task_id)['state'], 'queued')
@@ -1696,8 +1740,8 @@ class OrchestratorLaneTest(MonsterCase):
         self.orch.tick()
         self.assertEqual(self.task(task_id)['state'], 'queued')
         with self.assertRaises(monster_lane.ConfirmPaused):
-            actions.queue_op(self.root, {'op': 'run_now', 'id': task_id})
-        self.assertTrue(actions.queue_op(self.root, {'op': 'run_now', 'id': task_id, 'confirm': True})['override_pause'])
+            self.qop('run_now', task_id)
+        self.assertTrue(self.qop('run_now', task_id, confirm=True)['override_pause'])
         self.drive(lambda: self.task(task_id)['state'] in ('done', 'failed'))
         self.assertEqual(self.task(task_id)['state'], 'done', self.task(task_id)['error'])
 
@@ -1728,6 +1772,858 @@ class OrchestratorLaneTest(MonsterCase):
         self.assertEqual((self.task(task_id)['state'], self.task(task_id)['error']), ('failed', 'STOPPED: cost'))
         conv = catalog.item(self.root, f'monster:Giant Rat/{v}')['conversion']
         self.assertEqual((conv['state'], conv['step'], conv['error']), ('failed', 'collect', 'STOPPED: cost'))
+
+
+# ------------------------------------------------------------------------------------- recheck before cut-over (2026-11-25)
+
+class RecheckCase(MonsterCase):
+    """Shared fixture of the recheck-before-cutover regressions (review_v2_recheck_cutover_20261125; DESIGN_PHASE5.md H.11)."""
+
+    def frozen(self, n=1, views=('left',), files=('front.png',)):
+        mid, v = self.pick_rat(n)
+        self.finish_views('Giant Rat', v, views)
+        task_id = self.convert(mid, list(files))['task']
+        vj = mv.read_views_json(mv.views_dir(self.mroot, 'Giant Rat', v))
+        return mid, v, task_id, mv.frozen_digest(vj['frozen'])
+
+    def drop_queue(self):
+        taskqueue._QUEUES.pop(str(self.root), None)
+        db = taskqueue.db_path(self.root)
+        for suffix in ('', '-wal', '-shm'):
+            Path(str(db) + suffix).unlink(missing_ok=True)
+
+    def vj(self, v):
+        return mv.read_views_json(mv.views_dir(self.mroot, 'Giant Rat', v))
+
+    def sleeper(self, seconds=120):
+        proc = subprocess.Popen([sys.executable, '-c', f'import time; time.sleep({seconds})'])
+        self.addCleanup(lambda: proc.poll() is None and proc.kill())
+        return proc
+
+
+class RecheckDispositionTest(RecheckCase):
+    """Finding 3: idempotent terminal transitions, no older disposition over a newer one, a failed write is outstanding durable work."""
+
+    def test_cancel_stands_when_the_dispatcher_cancels_the_row_first(self):
+        mid, v, task_id, gen = self.frozen()
+        real = taskqueue.TaskQueue.cancel
+        calls = []
+
+        def cancel(queue, tid, detail='', manual_gen=None, expect=None):
+            if not calls:                                       # the dispatcher saw the new disposition and cancelled the row first
+                calls.append(1)
+                self.assertEqual(mv.disposition_of(self.vj(v), gen)['state'], 'cancelled')
+                self.assertTrue(real(queue, tid, 'the conversion of this choice was cancelled; use Retry'))
+            return real(queue, tid, detail, manual_gen, expect)
+        with mock.patch.object(taskqueue.TaskQueue, 'cancel', cancel):
+            out = self.qop('cancel', task_id)
+        self.assertEqual(out['state'], 'cancelled')
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['state'], 'cancelled')               # the durable cancel was NOT erased
+        self.assertEqual(self.qop('cancel', task_id)['state'], 'cancelled')                      # the identical transition again: fine
+        self.drop_queue()
+        out = monster_lane.tick(self.root)
+        self.assertEqual((out['queued'], out['restored']), ([], [f'Giant Rat/{v}']))
+
+    def test_cancel_takes_back_only_its_own_write_never_an_older_state(self):
+        mid, v, task_id, gen = self.frozen()
+        q = taskqueue.for_root(self.root)
+        real = taskqueue.TaskQueue.cancel
+
+        def started(queue, tid, detail='', manual_gen=None, expect=None):
+            queue.claim(tid, 'tok', None)                       # the row started between the disposition write and the cancel
+            return real(queue, tid, detail, manual_gen, expect)
+        with mock.patch.object(taskqueue.TaskQueue, 'cancel', started):
+            with self.assertRaises(ValueError):
+                self.qop('cancel', task_id)
+        self.assertIsNone(mv.disposition_of(self.vj(v), gen))                                     # our own write is taken back
+        self.assertEqual(q.get(task_id)['state'], 'starting')
+        # ... but not when a newer disposition was written meanwhile (the attempt failed): the newer one stays
+        q.requeue(task_id, 'tok', 'again')
+
+        def failed_meanwhile(queue, tid, detail='', manual_gen=None, expect=None):
+            queue.claim(tid, 'tok2', None)
+            mv.set_disposition(self.root, 'Giant Rat', v, gen, {'state': 'failed', 'reason': 'newer', 'key': 'k'})
+            return real(queue, tid, detail, manual_gen, expect)
+        with mock.patch.object(taskqueue.TaskQueue, 'cancel', failed_meanwhile):
+            with self.assertRaises(ValueError):
+                self.qop('cancel', task_id)
+        disp = mv.disposition_of(self.vj(v), gen)
+        self.assertEqual((disp['state'], disp['reason']), ('failed', 'newer'))
+        self.assertGreater(disp['seq'], 1)                                                       # a monotonic sequence per variant
+
+    def test_identical_transition_is_idempotent_and_sequence_guards_undo(self):
+        mid, v, task_id, gen = self.frozen()
+        first = mv.set_disposition(self.root, 'Giant Rat', v, gen, {'state': 'failed', 'reason': 'a'})
+        again = mv.set_disposition(self.root, 'Giant Rat', v, gen, {'state': 'failed', 'reason': 'b'})
+        self.assertEqual((first['written'], again['written'], again.get('same'), again['seq']), (True, False, True, first['seq']))
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['reason'], 'a')
+        stale = mv.set_disposition(self.root, 'Giant Rat', v, gen, None, expect_seq=first['seq'] - 1)
+        self.assertEqual((stale['written'], stale.get('stale')), (False, True))
+        self.assertIsNotNone(mv.disposition_of(self.vj(v), gen))
+
+    def test_failed_disposition_write_keeps_the_row_unfinished_and_blocks_reconstruction(self):
+        mid, v, task_id, gen = self.frozen()
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, 'tok', None)
+        orch = orchestrator.Orchestrator(self.root, idle=lambda: 10.0, scan_stale=False)
+        result = {'exit': 1, 'last_json': {'status': 'failed', 'step': 'collect', 'error': 'STOPPED: cost'}}
+        mv.FAULTS['disposition_write'] = lambda: (_ for _ in ()).throw(OSError('disk full'))
+        orch._finish(q.get(task_id), result)
+        row = q.get(task_id)
+        self.assertEqual(row['state'], 'starting')                                               # NOT finished: the slot stays held
+        self.assertIn('could not be recorded', row['error'])
+        self.assertTrue(any('could not be recorded' in e for e in orch.errors))
+        pending = monster_lane.pending_disposition(self.root, 'Giant Rat', v, gen)
+        self.assertEqual((pending['state'], 'disk full' in pending['error']), ('failed', True))
+        conv = mv.item(self.root, mid)['conversion']
+        self.assertEqual(conv['state'], 'failed')
+        self.assertIn('could not be recorded', conv['error'])
+        self.assertIn('conversion outcome not recorded yet', ' '.join(b['text'] for b in self.tabs()['approved'][mid]['badges']))
+        # the derived database is replaced while the write is still outstanding: nothing is queued again
+        self.drop_queue()
+        out = monster_lane.tick(self.root)
+        self.assertEqual((out['queued'], out['restored']), ([], []))
+        self.assertTrue(any('not recorded' in e for e in out['errors']))
+        self.assertEqual(taskqueue.for_root(self.root).tasks(lane=monster_lane.LANE), [])
+        # the write works again: the tick completes the outstanding work, and only then the generation is restored as FAILED
+        mv.FAULTS.clear()
+        out = monster_lane.tick(self.root)
+        self.assertEqual((out['queued'], out['restored']), ([], [f'Giant Rat/{v}']))
+        self.assertIsNone(monster_lane.pending_disposition(self.root, 'Giant Rat', v, gen))
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['state'], 'failed')
+        self.assertEqual([t['state'] for t in taskqueue.for_root(self.root).tasks(lane=monster_lane.LANE)], ['failed'])
+
+    def test_row_fails_at_a_later_pass_once_the_record_is_written(self):
+        mid, v, task_id, gen = self.frozen()
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, 'tok', None)
+        orch = orchestrator.Orchestrator(self.root, idle=lambda: 10.0, scan_stale=False)
+        result = {'exit': 1, 'last_json': {'status': 'failed', 'step': 'collect', 'error': 'STOPPED: cost'}}
+        mv.FAULTS['disposition_write'] = lambda: (_ for _ in ()).throw(OSError('disk full'))
+        orch._lost(q.get(task_id))
+        self.assertEqual(q.get(task_id)['state'], 'starting')
+        mv.FAULTS.clear()
+        orch._finish(q.get(task_id), result)
+        self.assertEqual(q.get(task_id)['state'], 'failed')
+        self.assertIsNone(monster_lane.pending_disposition(self.root, 'Giant Rat', v, gen))
+
+    def test_invalid_disposition_state_is_damage_not_absence(self):
+        mid, v, task_id, gen = self.frozen()
+        self.qop('cancel', task_id)
+        path = mv.views_dir(self.mroot, 'Giant Rat', v) / 'views.json'
+        raw = json.loads(path.read_text())
+        raw['conversion'][gen]['state'] = 'canceled?'
+        path.write_text(json.dumps(raw))
+        with self.assertRaises(guard.Unreadable):
+            mv.read_views_json(path.parent)
+        self.assertIsNotNone(mv.views_problem(raw))
+        with self.assertRaises(guard.Unreadable):
+            mv.disposition_of({'conversion': {gen: {'state': 'done'}}}, gen)
+        self.drop_queue()
+        out = monster_lane.tick(self.root)                                                       # indeterminate: never reconstructed
+        self.assertEqual((out['queued'], out['restored']), ([], []))
+        self.assertTrue(any(f'Giant Rat/{v}' in e for e in out['errors']))
+        self.assertTrue(self.tabs()['approved'][mid]['damaged'])
+        self.assertEqual(json.loads(path.read_text()), raw)                                      # never replaced
+
+
+class RecheckIdentityTest(RecheckCase):
+    """Finding 4: Run now / Retry / Cancel act on the task the client displayed (key + generation), never on whoever has that row id."""
+
+    def test_stale_row_number_never_reaches_another_variant(self):
+        mid1, v1, t1, g1 = self.frozen(1)
+        mid2, v2, t2, g2 = self.frozen(2)
+        shown = {'id': t2} | self.ident(t2)                     # what the client displays for Giant Rat/<v2>
+        self.qop('cancel', t1)
+        self.qop('cancel', t2)
+        self.drop_queue()
+        q = taskqueue.for_root(self.root)
+        # the rebuilt queue restores them in the other order: the old row number of v2 now belongs to v1
+        for v, g in ((v2, g2), (v1, g1)):
+            frozen = self.vj(v)['frozen']
+            q.restore_terminal(monster_lane.LANE, monster_lane.task_key('Giant Rat', v, frozen), monster_lane.set_name('Giant Rat', v),
+                               'convert', monster_lane._args('Giant Rat', v, frozen), 'cancelled', 'restored', 4, 1)
+        by_variant = {t['set_name']: t for t in q.tasks(lane=monster_lane.LANE)}
+        self.assertNotEqual(by_variant[f'monster:Giant Rat/{v2}']['id'], shown['id'])
+        self.assertEqual(q.get(shown['id'])['set_name'], f'monster:Giant Rat/{v1}')
+        out = actions.queue_op(self.root, {'op': 'run_now'} | shown)
+        self.assertEqual(out['key'], shown['key'])
+        self.assertEqual(q.by_key(shown['key'])['state'], 'queued')                               # the displayed task, found by its key
+        self.assertEqual(by_variant[f'monster:Giant Rat/{v1}']['state'], 'cancelled')
+        self.assertEqual(q.get(shown['id'])['state'], 'cancelled')                                # the row with that number is untouched
+        self.assertIsNotNone(mv.disposition_of(self.vj(v1), g1))
+
+    def test_identity_is_required_and_an_expired_one_is_409_changed(self):
+        mid, v, task_id, gen = self.frozen()
+        ident = self.ident(task_id)
+        for op in ('cancel', 'retry', 'run_now'):
+            with self.assertRaises(ValueError):
+                actions.queue_op(self.root, {'op': op, 'id': task_id})                             # a row number alone
+            with self.assertRaises(ValueError):
+                actions.queue_op(self.root, {'op': op, 'id': task_id, 'key': ident['key']})        # no generation
+            with self.assertRaises(guard.Changed) as caught:
+                actions.queue_op(self.root, {'op': op, 'id': task_id, 'key': ident['key'], 'generation': '0' * 12})
+            self.assertEqual(caught.exception.code, 'changed')
+            with self.assertRaises(guard.Changed):
+                actions.queue_op(self.root, {'op': op, 'id': task_id, 'key': f'{monster_lane.LANE}:Giant Rat/nope:{gen}', 'generation': gen})
+        self.assertEqual(taskqueue.for_root(self.root).get(task_id)['state'], 'queued')
+        self.assertIsNone(mv.disposition_of(self.vj(v), gen))
+
+    def test_the_state_change_compares_the_identity_in_its_own_transaction(self):
+        mid, v, task_id, gen = self.frozen()
+        q = taskqueue.for_root(self.root)
+        other = {'key': 'monster_convert:Other/1:000000000000', 'generation': '000000000000'}
+        for call in (lambda: q.cancel(task_id, 'x', expect=other), lambda: q.mark_run_now(task_id, None, expect=other),
+                     lambda: q.retry(task_id, expect=other),
+                     lambda: q.cancel(task_id, 'x', expect={'key': self.ident(task_id)['key'], 'generation': 'f' * 12})):
+            with self.assertRaises(taskqueue.Expired):
+                call()
+        row = q.get(task_id)
+        self.assertEqual((row['state'], row['args'].get('run_now')), ('queued', False))
+        # the row is replaced between the lookup and the write (a rebuilt database): the lane answers 409 changed, nothing is written
+        task = monster_lane.resolve_task(self.root, task_id, **self.ident(task_id))
+        self.drop_queue()
+        q = taskqueue.for_root(self.root)
+        q.enqueue_once(monster_lane.LANE, 'monster_convert:Other/1:000000000000', 'monster:Other/1', 'convert', {'frozen_sha': '0' * 12})
+        with self.assertRaises(guard.Changed):
+            monster_lane.cancel_task(self.root, task)
+        self.assertIsNone(mv.disposition_of(self.vj(v), gen))
+        self.assertEqual(q.tasks(lane=monster_lane.LANE)[0]['state'], 'queued')
+
+    def test_queue_and_item_expose_the_identity(self):
+        mid, v, task_id, gen = self.frozen()
+        row = next(t for t in orchestrator.queue_state(self.root, True)['tasks'] if t['id'] == task_id)
+        self.assertEqual((row['key'], row['generation']), (self.ident(task_id)['key'], gen))
+        conv = mv.item(self.root, mid)['conversion']
+        self.assertEqual((conv['key'], conv['generation'], conv['task_id']), (row['key'], gen, task_id))
+
+
+class RecheckPauseTest(RecheckCase):
+    """Finding 5: every pause transition has its own pause_id; a confirmed Run now overrides exactly the pause the user saw."""
+
+    def test_two_pauses_within_one_second_have_different_ids(self):
+        first = modes.write_mode(self.root, 'pause')['pause_id']
+        modes.write_mode(self.root, 'run')
+        second = modes.write_mode(self.root, 'pause')['pause_id']
+        self.assertTrue(first and second and first != second)
+        self.assertEqual(modes.read_mode(self.root)['since'][:17], modes.read_mode(self.root)['since'][:17])
+        self.assertFalse(monster_lane.gate(self.root, {'run_now': True, 'override_pause': first}, 1000, True)['open'])
+        self.assertTrue(monster_lane.gate(self.root, {'run_now': True, 'override_pause': second}, 10, True)['open'])
+        self.assertIsNone(modes.write_mode(self.root, 'run')['pause_id'])
+        # files written by somebody else (the supervisor, its `mode` command) carry no id: each write is its own identity
+        batch = self.root / '.codex_jobs/_batch'
+        body = json.dumps({'mode': 'pause-conversions', 'since': '2026-11-25T10:00:00'})
+        (batch / 'supervisor_mode.json').write_text(body)
+        a = modes.read_mode(self.root)['pause_id']
+        os.remove(batch / 'supervisor_mode.json')
+        (batch / 'supervisor_mode.json').write_text(body)                                         # resume ... pause again, the same second
+        b = modes.read_mode(self.root)['pause_id']
+        self.assertTrue(a.startswith('file:') and b.startswith('file:') and a != b)
+        self.assertEqual(b, modes.read_mode(self.root)['pause_id'])                               # stable while the file is not rewritten
+        modes.write_mode(self.root, 'views-run')
+        pause = json.dumps({'since': 's', 'reason': 'manual pause-conversions', 'scope': ['conversions']})
+        (batch / 'PAUSE').write_text(pause)
+        p1 = modes.manual_pause(self.root)
+        (batch / 'PAUSE').unlink()
+        (batch / 'PAUSE').write_text(pause)
+        p2 = modes.manual_pause(self.root)
+        self.assertEqual((p1['kind'], p2['kind'], p1['pause_id'] != p2['pause_id']), ('pause', 'pause', True))
+        (batch / 'PAUSE').write_text(json.dumps({'since': 's', 'reason': 'user active', 'scope': ['conversions', 'views']}))
+        self.assertIsNone(modes.manual_pause(self.root))                                          # the idle gate is not a manual pause
+
+    def test_confirm_must_echo_the_pause_the_user_saw(self):
+        mid, v, task_id, gen = self.frozen()
+        ident = {'id': task_id} | self.ident(task_id)
+        seen = modes.write_mode(self.root, 'pause-conversions')['pause_id']
+        with self.assertRaises(monster_lane.ConfirmPaused) as caught:
+            actions.queue_op(self.root, {'op': 'run_now'} | ident)
+        self.assertEqual(caught.exception.extra['pause_id'], seen)
+        with self.assertRaises(monster_lane.ConfirmPaused):                                       # `confirm: true` alone is no consent
+            actions.queue_op(self.root, {'op': 'run_now', 'confirm': True} | ident)
+        modes.write_mode(self.root, 'views-run')                                                  # resumed ... and paused again
+        later = modes.write_mode(self.root, 'pause-conversions')['pause_id']
+        with self.assertRaises(monster_lane.ConfirmPaused) as caught:                             # the consent was for the EARLIER pause
+            actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': seen} | ident)
+        self.assertEqual(caught.exception.extra['pause_id'], later)
+        q = taskqueue.for_root(self.root)
+        self.assertFalse(q.get(task_id)['args'].get('run_now'))
+        out = actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': later} | ident)
+        self.assertEqual((out['override_pause'], out['pause_id'], q.get(task_id)['args']['override_pause']), (True, later, later))
+        self.assertEqual(len(monster_lane.plan_starts(self.root, idle=10, idle_known=True)['start']), 1)
+        modes.write_mode(self.root, 'pause-conversions')                                          # a later pause is NOT overridden
+        self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])
+
+    def test_pause_id_is_exposed_to_the_client(self):
+        mid, v, task_id, gen = self.frozen()
+        pid = modes.write_mode(self.root, 'pause')['pause_id']
+        self.assertEqual(modes.snapshot(self.root, supervisor=(False, ''))['pause_id'], pid)       # queue `mode`
+        self.assertEqual(server.status_of(self.root, {})['pause_id'], pid)                        # GET /api/v2/state status
+        self.assertEqual(monster_lane.lane_status(self.root)['gate']['pause_id'], pid)            # queue `monsters.gate`
+        conv = mv.item(self.root, mid)['conversion']
+        self.assertEqual((conv['pause_id'], conv['waiting_reason']), (pid, 'paused'))
+
+
+class RecheckPaidTest(RecheckCase):
+    """Finding 8 (lane side): a repair carries its evidence; only the backend's confirmation counts a charge."""
+
+    def test_repair_survives_a_moved_record(self):
+        record = {'model_id': 'm8', 'actions': {'geometry': {'confirmed_at': 't', 'provider_action_id': 'pa-8', 'observed_cost': 0.5}},
+                  'pending_action': None}
+        rec_dir = self.root / 'hyper3d'
+        rec_dir.mkdir()
+        rec_path = rec_dir / 'studio_submission.json'
+        rec_path.write_text(json.dumps(record))
+        monster_lane.paid_log_path(self.root).mkdir(parents=True)                                 # the log cannot be written
+        self.assertIn('could not be written', monster_lane.reconcile_paid(self.root, 'Giant Rat', 'main', ['front.png'], rec_path, record))
+        stored = monster_lane.lane_status(self.root)['paid']['errors'][0]
+        self.assertEqual([(a['id'], a['provider_id'], a['credits'], a['status']) for a in stored['actions']],
+                         [('hyper3d:m8:geometry', 'pa-8', 0.5, 'confirmed')])
+        rec_dir.rename(self.root / 'hyper3d_prev_20261125T120000')                                # Reconvert moved the record away
+        monster_lane.paid_log_path(self.root).rmdir()
+        self.assertEqual(monster_lane.repair_accounting(self.root), [])
+        summary = monster_lane.paid_summary(self.root)
+        self.assertEqual((summary['count'], summary['credits'], summary['errors']), (1, 0.5, []))
+        self.assertEqual(monster_lane.paid_entries(self.root)[0]['provider_id'], 'pa-8')
+        # a NEW conversion's record at the same path is never mistaken for the old one
+        rec_dir.mkdir()
+        other = {'model_id': 'm9', 'actions': {'geometry': {'confirmed_at': 't2', 'observed_cost': 0.5}}}
+        rec_path.write_text(json.dumps(other))
+        monster_lane.paid_log_path(self.root).unlink()
+        monster_lane.paid_log_path(self.root).mkdir()
+        monster_lane.reconcile_paid(self.root, 'Giant Rat', 'main', ['front.png'], rec_path, record)
+        monster_lane.paid_log_path(self.root).rmdir()
+        self.assertEqual(monster_lane.repair_accounting(self.root), [])
+        self.assertEqual([e['id'] for e in monster_lane.paid_entries(self.root)], ['hyper3d:m8:geometry'])
+
+    def test_an_error_without_evidence_and_without_its_record_stays_open(self):
+        guard.write_atomic(monster_lane.paid_errors_path(self.root), json.dumps({
+            (self.root / 'gone.json').as_posix(): {'time': 't', 'error': 'old', 'monster': 'Giant Rat', 'variant': 'main', 'views': []}}).encode())
+        open_errors = monster_lane.repair_accounting(self.root)
+        self.assertEqual(len(open_errors), 1)
+        self.assertIn('is gone', open_errors[0])
+        self.assertEqual(len(monster_lane.paid_summary(self.root)['errors']), 1)                  # never cleared silently
+
+    def test_unconfirmed_click_is_uncertain_and_stays_protected(self):
+        mid, v, task_id, gen = self.frozen()
+        os.environ['FAKE_H3D'] = 'unconfirmed_collect'          # the click was sent, the backend did not see the stage advance
+        verdict = monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
+        self.assertEqual((verdict['status'], verdict['paid'], verdict['paid_uncertain']), ('failed', False, ['geometry']))
+        summary = monster_lane.paid_summary(self.root)
+        self.assertEqual((summary['count'], summary['credits'], summary['uncertain']), (0, 0, {'count': 1, 'credits': 0.5}))
+        conv = mv.item(self.root, mid)['conversion']
+        self.assertEqual((conv['paid'], conv['paid_uncertain'], conv['record']['paid_review']['action']), (False, ['geometry'], 'geometry'))
+        os.environ['FAKE_H3D'] = 'ok'                           # never clicked again by the lane
+        verdict = monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
+        self.assertEqual(verdict['status'], 'failed')
+        self.assertIn("unresolved 'geometry' click", verdict['error'])
+        self.assertEqual(self.paid_clicks(), 1)
+
+    def test_changed_upload_copy_stops_before_the_paid_collect(self):
+        mid, v, task_id, gen = self.frozen()
+        os.environ['FAKE_H3D'] = 'busy_collect'
+        monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
+        upload = mv.models_dir(self.mroot, 'Giant Rat', v) / 'hyper3d' / 'upload_inputs' / 'front.png'
+        upload.write_bytes(upload.read_bytes() + b'x')
+        os.environ['FAKE_H3D'] = 'ok'
+        verdict = monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
+        self.assertEqual((verdict['status'], verdict['step']), ('failed', 'check'))
+        self.assertIn('uploaded', verdict['error'])
+        self.assertEqual(self.paid_clicks(), 0)
+
+
+DRIVER_STUB = r'''
+import os, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+import monster_lane
+tracker = monster_lane._Tracker(sys.argv[2], 'Giant Rat', sys.argv[3], own_process=True)
+grand = 'import subprocess, sys, time; p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"]); print(p.pid, flush=True); time.sleep(120)'
+child = subprocess.Popen([sys.executable, '-c', grand], stdout=subprocess.PIPE, text=True)
+print(tracker.job or '-', child.pid, child.stdout.readline().strip(), flush=True)
+time.sleep(120)
+'''
+
+
+class RecheckTreeTest(RecheckCase):
+    """Finding 9: ownership before any signal; the whole tree is owned through the driver's exit; incomplete evidence keeps the slot."""
+
+    def running(self, pid=None, create=None):
+        mid, v, task_id, gen = self.frozen()
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, 'tok', None)
+        q.mark_running(task_id, 'tok', pid, create)
+        return v, task_id, q
+
+    def tree_file(self, v, **data):
+        path = monster_lane.children_path(self.root, 'Giant Rat', v)
+        guard.write_atomic(path, json.dumps({'set_name': f'monster:Giant Rat/{v}', 'driver': None, 'children': []} | data).encode())
+        return path
+
+    def test_unverified_parent_means_no_signal_at_all(self):
+        stranger = self.sleeper()                               # a live process on the recorded wrapper pid, identity NOT proven
+        v, task_id, q = self.running(stranger.pid, None)
+        child = self.sleeper()
+        self.tree_file(v, children=[{'pid': child.pid, 'create': monster_lane._create_time(child.pid), 'argv': ['collect']}])
+        orch = orchestrator.Orchestrator(self.root, idle=lambda: 10.0, scan_stale=False)
+        q.request_kill(task_id, 'tok')
+        self.assertEqual(orch._check_active(q.get(task_id), time.time()), 'kill_failed')
+        self.assertIsNone(stranger.poll())                                                       # nothing was signalled:
+        self.assertIsNone(child.poll())                                                          # not even the recorded child
+        row = q.get(task_id)
+        self.assertIn(row['state'], taskqueue.ACTIVE)                                            # the slot stays held, visibly
+        self.assertIn('did not signal anything', row['error'])
+        self.assertIn('could not be verified', row['error'])
+
+    def test_recorded_process_without_a_create_time_blocks_every_signal(self):
+        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
+        dead.wait()
+        v, task_id, q = self.running(dead.pid, None)
+        unknown, known = self.sleeper(), self.sleeper()
+        self.tree_file(v, children=[{'pid': unknown.pid, 'create': None, 'argv': ['?']},
+                                    {'pid': known.pid, 'create': monster_lane._create_time(known.pid), 'argv': ['collect']}])
+        plan = monster_lane.tree_plan(self.root, 'Giant Rat', v)
+        self.assertEqual(len(plan['blocking']), 1)
+        orch = orchestrator.Orchestrator(self.root, idle=lambda: 10.0, scan_stale=False)
+        q.request_kill(task_id, 'tok')
+        self.assertEqual(orch._check_active(q.get(task_id), time.time()), 'kill_failed')
+        self.assertIsNone(unknown.poll())
+        self.assertIsNone(known.poll())
+        self.assertIn(q.get(task_id)['state'], taskqueue.ACTIVE)
+
+    def test_stale_pid_never_lends_its_descendants(self):
+        """A recorded pid whose create time does not match is another process now: neither it nor its children are in the plan."""
+        parent = subprocess.Popen([sys.executable, '-c', 'import subprocess, sys, time; subprocess.Popen([sys.executable, "-c", '
+                                   '"import time; time.sleep(120)"]); time.sleep(120)'])
+        time.sleep(1.0)
+        import psutil
+        kids = psutil.Process(parent.pid).children(recursive=True)
+        self.assertEqual(len(kids), 1)
+
+        def clean():
+            for proc in [*kids, parent]:
+                try:
+                    proc.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        self.addCleanup(clean)
+        mid, v, task_id, gen = self.frozen()
+        self.tree_file(v, children=[{'pid': parent.pid, 'create': monster_lane._create_time(parent.pid) - 500, 'argv': ['old']}])
+        plan = monster_lane.tree_plan(self.root, 'Giant Rat', v, [(parent.pid, monster_lane._create_time(parent.pid) - 500)])
+        self.assertEqual((plan['procs'], plan['blocking']), ([], []))
+        self.assertIsNone(monster_lane.tree_hold(self.root, 'Giant Rat', v))                      # nothing of that record lives
+
+    def test_incomplete_evidence_keeps_the_slot(self):
+        mid, v, task_id, gen = self.frozen()
+        path = self.tree_file(v, driver={'pid': 999999, 'create': 1.0}, incomplete='a child was being started (python.exe ...)')
+        held = monster_lane.tree_hold(self.root, 'Giant Rat', v)
+        self.assertIn('not fully known', held)
+        self.assertTrue(path.exists())                                                           # kept until somebody checked
+        plan = monster_lane.plan_starts(self.root, idle=1000, idle_known=True)
+        self.assertEqual((plan['start'], plan['active']), ([], 1))
+        self.assertEqual(monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True,
+                                                     say=lambda t: None)['status'], 'busy')
+        path.write_text('{broken')                                                               # an unreadable record proves nothing either
+        self.assertIn('not fully known', monster_lane.tree_hold(self.root, 'Giant Rat', v))
+        path.unlink()
+        self.assertEqual(len(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start']), 1)
+
+    def test_surviving_grandchild_is_recorded_and_holds_the_slot(self):
+        mid, v, task_id, gen = self.frozen()
+        tracker = monster_lane._Tracker(self.root, 'Giant Rat', v)
+        note = Path(self.temp.name) / 'grand.pid'
+        code = ('import subprocess, sys, time; D = subprocess.DEVNULL; '
+                'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdin=D, stdout=D, stderr=D); '
+                'open(sys.argv[1], "w").write(str(p.pid)); time.sleep(2.5)')
+        code_out, _err = monster_lane._run([sys.executable, '-c', code, str(note)], HERE, lambda t: None, None, tracker)
+        self.assertEqual(code_out, 0)                           # the step is over, its grandchild lives on
+        grand = int(note.read_text())
+        self.addCleanup(lambda: __import__('psutil').pid_exists(grand) and __import__('psutil').Process(grand).kill())
+        tracker.close()
+        path = monster_lane.children_path(self.root, 'Giant Rat', v)
+        raw = json.loads(path.read_text())                      # (the driver ran inside this test process: it is "gone" now)
+        path.write_text(json.dumps(raw | {'driver': None}))
+        data = monster_lane.recorded_children(self.root, 'Giant Rat', v)
+        self.assertIn(grand, [d['pid'] for d in data['descendants']])                            # the grandchild did not escape the record
+        self.assertIn(str(grand), monster_lane.tree_hold(self.root, 'Giant Rat', v))
+        self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])
+        plan = monster_lane.tree_plan(self.root, 'Giant Rat', v)
+        self.assertIn(grand, [p.pid for p in plan['procs']])
+        self.assertEqual(monster_lane.drain_tree(self.root, 'Giant Rat', v, plan, 10.0)['problems'], [])
+        self.assertFalse(monster_lane.children_path(self.root, 'Giant Rat', v).exists())
+
+    def test_spawn_is_refused_when_it_cannot_be_recorded(self):
+        mid, v, task_id, gen = self.frozen()
+        tracker = monster_lane._Tracker(self.root, 'Giant Rat', v)
+        with mock.patch.object(guard, 'write_atomic', side_effect=OSError('read-only')), \
+                mock.patch.object(subprocess, 'Popen') as popen:
+            code, err = monster_lane._run([sys.executable, '-c', 'pass'], Path(self.temp.name), lambda t: None, None, tracker)
+        self.assertEqual((code, popen.call_count), (-1, 0))
+        self.assertIn('could not be recorded', err)
+        tracker.close()
+
+    @unittest.skipUnless(os.name == 'nt', 'Windows Job Objects')
+    def test_job_object_owns_the_tree_through_the_drivers_exit(self):
+        mid, v, task_id, gen = self.frozen()
+        stub = Path(self.temp.name) / 'driver_stub.py'
+        stub.write_text(DRIVER_STUB)
+        driver = subprocess.Popen([sys.executable, str(stub), str(HERE), str(self.root), v], stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: driver.poll() is None and driver.kill())
+        job, child, grand = driver.stdout.readline().split()
+        child, grand = int(child), int(grand)
+        import psutil
+        self.addCleanup(lambda: [psutil.Process(p).kill() for p in (child, grand) if psutil.pid_exists(p)] and None)
+        self.assertTrue(job.startswith(monster_lane.JOB_PREFIX), job)
+        state = monster_lane.tree_state(self.root, 'Giant Rat', v)                                # this process takes a handle of the job
+        self.assertTrue(state['job'])
+        self.assertEqual({p['pid'] for p in state['live']}, {driver.pid, child, grand})
+        driver.kill()                                                                            # the driver dies; nothing closes the job
+        driver.wait(10)
+        deadline = time.time() + 10
+        while time.time() < deadline and driver.pid in {p['pid'] for p in monster_lane.tree_state(self.root, 'Giant Rat', v)['live']}:
+            time.sleep(0.1)
+        state = monster_lane.tree_state(self.root, 'Giant Rat', v)
+        self.assertTrue(state['job'])
+        self.assertEqual({p['pid'] for p in state['live']}, {child, grand})                       # still owned, grandchild included
+        self.assertTrue(psutil.pid_exists(child) and psutil.pid_exists(grand))                    # (KILL_ON_JOB_CLOSE is off)
+        self.assertIn('still runs', monster_lane.tree_hold(self.root, 'Giant Rat', v))
+        plan = monster_lane.tree_plan(self.root, 'Giant Rat', v)
+        self.assertIsNotNone(plan['job'])
+        out = monster_lane.drain_tree(self.root, 'Giant Rat', v, plan, 10.0)
+        self.assertEqual((out['problems'], out['killed']), ([], 2))
+        deadline = time.time() + 10
+        while time.time() < deadline and (psutil.pid_exists(child) or psutil.pid_exists(grand)):
+            time.sleep(0.1)
+        self.assertFalse(psutil.pid_exists(child) or psutil.pid_exists(grand))
+        self.assertFalse(monster_lane.children_path(self.root, 'Giant Rat', v).exists())
+        self.assertIsNone(monster_lane.tree_hold(self.root, 'Giant Rat', v))
+
+
+class RecheckApproveTest(RecheckCase):
+    """Finding 10 (server side): Completed certifies the approved LOD's sha256 and generation, not its size."""
+
+    def approved(self):
+        mid, v, task_id, gen = self.frozen()
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, 'tok', None)
+        q.finish(task_id, 'tok', True)
+        self.converted('Giant Rat', v)
+        sha = mv.item(self.root, mid)['lods']['0p4']['sha256']
+        self.act(mid, 'approve', lod='0p4', glb_sha256=sha)
+        self.assertIn(mid, self.tabs()['completed'])
+        return mid, v, gen, mv.models_dir(self.mroot, 'Giant Rat', v)
+
+    def test_replaced_glb_of_equal_length_leaves_completed(self):
+        mid, v, gen, mdir = self.approved()
+        glb = mdir / 'reduced' / 'lod_error_0p4.glb'
+        size = glb.stat().st_size
+        time.sleep(0.05)
+        glb.write_bytes(b'X' * size)                                                             # other bytes, the same length
+        self.assertEqual(mv.reduce_status(mdir, gen)['ok'], True)                                # (the size-only check is blind to it)
+        card = self.tabs()['3d'][mid]
+        self.assertNotIn(mid, self.tabs()['completed'])
+        self.assertEqual(card['actions'], ['unapprove'])
+        self.assertIn('not the model that was approved', ' '.join(b['text'] for b in card['badges']))
+        # another level changing does not touch the approval of 0p4
+        glb.write_bytes(b'glb0p4')
+        other = mdir / 'reduced' / 'lod_error_0p8.glb'
+        other.write_bytes(b'Y' * other.stat().st_size)
+        self.assertIn(mid, self.tabs()['completed'])
+
+    def test_approval_of_another_generation_is_not_completed(self):
+        mid, v, gen, mdir = self.approved()
+        choice = json.loads((mdir / 'chosen_lod.json').read_text())
+        self.assertEqual(choice['generation'], gen)
+        choice['generation'] = '0' * 12
+        (mdir / 'chosen_lod.json').write_text(json.dumps(choice))
+        self.assertIn('another choice of views', ' '.join(b['text'] for b in self.tabs()['3d'][mid]['badges']))
+        # an approval without a digest counts only for a legacy reduction (approved before v2 recorded digests)
+        (mdir / 'chosen_lod.json').write_text(json.dumps({'lod': '0p4', 'approved': True}))
+        self.assertIn('no model digest', ' '.join(b['text'] for b in self.tabs()['3d'][mid]['badges']))
+        legacy = self.mroot / 'pipeline/Goblin Shaman/models/main/chosen_lod.json'
+        legacy.write_text(json.dumps({'lod': '0p4', 'approved': True}))
+        self.assertIn('monster:Goblin Shaman/main', self.tabs()['completed'])
+
+
+class RecheckStrictReadTest(RecheckCase):
+    """Finding 11: a malformed journal / chosen_lod.json blocks the mutations it guards and is never overwritten or removed."""
+
+    def test_malformed_pick_journal_blocks_picks_and_stays(self):
+        path = mv.journal_path(self.root, 'Giant Rat')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b'{"op": "pick", "monster": "Giant Rat", "tmp": ".v2_pi')                # a torn write
+        before = path.read_bytes()
+        with self.assertRaises(guard.Unreadable):
+            self.act('mconcept:Giant Rat/codex1', 'approve')
+        self.assertEqual(path.read_bytes(), before)                                              # not replaced, not removed
+        self.assertFalse((self.mroot / 'pipeline' / 'Giant Rat').exists())
+        out = monster_lane.tick(self.root)
+        self.assertTrue(any(path.name in e for e in out['errors']))
+        self.assertEqual(path.read_bytes(), before)
+        card = self.tabs()['concepts']['mconcept:Giant Rat/codex1']
+        self.assertEqual(card['actions'], [])                                                    # read-only until it is repaired
+        self.assertIn('damaged', ' '.join(b['text'] for b in card['badges']))
+        self.assertTrue(self.tabs()['concepts']['mconcept:Hobgoblin/codex3']['actions'])          # other monsters are not affected
+        path.unlink()
+        self.assertEqual(self.act('mconcept:Giant Rat/codex1', 'approve')['variant'], 'main')
+        # a journal that is JSON but no journal of this monster is not dropped either
+        path.write_text(json.dumps({'op': 'pick', 'monster': 'Somebody Else'}))
+        with self.assertRaises(guard.Unreadable):
+            self.act('mconcept:Giant Rat/codex2', 'approve')
+        self.assertTrue(path.exists())
+
+    def converted_variant(self):
+        mid, v, task_id, gen = self.frozen(views=('left', 'back'))
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, 'tok', None)
+        q.finish(task_id, 'tok', True)
+        self.converted('Giant Rat', v)
+        (self.mroot / f'pipeline/Giant Rat/models/{v}/hyper3d').mkdir()
+        return mid, v, mv.models_dir(self.mroot, 'Giant Rat', v)
+
+    def test_malformed_reconvert_journal_blocks_the_variant_and_stays(self):
+        mid, v, mdir = self.converted_variant()
+        item = mv.item(self.root, mid)
+        rev, sha = item['views_rev'], item['lods']['0p4']['sha256']
+        journal = mdir / mv.RECONVERT_JOURNAL
+        journal.write_bytes(b'{"schema": 1, "moves": [["hyper3d", "hyper3d_pr')
+        before = journal.read_bytes()
+        for verb, args in (('reconvert', {'files': ['front.png'], 'views_rev': rev, 'confirm': True}),
+                           ('approve', {'lod': '0p4', 'glb_sha256': sha}), ('views', {'enabled': {'left': False}}),
+                           ('view_retry', {'view': 'right'})):
+            with self.assertRaises(guard.Unreadable, msg=verb):
+                self.act(mid, verb, **args)
+        with self.assertRaises(guard.Unreadable):
+            actions.set_lod(self.root, {'id': mid, 'lod': '0p2'})
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertTrue((mdir / 'hyper3d').is_dir() and (mdir / 'reduced').is_dir() and not list(mdir.glob('*_prev_*')))
+        out = monster_lane.tick(self.root)
+        self.assertTrue(any('reconvert recovery error' in e for e in out['errors']))
+        self.assertEqual(journal.read_bytes(), before)
+        card = self.tabs()['3d'][mid]                                                            # a read-only damaged card, in its tab
+        self.assertEqual((card['actions'], bool(card['damaged'])), ([], True))
+        self.assertEqual(mv.item(self.root, mid)['state'], 'damaged')
+        # a moves list that is no reconvert journal is refused as well (it would rename arbitrary folders)
+        journal.write_text(json.dumps({'schema': 1, 'moves': [['reduced', '../../elsewhere']], 'generation': 'x'}))
+        with self.assertRaises(guard.Unreadable):
+            self.act(mid, 'approve', lod='0p4', glb_sha256=sha)
+        journal.unlink()
+        self.assertTrue(self.act(mid, 'approve', lod='0p4', glb_sha256=sha)['approved'])
+
+    def test_malformed_chosen_lod_is_never_overwritten_by_the_lod_writer(self):
+        mid, v, mdir = self.converted_variant()
+        choice = mdir / 'chosen_lod.json'
+        for damage in (b'{"lod": "0p4", "appro', b'[1, 2]'):
+            choice.write_bytes(damage)
+            with self.assertRaises(guard.Unreadable):
+                actions.set_lod(self.root, {'id': mid, 'lod': '0p2'})
+            with self.assertRaises(guard.Unreadable):
+                self.act(mid, 'approve', lod='0p4', glb_sha256='0' * 64)
+            self.assertEqual(choice.read_bytes(), damage)
+            self.assertTrue(self.tabs()['3d'][mid]['damaged'])
+        choice.unlink()
+        self.assertEqual(actions.set_lod(self.root, {'id': mid, 'lod': '0p2'})['lod'], '0p2')
+
+
+@unittest.skipUnless(os.name == 'nt', 'junctions')
+class RecheckContainmentTest(RecheckCase):
+    """Finding 14: every nested destination is resolved again right before use; a link or junction on the way is refused."""
+
+    def junction(self, link):
+        import _winapi
+        outside = Path(self.temp.name) / f'outside_{link.name}'
+        outside.mkdir()
+        link.parent.mkdir(parents=True, exist_ok=True)
+        _winapi.CreateJunction(str(outside), str(link))
+        return outside
+
+    def test_driver_refuses_a_linked_hyper3d_folder(self):
+        mid, v, task_id, gen = self.frozen()
+        outside = self.junction(mv.models_dir(self.mroot, 'Giant Rat', v) / 'hyper3d')
+        verdict = monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
+        self.assertEqual((verdict['status'], verdict['step']), ('failed', 'check'))
+        self.assertIn('link or junction', verdict['error'])
+        self.assertEqual((list(outside.iterdir()), self.calls()), ([], []))                        # nothing written, nothing started
+
+    def test_driver_refuses_a_linked_snapshot_upload_or_reduced_folder(self):
+        mid, v, task_id, gen = self.frozen()
+        mdir = mv.models_dir(self.mroot, 'Giant Rat', v)
+        outside = self.junction(mdir / 'hyper3d' / f'inputs_{gen}')
+        verdict = monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
+        self.assertEqual(verdict['status'], 'failed')
+        self.assertEqual((list(outside.iterdir()), self.calls()), ([], []))
+        os.rmdir(mdir / 'hyper3d' / f'inputs_{gen}')
+        up = self.junction(mdir / 'hyper3d' / 'upload_inputs')
+        verdict = monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
+        self.assertEqual(verdict['status'], 'failed')
+        self.assertEqual((list(up.iterdir()), self.calls()), ([], []))
+        os.rmdir(mdir / 'hyper3d' / 'upload_inputs')
+        red = self.junction(mdir / 'reduced')
+        verdict = monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
+        self.assertEqual(verdict['status'], 'failed')
+        self.assertEqual((list(red.iterdir()), self.calls()), ([], []))
+
+    def test_snapshot_and_recovery_destinations_are_checked(self):
+        mid, v, task_id, gen = self.frozen()
+        mdir, vdir = mv.models_dir(self.mroot, 'Giant Rat', v), mv.views_dir(self.mroot, 'Giant Rat', v)
+        outside = self.junction(mdir / 'hyper3d')
+        snap, problem = monster_lane.snapshot_inputs(mdir / 'hyper3d', vdir, self.vj(v)['frozen'], self.mroot)
+        self.assertIsNone(snap)
+        self.assertIn('refusing', problem)
+        self.assertEqual(list(outside.iterdir()), [])
+        # an interrupted Reconvert whose folder was swapped for a junction: recovery opens no lock and renames nothing through it
+        os.rmdir(mdir / 'hyper3d')
+        os.rmdir(mdir)
+        elsewhere = self.junction(mdir)
+        (elsewhere / mv.RECONVERT_JOURNAL).write_text(json.dumps({'schema': 1, 'moves': [['reduced', 'reduced_prev_20261125T000000']],
+                                                                  'generation': 'x'}))
+        (elsewhere / 'reduced_prev_20261125T000000').mkdir()
+        out = mv.recover_reconverts(self.root)
+        self.assertTrue(out and 'error' in out[0])
+        self.assertEqual(sorted(p.name for p in elsewhere.iterdir()), [mv.RECONVERT_JOURNAL, 'reduced_prev_20261125T000000'])
+
+
+class RecheckViewsTest(RecheckCase):
+    """Finding 15 (app side): png_check is the one validator; a good image with bad provenance is repaired, not redrawn; one
+    terminal-state rule for the item phase and the unattended freeze."""
+
+    def test_app_uses_the_runners_validator(self):
+        import png_check
+        mid, v = self.pick_rat()
+        vdir = mv.views_dir(self.mroot, 'Giant Rat', v)
+        self.finish_views('Giant Rat', v, ('left', 'back', 'right'))
+        from PIL import Image
+        Image.new('RGBA', (16, 16), (0, 0, 0, 0)).save(vdir / 'left.png')                         # completely invisible
+        Image.new('RGB', (16, 16), (200, 0, 0)).save(vdir / 'back.png')
+        for view in ('left', 'back', 'right'):
+            self.assertEqual(mv.png_problem(vdir / f'{view}.png'), png_check.png_problem(vdir / f'{view}.png'))
+        self.assertIn('solid pixels', mv.view_problem(vdir, 'left'))
+        self.assertIn('not RGBA', mv.view_problem(vdir, 'back'))
+        self.assertEqual(mv.available_views(vdir), ['front', 'right'])
+        with self.assertRaises(mv.Missing):
+            mv.freeze(vdir, ['front.png', 'left.png'])                                            # freeze
+        with self.assertRaises(mv.Missing):
+            self.convert(mid, ['front.png', 'left.png'])                                          # convert
+        self.assertEqual(self.act(mid, 'view_retry', view='left')['state'], 'pending')            # retry: the runner would reject it too
+        (vdir / 'right.prompts.json').write_text('[1]')                                           # provenance must be a JSON OBJECT
+        self.assertEqual(mv.view_problem(vdir, 'right'), 'right.prompts.json: ' + png_check.provenance_problem(vdir / 'right.prompts.json'))
+
+    def test_repair_provenance_keeps_the_image(self):
+        mid, v = self.pick_rat()
+        vdir = mv.views_dir(self.mroot, 'Giant Rat', v)
+        self.finish_views('Giant Rat', v, ('left', 'back', 'right'))
+        name = mv.view_task_name('Giant Rat', v, 'left')
+        status = self.root / '.codex_jobs/_batch/status' / f'{name}.json'
+        guard.write_atomic(status, json.dumps({'state': 'failed', 'reason': 'provenance', 'error': 'left.prompts.json: provenance missing',
+                                               'attempts': 1, 'jobs': [{'job': f'{name}-a01'}]}).encode())   # the runner's verdict
+        (vdir / 'left.prompts.json').unlink()
+        (vdir / 'back.prompts.json').write_text('not json at all')
+        image = (vdir / 'left.png').read_bytes()
+        views = {x['name']: x for x in mv.item(self.root, mid)['views']}
+        self.assertEqual([(views[n]['valid'], views[n]['retry'], views[n]['repair']) for n in ('left', 'back', 'right')],
+                         [(False, False, 'provenance'), (False, False, 'provenance'), (True, False, None)])
+        with self.assertRaises(ValueError) as caught:
+            self.act(mid, 'view_retry', view='left')                                              # never a regeneration
+        self.assertIn('view_repair', str(caught.exception))
+        self.assertEqual((vdir / 'left.png').read_bytes(), image)
+        r = self.act(mid, 'view_repair', view='left')
+        self.assertEqual((r['record'], r['moved_aside'], r['prompt_source']), ('left.prompts.json', None, f'.codex_jobs/_batch/tasks/{name}.json'))
+        record = json.loads((vdir / 'left.prompts.json').read_text())
+        task = json.loads((self.root / '.codex_jobs/_batch/tasks' / f'{name}.json').read_text())
+        self.assertEqual((record['job_prompt'], record['view'], record['variant'], record['sha256']),
+                         (task['prompt'], 'left', v, hashlib.sha256(image).hexdigest()))
+        self.assertEqual(record['prompt'], monster_prompts.image_prompt('left', 'Giant Rat', COLOURS))
+        self.assertEqual((vdir / 'left.png').read_bytes(), image)                                 # the image was not touched
+        self.assertEqual(json.loads(status.read_text())['state'], 'failed')                       # the runner marks it done (REPAIRED) itself
+        r = self.act(mid, 'view_repair', view='back')
+        self.assertTrue(r['moved_aside'].startswith('back.prompts.json.invalid-'))                # the bad record is kept aside
+        self.assertEqual((vdir / r['moved_aside']).read_text(), 'not json at all')
+        self.assertEqual(mv.available_views(vdir), ['front', 'left', 'back', 'right'])
+        with self.assertRaises(ValueError):
+            self.act(mid, 'view_repair', view='left')                                             # valid already
+        (vdir / 'right.png').write_bytes(png('opaque', opaque=True))
+        (vdir / 'right.prompts.json').unlink()
+        with self.assertRaises(ValueError):
+            self.act(mid, 'view_repair', view='right')                                            # a bad IMAGE is Retry's
+        self.assertEqual({x['name']: (x['retry'], x['repair']) for x in mv.item(self.root, mid)['views']}['right'], (True, None))
+
+    def test_one_terminal_state_rule_for_the_phase_and_the_unattended_freeze(self):
+        mid, v = self.pick_rat(unattended=True)
+        vdir = mv.views_dir(self.mroot, 'Giant Rat', v)
+        tasks = self.root / '.codex_jobs/_batch/tasks'
+        for path in tasks.glob('*.json'):                       # the descriptors are gone (never written, or lost)
+            path.unlink()
+        for view in ('left', 'back'):
+            (vdir / f'{view}.png').write_bytes(png(f'hand {view}'))
+            (vdir / f'{view}.prompts.json').write_text('{"prompt": "p"}')
+        # right: no descriptor and no image -> BOTH say "still coming"
+        self.assertEqual(mv.item(self.root, mid)['phase'], 'generating')
+        self.assertEqual(mv.auto_freeze(self.root), [])
+        (vdir / 'right.png').write_bytes(png('hand right'))
+        # right: a good image without provenance -> still BOTH waiting; the UI offers the repair
+        self.assertEqual(mv.item(self.root, mid)['phase'], 'generating')
+        self.assertEqual(mv.auto_freeze(self.root), [])
+        self.assertEqual({x['name']: x['repair'] for x in mv.item(self.root, mid)['views']}['right'], 'provenance')
+        self.act(mid, 'view_repair', view='right')
+        # every planned view is a valid file without a descriptor -> BOTH are settled (it used to be `choose` here and a wait forever there)
+        self.assertEqual(mv.item(self.root, mid)['phase'], 'choose')
+        self.assertEqual(mv.auto_freeze(self.root), [f'Giant Rat/{v}'])
+        self.assertEqual(self.vj(v)['frozen']['files'], ['front.png', 'left.png', 'back.png', 'right.png'])
+
+
+class RecheckDescriptorTest(RecheckCase):
+    """Phase 5 row 10: old undigested / unguarded monster view descriptors are found on withdraw and never left to the runner."""
+
+    def legacy(self, v, view='left', guarded=False, **extra):
+        name = f'mviews--Giant_Rat--{v}--{view}'                # the name before the canonical digest was part of it
+        desc = {'name': name, 'launcher': 'monsters', 'monster': 'Giant Rat', 'variant': v, 'view': view, 'prompt': 'old', 'outputs': []}
+        if guarded:
+            desc['guard'] = {'file': 'x', 'key': 'pick_gen', 'value': 'y'}
+        path = self.root / '.codex_jobs/_batch/tasks' / f'{name}.json'
+        guard.write_atomic(path, json.dumps(desc | extra).encode())
+        return name, path
+
+    def test_withdraw_finds_and_withdraws_old_names(self):
+        cid = 'mconcept:Giant Rat/codex1'
+        v = self.act(cid, 'approve')['variant']
+        name, path = self.legacy(v)
+        self.assertNotIn(name, [mv.view_task_name('Giant Rat', v, x) for x in mv.EXTRA_VIEWS])
+        self.assertIn(name, mv.variant_descriptors(self.root, 'Giant Rat', v))
+        guard.write_atomic(self.root / '.codex_jobs/_batch/status' / f'{name}.json', json.dumps({'state': 'running', 'attempts': 1}).encode())
+        with self.assertRaises(guard.Conflict):                                                  # an old-named job that started blocks the undo
+            self.act(cid, 'unapprove', to='concepts')
+        self.assertTrue(path.exists())
+        (self.root / '.codex_jobs/_batch/status' / f'{name}.json').unlink()
+        self.act(cid, 'unapprove', to='concepts')
+        self.assertEqual(list((self.root / '.codex_jobs/_batch/tasks').glob('*.json')), [])        # the old name was withdrawn too
+        self.assertEqual(len(list((self.root / '.codex_jobs/_batch/tasks').glob('*.withdrawn-*'))), 4)
+
+    def test_unguarded_descriptors_are_reconciled_before_dispatch(self):
+        cid = 'mconcept:Giant Rat/codex1'
+        v = self.act(cid, 'approve')['variant']
+        tasks = self.root / '.codex_jobs/_batch/tasks'
+        current = tasks / f'{mv.view_task_name("Giant Rat", v, "left")}.json'
+        current.unlink()                                        # only the old descriptor exists for `left`
+        old_left, old_left_path = self.legacy(v, 'left')
+        orphan, orphan_path = self.legacy('9', 'back')          # a variant that does not exist (withdrawn long ago)
+        running, running_path = self.legacy(v, 'right')
+        guard.write_atomic(self.root / '.codex_jobs/_batch/status' / f'{running}.json', json.dumps({'state': 'running'}).encode())
+        desc = json.loads((tasks / f'{mv.view_task_name("Giant Rat", v, "back")}.json').read_text())
+        self.assertTrue(mv.guard_ok(desc))
+        out = monster_lane.tick(self.root)
+        self.assertIn(f'{old_left}: republished', out['recovered'])
+        self.assertIn(f'{orphan}: withdrawn', out['recovered'])
+        self.assertFalse(old_left_path.exists() or orphan_path.exists())
+        self.assertTrue(mv.guard_ok(json.loads(current.read_text())))                             # the guarded, digested descriptor replaces it
+        self.assertTrue(running_path.exists())                                                   # a running one is only reported
+        self.assertTrue(any(running in e for e in out['errors']))
+        left = [p.name for p in tasks.glob('*.json')]
+        self.assertEqual(sorted(left), sorted([f'{mv.view_task_name("Giant Rat", v, x)}.json' for x in mv.EXTRA_VIEWS] + [f'{running}.json']))
+        self.assertEqual(monster_lane.tick(self.root)['recovered'], [])                           # idempotent
+        # a current-named descriptor that lost its guard is not left to the runner either
+        desc.pop('guard')
+        (tasks / f'{desc["name"]}.json').write_text(json.dumps(desc))
+        out = monster_lane.tick(self.root)
+        self.assertIn(f'{desc["name"]}: republished', out['recovered'])
+        self.assertTrue(mv.guard_ok(json.loads((tasks / f'{desc["name"]}.json').read_text())))
 
 
 class MigrateCliTest(MonsterCase):

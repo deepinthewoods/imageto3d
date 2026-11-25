@@ -9,6 +9,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -18,6 +19,7 @@ import convert_queue as cq  # noqa: E402
 import tripo_browser_lock as tbl  # noqa: E402
 
 REAL_NAP = cq.nap
+REAL_CONVERT = cq.convert
 
 
 def done(stdout='', returncode=0, stderr=''):
@@ -317,9 +319,61 @@ class JobEligibleTests(unittest.TestCase):
         ok, why = cq.job_eligible(self.root, 'set_a--abc')
         self.assertEqual((ok, why), (False, 'every unconverted module is being converted by another worker'))
 
+    # ---- recheck-before-cutover finding 16: root-scoped, bounded, read-only
+    def tree(self, root):
+        return sorted(str(p.relative_to(root)) for p in root.rglob('*'))
+
+    def test_a_temp_root_query_creates_nothing_in_the_imported_checkout_or_in_the_root(self):
+        self.job()
+        other = Path(tempfile.mkdtemp())                                             # stands in for the imported (real) checkout
+        self.addCleanup(lambda: __import__('shutil').rmtree(other, ignore_errors=True))
+        before = self.tree(self.root)
+        with mock.patch.object(cq.portable, 'ROOT', other):
+            self.assertTrue(cq.job_eligible(self.root, 'set_a--abc')[0])
+        self.assertEqual(self.tree(other), [])                                       # no sidecar under the imported checkout root
+        self.assertEqual(self.tree(self.root), before)                               # and none under the queried root either
+        self.assertFalse((self.root / '.codex_jobs' / '_batch' / 'record_locks').exists())
+
+    def hold_record_lock(self, record):
+        """A separate process that holds the record's lock of THIS root the way a writer does (convert_job.update_record)."""
+        code = ('import sys, time; sys.path.insert(0, sys.argv[1]); import portable\n'
+                'with portable.file_lock(sys.argv[2], exclusive=True, sidecar=True, root=sys.argv[3]):\n'
+                '    print("held", flush=True); time.sleep(60)\n')
+        child = subprocess.Popen([sys.executable, '-c', code, str(Path(cq.portable.__file__).parent), str(record), str(self.root)],
+                                 stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (child.kill(), child.wait(), child.stdout.close()))
+        self.assertEqual(child.stdout.readline().strip(), 'held')
+        return child
+
+    def test_a_held_record_lock_answers_record_busy_quickly(self):
+        job = self.job()
+        child = self.hold_record_lock(job / '.tripo-job.json')
+        started = time.monotonic()
+        self.assertEqual(cq.job_eligible(self.root, 'set_a--abc'), (False, 'record busy'))
+        self.assertLess(time.monotonic() - started, cq.PROBE_WAIT + 3)
+        child.kill()
+        child.wait()
+        self.assertTrue(cq.job_eligible(self.root, 'set_a--abc')[0])                 # only temporarily ineligible
+
+    def test_the_probe_lock_is_bounded_and_the_writers_default_still_blocks_and_creates(self):
+        job = self.job()
+        record = job / '.tripo-job.json'
+        with self.assertRaises(FileNotFoundError):                                   # a missing record, as before
+            with cq.portable.file_lock(self.root / 'nope.json', sidecar=True, timeout=0, create=False, root=self.root):
+                pass
+        with cq.portable.file_lock(record, exclusive=True, sidecar=True, root=self.root):   # the writers' form
+            pass
+        if cq.portable.WINDOWS:
+            self.assertTrue(cq.portable.record_lock_path(record, self.root).is_file())
+        self.hold_record_lock(record)
+        with self.assertRaises(cq.portable.LockBusy):
+            with cq.portable.file_lock(record, exclusive=False, sidecar=True, timeout=0.2, create=False, root=self.root):
+                pass
+
     def test_it_agrees_with_next_job(self):
         self.job()
-        with mock.patch.object(cq, 'ROOT', self.root), mock.patch.object(cq, 'LOCKS', self.locks):
+        with mock.patch.object(cq, 'ROOT', self.root), mock.patch.object(cq, 'LOCKS', self.locks), \
+                mock.patch.object(cq.portable, 'ROOT', self.root):   # the worker's record lock stays in the temp root too
             self.assertTrue(cq.job_eligible(self.root, 'set_a--abc')[0])
             job, owner = cq.next_job({'set_a'})
             self.assertEqual((job.name, owner), ('set_a--abc', True))
@@ -441,6 +495,112 @@ class WorkerStopTests(Base):
         started = time.time()
         REAL_NAP(30)
         self.assertLess(time.time() - started, 2)
+
+
+class DrainTests(Base):
+    """DESIGN_PHASE4 I.10 (pre-cut-over review finding 1): no intake during a drain; a child's drain exit is never a failure."""
+
+    def test_convert_drain_starts_no_job(self):
+        (self.batch / 'CONVERT_DRAIN').write_text(json.dumps({'reason': 'legacy convert worker drain'}))
+        self.assertEqual(cq.conversions_blocked(), 'CONVERT_DRAIN: legacy convert worker drain')
+        self.stop_on_nap(1)
+        with mock.patch.object(cq, 'next_job', side_effect=AssertionError('took a job')):
+            cq.main(['--sets', 'x', '--no-tripo'])
+        self.assertTrue(any('PAUSED (CONVERT_DRAIN: legacy convert worker drain)' in l for l in self.events()))
+        (self.batch / 'CONVERT_HOLD').write_text(json.dumps({'reason': 'supervisor restart'}))
+        self.assertEqual(cq.conversions_blocked(), 'CONVERT_HOLD: supervisor restart')       # the hold is named first
+
+    def test_a_drain_exit_is_deferred_and_never_counted(self):
+        self.code = cq.DRAIN_EXIT
+        self.assertEqual(cq.DRAIN_EXIT, 76)
+        jobs = iter([(self.job, True)])
+
+        def next_job(sets):
+            (self.batch / 'CONVERT_DRAIN').write_text('{}')                          # the drain begins while the child waits at its gate
+            return next(jobs)
+        self.stop_on_nap(1)
+        with mock.patch.object(cq, 'next_job', side_effect=next_job):
+            cq.main(['--sets', 'set_a', '--no-tripo'])
+        self.assertEqual(len(self.converts), 1)                                      # no fallback backend, no second job
+        self.assertFalse((self.batch / 'convert_locks' / 'set_a--abc.fails').exists())
+        events = self.events()
+        self.assertTrue(any(' DEFERRED set_a--abc: ' in l for l in events), events)
+        self.assertFalse(any('FAILED' in l for l in events), events)
+        self.assertTrue(any('PAUSED (CONVERT_DRAIN' in l for l in events), events)
+
+    def test_a_drain_exit_on_the_tripo_path_reads_no_balance_again(self):
+        self.code = cq.DRAIN_EXIT
+        reads = []
+        jobs = iter([(self.job, True)])
+
+        def next_job(sets):
+            (self.batch / 'CONVERT_DRAIN').write_text('{}')
+            return next(jobs)
+        self.stop_on_nap(1)
+        with mock.patch.object(cq, 'next_job', side_effect=next_job), \
+                mock.patch.object(cq, 'read_tripo_balance', lambda wait=None: reads.append(1) or (30, None)):
+            cq.main(['--sets', 'set_a'])
+        self.assertEqual((len(reads), self.converts), (1, [['--max-submits', '1']]))
+        self.assertFalse((self.batch / 'convert_locks' / 'set_a--abc.fails').exists())
+
+    def test_the_children_are_told_that_this_worker_knows_the_drain_exit(self):
+        seen = {}
+
+        def run(cmd, **kwargs):
+            seen.update(kwargs.get('env') or {})
+            return done()
+        with mock.patch.object(cq, 'convert', REAL_CONVERT), mock.patch.object(cq, 'LOGS', self.batch / 'convert_logs'), \
+                mock.patch.object(cq.subprocess, 'run', run):
+            cq.convert(self.job, [])
+        self.assertEqual(seen.get(cq.DRAIN_AWARE_ENV), '1')
+
+
+class OwnerTests(Base):
+    """Pre-cut-over review finding 2: a listed id authorizes a job only when its recorded owner agrees."""
+
+    def stage(self, name, parent=None):
+        job = self.root / 'multiview_ready' / name
+        job.mkdir(parents=True)
+        record = {'set': name.split('--')[0], 'job_id': name.split('--')[1], 'modules': [{'race_gender': 'human_male', 'module': 'outfit'}]}
+        (job / '.tripo-job.json').write_text(json.dumps(record | ({'parent_set': parent} if parent else {})))
+        return job
+
+    def namespace(self, text):
+        path = self.root / '.codex_jobs' / '_app' / 'set_namespace.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def test_the_reviewers_case_is_not_dispatched(self):
+        self.stage('cape_human_male--abcdef', parent='cape_human_male')                 # an independent set's job
+        self.namespace(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
+        sets = {'cape', 'cape_human_male'}                                              # the family id was written for cape
+        self.assertEqual(cq.next_job(sets), (None, False))
+        self.assertEqual(cq.next_job(sets), (None, False))
+        owner = [l for l in self.events() if ' OWNER ' in l]
+        self.assertEqual(len(owner), 1, owner)                                          # reported once
+        self.assertIn('for the set cape', owner[0])
+
+    def test_rules(self):
+        self.assertEqual(cq.read_namespace(self.root), ({}, {}))                        # no preview app record: the list alone decides
+        self.assertTrue(cq.owner_allows(self.root, 'a_gnome--1', {}, ['a_gnome'])[0])
+        self.assertTrue(cq.owner_allows(self.root, 'a_gnome--1', {'parent_set': 'a'}, ['a', 'a_gnome'])[0])
+        self.assertFalse(cq.owner_allows(self.root, 'a_gnome--1', {'parent_set': 'a'}, ['a_gnome'])[0])     # its parent is not listed
+        self.assertFalse(cq.owner_allows(self.root, 'a_gnome--1', {'parent_set': 'a'}, ['a', 'a_gnome', '!a'])[0])
+        self.assertFalse(cq.owner_allows(self.root, 'a_gnome--1', {'parent_set': 7}, ['a_gnome'])[0])
+        self.namespace(json.dumps({'sets': {'a': 'x', 'b_gnome': 'x'}, 'families': {'a_gnome': 'a'}}))
+        self.assertTrue(cq.owner_allows(self.root, 'a_gnome--1', {}, ['a', 'a_gnome'])[0])
+        self.assertFalse(cq.owner_allows(self.root, 'a_gnome--1', {}, ['a_gnome'])[0])                      # registered for a: a must be listed
+        self.assertFalse(cq.owner_allows(self.root, 'b_gnome--1', {'parent_set': 'b'}, ['b', 'b_gnome'])[0])   # b_gnome is a set of its own
+        self.assertTrue(cq.owner_allows(self.root, 'b_gnome--1', {'parent_set': 'b_gnome'}, ['b_gnome'])[0])
+        self.namespace('{broken')
+        self.assertIsNone(cq.read_namespace(self.root))
+        self.assertFalse(cq.owner_allows(self.root, 'a_gnome--1', {'parent_set': 'a'}, ['a', 'a_gnome'])[0])   # cannot be verified
+        self.assertTrue(cq.owner_allows(self.root, 'a--1', {}, ['a'])[0])
+
+    def test_an_owned_job_is_taken(self):
+        job = self.stage('cape_human_male--abcdef', parent='cape')
+        self.namespace(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
+        self.assertEqual(cq.next_job({'cape', 'cape_human_male'}), (job, True))
 
 
 if __name__ == '__main__':

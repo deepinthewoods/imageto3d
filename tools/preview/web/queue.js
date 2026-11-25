@@ -20,6 +20,8 @@ const TONE = { running: 'info', starting: 'info', queued: 'info', done: 'ok', fa
 const OP_TEXT = { retry: ['Retrying', 'Retry'], cancel: ['Cancelled', 'Cancel'], kill_retry: ['Killed and re-queued', 'Kill & retry'], kill: ['Killed', 'Kill'] };
 const ACTIVE = ['running', 'starting', 'stalled', 'orphan'];
 const isActive = task => ACTIVE.includes(task.state);
+/** What identifies a displayed task beyond its row number: {key, generation?} (generation: the frozen view list of a monster conversion). */
+const identity = task => ({ ...(task.key ? { key: task.key } : {}), ...(task.generation ? { generation: task.generation } : {}) });
 
 /** Sets whose card carries a "stale n" badge (the stale scan found their published builds, or their bare builds, out of date). */
 const staleSets = () => ['3d', 'aligned', 'completed'].flatMap(tab => state.tabs[tab] || [])
@@ -87,7 +89,9 @@ export function mountQueue(container) {
     if (busy.has(task.id)) return;
     busy.add(task.id);
     try {
-      await api.queueOp(kind, task.id, kind === 'kill_retry' && task.token ? { token: task.token } : undefined);
+      // the task as displayed: its key (and, for a monster conversion, its frozen generation). The server acts on THAT task and answers
+      // 409 `changed` when the row number means another task by now (a rebuilt queue renumbers its rows).
+      await api.queueOp(kind, task.id, { ...identity(task), ...(kind === 'kill_retry' && task.token ? { token: task.token } : {}) });
       toast(`${OP_TEXT[label][0]} task ${task.id}`, { ms: 2000 });
     } catch (error) {
       if (!error.conflict) toast(`${OP_TEXT[label][1]} failed: ${error.message}`);
@@ -102,7 +106,7 @@ export function mountQueue(container) {
     if (busy.has(task.id)) return;
     busy.add(task.id);
     try {
-      const result = await runNowTask(task.id);
+      const result = await runNowTask({ id: task.id, ...identity(task) });
       if (result) toast(result.warning ? `Run now: ${result.warning}` : `Task ${task.id} starts now`, { ms: result.warning ? 8000 : 2500 });
     } catch (error) {
       toast(`Run now failed: ${error.message}`);

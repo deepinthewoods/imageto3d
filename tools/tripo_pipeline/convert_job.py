@@ -76,6 +76,13 @@ Usage (from the imageto3d folder):
   command) get $IMAGETO3D_PAID_GATE (`paid_gate.env_for(ROOT)`, or the one this process inherited) and check it again right before
   their credit-capable click. A child that stopped there exits 4 (nothing clicked; its record unchanged or set aside): this process
   waits for the gate again and repeats the step; it is never counted as a failure.
+- Drain (DESIGN_PHASE4 I.10; pre-cut-over review finding 1): while this process is BLOCKED at the gate (nothing paid in flight) it keeps
+  `.codex_jobs/_batch/gate_wait/<pid>.json` = {pid, create_time, job, module, step, since} (removed when it leaves the gate). When
+  `.codex_jobs/_batch/CONVERT_DRAIN` exists while it waits (the service manager drains an older convert worker; the file alone also
+  closes the gate), it releases its module lock, marks the module in the job record's `deferred` (not a failure; removed when the module
+  converts), writes `.codex_jobs/_batch/drain_exits/<pid>_<ms>.json` = {pid, ppid, job, module, step, time, fails_before, parent_aware,
+  lock_released} and exits 76 (DRAIN_EXIT; not 75, which is a busy Tripo browser profile). A current convert_queue.py (it sets $IMAGETO3D_DRAIN_AWARE) never counts that exit as a
+  failure; the manager restores the failure count an older worker wrote for it. Re-running the job continues it.
 --dry-run: opens Studio, fills the form and screenshots it without pressing Generate.
 --max-submits N: submit at most N new modules in this run (e.g. what the Tripo credit balance covers); the others are
   skipped, the job stays in processing/ with state `partially_converted` and the script exits 3. Re-run (e.g. with
@@ -123,6 +130,9 @@ PAUSE = ROOT / '.codex_jobs/_batch/PAUSE'   # tools/pipeline_supervisor.py: no p
 CONVERT_HOLD = ROOT / '.codex_jobs/_batch/CONVERT_HOLD'   # preview app service manager (DESIGN_PHASE4 I.1): no paid step while it exists
 _IMPORT_ROOT = ROOT
 GATE_POLL = 15   # seconds between looks at PAUSE / CONVERT_HOLD while a paid step waits
+DRAIN_EXIT = 76  # exit code (75 = Tripo browser busy, tripo_browser_lock.EXIT_BUSY): left a closed gate because CONVERT_DRAIN exists; the module is deferred, never a failure
+DRAIN_AWARE_ENV = 'IMAGETO3D_DRAIN_AWARE'   # set by a convert_queue.py that does not count DRAIN_EXIT as a failure
+_RUN = {'job': None, 'record': None, 'lock': None}   # main(): the job name, its record path and the module lock this process holds
 BLENDER = portable.default_blender()   # $BLENDER, else /usr/local/bin/blender (Linux) / the newest installed Blender (Windows)
 portable.utf8_environment()            # Windows: child python / Blender processes read and write UTF-8
 SPLIT_METHODS = ('segment-first', 'per-face', 'none')
@@ -173,13 +183,26 @@ def _gate_json(path):
     return data if isinstance(data, dict) else None
 
 
+def drain_files():
+    """(CONVERT_DRAIN, gate_wait/, drain_exits/) under the batch folder of the current ROOT (DESIGN_PHASE4 I.10)."""
+    batch = gate_files()[1].parent
+    return batch / 'CONVERT_DRAIN', batch / 'gate_wait', batch / 'drain_exits'
+
+
+def drain_requested():
+    """CONVERT_DRAIN exists (readable or not): a process blocked at the gate leaves instead of waiting."""
+    return drain_files()[0].exists()
+
+
 def conversion_gate():
     """Why a paid step must wait right now, else None: CONVERT_HOLD exists, or PAUSE exists and its scope covers conversions
-    (a PAUSE without a readable scope counts: fail closed)."""
+    (a PAUSE without a readable scope counts: fail closed), or CONVERT_DRAIN exists (a drain without its hold still closes the gate)."""
     pause, hold = gate_files()
     if hold.exists():
         data = _gate_json(hold) or {}
         return f'CONVERT_HOLD: {data.get("reason") or "conversion hold"}'
+    if drain_requested():
+        return f'CONVERT_DRAIN: {(_gate_json(drain_files()[0]) or {}).get("reason") or "conversion drain"}'
     if pause.exists():
         data = _gate_json(pause)
         scope = (data or {}).get('scope')
@@ -188,17 +211,106 @@ def conversion_gate():
     return None
 
 
+def _own_create_time():
+    try:
+        import psutil
+        return psutil.Process(os.getpid()).create_time()
+    except Exception:   # noqa: BLE001  (no psutil: the pid alone names this process)
+        return None
+
+
+def _write_json_atomic(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f'{path.name}.{os.getpid()}.tmp')
+    temp.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+    os.replace(temp, path)
+
+
+def gate_wait_path():
+    return drain_files()[1] / f'{os.getpid()}.json'
+
+
+def gate_wait_enter(key, step):
+    """Record that this process is blocked at the gate (nothing paid in flight): gate_wait/<pid>.json. Never raises."""
+    try:
+        _write_json_atomic(gate_wait_path(), {'pid': os.getpid(), 'create_time': _own_create_time(), 'job': _RUN.get('job'), 'module': key,
+                                              'step': step, 'since': time.time()})
+    except OSError:
+        pass
+
+
+def gate_wait_leave():
+    try:
+        gate_wait_path().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _fails_before():
+    """The job's current failure count (`convert_locks/<job>.fails`): 0 when absent, None when unknown."""
+    if not _RUN.get('job'):
+        return None
+    path = gate_files()[1].parent / 'convert_locks' / f'{_RUN["job"]}.fails'
+    try:
+        return int(path.read_text(encoding='utf-8').strip())
+    except FileNotFoundError:
+        return 0
+    except (OSError, ValueError):
+        return None
+
+
+def leave_for_drain(key, step, reason):
+    """Leave a closed gate because CONVERT_DRAIN exists (DESIGN_PHASE4 I.10): nothing paid is in flight here. The module lock this process
+    holds is released, the module is marked `deferred` in the job record (not a failure, not a state change), the exit is recorded in
+    drain_exits/ for the manager (which restores the failure count an older worker writes for a non-zero exit) and the process exits
+    DRAIN_EXIT. Every step is best effort: the exit itself always happens."""
+    now = time.time()
+    lock, released = _RUN.get('lock'), False
+    try:
+        if lock is not None and lock_holder(lock) == os.getpid():
+            lock.unlink(missing_ok=True)
+            released = True
+    except OSError:
+        pass
+    _RUN['lock'] = None
+    note = {'time': time.strftime('%Y-%m-%dT%H:%M:%S', time.localtime(now)), 'step': step, 'reason': reason, 'pid': os.getpid()}
+    if _RUN.get('record') is not None:
+        try:
+            update_record(_RUN['record'], lambda r: r.setdefault('deferred', {}).__setitem__(key, note))
+        except (OSError, ValueError) as error:
+            print(f'== {key}: the deferral could not be written to the job record ({error})', flush=True)
+    try:
+        _write_json_atomic(drain_files()[2] / f'{os.getpid()}_{int(now * 1000)}.json',
+                           {'pid': os.getpid(), 'create_time': _own_create_time(), 'ppid': os.getppid(), 'job': _RUN.get('job'),
+                            'module': key, 'step': step, 'reason': reason, 'time': now, 'fails_before': _fails_before(),
+                            'parent_aware': bool(os.environ.get(DRAIN_AWARE_ENV)), 'lock_released': released})
+    except OSError as error:
+        print(f'== {key}: the drain exit could not be recorded ({error})', flush=True)
+    print(f'== {key}: DEFERRED (CONVERT_DRAIN while waiting at the gate: {reason}); nothing paid in flight, module lock '
+          f'{"released" if released else "not held"}; exit {DRAIN_EXIT} before {step}', flush=True)
+    gate_wait_leave()
+    raise SystemExit(DRAIN_EXIT)
+
+
 def wait_for_gate(key, step):
-    """Block (printing once) while conversion_gate() says a paid step must wait; returns at once when it is open."""
+    """Block (printing once) while conversion_gate() says a paid step must wait; returns at once when it is open. While it blocks it
+    keeps gate_wait/<pid>.json; with CONVERT_DRAIN it leaves through leave_for_drain (exit DRAIN_EXIT) instead of waiting."""
     announced = False
-    while True:
-        reason = conversion_gate()
-        if not reason:
-            break
-        if not announced:
-            print(f'== {key}: PAUSED ({reason}); waiting before {step}', flush=True)
-            announced = True
-        time.sleep(GATE_POLL)
+    try:
+        while True:
+            reason = conversion_gate()
+            if not reason:
+                break
+            if drain_requested():
+                leave_for_drain(key, step, reason)
+            if not announced:
+                print(f'== {key}: PAUSED ({reason}); waiting before {step}', flush=True)
+                announced = True
+                gate_wait_enter(key, step)
+            time.sleep(GATE_POLL)
+    finally:
+        if announced:
+            gate_wait_leave()
     if announced:
         print(f'== {key}: pause/hold lifted; {step}', flush=True)
 
@@ -248,26 +360,33 @@ def wait_for_child_gate(key, step, child_env):
     """After a child's exit GATE_CLOSED: wait (printing once) until the gate the CHILD was given is open again (its extra `cmd`
     included), so a gate that only the child's check sees as closed never turns into a tight respawn loop."""
     announced = False
-    while True:
-        reason = paid_gate.closed_reason(child_env)
-        if not reason:
-            break
-        if not announced:
-            print(f'== {key}: PAUSED ({reason}); waiting before {step}', flush=True)
-            announced = True
-        time.sleep(GATE_POLL)
+    try:
+        while True:
+            reason = paid_gate.closed_reason(child_env)
+            if not reason:
+                break
+            if drain_requested():   # the child stopped before its click: nothing paid in flight (DESIGN_PHASE4 I.10)
+                leave_for_drain(key, step, reason)
+            if not announced:
+                print(f'== {key}: PAUSED ({reason}); waiting before {step}', flush=True)
+                announced = True
+                gate_wait_enter(key, step)
+            time.sleep(GATE_POLL)
+    finally:
+        if announced:
+            gate_wait_leave()
 
 
 # Several queue workers may convert different modules of one job at once: each module is claimed with a lock
 # file, and the job record is only ever read-modified-written under an exclusive lock (portable.file_lock: flock on
 # Linux; on Windows a sidecar `<record>.lock` byte lock that readers take exclusively too).
 def read_record(path):
-    with portable.file_lock(path, exclusive=False, sidecar=True):
+    with portable.file_lock(path, exclusive=False, sidecar=True, root=ROOT):   # the sidecar of THIS root (a temp root in tests)
         return json.loads(Path(path).read_text(encoding='utf-8-sig'))
 
 
 def update_record(path, change):
-    with portable.file_lock(path, exclusive=True, sidecar=True):
+    with portable.file_lock(path, exclusive=True, sidecar=True, root=ROOT):
         record = json.loads(Path(path).read_text(encoding='utf-8-sig'))
         change(record)
         Path(path).write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
@@ -839,6 +958,7 @@ def main(argv):
             job = staged
     record_path = job / '.tripo-job.json'
     record = read_record(record_path)
+    _RUN.update(job=job_name, record=None if dry_run else record_path, lock=None)
     record.setdefault('module_conversion', {})
     locks = ROOT / 'models' / record['set'] / record['job_id'] / '.module_locks'
     summary, errors, elsewhere = {}, [], []
@@ -883,8 +1003,10 @@ def main(argv):
                 elsewhere.append(key)
                 summary[key] = 'being converted by another worker'
                 continue
+            _RUN['lock'] = lock
             if module_converted(read_record(record_path), key, out):  # finished by another worker meanwhile
                 lock.unlink(missing_ok=True)
+                _RUN['lock'] = None
                 summary[key] = 'already converted'
                 continue
         if submission.exists():  # collect with the backend that submitted it
@@ -992,8 +1114,16 @@ def main(argv):
                                                 regenerate_reason(info)['text']}
                                                if previous.get('free_retries_exhausted') and regenerate_reason(info) else {})}
         entry_done = record['module_conversion'][key]
-        record = update_record(record_path, lambda r: r.setdefault('module_conversion', {}).__setitem__(key, entry_done))
+
+        def module_done(r, key=key, entry_done=entry_done):
+            r.setdefault('module_conversion', {})[key] = entry_done
+            if isinstance(r.get('deferred'), dict):      # a module that left a drain earlier (DESIGN_PHASE4 I.10) is converted now
+                r['deferred'].pop(key, None)
+                if not r['deferred']:
+                    del r['deferred']
+        record = update_record(record_path, module_done)
         lock.unlink(missing_ok=True)
+        _RUN['lock'] = None
         summary[key] = {k: v['triangles'] for k, v in levels.items()} | {'review': review}
     unfinished = []
     if not dry_run:

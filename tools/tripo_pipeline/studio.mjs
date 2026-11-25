@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { gatedPaidClick } from './paid_click.mjs';
 
 const [command, sourceArg, outputArg, topologyArg] = process.argv.slice(2);
 if (!['submit', 'collect', 'retry', 'balance'].includes(command)) throw new Error('Usage: node studio.mjs submit <views_dir> <output_dir> [Triangle|Quad] | collect <output_dir> | retry <previous_output_dir> <output_dir> | balance');
@@ -55,15 +56,28 @@ if(!process.env[LOCK_ENV]){
  if(run.error)console.error(`cannot reserve the Tripo profile (${run.error.message}); not opening it`);
  process.exit(run.status ?? 1);
 }
+// Browser lifetime (recheck-before-cutover finding 18): the reservation belongs to the python holder; if it dies, this process and
+// its Firefox still have the profile open. So `verify --register-pid` records this node process beside the profile (pid + create
+// time, <profile>.imageto3d.pid; it prints the path) and the next acquirer treats the profile as busy while this process, or a
+// Firefox started on the profile, still runs. The file is removed only after the command ended normally (context closed); after
+// an error it stays and the next acquirer clears it once nothing uses the profile.
+let browserPidFile=null;
 {
- const check=spawnSync(PY,['-X','utf8',LOCK_TOOL,'verify','--profile',profile,'--lock',process.env[LOCK_ENV],'--token',process.env[TOKEN_ENV]??''],{encoding:'utf8',stdio:['ignore','pipe','pipe']});
+ const check=spawnSync(PY,['-X','utf8',LOCK_TOOL,'verify','--profile',profile,'--lock',process.env[LOCK_ENV],'--token',process.env[TOKEN_ENV]??'','--register-pid',String(process.pid)],{encoding:'utf8',stdio:['ignore','pipe','pipe']});
  if(check.status!==0){
   console.error(`Tripo profile reservation refused: ${((check.stdout||'')+(check.stderr||'')).trim().split('\n')[0]||check.error?.message||`verify exit ${check.status}`}; not opening ${profile}`);
   process.exit(1);
  }
+ browserPidFile=(check.stdout||'').trim().split('\n').pop()||null;
+}
+function unregisterBrowser(){
+ if(!browserPidFile)return;
+ try{if(JSON.parse(fs.readFileSync(browserPidFile,'utf8')).pid===process.pid)fs.unlinkSync(browserPidFile);}catch{}
 }
 // Click-time paid gate (DESIGN_PHASE4 I.8, tools/paid_gate.py): with IMAGETO3D_PAID_GATE set (convert_job passes it to a paid submit)
 // the gate is checked right before the Generate click; null = open (or no gate: a manual run), else the reason it is closed.
+// Recheck finding 6: "right before" means AFTER Playwright's actionability wait (paid_click.mjs gatedPaidClick: trial click first,
+// then this gate, then the intent and a dispatch with a short bounded timeout), never before an auto-waiting click().
 const GATE_TOOL = fileURLToPath(new URL('../paid_gate.py',import.meta.url));
 const EXIT_GATE_CLOSED = 4;
 function paidGateClosed(){
@@ -192,23 +206,43 @@ async function submit(){
   // Studio disables Generate while another model of this account is generating; wait it out
   // rather than failing (a failed click is never charged, but leaves a stale record).
   const queueDeadline=Date.now()+Number(process.env.TRIPO_QUEUE_WAIT_MIN??30)*60000;
-  while(!(await generate.isEnabled())){
-   if(Date.now()>queueDeadline)throw new Error('Generate stayed disabled; another Studio generation may be stuck');
-   record.status='waiting_for_studio_queue';write(record);await page.waitForTimeout(15000);
+  // Finding 6: every wait (the Studio queue, the upload slots, Playwright's actionability: visible, stable, enabled, not covered)
+  // ends BEFORE the paid gate is asked; the gate, the intent and the dispatch then follow at once (gatedPaidClick).
+  let click;
+  for(let attempt=1;;attempt++){
+   while(!(await generate.isEnabled())){
+    if(Date.now()>queueDeadline)throw new Error('Generate stayed disabled; another Studio generation may be stuck');
+    record.status='waiting_for_studio_queue';write(record);await page.waitForTimeout(15000);
+   }
+   click=await gatedPaidClick({control:generate,gateClosed:paidGateClosed,
+    stillReady:async()=>{const empty=await pending();return empty.length?`Upload slot emptied before Generate: ${empty.join(', ')}`:null;},
+    writeIntent:()=>{record.status='submission_attempted';record.submit_clicked_at=new Date().toISOString();write(record);}});
+   if(click.outcome!=='not_actionable')break;
+   if(attempt>=3){
+    // never clicked, no intent written: the record is set aside so a resume submits fresh
+    record.status='not_clicked';record.not_clicked=click.error;write(record);
+    fs.renameSync(recordPath,recordPath.replace(/\.json$/,`.not_clicked_${Date.now()}.json`));
+    throw new Error(`Generate was not clicked (${click.error})`);
+   }
+   record.status='waiting_for_generate_control';record.generate_not_actionable=click.error;write(record);await page.waitForTimeout(5000);
   }
-  if((await pending()).length)throw new Error(`Upload slot emptied before Generate: ${(await pending()).join(', ')}`);
-  const gate=paidGateClosed();   // immediately before the intent and the click: the queue wait above can last 30 min
-  if(gate){
+  if(click.outcome==='gate_closed'){
    // nothing was clicked: the record is set aside, so the resumed submit starts fresh; the caller waits for its gate (exit 4)
+   const gate=click.gate;
    record.status='gate_closed';record.gate_closed=gate;write(record);
    fs.renameSync(recordPath,recordPath.replace(/\.json$/,`.gate_closed_${Date.now()}.json`));
    console.error(`PAID GATE CLOSED: ${gate}`);process.exitCode=EXIT_GATE_CLOSED;return;
   }
-  record.status='submission_attempted';record.submit_clicked_at=new Date().toISOString();write(record);
-  await generate.click();await page.waitForTimeout(7000);
+  // 'clicked', or 'uncertain': the dispatch failed / timed out after the intent was written, so the click MAY have happened.
+  await page.waitForTimeout(7000);
   record.response=responses[0]??null;record.project_id=record.response?.project_id??page.url().match(/[a-f0-9-]{36}$/)?.[0]??null;
-  record.status=record.response?.code===0&&record.project_id?'submitted':'submission_needs_review';record.after_submit_at=new Date().toISOString();write(record);
-  await page.screenshot({path:path.join(output,'after_submit.png')});
+  const delivered=record.response?.code===0&&Boolean(record.project_id);
+  const uncertain=click.outcome==='uncertain'&&!delivered;
+  if(click.outcome==='uncertain'){record.click_delivery=delivered?'confirmed by the Studio response':'uncertain';record.click_error=click.error;}
+  if(uncertain)record.review='The Generate click may or may not have happened (the intent is kept): check the Studio workspace and the credit balance. This record is never re-clicked automatically.';
+  record.status=delivered?'submitted':'submission_needs_review';record.after_submit_at=new Date().toISOString();write(record);
+  await page.screenshot({path:path.join(output,'after_submit.png')}).catch(()=>{});
+  if(uncertain)throw new Error(`Generate click delivery is uncertain (${click.error}); ${recordPath} needs review and is not re-clicked`);
   console.log(JSON.stringify({status:record.status,project_id:record.project_id,task_id:record.response?.task_id,cost}));
  }catch(err){
   // never clicked Generate: move the record aside so a resume submits fresh instead of stopping on it
@@ -311,3 +345,4 @@ async function balance(){
  }finally{await context.close();}
 }
 if(command==='submit')await submit();else if(command==='retry')await retry();else if(command==='balance')await balance();else await collect();
+unregisterBrowser();   // reached only when the command ended normally: its browser context is closed

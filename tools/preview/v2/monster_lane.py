@@ -38,7 +38,7 @@ Before every step the gate is checked again. The LAST stdout line is the verdict
 
 GATE (identical to conversions): the conversion hold `.codex_jobs/_batch/CONVERT_HOLD` -> wait, never overridden; mode `pause` /
 `pause-conversions`, or a PAUSE file with `conversions` in its scope for a manual reason -> wait; a Run now confirmed while paused stores
-the PAUSE KEY it overrode (`override_pause` = `pause_key()`: the mode and its `since`, or the PAUSE file's `since` and reason) and overrides
+the PAUSE ID it overrode (`override_pause` = the `pause_id` of modes.manual_pause: unique per pause transition, recheck finding 5) and overrides
 only that pause (a new pause needs a new confirmation; an ordinary Retry clears Run now and the override, F4); mode `auto` / `views-run`
 -> only when the user is away (idle >= 300 s) and no "user active" PAUSE -> a per-task Run now overrides this idle gate only.
 `gate()['code']`: `held` | `paused` | `user_present` (None when open).
@@ -56,6 +56,7 @@ import shutil
 import stat
 import subprocess
 import sys
+import threading
 import time
 import uuid
 
@@ -84,7 +85,7 @@ PAID_LOG = 'paid_log.jsonl'
 PAID_ERRORS = 'paid_log_errors.json'
 CREDITS_PER_MODEL = 0.5            # what the confirmations SAY a conversion costs; never substituted for an unobserved amount (F5)
 PAID_KINDS = ('geometry', 'material_generate', 'material_confirm')    # = rodin_backend.COST_KINDS
-IDLE_REASONS = ('user active', 'user active (views keep running)')   # pipeline_supervisor: the screen-on pauses (not manual)
+IDLE_REASONS = modes.IDLE_REASONS  # pipeline_supervisor: the screen-on pauses (not manual)
 BUSY_TEXT = 'profile busy'
 TASK_ENV = {'PYTHONUTF8': '1', 'PYTHONUNBUFFERED': '1'}
 HOLD_FILE = 'CONVERT_HOLD'         # = services.HOLD_FILE (DESIGN_PHASE4.md I.1); read here without importing services (psutil)
@@ -94,7 +95,8 @@ CREATE_TOLERANCE = 1.0
 
 
 class ConfirmPaused(guard.Conflict):
-    """Run now while conversions are paused by hand: the client asks for confirmation, then sends `confirm: true` (HTTP 409)."""
+    """Run now while conversions are paused by hand (HTTP 409 `confirm`, body `pause_id`): the client asks the user, then sends
+    `confirm: true` AND the `pause_id` it showed (finding 5); an echoed id that is not the pause in force is answered the same way."""
     code = 'confirm'
 
 
@@ -211,43 +213,189 @@ def _generation_of(task: dict) -> tuple[str, str, str] | None:
     return (monster, variant, generation) if isinstance(generation, str) and generation else None
 
 
+def resolve_task(root: Path, task_id: object, key: object, generation: object) -> dict:
+    """The lane row the client DISPLAYED (finding 4): found by its `key`, with the frozen `generation` it was shown for; `task_id` is a
+    hint only (a rebuilt database assigns new row numbers, so an id may name another variant's task by now). 409 `changed` when that
+    identity is not in the queue any more; 400 without a key / generation."""
+    if not isinstance(key, str) or not key or not isinstance(generation, str) or not generation:
+        raise ValueError('key and generation are required: the conversion task the client displayed (a row number alone does not '
+                         'identify it)')
+    q = queue(root)
+    task = q.by_key(key)
+    if task is None and not q.health_view().get('ok'):
+        raise guard.Unreadable('the task queue cannot be read; try again shortly')
+    args = task.get('args') if task is not None and isinstance(task.get('args'), dict) else {}
+    if task is None or task['lane'] != LANE or args.get('frozen_sha') != generation or not key.endswith(f':{generation}'):
+        raise guard.Changed('the conversion task you were shown is not in the queue any more (the queue was rebuilt, or the views were '
+                            'chosen again); reload and look again', changes=['task'])
+    return task
+
+
+def task_ident(task: dict) -> dict:
+    """{key, generation} of a lane row: what every state change compares in its own transaction (taskqueue.check_identity)."""
+    return {'key': task['key'], 'generation': (task.get('args') or {}).get('frozen_sha')}
+
+
+# A disposition that could not be written to views.json is OUTSTANDING DURABLE WORK (finding 3): the intent is first written to
+# `.codex_jobs/_app/monster_lane/<variant key>.disposition.json` {pending: {<generation>: {value, time, error}}}, then views.json; the
+# intent is removed only once views.json carries it. While an intent is pending the orchestrator does NOT finish the row, every tick
+# retries the write (repair_dispositions), nothing queues that generation again, and the card / item / Queue errors show it.
+
+PENDING_SUFFIX = '.disposition.json'
+
+
+def pending_path(root: Path, monster: str, variant: str) -> Path:
+    return Path(root) / guard.APP / CHILDREN_DIR / f'{variant_key(monster, variant)}{PENDING_SUFFIX}'
+
+
+def _pending_lock(root: Path, monster: str, variant: str) -> guard.OsLock:
+    return guard.os_lock(Path(root) / guard.APP / 'locks' / 'mdisposition' / f'{variant_key(monster, variant)}.lock')
+
+
+def _read_pending(path: Path) -> dict:
+    """{generation: intent} of a pending-dispositions file ({} when absent). A file that cannot be read is `{"*": {error}}`: it blocks
+    every generation of the variant (indeterminate), and it is never replaced."""
+    try:
+        value = mv.read_strict(path, path.name)
+    except guard.Unreadable as exc:
+        return {'*': {'state': None, 'error': str(exc), 'unreadable': True}}
+    if value is None:
+        return {}
+    pending = value.get('pending')
+    if not isinstance(pending, dict) or any(not isinstance(v, dict) for v in pending.values()):
+        return {'*': {'state': None, 'error': f'{path.name}: not a pending-dispositions file', 'unreadable': True}}
+    return pending
+
+
+def pending_disposition(root: Path, monster: str, variant: str, generation: str) -> dict | None:
+    """The outstanding disposition write of a generation ({state, error, time, ...}), or None."""
+    try:
+        pending = _read_pending(pending_path(root, monster, variant))
+    except ValueError:
+        return None
+    return pending.get(generation) or pending.get('*')
+
+
+def _write_pending(path: Path, monster: str, variant: str, pending: dict) -> None:
+    if pending:
+        guard.write_atomic(path, mv.dump({'schema': 1, 'monster': monster, 'variant': variant, 'pending': pending}))
+    else:
+        path.unlink(missing_ok=True)
+
+
+def persist_disposition(root: Path, monster: str, variant: str, generation: str, value: dict) -> dict:
+    """Durably record `value` ({state, reason, key}) for a generation (finding 3): the intent file first, then views.json
+    (mv.set_disposition, idempotent for the same state), then the intent is dropped. ANY failure raises and leaves the intent (with the
+    error) behind; the caller must not finish the queue row then."""
+    path = pending_path(root, monster, variant)
+    with _pending_lock(root, monster, variant):
+        pending = _read_pending(path)
+        if '*' in pending:
+            raise guard.Unreadable(pending['*']['error'])
+        intent = {'state': value.get('state'), 'value': dict(value), 'time': guard.now(), 'error': None}
+        pending[generation] = intent
+        _write_pending(path, monster, variant, pending)        # the durable intent FIRST
+        try:
+            out = mv.set_disposition(root, monster, variant, generation, value)
+        except BaseException as exc:
+            intent['error'] = f'{type(exc).__name__}: {exc}'[:400]
+            try:
+                _write_pending(path, monster, variant, pending)
+            except OSError:
+                pass
+            raise
+        pending.pop(generation, None)
+        _write_pending(path, monster, variant, pending)
+    return out
+
+
+def repair_dispositions(root: Path) -> list[str]:
+    """HOOK (tick): write every outstanding disposition again. Returns the ones still open (shown in the orchestrator errors)."""
+    out = []
+    folder = Path(root) / guard.APP / CHILDREN_DIR
+    try:
+        paths = sorted(folder.glob(f'*{PENDING_SUFFIX}'))
+    except OSError:
+        return out
+    for path in paths:
+        try:
+            value = mv.read_strict(path, path.name) or {}
+            monster, variant = mv.safe_part(value.get('monster'), 'monster'), mv.check_variant(value.get('variant'))
+            if path != pending_path(root, monster, variant):
+                raise guard.Unreadable(f'{path.name} does not belong to {monster}/{variant}')
+            for generation, intent in sorted(_read_pending(path).items()):
+                if generation == '*' or not isinstance(intent.get('value'), dict):
+                    raise guard.Unreadable(str(intent.get('error') or f'{path.name}: invalid entry'))
+                try:
+                    persist_disposition(root, monster, variant, generation, intent['value'])
+                except Exception as exc:  # noqa: BLE001  (kept; retried at the next tick)
+                    out.append(f'{monster}/{variant}: the {intent.get("state")} of its conversion is not recorded yet '
+                               f'({type(exc).__name__}: {exc})')
+        except Exception as exc:  # noqa: BLE001
+            out.append(f'{path.name}: {type(exc).__name__}: {exc}')
+    return out
+
+
 def record_failure(root: Path, task: dict, error: str | None) -> None:
-    """HOOK (orchestrator, BEFORE it fails the row): persist `failed` for the task's generation (F4)."""
+    """HOOK (orchestrator, BEFORE it fails the row): persist `failed` for the task's generation (F4). RAISES when the record cannot be
+    written (finding 3): the orchestrator then leaves the row unfinished and tries again at its next pass; the intent stays on disk."""
     gen = _generation_of(task)
     if gen:
-        mv.set_disposition(root, gen[0], gen[1], gen[2], {'state': 'failed', 'reason': str(error or 'failed')[:300], 'key': task.get('key')})
+        persist_disposition(root, gen[0], gen[1], gen[2], {'state': 'failed', 'reason': str(error or 'failed')[:300], 'key': task.get('key')})
 
 
-def cancel_task(root: Path, task_id: int, detail: str = 'manual') -> bool:
-    """HOOK (Queue tab Cancel of a monster row): persist `cancelled` for the generation FIRST, then cancel the queued row; when the row was
-    no longer queued, the previous disposition is put back. False when it was not queued."""
+def cancel_task(root: Path, task: dict, detail: str = 'manual') -> bool:
+    """HOOK (Queue tab Cancel of a monster row; `task` = resolve_task's row): persist `cancelled` for the generation FIRST, then cancel
+    the queued row in a transaction that compares the displayed identity (finding 4). Finding 3:
+      - a row that is ALREADY cancelled (the dispatcher saw the new disposition and cancelled it first, or a repeated click) is the same
+        terminal state: success, the durable `cancelled` stands;
+      - when the row left the queue another way (it started), only OUR OWN write is taken back, and only while no newer disposition was
+        written (the variant's monotonic sequence): an older disposition is never put back over a newer one.
+    False when the row was not queued."""
     q = queue(root)
-    task = q.get(task_id)
-    if task is None or task['lane'] != LANE:
-        raise mv.not_found(f'Unknown monster conversion task {task_id}')
+    if task['lane'] != LANE:
+        raise mv.not_found(f'Unknown monster conversion task {task["id"]}')
     gen = _generation_of(task)
-    previous = None
-    if gen and task['state'] == 'queued':
-        previous = mv.set_disposition(root, gen[0], gen[1], gen[2], {'state': 'cancelled', 'reason': 'cancelled by the user', 'key': task['key']})
-    done = q.cancel(task_id, detail, manual_gen='manual')
-    if not done and gen and task['state'] == 'queued':
-        mv.set_disposition(root, gen[0], gen[1], gen[2], previous)
-    return done
+    value = {'state': 'cancelled', 'reason': 'cancelled by the user', 'key': task['key']}
+    if task['state'] == 'cancelled':
+        if gen and mv.disposition_of(mv.read_views_json(mv.views_dir(mv.mroot_of(root), gen[0], gen[1])), gen[2]) is None:
+            mv.set_disposition(root, gen[0], gen[1], gen[2], value)
+        return True
+    if task['state'] != 'queued':
+        return False
+    wrote = mv.set_disposition(root, gen[0], gen[1], gen[2], value) if gen else None
+    try:
+        done = q.cancel(task['id'], detail, manual_gen='manual', expect=task_ident(task))
+    except taskqueue.Expired as exc:
+        if wrote and wrote.get('written'):
+            mv.set_disposition(root, gen[0], gen[1], gen[2], None, expect_seq=wrote['seq'])
+        raise guard.Changed(f'{exc}; reload and look again', changes=['task']) from None
+    if done:
+        return True
+    now = q.by_key(task['key'])
+    if now is not None and now['state'] == 'cancelled':
+        return True                                            # the same terminal transition, made by the dispatcher first
+    if wrote and wrote.get('written'):
+        mv.set_disposition(root, gen[0], gen[1], gen[2], None, expect_seq=wrote['seq'])
+    return False
 
 
-def retry_task(root: Path, task_id: int) -> bool:
-    """HOOK (Retry of a failed / cancelled monster row, also Run now of one): the generation's disposition is cleared FIRST (the plan would
-    cancel the queued row otherwise), then the row is queued again; Retry also clears Run now and its pause override (taskqueue.retry)."""
+def retry_task(root: Path, task: dict) -> bool:
+    """HOOK (Retry of a failed / cancelled monster row, also Run now of one; `task` = resolve_task's row): the generation's disposition
+    is cleared FIRST (the plan would cancel the queued row otherwise), then the row is queued again in a transaction that compares the
+    displayed identity; Retry also clears Run now and its pause override (taskqueue.retry). A Retry that finds the row in another state
+    changes nothing back: whoever moved the row owns the newer state (finding 3)."""
     q = queue(root)
-    task = q.get(task_id)
-    if task is None or task['lane'] != LANE:
-        raise mv.not_found(f'Unknown monster conversion task {task_id}')
+    if task['lane'] != LANE:
+        raise mv.not_found(f'Unknown monster conversion task {task["id"]}')
     gen = _generation_of(task)
-    previous = mv.set_disposition(root, gen[0], gen[1], gen[2], None) if gen and task['state'] in ('failed', 'cancelled') else None
-    done = q.retry(task_id)
-    if not done and previous is not None:
-        mv.set_disposition(root, gen[0], gen[1], gen[2], previous)
-    return done
+    cleared = mv.set_disposition(root, gen[0], gen[1], gen[2], None) if gen and task['state'] in ('failed', 'cancelled') else None
+    try:
+        return q.retry(task['id'], expect=task_ident(task))
+    except taskqueue.Expired as exc:
+        if cleared and cleared.get('written') and isinstance(cleared.get('previous'), dict):
+            mv.set_disposition(root, gen[0], gen[1], gen[2], cleared['previous'], expect_seq=cleared['seq'])
+        raise guard.Changed(f'{exc}; reload and look again', changes=['task']) from None
 
 
 def active_reason(root: Path, monster: str, variant: str) -> str | None:
@@ -263,10 +411,7 @@ def active_reason(root: Path, monster: str, variant: str) -> str | None:
         raise guard.Unreadable('the task queue cannot be read; refusing while a conversion might be active')
     if driver_busy(root, monster, variant):
         return 'a conversion driver of this variant is running'
-    kids = live_children(root, monster, variant)
-    if kids:
-        return f'a process of the last conversion attempt still runs (pid {", ".join(str(k["pid"]) for k in kids)})'
-    return None
+    return tree_hold(root, monster, variant)
 
 
 def tick(root: Path) -> dict:
@@ -279,6 +424,8 @@ def tick(root: Path) -> dict:
     recovered = mv.recover_journals(root) + mv.recover_reconverts(root)
     errors += [r for r in recovered if ' error ' in r]
     errors += repair_accounting(root)
+    errors += repair_dispositions(root)                         # outstanding durable work first (finding 3)
+    recovered += mv.reconcile_descriptors(root, errors)          # no unguarded / old-named monster view task waits for the runner (row 10)
     frozen_now = mv.auto_freeze(root, errors)
     queued, restored = [], []
     if LANE in taskqueue.LANES:
@@ -296,6 +443,11 @@ def tick(root: Path) -> dict:
                     errors.append(f'{name}: the queue cannot be read')
                     continue
                 if row is not None:
+                    continue
+                pending = pending_disposition(root, entry['monster'], entry['variant'], entry['digest'])
+                if pending is not None:                         # indeterminate: never reconstructed automatically (finding 3)
+                    errors.append(f'{name}: the outcome of its conversion is not recorded in views.json yet '
+                                  f'({pending.get("error") or "pending"}); it is not queued again until that is written')
                     continue
                 disp = mv.disposition_of(entry['views_json'], entry['digest'])
                 if disp is not None:
@@ -324,41 +476,38 @@ def read_hold(root: Path) -> dict | None:
     return value if isinstance(value, dict) else {'reason': 'unreadable CONVERT_HOLD file'}
 
 
-def pause_key(root: Path) -> str | None:
-    """The identity of the manual pause of conversions now in force (None when there is none): the mode file's pause mode and `since`,
-    else the PAUSE file's `since` and reason (a "user active" PAUSE is the idle gate, not a manual pause). A confirmed Run now overrides
-    exactly this pause (F4)."""
-    mode = modes.read_mode(root)
-    if mode['mode'] in ('pause', 'pause-conversions'):
-        return f'mode:{mode["mode"]}:{mode.get("since")}'
-    pause = modes.read_pause(root)
-    if pause is not None and 'conversions' in (pause.get('scope') or []) and pause.get('reason') not in IDLE_REASONS:
-        return f'pause:{pause.get("since")}:{pause.get("reason")}'
-    return None
+def pause_id(root: Path) -> str | None:
+    """The `pause_id` of the manual pause of conversions now in force (modes.manual_pause; None when there is none). A confirmed Run now
+    overrides exactly this pause (finding 5): every pause transition has its own id, also two within one second."""
+    manual = modes.manual_pause(root)
+    return manual['pause_id'] if manual else None
 
 
 def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_known: bool = False) -> dict:
-    """Whether a monster conversion step may run now: {open, reason, code, mode, pause, pause_key, hold, idle, away, needs_confirm}.
-    `idle` = the user's idle seconds (None + idle_known=False: read presence.json / GetLastInputInfo). `code`: held | paused | user_present
-    | None. `args.override_pause` overrides a manual pause only while it equals pause_key() (the pause the user confirmed)."""
+    """Whether a monster conversion step may run now: {open, reason, code, mode, pause, pause_id, paused, pause_reason, hold, idle, away,
+    needs_confirm}. `idle` = the user's idle seconds (None + idle_known=False: read presence.json / GetLastInputInfo). `code`: held |
+    paused | user_present | None. `paused` / `pause_id` / `pause_reason` describe the manual pause in force whatever else closes the gate;
+    `args.override_pause` overrides a manual pause only while it equals `pause_id` (the pause the user confirmed, finding 5)."""
     args = args or {}
-    mode = modes.read_mode(root)['mode']
+    mode_rec = modes.read_mode(root)
+    mode = mode_rec['mode']
     pause = modes.read_pause(root)
     hold = read_hold(root)
-    key = pause_key(root)
+    manual = modes.manual_pause(root, mode_rec, pause)
+    key = manual['pause_id'] if manual else None
     if idle is None and not idle_known:
         idle, _source = modes.idle_seconds()
     away = idle is not None and idle >= modes.AWAY_AFTER
     run_now = bool(args.get('run_now'))
     override = isinstance(args.get('override_pause'), str) and key is not None and args['override_pause'] == key
-    out = {'open': True, 'reason': None, 'code': None, 'mode': mode, 'pause': pause, 'pause_key': key, 'hold': hold, 'idle': idle,
-           'away': away, 'needs_confirm': False}
+    out = {'open': True, 'reason': None, 'code': None, 'mode': mode, 'pause': pause, 'pause_id': key, 'paused': manual is not None,
+           'pause_reason': manual['reason'] if manual else None, 'hold': hold, 'idle': idle, 'away': away, 'needs_confirm': False}
     if hold is not None:                                   # never overridden: the supervisor is (re)starting or has not ticked yet
         return out | {'open': False, 'code': 'held', 'reason': f'conversions are held (CONVERT_HOLD: {hold.get("reason") or "no reason"}); '
                       'they wait until the running supervisor completes a tick'}
     paused_conv = pause is not None and 'conversions' in (pause.get('scope') or [])
     idle_pause = paused_conv and pause.get('reason') in IDLE_REASONS
-    if mode in ('pause', 'pause-conversions') and not override:
+    if mode in modes.PAUSE_MODES and not override:
         return out | {'open': False, 'code': 'paused', 'reason': f'conversions are paused (mode {mode})', 'needs_confirm': True}
     if paused_conv and not idle_pause and not override:
         return out | {'open': False, 'code': 'paused', 'reason': f'conversions are paused ({pause.get("reason") or "PAUSE file"})',
@@ -383,7 +532,8 @@ def gate_command(root: Path, args: dict, idle: float | None = None, idle_known: 
 
 def plan_starts(root: Path, now: float | None = None, idle: float | None = None, idle_known: bool = False) -> dict:
     """HOOK (orchestrator `_start_monsters`): {start: [task] (0 or 1), cancel: [(task, reason)], waiting: {task id: reason}, active: n}.
-    At most LIMIT attempts of the lane run at once (a variant whose earlier attempt left a live child counts as active, F14); every queued
+    At most LIMIT attempts of the lane run at once (a variant whose earlier attempt left a live process, or a process tree that is
+    not fully known, counts as active: F14, finding 9); every queued
     row of the lane is considered, Run now rows FIRST (F18); a queued task that is no longer wanted is to be cancelled; a damaged one waits;
     the first queued task whose gate is open is started (the gate is per task: Run now opens it for that task only)."""
     q = queue(root)
@@ -408,8 +558,12 @@ def plan_starts(root: Path, now: float | None = None, idle: float | None = None,
             out['waiting'][task['id']] = 'another monster conversion is running'
             continue
         gen = _generation_of(task)
-        if gen and live_children(root, gen[0], gen[1]):
-            out['waiting'][task['id']] = 'a process of the previous attempt still runs'
+        held = tree_hold(root, gen[0], gen[1]) if gen else None
+        if held:
+            out['waiting'][task['id']] = held
+            continue
+        if gen and pending_disposition(root, gen[0], gen[1], gen[2]) is not None:
+            out['waiting'][task['id']] = 'the outcome of the last attempt is not recorded yet'
             continue
         g = gate(root, task.get('args'), idle, idle_known)
         if g['open']:
@@ -457,32 +611,43 @@ def finish_outcome(root: Path, task: dict, result: dict) -> dict:
     return {'outcome': 'failed', 'error': str(last.get('error') or f'exit code {result.get("exit")}'), 'delay': 0.0}
 
 
-def run_now(root: Path, task_id: object, confirm: bool = False) -> dict:
-    """HOOK (POST /api/v2/queue {op: "run_now", id, confirm?}): mark a queued (or failed / cancelled: queued again through retry_task)
-    monster conversion to run now. It overrides the idle gate; while conversions are paused by hand it needs `confirm: true` (409 `confirm`
-    otherwise) and then overrides THAT pause (its pause_key) for this task. The conversion hold (CONVERT_HOLD) is never overridden: the task
-    is marked and starts when the hold lifts (the answer carries a `warning`)."""
-    if isinstance(task_id, bool) or not isinstance(task_id, int):
-        raise ValueError('id (a task number) is required')
+def run_now(root: Path, task_id: object, confirm: bool = False, key: object = None, generation: object = None,
+            pause_id: object = None) -> dict:
+    """HOOK (POST /api/v2/queue {op: "run_now", id, key, generation, confirm?, pause_id?}): mark a queued (or failed / cancelled: queued
+    again through retry_task) monster conversion to run now. The task is the one the client DISPLAYED (`key` + `generation`; `id` is a
+    hint; 409 `changed` when it expired, finding 4) and every state change compares that identity in its own transaction. Run now
+    overrides the idle gate. While conversions are paused by hand it needs `confirm: true` AND the `pause_id` the user was shown (409
+    `confirm` with the current `pause_id` otherwise, also when the echoed id is not the pause in force any more); the override then holds
+    for THAT pause only (finding 5). The conversion hold (CONVERT_HOLD) is never overridden: the task is marked and starts when the hold
+    lifts (the answer carries a `warning`)."""
+    task = resolve_task(root, task_id, key, generation)
+    ident, task_id = task_ident(task), task['id']
     q = queue(root)
-    task = q.get(task_id)
-    if task is None or task['lane'] != LANE:
-        raise mv.not_found(f'Unknown monster conversion task {task_id}')
     g = gate(root, {'run_now': True})
-    if not g['open'] and g['needs_confirm'] and not confirm:
-        raise ConfirmPaused(f'{g["reason"]}: run this conversion anyway? (it pays {CREDITS_PER_MODEL} Hyper3D credits)')
-    if task['state'] in ('failed', 'cancelled'):
-        check = task_check(root, task)
-        if not check['wanted'] or check['damaged']:
-            raise ValueError(f'task {task_id} cannot run: {check["why"]}')
-        retry_task(root, task_id)
-    elif task['state'] != 'queued':
-        raise ValueError(f'task {task_id} is {task["state"]}; Run now is for a queued task')
-    override = g['pause_key'] if (confirm and g['needs_confirm']) else None
-    if not q.mark_run_now(task_id, override):
-        raise ValueError(f'task {task_id} is no longer queued')
+    override = None
+    if g['paused']:
+        if not confirm:
+            raise ConfirmPaused(f'conversions are paused ({g["pause_reason"]}): run this conversion anyway? (it pays {CREDITS_PER_MODEL} '
+                                'Hyper3D credits)', pause_id=g['pause_id'])
+        if not isinstance(pause_id, str) or pause_id != g['pause_id']:
+            raise ConfirmPaused(f'the pause changed since you were asked: conversions are paused ({g["pause_reason"]}) now. Run this '
+                                f'conversion anyway? (it pays {CREDITS_PER_MODEL} Hyper3D credits)', pause_id=g['pause_id'])
+        override = g['pause_id']
+    try:
+        if task['state'] in ('failed', 'cancelled'):
+            check = task_check(root, task)
+            if not check['wanted'] or check['damaged']:
+                raise ValueError(f'task {task_id} cannot run: {check["why"]}')
+            retry_task(root, task)
+        elif task['state'] != 'queued':
+            raise ValueError(f'task {task_id} is {task["state"]}; Run now is for a queued task')
+        if not q.mark_run_now(task_id, override, expect=ident):
+            raise ValueError(f'task {task_id} is no longer queued')
+    except taskqueue.Expired as exc:
+        raise guard.Changed(f'{exc}; reload and look again', changes=['task']) from None
     mv.invalidate()
-    out = {'ok': True, 'id': task_id, 'state': 'queued', 'run_now': True, 'override_pause': bool(override), 'pause_key': override}
+    out = {'ok': True, 'id': task_id, 'key': task['key'], 'generation': ident['generation'], 'state': 'queued', 'run_now': True,
+           'override_pause': bool(override), 'pause_id': override}
     if g['code'] == 'held':
         out['warning'] = g['reason']
     return out
@@ -518,29 +683,55 @@ def _number(value) -> float | None:
     return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
 
 
+PROVIDER_IDS = ('provider_action_id',)
+ACTION_COSTS = ('observed_cost',)
+
+
+def advance_evidence(record: dict, kind: str) -> str | None:
+    """The evidence that a paid action was CHARGED (finding 8), or None: `actions[<kind>].confirmed_at`, which the backend
+    (rodin_backend) writes only when it saw the paid stage advance (with `confirmed_by`, `stage_before` / `stage_after`, the balances).
+    Nothing else counts: not a cleared `pending_action`, not an observed stage, not the record's status. An unconfirmed click keeps
+    `pending_action` and gets a `paid_review` note in the record."""
+    actions = record.get('actions') if isinstance(record.get('actions'), dict) else {}
+    entry = actions.get(kind) if isinstance(actions.get(kind), dict) else {}
+    if not entry.get('confirmed_at'):
+        return None
+    how = entry.get('confirmed_by')
+    return f'confirmed {entry["confirmed_at"]}' + (f' by {how}' if how else '')
+
+
 def paid_actions(record: dict | None) -> list[dict]:
-    """The credit-capable actions a submission record names (F5): [{action, status, credits, id}]. `status` confirmed = the backend
-    observed the next stage after the click (its pending intent was cleared); uncertain = the intent is still pending (the click may or may
-    not have happened). `credits` = the cost observed on the page for that click, None when it was not observed (never assumed). An action
-    observed at cost 0 is free and not listed. `id` = `hyper3d:<model id>:<action>` (the provider's stable identity)."""
+    """The credit-capable actions a submission record names (F5, finding 8): [{action, status, credits, id, provider_id, evidence,
+    model_id}]. `status` confirmed ONLY when the backend recorded `actions[<kind>].confirmed_at` (advance_evidence); otherwise uncertain
+    (the click may or may not have happened; a cleared intent alone proves nothing). `credits` = the cost the backend observed for that
+    click (`actions[<kind>].observed_cost`, else `observed_cost_<kind>.credits`), None when it was not observed (never assumed). An action
+    observed at cost 0 is free and not listed. `id` = `hyper3d:<model id>:<action>` (the ledger identity); `provider_id` = the provider's
+    own action id when the backend recorded one."""
     if not isinstance(record, dict):
         return []
     actions = record.get('actions') if isinstance(record.get('actions'), dict) else {}
-    pending = record.get('pending_action')
     model = record.get('model_id') if isinstance(record.get('model_id'), str) and record.get('model_id') else None
     out = []
     for kind in PAID_KINDS:
         if kind not in actions:
             continue
-        observed = record.get(f'observed_cost_{kind}')
-        credits = _number(observed.get('credits')) if isinstance(observed, dict) else None
+        entry = actions[kind] if isinstance(actions[kind], dict) else {}
+        costs = [entry.get(f).get('credits') if isinstance(entry.get(f), dict) else entry.get(f) for f in ACTION_COSTS]
+        credits = next((n for n in map(_number, costs) if n is not None), None)
+        if credits is None:
+            observed = record.get(f'observed_cost_{kind}')
+            credits = _number(observed.get('credits')) if isinstance(observed, dict) else None
         if credits == 0:
             continue
-        out.append({'action': kind, 'status': 'uncertain' if pending == kind else 'confirmed', 'credits': credits,
-                    'id': f'hyper3d:{model}:{kind}' if model else None})
+        evidence = advance_evidence(record, kind)
+        out.append({'action': kind, 'status': 'confirmed' if evidence else 'uncertain', 'credits': credits,
+                    'id': f'hyper3d:{model}:{kind}' if model else None,
+                    'provider_id': next((str(entry[f]) for f in PROVIDER_IDS if isinstance(entry.get(f), (str, int)) and entry[f]), None),
+                    'evidence': evidence, 'model_id': entry.get('model_id') if isinstance(entry.get('model_id'), str) else model})
     committed = _number(record.get('credits_committed'))
     if not out and committed and committed > 0:                  # credits committed without a named paid action (an older record)
-        out.append({'action': 'committed', 'status': 'uncertain', 'credits': committed, 'id': f'hyper3d:{model}:committed' if model else None})
+        out.append({'action': 'committed', 'status': 'uncertain', 'credits': committed, 'id': f'hyper3d:{model}:committed' if model else None,
+                    'provider_id': None, 'evidence': None, 'model_id': model})
     return out
 
 
@@ -564,23 +755,45 @@ def accounting_error(root: Path, record_path: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
-def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], record_path: Path, record: dict | None) -> str | None:
+def _stored_actions(info: object) -> list[dict]:
+    """The paid actions an unrepaired write error carries (its evidence: ledger id, provider id, observed amount, status)."""
+    actions = info.get('actions') if isinstance(info, dict) else None
+    return [a for a in actions if isinstance(a, dict) and isinstance(a.get('action'), str)] if isinstance(actions, list) else []
+
+
+def _merge_actions(rec_text: str, *lists: list[dict]) -> list[dict]:
+    """One action per ledger id; a later list wins, except that a confirmed action is never downgraded."""
+    out: dict[str, dict] = {}
+    for actions in lists:
+        for action in actions:
+            ident = action.get('id') or f'record:{rec_text}:{action["action"]}'
+            prev = out.get(ident)
+            if prev is not None and prev.get('status') == 'confirmed' and action.get('status') != 'confirmed':
+                continue
+            out[ident] = dict(action) | {'id': ident}
+    return list(out.values())
+
+
+def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], record_path: Path, record: dict | None,
+                   stored: list[dict] | None = None) -> str | None:
     """Bring paid_log.jsonl in line with a record (F5), on every run: one entry per provider action id, appended when it is new or its
     status / amount changed (a confirmed entry is final). An older lane's entry (no `id`) for the same record and model covers its
     geometry click. A write error is kept in paid_log_errors.json (shown in the Queue and the item) until a later reconcile succeeds; the
-    error text is returned (None = in line)."""
+    error text is returned (None = in line).
+    Finding 8: the error entry STORES the actions it could not log ({id, provider_id, action, status, credits, model_id, evidence}), so a
+    repair does not depend on the record still being at `record_path` (Reconvert moves it): `stored` = those actions; they are logged
+    even when the record is gone or belongs to another model by now."""
     rec_text = Path(record_path).as_posix()
-    wanted = paid_actions(record)
+    wanted = _merge_actions(rec_text, stored or [], paid_actions(record))
     try:
         with guard.os_lock(Path(root) / guard.APP / 'paid_log.lock'):
             entries = paid_entries(root)
             last = {e['id']: e for e in entries if isinstance(e.get('id'), str)}
-            legacy = any(e.get('record') == rec_text and 'id' not in e and e.get('model_id') == (record or {}).get('model_id')
-                         for e in entries)
             new = []
             for action in wanted:
-                ident = action['id'] or f'record:{rec_text}:{action["action"]}'
+                ident = action['id']
                 prev = last.get(ident)
+                legacy = any(e.get('record') == rec_text and 'id' not in e and e.get('model_id') == action.get('model_id') for e in entries)
                 if prev is None and legacy and action['action'] in ('geometry', 'committed'):
                     continue
                 if prev is not None and (prev.get('status') == 'confirmed' or
@@ -588,7 +801,8 @@ def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], rec
                     continue
                 new.append({'time': guard.now(), 'kind': 'hyper3d', 'id': ident, 'action': action['action'], 'status': action['status'],
                             'credits': action['credits'], 'monster': monster, 'variant': variant, 'views': list(files),
-                            'record': rec_text, 'model_id': (record or {}).get('model_id')})
+                            'record': rec_text, 'model_id': action.get('model_id'), 'provider_id': action.get('provider_id'),
+                            'evidence': action.get('evidence')})
             if new:
                 path = paid_log_path(root)
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -604,7 +818,9 @@ def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], rec
         text = f'the paid log could not be written ({type(exc).__name__}: {exc})'
         try:
             errors = _read_errors(root)
-            errors[rec_text] = {'time': guard.now(), 'error': text, 'monster': monster, 'variant': variant, 'views': list(files)}
+            kept = _merge_actions(rec_text, _stored_actions(errors.get(rec_text)), wanted)     # the evidence travels with the repair
+            errors[rec_text] = {'time': guard.now(), 'error': text, 'monster': monster, 'variant': variant, 'views': list(files),
+                                'model_id': (record or {}).get('model_id'), 'actions': kept}
             guard.write_atomic(paid_errors_path(root), mv.dump(errors))
         except OSError:
             pass                                               # the verdict and the task row still carry the text
@@ -612,15 +828,25 @@ def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], rec
 
 
 def repair_accounting(root: Path) -> list[str]:
-    """HOOK (tick): retry the paid-log reconciliation of every record with an unrepaired write error. Returns the errors still open."""
+    """HOOK (tick): retry the paid-log reconciliation of every record with an unrepaired write error, from the evidence STORED with the
+    error (finding 8) plus the record when it is still the same model's. An error whose record is gone and that carries no stored action
+    cannot be resolved: it stays listed (never cleared silently). Returns the errors still open."""
     out = []
     for rec_text, info in list(_read_errors(root).items()):
         if not isinstance(info, dict) or not isinstance(info.get('monster'), str):
             out.append(f'paid log: {rec_text}: {info}')
             continue
+        stored = _stored_actions(info)
         record = mv.read_json(Path(rec_text), None)
-        error = reconcile_paid(root, info['monster'], str(info.get('variant')), list(info.get('views') or []), Path(rec_text),
-                               record if isinstance(record, dict) else None)
+        record = record if isinstance(record, dict) else None
+        if record is not None and stored and info.get('model_id') is not None and record.get('model_id') != info.get('model_id'):
+            record = None                                      # another conversion's record sits at that path now (Reconvert)
+        if record is None and not stored:
+            out.append(f'paid log: {info["monster"]}/{info.get("variant")}: the record {rec_text} is gone and the error carries no '
+                       f'stored action; check {PAID_LOG} by hand ({info.get("error")})')
+            continue
+        error = reconcile_paid(root, info['monster'], str(info.get('variant')), list(info.get('views') or []), Path(rec_text), record,
+                               stored=stored)
         if error:
             out.append(f'paid log: {info["monster"]}/{info.get("variant")}: {error}')
     return out
@@ -628,7 +854,8 @@ def repair_accounting(root: Path) -> list[str]:
 
 def paid_summary(root: Path) -> dict:
     """{count, credits (confirmed, observed amounts), unknown_amounts (confirmed without an observed amount), uncertain {count, credits},
-    recent, errors}: the last entry of every provider action id counts; entries of an older lane (no id) count as confirmed."""
+    recent, errors}: the last entry of every provider action id counts; entries of an older lane (no id) count as confirmed. An action is
+    `confirmed` only with evidence that its paid stage advanced (paid_actions, finding 8)."""
     entries = [e for e in paid_entries(root) if e.get('kind') == 'hyper3d']
     by_id, legacy = {}, []
     for entry in entries:
@@ -688,7 +915,8 @@ def _create_time(pid: int | None) -> float | None:
 
 
 def _alive(pid: object, create: object) -> bool:
-    """The recorded process (pid + create time) is still running."""
+    """The recorded process (pid + create time) is still running. Without a recorded create time any live process with that pid counts
+    (that keeps a slot held; it is never enough to SIGNAL the process: see `_proven`)."""
     if psutil is None or not isinstance(pid, int) or pid <= 0:
         return False
     actual = _create_time(pid)
@@ -697,33 +925,225 @@ def _alive(pid: object, create: object) -> bool:
     return not isinstance(create, (int, float)) or abs(actual - float(create)) <= CREATE_TOLERANCE
 
 
+def _proven(pid: object, create: object) -> bool:
+    """The live process `pid` IS the recorded one: a recorded create time that matches. The only identity a signal may rely on."""
+    return isinstance(create, (int, float)) and not isinstance(create, bool) and _alive(pid, create)
+
+
+# ---- Windows Job Object (finding 9) ------------------------------------------------------------------------------------------------
+# The driver process of an attempt (`monster_lane.py run`) creates a NAMED job object (no limits: JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE is
+# off) and assigns ITSELF before it starts any child, so every descendant (collector, browser, reducer, Blender and whatever they start)
+# is in the job from its first instruction. The job's name is recorded in the children file; the orchestrator opens it by name while the
+# driver lives and KEEPS that handle, so it owns the whole tree through the driver's exit: the job says exactly which processes of the
+# attempt still run (grandchildren included) and can terminate them all. Without a job (not Windows, the assignment failed, or the
+# orchestrator restarted after the driver died, which makes the name unreachable) the lane falls back to the processes recorded as
+# they appeared, and keeps the slot whenever that evidence is incomplete.
+
+JOB_PREFIX = 'Local\\imageto3d-mlane-'
+JOB_OBJECT_ASSIGN_PROCESS, JOB_OBJECT_QUERY, JOB_OBJECT_TERMINATE = 0x0001, 0x0004, 0x0008
+JOB_PROCESS_ID_LIST = 3                # JOBOBJECTINFOCLASS.JobObjectBasicProcessIdList
+ERROR_MORE_DATA = 234
+_K32 = None
+_JOBS: dict[str, tuple[str, int]] = {}  # children file -> (job name, handle held by THIS process)
+_JOBS_LOCK = threading.Lock()
+
+
+def _k32():
+    """kernel32 with the job functions typed (None off Windows)."""
+    global _K32
+    if os.name != 'nt':
+        return None
+    if _K32 is None:
+        import ctypes
+        from ctypes import wintypes
+        k = ctypes.WinDLL('kernel32', use_last_error=True)
+        k.CreateJobObjectW.restype, k.CreateJobObjectW.argtypes = wintypes.HANDLE, [ctypes.c_void_p, wintypes.LPCWSTR]
+        k.OpenJobObjectW.restype, k.OpenJobObjectW.argtypes = wintypes.HANDLE, [wintypes.DWORD, wintypes.BOOL, wintypes.LPCWSTR]
+        k.AssignProcessToJobObject.restype, k.AssignProcessToJobObject.argtypes = wintypes.BOOL, [wintypes.HANDLE, wintypes.HANDLE]
+        k.GetCurrentProcess.restype, k.GetCurrentProcess.argtypes = wintypes.HANDLE, []
+        k.QueryInformationJobObject.restype = wintypes.BOOL
+        k.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+        k.TerminateJobObject.restype, k.TerminateJobObject.argtypes = wintypes.BOOL, [wintypes.HANDLE, wintypes.UINT]
+        k.CloseHandle.restype, k.CloseHandle.argtypes = wintypes.BOOL, [wintypes.HANDLE]
+        _K32 = k
+    return _K32
+
+
+def job_create(name: str) -> int | None:
+    """A new named job object with default limits (nothing is killed when its handles close). None when it cannot be made."""
+    k = _k32()
+    if k is None:
+        return None
+    return k.CreateJobObjectW(None, name) or None
+
+
+def job_assign_self(handle: int) -> bool:
+    """Put THIS process into the job: every child it starts from now on is in the job too."""
+    k = _k32()
+    return bool(k and k.AssignProcessToJobObject(handle, k.GetCurrentProcess()))
+
+
+def job_open(name: str) -> int | None:
+    """A query + terminate handle of a named job that still exists (None otherwise)."""
+    k = _k32()
+    if k is None or not name:
+        return None
+    return k.OpenJobObjectW(JOB_OBJECT_QUERY | JOB_OBJECT_TERMINATE, False, name) or None
+
+
+def job_pids(handle: int) -> list[int] | None:
+    """The process ids in the job now (None when the job cannot be queried)."""
+    k = _k32()
+    if k is None or not handle:
+        return None
+    import ctypes
+    from ctypes import wintypes
+    count = 256
+    while True:
+        class ProcessIdList(ctypes.Structure):
+            _fields_ = [('assigned', wintypes.DWORD), ('listed', wintypes.DWORD), ('pids', ctypes.c_size_t * count)]
+        info = ProcessIdList()
+        if k.QueryInformationJobObject(handle, JOB_PROCESS_ID_LIST, ctypes.byref(info), ctypes.sizeof(info), None):
+            return [int(info.pids[i]) for i in range(min(info.listed, count))]
+        if ctypes.get_last_error() != ERROR_MORE_DATA or count >= 1 << 16:
+            return None
+        count *= 4
+
+
+def job_terminate(handle: int) -> bool:
+    k = _k32()
+    return bool(k and handle and k.TerminateJobObject(handle, 1))
+
+
+def job_close(handle: int | None) -> None:
+    k = _k32()
+    if k is not None and handle:
+        k.CloseHandle(handle)
+
+
+def _job_handle(path: Path, name: object) -> int | None:
+    """The handle this process holds for the job a children file names (opened by name on first sight and then kept: ownership through
+    the driver's exit). None when the file names no job or it can no longer be opened."""
+    key = str(path)
+    with _JOBS_LOCK:
+        held = _JOBS.get(key)
+        if held is not None and held[0] != name:
+            job_close(held[1])
+            _JOBS.pop(key, None)
+            held = None
+        if held is not None:
+            return held[1]
+        if not isinstance(name, str) or not name.startswith(JOB_PREFIX):
+            return None
+        handle = job_open(name)
+        if handle:
+            _JOBS[key] = (name, handle)
+        return handle
+
+
+def _forget_job(path: Path) -> None:
+    with _JOBS_LOCK:
+        held = _JOBS.pop(str(path), None)
+    if held is not None:
+        job_close(held[1])
+
+
+def _recorded(value: dict) -> list[dict]:
+    """Every process a children file records: the driver, its direct children and every descendant seen ({pid, create, role})."""
+    out, seen = [], set()
+    groups = ([dict(value['driver']) | {'role': 'driver'}] if isinstance(value.get('driver'), dict) else [],
+              [dict(c) | {'role': 'child'} for c in value.get('children') or [] if isinstance(c, dict)],
+              [dict(c) | {'role': 'descendant'} for c in value.get('descendants') or [] if isinstance(c, dict)])
+    for group in groups:
+        for proc in group:
+            ident = (proc.get('pid'), proc.get('create'))
+            if isinstance(proc.get('pid'), int) and ident not in seen:
+                seen.add(ident)
+                out.append(proc)
+    return out
+
+
+def _tree_state(path: Path) -> dict:
+    """What is known about the process tree of a variant's last attempt (finding 9): {file, job, live: [{pid, create, role}],
+    incomplete: reason | None, set_name}.
+      - job: this process holds the attempt's Job Object: `live` = exactly the processes still in the job (complete evidence);
+      - otherwise `live` = the recorded processes (driver, children, descendants as they appeared) that still run, and `incomplete` says
+        why that record cannot be trusted to be the whole tree (a spawn that was never recorded, a tracking error, an unreadable file)
+        once the driver that could correct it is gone."""
+    try:
+        value = mv.read_strict(path, path.name)
+    except guard.Unreadable as exc:
+        return {'file': True, 'job': False, 'live': [], 'incomplete': str(exc), 'set_name': path.name}
+    if value is None:
+        _forget_job(path)
+        return {'file': False, 'job': False, 'live': [], 'incomplete': None, 'set_name': None}
+    name = str(value.get('set_name') or path.name)
+    handle = _job_handle(path, value.get('job'))
+    if handle is not None:
+        pids = job_pids(handle)
+        if pids is not None:
+            live = [{'pid': pid, 'create': _create_time(pid), 'role': 'job'} for pid in pids]
+            return {'file': True, 'job': True, 'live': [p for p in live if p['create'] is not None], 'incomplete': None,
+                    'set_name': name, 'handle': handle}
+    recorded = _recorded(value)
+    live = [p for p in recorded if _alive(p.get('pid'), p.get('create'))]
+    driver = value.get('driver') if isinstance(value.get('driver'), dict) else None
+    driver_alive = driver is not None and _proven(driver.get('pid'), driver.get('create'))
+    incomplete = None if driver_alive or not value.get('incomplete') else str(value['incomplete'])
+    return {'file': True, 'job': False, 'live': live, 'incomplete': incomplete, 'set_name': name}
+
+
+def tree_state(root: Path, monster: str, variant: str) -> dict:
+    return _tree_state(children_path(root, monster, variant))
+
+
+def _hold_text(path: Path, state: dict) -> str | None:
+    if state['live']:
+        return f'a process of the last conversion attempt still runs (pid {", ".join(str(p["pid"]) for p in state["live"][:8])})'
+    if state['incomplete']:
+        return (f'the process tree of the last conversion attempt is not fully known ({state["incomplete"]}); the slot stays held: check '
+                f'that nothing of it runs, then remove {path.as_posix()}')
+    return None
+
+
+def tree_hold(root: Path, monster: str, variant: str) -> str | None:
+    """Why the variant's last attempt still holds its slot (a live process of its tree, or incomplete evidence about the tree), else
+    None. A record whose whole tree is verifiably gone is removed here."""
+    path = children_path(root, monster, variant)
+    state = _tree_state(path)
+    text = _hold_text(path, state)
+    if text is None and state['file']:
+        path.unlink(missing_ok=True)
+        _forget_job(path)
+    return text
+
+
 def recorded_children(root: Path, monster: str, variant: str) -> dict:
-    """{driver: {pid, create} | None, children: [{pid, create, argv}]} of the variant's last driver (empty when none)."""
+    """{driver: {pid, create} | None, children: [{pid, create, argv}], descendants: [...], job, incomplete} of the variant's last driver
+    (empty when none)."""
     value = mv.read_json(children_path(root, monster, variant), None)
     if not isinstance(value, dict):
-        return {'driver': None, 'children': []}
-    kids = [c for c in value.get('children') or [] if isinstance(c, dict)]
-    return {'driver': value.get('driver') if isinstance(value.get('driver'), dict) else None, 'children': kids}
+        return {'driver': None, 'children': [], 'descendants': [], 'job': None, 'incomplete': None}
+    return {'driver': value.get('driver') if isinstance(value.get('driver'), dict) else None,
+            'children': [c for c in value.get('children') or [] if isinstance(c, dict)],
+            'descendants': [c for c in value.get('descendants') or [] if isinstance(c, dict)],
+            'job': value.get('job'), 'incomplete': value.get('incomplete')}
 
 
 def live_children(root: Path, monster: str, variant: str) -> list[dict]:
-    """The recorded children of the variant's drivers that still run (verified by pid + create time)."""
-    return [c for c in recorded_children(root, monster, variant)['children'] if _alive(c.get('pid'), c.get('create'))]
+    """The processes of the variant's last attempt that still run (the Job Object's, else the recorded ones verified by pid + create
+    time; the driver itself included)."""
+    return tree_state(root, monster, variant)['live']
 
 
 def clear_children(root: Path, monster: str, variant: str) -> None:
-    """After a verified drain: forget the recorded processes (only the dead ones are dropped when some still run)."""
-    path = children_path(root, monster, variant)
-    data = recorded_children(root, monster, variant)
-    alive = [c for c in data['children'] if _alive(c.get('pid'), c.get('create'))]
-    if alive:
-        guard.write_atomic(path, mv.dump({'driver': data['driver'], 'children': alive}))
-    else:
-        path.unlink(missing_ok=True)
+    """After a verified drain: forget the attempt's process record (kept while anything of it still runs or the evidence is incomplete)."""
+    tree_hold(root, monster, variant)
 
 
 def stray_trees(root: Path) -> list[str]:
-    """set_names (`monster:<M>/<v>`) of variants whose recorded children still run (counted as active by the plan, F14)."""
+    """set_names (`monster:<M>/<v>`) of variants whose last attempt still holds its slot (a live process or incomplete evidence about
+    its tree): counted as active by the plan (F14, finding 9)."""
     out = []
     folder = Path(root) / guard.APP / CHILDREN_DIR
     try:
@@ -731,39 +1151,218 @@ def stray_trees(root: Path) -> list[str]:
     except OSError:
         return out
     for path in paths:
-        value = mv.read_json(path, None)
-        if not isinstance(value, dict):
-            continue
-        if any(_alive(c.get('pid'), c.get('create')) for c in value.get('children') or [] if isinstance(c, dict)):
-            out.append(str(value.get('set_name') or path.name))
+        state = _tree_state(path)
+        if _hold_text(path, state):
+            out.append(str(state['set_name'] or path.name))
     return out
 
 
-class _Tracker:
-    """The children file of one driver run: every child is recorded (pid, create time, argv) from right after its start until it exited."""
+def tree_plan(root: Path, monster: str, variant: str, roots: list[tuple] | tuple = ()) -> dict:
+    """Kill & retry, step 1 (finding 9): WHAT may be signalled, decided before any signal. {job: handle | None, procs: [psutil.Process],
+    blocking: [text], incomplete: text | None}.
+      - with the attempt's Job Object: the job is the tree (nothing is enumerated by parent pid);
+      - otherwise only processes whose identity is PROVEN (pid + a recorded create time that matches): the `roots` the caller verified
+        and the recorded driver / children / descendants, each with its descendants at this moment. A recorded process that is alive but
+        has no recorded create time is `blocking`: nothing at all is signalled then (it may be an unrelated process on a reused pid)."""
+    path = children_path(root, monster, variant)
+    state = _tree_state(path)
+    plan = {'job': state.get('handle') if state['job'] else None, 'procs': [], 'blocking': [], 'incomplete': state['incomplete']}
+    if plan['job'] is not None or psutil is None:
+        return plan
+    procs: dict[int, object] = {}
 
-    def __init__(self, root: Path, monster: str, variant: str) -> None:
+    def collect(pid, created) -> None:
+        if pid == os.getpid() or not _proven(pid, created):     # (never this process: a driver run inside it, as in tests)
+            return
+        try:
+            top = psutil.Process(pid)
+            for proc in [top] + top.children(recursive=True):
+                procs.setdefault(proc.pid, proc)
+        except psutil.Error:
+            pass
+    for pid, created in roots:
+        collect(pid, created)
+    value = mv.read_json(path, None)
+    for proc in _recorded(value) if isinstance(value, dict) else []:
+        if not _alive(proc.get('pid'), proc.get('create')):
+            continue
+        if not _proven(proc.get('pid'), proc.get('create')):
+            plan['blocking'].append(f'the recorded {proc.get("role")} {proc.get("pid")} has no recorded create time: it cannot be told '
+                                    'from an unrelated process')
+            continue
+        collect(proc['pid'], proc['create'])
+    own = {pid for pid, _created in roots}
+    plan['procs'] = [proc for pid, proc in procs.items() if pid not in own]
+    return plan
+
+
+def drain_tree(root: Path, monster: str, variant: str, plan: dict, wait: float = 10.0) -> dict:
+    """Kill & retry, step 2: stop what `tree_plan` named and confirm it is gone. {killed: n, problems: [text]}. The record is removed
+    only when the whole tree is verifiably gone; incomplete evidence stays a problem (the caller keeps the slot)."""
+    problems: list[str] = []
+    killed = 0
+    if plan.get('job') is not None:
+        before = job_pids(plan['job']) or []
+        if before and not job_terminate(plan['job']):
+            problems.append('the job object of the attempt could not be terminated')
+        deadline = time.monotonic() + wait
+        left = job_pids(plan['job'])
+        while left and time.monotonic() < deadline:
+            time.sleep(0.1)
+            left = job_pids(plan['job'])
+        if left is None:
+            problems.append('the job object of the attempt cannot be queried')
+        elif left:
+            problems.append(f'process(es) {", ".join(map(str, left[:8]))} of the attempt are still running after the kill')
+        killed = len(before) - len(left or [])
+    elif psutil is not None:
+        tree = list(plan.get('procs') or [])
+        for proc in reversed(tree):                             # deepest first (children lists are breadth-first)
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error as exc:
+                problems.append(f'child {proc.pid} could not be killed ({exc})')
+        _gone, alive = psutil.wait_procs(tree, timeout=wait) if tree else ([], [])
+        for proc in alive:
+            problems.append(f'child {proc.pid} is still running after the kill')
+        killed = len(tree) - len(alive)
+    if not problems:
+        held = tree_hold(root, monster, variant)               # removes the record when everything is gone
+        if held:
+            problems.append(held)
+    return {'killed': killed, 'problems': problems}
+
+
+class _Tracker:
+    """The children file of one driver run (finding 9): the driver, the Job Object it put itself into (`own_process`), every child from
+    BEFORE its start (`reserve`) until it exited, and every descendant as it appears (a watcher thread, psutil). `incomplete` names why
+    the record may not be the whole tree; the file is removed only when the driver itself sees no descendant left."""
+    WATCH_S = 0.5
+
+    def __init__(self, root: Path, monster: str, variant: str, own_process: bool = False) -> None:
         self.path = children_path(root, monster, variant)
         self.set_name = set_name(monster, variant)
         self.driver = {'pid': os.getpid(), 'create': _create_time(os.getpid())}
         self.children: list[dict] = []
-        self._write()
+        self.descendants: dict[int, dict] = {}
+        self.incomplete: str | None = None
+        self.job: str | None = None
+        self.job_error: str | None = None
+        self._handle = None
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        if own_process:
+            self._own_job(variant_key(monster, variant))
+        self._write()                                           # an attempt whose tree cannot be recorded does not start (OSError)
+        self._thread = None
+        if psutil is not None:
+            self._thread = threading.Thread(target=self._watch, name='monster-tree', daemon=True)
+            self._thread.start()
+
+    def _own_job(self, key: str) -> None:
+        name = f'{JOB_PREFIX}{key}-{uuid.uuid4().hex[:12]}'
+        handle = job_create(name)
+        if handle and job_assign_self(handle):
+            self.job, self._handle = name, handle
+            return
+        job_close(handle)
+        self.job_error = 'no job object (not Windows, or this process could not be assigned); the recorded processes are the evidence'
 
     def _write(self) -> None:
-        guard.write_atomic(self.path, mv.dump({'set_name': self.set_name, 'driver': self.driver, 'children': self.children}))
+        guard.write_atomic(self.path, mv.dump({'schema': 2, 'set_name': self.set_name, 'driver': self.driver, 'job': self.job,
+                                               'job_error': self.job_error, 'children': self.children,
+                                               'descendants': list(self.descendants.values()), 'incomplete': self.incomplete}))
+
+    def _scan(self) -> bool:
+        """Record every descendant of this driver that is not recorded yet. True when something was added."""
+        if psutil is None:
+            return False
+        added = False
+        for proc in psutil.Process(os.getpid()).children(recursive=True):
+            try:
+                if proc.pid not in self.descendants or abs(self.descendants[proc.pid]['create'] - proc.create_time()) > CREATE_TOLERANCE:
+                    self.descendants[proc.pid] = {'pid': proc.pid, 'create': proc.create_time(), 'name': proc.name()}
+                    added = True
+            except psutil.Error:
+                continue
+        return added
+
+    def _watch(self) -> None:
+        while not self._stop.wait(self.WATCH_S):
+            try:
+                with self._lock:
+                    if self._scan():
+                        self._write()
+            except Exception as exc:  # noqa: BLE001  (the evidence is incomplete from here on: the slot stays held, visibly)
+                with self._lock:
+                    self.incomplete = f'descendant tracking failed ({type(exc).__name__}: {exc})'
+                    try:
+                        self._write()
+                    except OSError:
+                        pass
+
+    def reserve(self, argv: list[str]) -> None:
+        """BEFORE a child is started: the file says a spawn is under way. Raises OSError when that cannot be written (no spawn then)."""
+        with self._lock:
+            before, self.incomplete = self.incomplete, self.incomplete or f'a child was being started ({Path(str(argv[0])).name} ...)'
+            try:
+                self._write()
+            except OSError:
+                self.incomplete = before
+                raise
+
+    def unreserve(self) -> None:
+        with self._lock:
+            if self.incomplete and self.incomplete.startswith('a child was being started'):
+                self.incomplete = None
+            self._write()
 
     def add(self, proc: subprocess.Popen, argv: list[str]) -> None:
-        self.children.append({'pid': proc.pid, 'create': _create_time(proc.pid), 'argv': [str(a) for a in argv[:4]],
-                              'started': time.time()})
-        self._write()
+        with self._lock:
+            self.children.append({'pid': proc.pid, 'create': _create_time(proc.pid), 'argv': [str(a) for a in argv[:4]],
+                                  'started': time.time()})
+            if self.incomplete and self.incomplete.startswith('a child was being started'):
+                self.incomplete = None
+            try:
+                self._scan()
+            except Exception:  # noqa: BLE001  (the watcher records the error)
+                pass
+            self._write()
 
     def remove(self, proc: subprocess.Popen) -> None:
-        self.children = [c for c in self.children if c['pid'] != proc.pid]
-        self._write()
+        with self._lock:
+            self.children = [c for c in self.children if c['pid'] != proc.pid]
+            try:
+                self._scan()
+            except Exception:  # noqa: BLE001
+                pass
+            self.descendants = {pid: d for pid, d in self.descendants.items() if _alive(pid, d.get('create'))}
+            self._write()
 
     def close(self) -> None:
-        if not self.children:
-            self.path.unlink(missing_ok=True)
+        """End of the driver run: the record is removed only when the driver sees that nothing of its tree is left; otherwise it stays
+        (with the survivors) and the slot stays held."""
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+        with self._lock:
+            try:
+                self._scan()
+            except Exception as exc:  # noqa: BLE001
+                self.incomplete = self.incomplete or f'descendant tracking failed ({type(exc).__name__}: {exc})'
+            self.children = [c for c in self.children if _alive(c.get('pid'), c.get('create'))]
+            self.descendants = {pid: d for pid, d in self.descendants.items() if _alive(pid, d.get('create'))}
+            try:
+                if not self.children and not self.descendants and not self.incomplete:
+                    self.path.unlink(missing_ok=True)
+                else:
+                    self._write()
+            except OSError:
+                pass
+        job_close(self._handle)
+        self._handle = None
 
 
 # --------------------------------------------------------------------------------------------------------------- driver
@@ -794,18 +1393,28 @@ def stopped_message(stderr: str) -> str | None:
 
 def _run(argv: list[str], cwd: Path, say, env: dict | None = None, tracker: _Tracker | None = None) -> tuple[int, str]:
     """Run one step: stdout goes straight to our stdout (the attempt log), stderr is returned (and echoed). The child is recorded in the
-    children file while it runs (F14)."""
+    children file from before its start until it exited, and its descendants as they appear (F14, finding 9)."""
     say(f'[monster_lane] $ {" ".join(argv)}')
+    if tracker is not None:
+        try:
+            tracker.reserve(argv)                               # recorded BEFORE the spawn (finding 9): no untracked child
+        except OSError as exc:
+            return -1, f'the child process could not be recorded ({exc}); it was not started'
     try:
         proc = subprocess.Popen(argv, cwd=str(cwd), stdout=None, stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True,
                                 encoding='utf-8', errors='replace', creationflags=NO_WINDOW, env=env)
     except OSError as exc:
+        if tracker is not None:
+            try:
+                tracker.unreserve()
+            except OSError:
+                pass
         return -1, f'could not start {argv[0]}: {exc}'
     if tracker is not None:
         try:
             tracker.add(proc, argv)
         except OSError:
-            pass
+            pass                                               # the file still says a spawn was under way: incomplete evidence
     try:
         _out, err = proc.communicate()
     finally:
@@ -839,13 +1448,20 @@ def snapshot_dir(out_dir: Path, frozen: dict) -> Path:
     return Path(out_dir) / f'inputs_{mv.frozen_digest(frozen)}'
 
 
-def snapshot_inputs(out_dir: Path, vdir: Path, frozen: dict) -> tuple[Path | None, str | None]:
+def snapshot_inputs(out_dir: Path, vdir: Path, frozen: dict, mroot: Path | None = None) -> tuple[Path | None, str | None]:
     """The immutable upload folder of a generation (F7): `hyper3d/inputs_<generation>/` holds exactly the frozen files, read-only, each
     with its frozen sha256 (copied from views/<v>/ and verified; an existing folder is verified again and rebuilt when it differs).
-    (folder, None) or (None, problem)."""
+    (folder, None) or (None, problem). `mroot`: the monster root every destination is checked against right before use (resolved
+    containment, no link or junction on the way; finding 14)."""
     files = [str(f) for f in frozen.get('files') or []]
     digests = frozen.get('sha256') if isinstance(frozen.get('sha256'), dict) else {}
     snap = snapshot_dir(out_dir, frozen)
+    tmp = Path(out_dir) / f'.inputs_{mv.frozen_digest(frozen)}_{uuid.uuid4().hex[:8]}'
+    if mroot is not None:
+        try:
+            mv.contained(mroot, Path(out_dir), snap, tmp, *(snap / f for f in files), *(tmp / f for f in files))
+        except ValueError as exc:
+            return None, f'refusing the input snapshot: {exc}'
     if snap.is_dir():
         if sorted(os.listdir(snap)) == sorted(files) and all(_sha(snap / f) == digests.get(f) for f in files):
             return snap, None
@@ -853,7 +1469,6 @@ def snapshot_inputs(out_dir: Path, vdir: Path, frozen: dict) -> tuple[Path | Non
     problem = mv.frozen_problem(vdir, frozen)
     if problem:
         return None, f'{problem}; choose the views again'
-    tmp = Path(out_dir) / f'.inputs_{mv.frozen_digest(frozen)}_{uuid.uuid4().hex[:8]}'
     tmp.mkdir(parents=True)
     try:
         for name in files:
@@ -866,6 +1481,24 @@ def snapshot_inputs(out_dir: Path, vdir: Path, frozen: dict) -> tuple[Path | Non
         mv._rmtree_own(tmp)
         return None, str(exc)
     return snap, None
+
+
+def upload_problem(out_dir: Path) -> str | None:
+    """None when the FINAL copies the backend uploaded (`hyper3d/upload_inputs/`) still have the sizes and sha256 its record lists
+    (`rodin_backend.verify_upload_inputs`; a record without `inputs` is legacy = unknown, judged by inputs_problem alone). Checked on
+    every resume before a paid collect instead of trusting the saved metadata; a check that cannot run counts as a difference."""
+    try:
+        folder = str(HERE.parents[1] / 'hyper3d_pipeline')
+        if folder not in sys.path:
+            sys.path.insert(0, folder)
+        import rodin_backend
+        problems = rodin_backend.verify_upload_inputs(Path(out_dir))
+    except Exception as exc:  # noqa: BLE001  (fail closed before anything is paid)
+        return f'the uploaded inputs could not be verified ({type(exc).__name__}: {exc})'
+    if problems:
+        return ('the images the backend uploaded are not the ones its record lists (' + '; '.join(map(str, problems[:4])) +
+                '); nothing more is paid for this record: check it by hand')
+    return None
 
 
 def inputs_problem(record: dict, frozen: dict, snap: Path) -> str | None:
@@ -897,8 +1530,10 @@ def inputs_problem(record: dict, frozen: dict, snap: Path) -> str | None:
 
 def run_conversion(root: Path, monster: str, variant: str, *, frozen_sha: str | None = None, run_now: bool = False,
                    override_pause: str | None = None, idle: float | None = None, idle_known: bool = False, python: str | None = None,
-                   say=None) -> dict:
-    """The driver of one attempt (see the module docstring). Returns the verdict; never raises for a pipeline failure."""
+                   say=None, own_process: bool = False) -> dict:
+    """The driver of one attempt (see the module docstring). Returns the verdict; never raises for a pipeline failure. `own_process`
+    (the `run` sub-command only): this process IS the driver, so it puts itself into the attempt's Job Object (finding 9); a caller that
+    runs the driver inside another process (tests) must not."""
     say = say or (lambda text: print(text, flush=True))
     root, mroot = Path(root), mv.mroot_of(root)
     base = {'monster': monster, 'variant': variant}
@@ -913,11 +1548,13 @@ def run_conversion(root: Path, monster: str, variant: str, *, frozen_sha: str | 
     except guard.Busy:
         return base | {'status': 'busy', 'step': 'check', 'error': 'another conversion driver of this variant is running'}
     try:
-        kids = live_children(root, monster, variant)
-        if kids:
-            return base | {'status': 'busy', 'step': 'check',
-                           'error': f'a process of the previous attempt still runs (pid {", ".join(str(k["pid"]) for k in kids)})'}
-        tracker = _Tracker(root, monster, variant)
+        held = tree_hold(root, monster, variant)                # a live process of the previous attempt, or an incomplete record of it
+        if held:
+            return base | {'status': 'busy', 'step': 'check', 'error': held}
+        try:
+            tracker = _Tracker(root, monster, variant, own_process=own_process)
+        except OSError as exc:
+            return base | {'status': 'failed', 'step': 'check', 'error': f'the process record of the attempt could not be written ({exc})'}
         try:
             return _drive(root, mroot, monster, variant, base, tracker, frozen_sha=frozen_sha, run_now=run_now,
                           override_pause=override_pause, idle=idle, idle_known=idle_known, python=python, say=say)
@@ -952,6 +1589,17 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
         g = gate(root, args, idle, idle_known)
         return None if g['open'] else verdict('waiting', step, g['reason'])
 
+    def unsafe(step: str) -> dict | None:
+        """Finding 14: every destination this driver or its children write (hyper3d/ with its record, input snapshot and the backend's
+        upload folder, reduced/ and its success record) resolved against the monster root IMMEDIATELY before use; a link or junction
+        anywhere on the way is refused."""
+        try:
+            mv.contained(mroot, vdir, mdir, out_dir, record_path, snapshot_dir(out_dir, frozen) if frozen else out_dir,
+                         out_dir / 'upload_inputs', mdir / 'reduced', mdir / 'reduced' / mv.REDUCE_OK, mdir / 'reduce.log')
+        except ValueError as exc:
+            return verdict('failed', step, f'refusing to write outside the variant: {exc}')
+        return None
+
     def account(files: list[str]) -> None:
         record = mv.record_of(mdir)
         if record is not None or accounting_error(root, record_path):
@@ -959,6 +1607,10 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
 
     env = dict(os.environ) | paid_gate.env_for(root, override_pause=bool(run_now or override_pause),
                                                cmd=gate_command(root, args, idle, idle_known))
+    frozen = None
+    blocked = unsafe('check')
+    if blocked:
+        return blocked
     try:
         vj = mv.read_views_json(vdir)
     except guard.Unreadable as exc:
@@ -989,13 +1641,16 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
             return verdict('failed', 'check', f'{problem}; choose the views again')
         if not Path(py).is_file():
             return verdict('failed', 'submit', f'the Hyper3D venv python was not found: {py}')
-        blocked = gated('submit')
+        blocked = gated('submit') or unsafe('submit')
         if blocked:
             return blocked
         out_dir.mkdir(parents=True, exist_ok=True)
-        snap, problem = snapshot_inputs(out_dir, vdir, frozen)
+        snap, problem = snapshot_inputs(out_dir, vdir, frozen, mroot)
         if problem:
             return verdict('failed', 'check', problem)
+        blocked = unsafe('submit')                              # again, with the folders that exist now
+        if blocked:
+            return blocked
         plan = ['--view', files[0]] if len(files) == 1 else ['--views', ','.join(files)]
         code, err = _run([py, '-X', 'utf8', str(script), 'submit', str(snap), str(out_dir), *plan], mroot, say, env, tracker)
         steps.append(f'submit exit {code}')
@@ -1019,9 +1674,12 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
         if pending and not free_preview_resolved(record):
             return verdict('failed', 'collect', f'the record has an unresolved {pending!r} click; inspect '
                                                 f'{record_path.as_posix()} (hyper3d_single.py inspect) before resuming')
+        problem = upload_problem(out_dir)                       # the final upload copies, re-hashed before anything is paid
+        if problem:
+            return verdict('failed', 'check', problem)
         if not Path(py).is_file():
             return verdict('failed', 'collect', f'the Hyper3D venv python was not found: {py}')
-        blocked = gated('collect')
+        blocked = gated('collect') or unsafe('collect')
         if blocked:
             return blocked
         code, err = _run([py, '-X', 'utf8', str(script), 'collect', str(out_dir), '--allow-paid', '--accept-preview'], mroot, say, env,
@@ -1044,13 +1702,16 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
         return verdict('failed', 'collect', f'record status {status!r}' + (f' ({why})' if why else '') +
                        f'; inspect {record_path.as_posix()}')
 
-    blocked = gated('reduce')
+    blocked = gated('reduce') or unsafe('reduce')
     if blocked:
         return blocked
     redo = ['--redo'] if (mdir / 'reduced').exists() else []
     code, err = _run([sys.executable, '-X', 'utf8', str(mroot / 'tools' / 'reduce_monster.py'), f'{monster}/{variant}', *redo], mroot, say,
                      None, tracker)
     steps.append(f'reduce exit {code}')
+    blocked = unsafe('reduce')
+    if blocked:
+        return blocked
     problem = mv.reduced_files_problem(mdir)
     if code != 0 or problem:
         return verdict('failed', 'reduce', stopped_message(err) or problem or
@@ -1072,7 +1733,7 @@ def main(argv: list[str] | None = None) -> int:
     run.add_argument('--variant', required=True)
     run.add_argument('--frozen-sha', default='')
     run.add_argument('--run-now', action='store_true')
-    run.add_argument('--override-pause', default=None, metavar='PAUSE_KEY')
+    run.add_argument('--override-pause', default=None, metavar='PAUSE_ID')
     check = sub.add_parser('gate', help='exit 0 when a paid step of this task may run now, else 1 with the reason on stdout')
     check.add_argument('--root', type=Path, required=True)
     check.add_argument('--task-args', default='{}')
@@ -1092,7 +1753,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if g['open'] else 1
     try:
         result = run_conversion(args.root, args.monster, args.variant, frozen_sha=args.frozen_sha or None, run_now=args.run_now,
-                                override_pause=args.override_pause)
+                                override_pause=args.override_pause, own_process=True)
     except Exception as exc:  # noqa: BLE001  (the verdict line is always written)
         result = {'status': 'failed', 'step': 'driver', 'error': f'{type(exc).__name__}: {exc}', 'monster': args.monster,
                   'variant': args.variant}

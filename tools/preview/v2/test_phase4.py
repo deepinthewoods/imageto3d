@@ -269,7 +269,7 @@ class ModesTest(TempRoot):
             self.assertEqual(modes.write_mode(self.root, preset)['mode'], mode)
         self.assertEqual(modes.write_mode(self.root, 'pause')['mode'], 'pause')
         raw = json.loads((self.root / '.codex_jobs/_batch/supervisor_mode.json').read_text(encoding='utf-8'))
-        self.assertEqual(set(raw), {'mode', 'since'})
+        self.assertEqual(set(raw) - {'pause_id'}, {'mode', 'since'})          # (pause_id: the pause identity of modes.py, review finding 5)
         sup = pipeline_supervisor.Supervisor(self.root)
         self.assertEqual(sup.mode(), 'pause')                                  # the supervisor reads what we wrote
         with self.assertRaises(modes.ModeError):
@@ -284,7 +284,8 @@ class ModesTest(TempRoot):
         self.assertIsNone(modes.read_pause(self.root))
         path = self.root / '.codex_jobs/_batch/PAUSE'
         path.write_text(json.dumps({'since': 's', 'reason': 'manual pause', 'scope': ['conversions']}), encoding='utf-8')
-        self.assertEqual(modes.read_pause(self.root), {'since': 's', 'reason': 'manual pause', 'scope': ['conversions']})
+        pause = modes.read_pause(self.root)
+        self.assertEqual({k: v for k, v in pause.items() if k != 'pause_id'}, {'since': 's', 'reason': 'manual pause', 'scope': ['conversions']})
         path.write_text(json.dumps({'since': 's', 'reason': 'old'}), encoding='utf-8')
         self.assertEqual(modes.read_pause(self.root)['scope'], ['conversions', 'views'])
         path.write_text('garbage', encoding='utf-8')

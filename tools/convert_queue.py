@@ -54,7 +54,19 @@ left from before; deleted when honoured).
 Hyper3D); one generation at a time per machine (the backend's GPU lock), so one pixal3d worker is enough. --fallback pixal3d: use
 it instead of Hyper3D once the Tripo credits run out (--tripo-only still stops instead).
 
-Events (stdout and .codex_jobs/_batch/convert_events.log): CONVERT, CONVERTED, PARTIAL, FAILED, BALANCE, IDLE, FINISH, PAUSED.
+Drain (DESIGN_PHASE4 I.10; pre-cut-over review finding 1): while .codex_jobs/_batch/CONVERT_DRAIN exists no job is started
+(PAUSED, like CONVERT_HOLD). A convert_job.py that was blocked at its paid gate when the drain began leaves with exit 76
+(convert_job.DRAIN_EXIT: module lock released, module `deferred` in the job record, nothing paid in flight); that is reported as
+`DEFERRED <job>` and is never counted in `<job>.fails`. The children get $IMAGETO3D_DRAIN_AWARE so the manager knows this worker
+does not count the exit (it restores the count an older worker wrote).
+
+Recorded owner (pre-cut-over review finding 2): a set id on the list authorizes a job only when the job's recorded owner agrees
+(owner_allows): a job whose record names `parent_set` X is taken only when X is on the list and, where the preview app recorded
+whose id the job's prefix is (.codex_jobs/_app/set_namespace.json), that owner is X; a job without `parent_set` whose prefix was
+written as a family id of set S needs S on the list. A refused job is reported once (`OWNER <job>: ...`) and left alone.
+
+Events (stdout and .codex_jobs/_batch/convert_events.log): CONVERT, CONVERTED, PARTIAL, FAILED, DEFERRED, OWNER, BALANCE, IDLE, FINISH,
+PAUSED.
 """
 import argparse
 import fnmatch
@@ -80,7 +92,7 @@ BALANCE_RETRY = 300   # seconds a job held for an unreadable Tripo balance waits
 BALANCE_LOCK_WAIT = 600   # seconds the balance check waits for the Tripo browser lock (a v2 balance check, a running studio call)
 WORKER = 1   # this process's --worker number (set in main)
 sys.path.insert(0, str(ROOT / 'tools' / 'tripo_pipeline'))
-from convert_job import claim_module, lock_holder, module_converted, read_record  # noqa: E402
+from convert_job import DRAIN_AWARE_ENV, DRAIN_EXIT, claim_module, lock_holder, module_converted, read_record  # noqa: E402
 import portable  # noqa: E402  (also puts PYTHONUTF8=1 into the environment of the convert_job children on Windows)
 from tripo_browser_lock import TripoBrowserBusy, tripo_browser_lock  # noqa: E402
 import finish_sets  # noqa: E402
@@ -125,6 +137,9 @@ def conversions_blocked():
     hold = batch_file('CONVERT_HOLD')
     if hold.exists():
         return f'CONVERT_HOLD: {(read_json(hold) or {}).get("reason") or "conversion hold"}'
+    drain = batch_file('CONVERT_DRAIN')
+    if drain.exists():   # DESIGN_PHASE4 I.10: no intake while an older worker is drained (the file counts, readable or not)
+        return f'CONVERT_DRAIN: {(read_json(drain) or {}).get("reason") or "conversion drain"}'
     if PAUSE.exists():
         scope = (read_json(PAUSE) or {}).get('scope')
         if not isinstance(scope, list) or 'conversions' in scope:
@@ -276,13 +291,30 @@ def free_modules(job, record, root=None):
     return free, busy
 
 
-def candidate(job, root=None):
+PROBE_WAIT = 0.5   # seconds job_eligible waits for a record a writer holds before it answers 'record busy'
+
+
+def probe_record(path, root, wait=None):
+    """The job record for the read-only eligibility probe (recheck-before-cutover finding 16): the lock is the one of `root`
+    (never the imported checkout's), is never created (a record no writer of that root ever locked is read as it is) and is
+    waited for at most `wait` (default PROBE_WAIT) seconds, then portable.LockBusy. Nothing is written anywhere."""
+    with portable.file_lock(path, exclusive=False, sidecar=True, timeout=PROBE_WAIT if wait is None else wait, create=False, root=root):
+        return json.loads(Path(path).read_text(encoding='utf-8-sig'))
+
+
+def candidate(job, root=None, probe=False):
     """(free, busy) modules of a staged job folder when the worker would consider it at all, else (None, reason): its record is
-    readable, it is not `converted*` in processing/, and at least one module is neither converted nor held (free)."""
+    readable, it is not `converted*` in processing/, and at least one module is neither converted nor held (free).
+    `probe` (job_eligible): the record is read through probe_record (root-scoped, bounded, creates nothing); a record a writer
+    holds right now is (None, 'record busy'), i.e. temporarily not a candidate."""
     try:
-        record = read_record(job / '.tripo-job.json')
+        record = probe_record(job / '.tripo-job.json', ROOT if root is None else root) if probe else read_record(job / '.tripo-job.json')
+    except portable.LockBusy:
+        return None, 'record busy'
     except (OSError, ValueError) as error:
         return None, f'job record unreadable ({type(error).__name__})'
+    if probe and not isinstance(record, dict):
+        return None, 'job record unreadable (not an object)'
     if stage_of(job) == 'processing' and str(record.get('state', '')).startswith('converted'):
         return None, f'already {record.get("state")}'
     free, busy = free_modules(job, record, root)
@@ -291,18 +323,83 @@ def candidate(job, root=None):
     return (free, busy), None
 
 
+def listed(set_id, sets):
+    """The convert list's rule: some allow pattern matches `set_id` and no `!` exclude does."""
+    return (any(fnmatch.fnmatchcase(set_id, pattern) for pattern in sets if not pattern.startswith('!'))
+            and not any(fnmatch.fnmatchcase(set_id, pattern[1:]) for pattern in sets if pattern.startswith('!')))
+
+
+def read_namespace(root):
+    """The preview app's record of whose a listed id is (`.codex_jobs/_app/set_namespace.json`, tools/preview/v2/convert_list.py):
+    ({set id: ...}, {family id: parent set}); ({}, {}) when the file does not exist; None when it exists but cannot be read."""
+    path = Path(root) / '.codex_jobs' / '_app' / 'set_namespace.json'
+    try:
+        raw = json.loads(path.read_text(encoding='utf-8-sig'))
+    except FileNotFoundError:
+        return {}, {}
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict) or not isinstance(raw.get('sets', {}), dict) or not isinstance(raw.get('families', {}), dict):
+        return None
+    return raw.get('sets', {}), {k: v for k, v in raw.get('families', {}).items() if isinstance(v, str)}
+
+
+def owner_allows(root, job_name, record, sets):
+    """(ok, reason): the dispatch check of the job's RECORDED owner (pre-cut-over review finding 2). `sets` = the convert list's
+    patterns; the caller already knows that the job's own prefix is listed. A listed id authorizes the job only when:
+      - the record names `parent_set` X: X is listed, and the namespace's owner of the job's prefix (itself when it was approved
+        as a set, the set it was written for as a family id), when recorded, is X; with an unreadable namespace the owner cannot
+        be verified and the job waits;
+      - the record names no parent: when the prefix was written as a family id of S, S is listed (else the list alone decides).
+    Read-only."""
+    prefix = job_name.split('--')[0]
+    parent = record.get('parent_set') if isinstance(record, dict) else None
+    namespace = read_namespace(root)
+    owner = None
+    if namespace:
+        owner = prefix if prefix in namespace[0] else namespace[1].get(prefix)
+    if parent is not None:
+        if not isinstance(parent, str) or not parent:
+            return False, 'its record has an invalid parent_set'
+        if not listed(parent, sets):
+            return False, f'its record names the set {parent}, which is not on the convert list'
+        if namespace is None:
+            return False, 'set_namespace.json is unreadable: the owner its record names cannot be verified'
+        if owner and owner != parent:
+            return False, f'its record names the set {parent}, but {prefix} is on the convert list for the set {owner}'
+        return True, f'owner {parent}'
+    if owner and owner != prefix and not listed(owner, sets):
+        return False, f'{prefix} is a family id of the set {owner}, which is not on the convert list'
+    return True, f'owner {owner or prefix}'
+
+
+_OWNER_REPORTED = set()
+
+
+def owner_ok(job, sets):
+    """owner_allows for a staged job folder in the worker's loop; a refusal is emitted once per job and reason."""
+    try:
+        record = read_record(job / '.tripo-job.json')
+    except (OSError, ValueError):
+        return False   # candidate() skips an unreadable record too
+    ok, reason = owner_allows(ROOT, job.name, record, sets)
+    if not ok and (job.name, reason) not in _OWNER_REPORTED:
+        _OWNER_REPORTED.add((job.name, reason))
+        emit(f'OWNER {job.name}: not converted: {reason}')
+    return ok
+
+
 def next_job(sets):
-    """Returns (job, owner): an unheld job first (taking its lock), else a free module of a job another worker holds."""
+    """Returns (job, owner): an unheld job first (taking its lock), else a free module of a job another worker holds. A job is
+    considered only when its set id is listed AND its recorded owner agrees (owner_ok)."""
     candidates = []
     for stage in ('processing', 'multiview_ready'):
         for job in sorted((ROOT / stage).glob('*--*')):
             set_id = job.name.split('--')[0]
-            allowed = any(fnmatch.fnmatchcase(set_id, pattern) for pattern in sets if not pattern.startswith('!'))
-            excluded = any(fnmatch.fnmatchcase(set_id, pattern[1:]) for pattern in sets if pattern.startswith('!'))
-            if not allowed or excluded:
+            if not listed(set_id, sets):
                 continue
             counts, _ = candidate(job)
-            if counts:
+            if counts and owner_ok(job, sets):
                 candidates.append((job, *counts))
     for max_fails in (0, MAX_TRIES - 1):
         for job, free, busy in candidates:
@@ -321,13 +418,14 @@ def job_eligible(root, job_name):
     is taken, nothing is written): the job folder is in processing/ or multiview_ready/, its record is readable and not
     `converted*`, at least one module is free, it has failed fewer than MAX_TRIES times, and its job lock is free (or held by a
     dead process: claim takes it over) or, held by a live worker, the job is joinable (in processing/ with a module a live worker
-    is converting). The convert list (set patterns) and the PAUSE / CONVERT_HOLD gate are the caller's to check."""
+    is converting). It is scoped to `root` (the record lock of that root, never the imported checkout's), creates no file or
+    folder and never waits longer than PROBE_WAIT: a record a writer holds is (False, 'record busy'). The convert list (set patterns) and the PAUSE / CONVERT_HOLD gate are the caller's to check."""
     root = Path(root)
     locks = root / '.codex_jobs' / '_batch' / 'convert_locks'
     job = next((root / stage / job_name for stage in ('processing', 'multiview_ready') if (root / stage / job_name).is_dir()), None)
     if job is None:
         return False, 'not staged (no folder in processing/ or multiview_ready/)'
-    counts, why = candidate(job, root)
+    counts, why = candidate(job, root, probe=True)
     if not counts:
         return False, why
     free, busy = counts
@@ -356,7 +454,8 @@ def convert(job, args):
         handle.write(f'\n=== {datetime.now().isoformat(timespec="seconds")} {" ".join(args)}\n')
         handle.flush()
         return subprocess.run([sys.executable, str(ROOT / 'tools/tripo_pipeline/convert_job.py'), job.name, *args],
-                              cwd=ROOT, stdout=handle, stderr=subprocess.STDOUT).returncode
+                              cwd=ROOT, stdout=handle, stderr=subprocess.STDOUT,
+                              env={**os.environ, DRAIN_AWARE_ENV: '1'}).returncode   # this worker never counts DRAIN_EXIT as a failure
 
 
 def offload(set_id, names):
@@ -484,7 +583,7 @@ def main(argv=None):
                 tripo_done = True    # a verified shortfall: a numeric balance below the per-module cost
             else:
                 code = convert(job, ['--max-submits', str(submits)])
-                if code == 3 or balance - args.reserve < TRIPO_COST * 2:
+                if code != DRAIN_EXIT and (code == 3 or balance - args.reserve < TRIPO_COST * 2):
                     after, problem = read_tripo_balance()
                     if after is None and code == 3:
                         # phase 5 finding 3: a partial job on an unknown balance is held, never sent to the fallback backend
@@ -507,6 +606,11 @@ def main(argv=None):
                             release(job.name)
                             continue
         name = job.name
+        if code == DRAIN_EXIT:
+            # DESIGN_PHASE4 I.10: the child was blocked at its paid gate when a drain began and left (lock released, module deferred)
+            emit(f'DEFERRED {name}: convert_job left its paid gate for a conversion drain (CONVERT_DRAIN); not a failure')
+            release(name)
+            continue
         if code == 3 and args.tripo_only and args.backend == 'tripo':
             emit(f'STOP {name}: Tripo credits exhausted and --tripo-only is set; no Hyper3D fallback, worker exiting')
             release(name)
@@ -518,6 +622,10 @@ def main(argv=None):
             tripo_done = True
             code = convert(job, ['--backend', 'pixal3d'] if args.fallback == 'pixal3d'
                            else ['--backend', 'hyper3d', '--allow-paid', '--accept-preview'])
+        if code == DRAIN_EXIT:
+            emit(f'DEFERRED {name}: convert_job left its paid gate for a conversion drain (CONVERT_DRAIN); not a failure')
+            release(name)
+            continue
         if code == 0:
             emit(f'CONVERTED {name}')
             (LOCKS / f'{name}.fails').unlink(missing_ok=True)

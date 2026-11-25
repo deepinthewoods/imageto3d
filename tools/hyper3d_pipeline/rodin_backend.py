@@ -36,9 +36,29 @@ actions.free_preview gets done_at / model_id / resolved_by) as soon as its model
 submit, a `bind`, and on load by collect / preview / inspect of an existing record that is bound to a model. An unidentified
 click (no model URL) stays pending.
 
-Inputs (phase 5 review finding 7): submit copies the views it uploads into <out_dir>/upload_inputs/, uploads those copies and
-stores `inputs: [{name, sha256, size}]` (upload order, the exact bytes uploaded) and `upload_dir` in the record;
-`record_inputs(record)` reads it (None for a record written before the field existed = unknown).
+Bind (recheck-before-cutover finding 12): binding a model positively identifies the free preview, so `bind` (and the normal
+submit, and a later load of a bound record) writes the model link, the resolved free intent AND the status `submitted` in ONE
+atomic record write when the record was `submission_needs_review` / `submission_attempted` (or `ready_to_submit` with the free
+intent still pending: the click was never recorded). A pending PAID intent, or a record without a free-preview intent, keeps its
+status and its protection.
+
+Paid actions (recheck-before-cutover finding 8): a pending geometry / material intent is cleared ONLY on evidence that its paid
+stage advanced: the observed server stage lies past the stage the click was made in (geometry_preview -> material_ready ->
+material_preview -> export_ready). Seeing the same stage again proves nothing: the intent stays pending, the record gets
+`paid_review: {action, stage, at, why}` and collect stops ('needs review'; the click is never repeated automatically; a later run
+that finds the stage advanced confirms it). Each paid action records, in `actions.<kind>`: `intent_at`, `observed_cost` (the
+credits displayed on the control, checked against the expected cost) and `observed_cost_text`, `stage_before`, `balance_before`;
+and once confirmed `confirmed_at`, `confirmed_by: "stage_advanced"`, `stage_after`, `model_id`, `balance_after`, `balance_delta`
+(informational: other jobs share the wallet) and `provider_action_id` (only when the session can read one; None otherwise).
+An action counts as charged only when it has `confirmed_at`.
+
+Inputs (phase 5 review finding 7; recheck finding 13): submit copies the views it uploads into <out_dir>/upload_inputs/, hashes
+the copies, makes them READ-ONLY and uploads those copies; it stores `inputs: [{name, sha256, size}]` (upload order, the exact
+bytes uploaded) and `upload_dir` in the record; `record_inputs(record)` reads it (None for a record written before the field
+existed = unknown). `verify_upload_inputs(record)` re-hashes <out_dir>/upload_inputs/ against the record ([] = identical, None =
+unknown): submit runs it immediately before the upload and again before the click (a mismatch sets the record aside: nothing was
+generated), collect before every credit-capable intent (a mismatch stops before the paid click). Deleting an output folder on
+Windows needs the read-only attribute cleared first (renaming / moving it does not).
 """
 import argparse
 import contextlib
@@ -48,6 +68,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import struct
 import sys
 import time
@@ -91,6 +112,12 @@ EXIT_GATE_CLOSED = paid_gate.EXIT_GATE_CLOSED   # the CLI's exit code for it
 UPLOAD_DIR = 'upload_inputs'                    # <out_dir>/upload_inputs/: the exact files submit uploaded
 RECORD = 'studio_submission.json'
 COST_KINDS = ('geometry', 'material_generate', 'material_confirm')
+# finding 8: the server stage each paid click is made in; the action is confirmed only by a stage past it (STAGE_ORDER)
+PAID_STAGE_BEFORE = {'geometry': 'geometry_preview', 'material_generate': 'material_ready', 'material_confirm': 'material_preview'}
+STAGE_ORDER = ('geometry_preview', 'material_ready', 'material_preview', 'export_ready')
+# finding 12: statuses a positively identified free preview moves on from (to 'submitted')
+FREE_CLICKED = ('submission_attempted', 'submission_needs_review')
+FREE_INTENT_ONLY = ('ready_to_submit',)   # only while the free intent is still pending (the click-status write was lost)
 STAGES_TO_ACT = {'geometry_preview', 'material_ready', 'material_preview', 'export_ready'}
 
 
@@ -215,10 +242,12 @@ class Record:
         with self.path.with_name('events.jsonl').open('a') as stream:
             stream.write(json.dumps({'at': now(), 'event': event, **changes}, default=str) + '\n')
 
-    def bind(self, url, resolve=True):
+    def bind(self, url, resolve=True, how='bind', **changes):
         """Bind the model URL under the output lock (taken here when the caller does not hold it yet; the record is then
         re-read first, so a bind run on its own never writes back a stale copy). A bound model identifies the free preview:
-        with `resolve` its pending intent is resolved too (resolve_free_preview)."""
+        with `resolve` the model link, the resolved free intent and the status transition to `submitted` (free_preview_changes)
+        go into ONE atomic record write together with `changes` (finding 12: no crash can leave a bound record that collect
+        refuses). A pending paid intent is never touched."""
         ident = model_id(url)
         if not ident:
             raise ValueError('Expected a Hyper3D model URL ending in a UUID')
@@ -227,9 +256,8 @@ class Record:
                 self.reload()
             if self.data.get('model_id') not in (None, ident):
                 raise ValueError('This record is already bound to a different model')
-            self.save('model_linked', model_id=ident, model_url=f'{BASE}/{ident}', project_id=ident)
-            if resolve:
-                self.resolve_free_preview('bind')
+            free = self.free_preview_changes(how, ident) if resolve else {}
+            self.save('model_linked', model_id=ident, model_url=f'{BASE}/{ident}', project_id=ident, **{**free, **changes})
 
     def identified_model(self):
         """The model id this record is positively bound to (its model_url parses to a Hyper3D model UUID and model_id does not
@@ -239,21 +267,49 @@ class Record:
             return None
         return ident
 
+    def free_preview_changes(self, how, ident):
+        """The record changes that settle the free preview of the positively identified model `ident` (finding 1 + 12), {} when
+        there is nothing to settle:
+        - a pending `free_preview` intent is resolved (pending_action None, actions.free_preview done_at / model_id / resolved_by);
+        - the status becomes `submitted` when the free preview is resolved for this model (just now, or earlier by a writer that
+          did not move the status) and the status is FREE_CLICKED (or FREE_INTENT_ONLY with the intent still pending).
+        Any other pending action (a paid intent), a missing free-preview entry or one resolved for another model is ambiguous:
+        nothing changes, the record stays protected."""
+        data = self.data
+        if not ident:
+            return {}
+        pending = data.get('pending_action')
+        entry = (data.get('actions') or {}).get('free_preview')
+        changes = {}
+        if pending == 'free_preview':
+            actions = dict(data.get('actions') or {})
+            entry = dict(entry) if isinstance(entry, dict) else {}
+            entry.update(done_at=now(), model_id=ident, resolved_by=how)
+            actions['free_preview'] = entry
+            changes.update(pending_action=None, actions=actions)
+            movable = FREE_CLICKED + FREE_INTENT_ONLY
+        elif pending is None and isinstance(entry, dict) and entry.get('done_at') and entry.get('model_id') == ident:
+            movable = FREE_CLICKED          # resolved earlier (the pre-fix bind), the status was left behind
+        else:
+            return {}
+        if data.get('status') in movable:
+            changes.update(status='submitted', submitted_by=how)
+            if not data.get('after_submit_at'):
+                changes['after_submit_at'] = now()
+        return changes
+
     def resolve_free_preview(self, how, **changes):
-        """Phase 5 review finding 1: a pending `free_preview` intent whose model is positively identified (a bound model URL) is
-        done: pending_action is cleared and actions.free_preview gets done_at / model_id / resolved_by, in ONE save together with
-        `changes`. Returns True when it resolved. An unidentified click (no model URL) and any other pending action stay as they
-        are (`changes`, when given, are saved anyway)."""
-        ident = self.identified_model()
-        if self.data.get('pending_action') != 'free_preview' or not ident:
+        """Phase 5 review finding 1 / recheck finding 12: settle the free preview of a positively identified (bound) model in
+        ONE save together with `changes` (free_preview_changes: the pending intent is resolved and a status left at
+        submission_attempted / submission_needs_review becomes `submitted`). Returns True when it changed the intent or the
+        status. An unidentified click (no model URL) and any other pending action stay as they are (`changes`, when given, are
+        saved anyway)."""
+        free = self.free_preview_changes(how, self.identified_model())
+        if not free:
             if changes:
                 self.save('updated', **changes)
             return False
-        actions = dict(self.data.get('actions') or {})
-        entry = dict(actions.get('free_preview') or {})
-        entry.update(done_at=now(), model_id=ident, resolved_by=how)
-        actions['free_preview'] = entry
-        self.save('free_preview_resolved', pending_action=None, actions=actions, **changes)
+        self.save('free_preview_resolved', **{**free, **changes})
         return True
 
     def restore(self, data, event):
@@ -261,17 +317,45 @@ class Record:
         self.data = data
         self.save(event)
 
-    def intent(self, action):
+    def intent(self, action, **details):
+        """Write the intent of `action` before its click; `details` (a paid action's observed cost, stage and balance before
+        the click) go into actions.<action> in the same write."""
         if self.data.get('pending_action'):
             raise Stop('An earlier submission is unresolved; inspect the saved model first')
         if action in self.data.get('actions', {}):
             raise Stop(f'{action} was already submitted; refusing to repeat it')
         actions = dict(self.data.get('actions', {}))
-        actions[action] = {'intent_at': now()}
+        actions[action] = {'intent_at': now(), **details}
         self.save('submission_intent', pending_action=action, actions=actions)
 
-    def observed(self, stage):
-        self.save('server_stage_observed', stage=stage, pending_action=None)
+    def observed(self, stage, balance=None, provider_action_id=None):
+        """Record the observed server stage. A pending PAID intent is cleared only on evidence that its paid stage advanced
+        (finding 8): `stage` lies past the stage the click was made in. Then actions.<kind> gets confirmed_at / confirmed_by /
+        stage_after / model_id (+ balance_after, balance_delta, provider_action_id when known). The same (or an earlier / unknown)
+        stage proves nothing: the intent stays pending and `paid_review` says why. A pending free preview is never resolved by
+        a stage (only by its identified model). Returns the action that is still pending (None = nothing unresolved)."""
+        pending = self.data.get('pending_action')
+        if pending not in PAID_STAGE_BEFORE:
+            self.save('server_stage_observed', stage=stage)
+            return pending or None
+        actions = dict(self.data.get('actions') or {})
+        entry = dict(actions.get(pending) or {})
+        before = entry.get('stage_before') if entry.get('stage_before') in STAGE_ORDER else PAID_STAGE_BEFORE[pending]
+        if stage in STAGE_ORDER and STAGE_ORDER.index(stage) > STAGE_ORDER.index(before):
+            entry.update(confirmed_at=now(), confirmed_by='stage_advanced', stage_after=stage, model_id=self.data.get('model_id'),
+                         provider_action_id=provider_action_id or entry.get('provider_action_id'))
+            if balance is not None:
+                entry['balance_after'] = balance
+                if isinstance(entry.get('balance_before'), (int, float)):
+                    entry['balance_delta'] = round(entry['balance_before'] - balance, 4)
+            actions[pending] = entry
+            self.save('paid_action_confirmed', stage=stage, pending_action=None, actions=actions, paid_review=None)
+            return None
+        self.save('server_stage_observed', stage=stage, paid_review={
+            'action': pending, 'stage': stage, 'at': now(),
+            'why': f'the {pending} intent is pending and the model still shows {stage} (the click was made at {before}): '
+                   f'no evidence that the paid stage advanced'})
+        return pending
 
 
 def load_record(out_dir, how):
@@ -307,22 +391,87 @@ def record_inputs(record):
     return result
 
 
+def _unprotect(path):
+    """Make a (read-only) snapshot file writable again; missing = nothing to do."""
+    try:
+        os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
+    except FileNotFoundError:
+        pass
+
+
+def _protect(path):
+    """Read-only for everyone (Windows: the read-only attribute): the snapshot cannot be overwritten in place by accident."""
+    os.chmod(path, stat.S_IREAD | stat.S_IRGRP | stat.S_IROTH)
+
+
 def snapshot_inputs(plan, out_dir):
-    """Copy the views of `plan` into <out_dir>/upload_inputs/ and hash the copies: (dir, [{name, sha256, size}] of the uploaded
-    views in upload order). The browser uploads these copies, so the recorded hashes are the bytes uploaded. A views_omitted.json
-    marker is copied too (validate_views reads it)."""
+    """Copy the views of `plan` into <out_dir>/upload_inputs/, hash the copies and make them read-only (finding 13): (dir,
+    [{name, sha256, size}] of the uploaded views in upload order). The browser uploads these copies, so the recorded hashes
+    are the bytes uploaded; verify_upload_inputs re-hashes them before the upload and before every paid step. A
+    views_omitted.json marker is copied too (validate_views reads it). An earlier snapshot of a submission that was set aside
+    (not_submitted) is replaced."""
     target = Path(out_dir) / UPLOAD_DIR
     target.mkdir(parents=True, exist_ok=True)
     source = Path(plan['views_dir'])
+    marker = target / 'views_omitted.json'
+    _unprotect(marker)
     if (source / 'views_omitted.json').is_file():
-        shutil.copyfile(source / 'views_omitted.json', target / 'views_omitted.json')
+        shutil.copyfile(source / 'views_omitted.json', marker)
+        _protect(marker)
     else:
-        (target / 'views_omitted.json').unlink(missing_ok=True)
+        marker.unlink(missing_ok=True)
     for name in plan['images']:
+        _unprotect(target / name)
         shutil.copyfile(source / name, target / name)
     inputs = [{'name': name, 'sha256': sha256_file(target / name), 'size': (target / name).stat().st_size}
               for name in plan['uploaded']]
+    for name in plan['images']:
+        _protect(target / name)
     return target, inputs
+
+
+def verify_upload_inputs(record, upload_dir=None):
+    """Re-hash the final upload copies against the record (finding 13): [] when every recorded input is in
+    <record folder>/upload_inputs/ with the recorded size and sha256, else the list of differences; None when the record
+    predates the `inputs` field (unknown). `record`: as record_inputs (a Record, an output dir or a record path; for a bare
+    dict pass `upload_dir`). ValueError for a malformed inputs field."""
+    inputs = record_inputs(record)
+    if inputs is None:
+        return None
+    if upload_dir is None:
+        if isinstance(record, Record):
+            upload_dir = record.path.parent / UPLOAD_DIR
+        elif isinstance(record, dict):
+            upload_dir = record.get('upload_dir')
+        else:
+            path = Path(record)
+            upload_dir = (path if path.is_dir() else path.parent) / UPLOAD_DIR
+    if not upload_dir:
+        return ['the record names no upload_dir']
+    upload_dir = Path(upload_dir)
+    problems = []
+    for item in inputs:
+        path = upload_dir / item['name']
+        try:
+            size = path.stat().st_size
+            digest = sha256_file(path) if path.is_file() else None
+        except OSError as error:
+            problems.append(f'{item["name"]}: unreadable ({type(error).__name__})')
+            continue
+        if digest is None:
+            problems.append(f'{item["name"]}: not a file')
+        elif size != item['size'] or digest != item['sha256']:
+            problems.append(f'{item["name"]}: {size} bytes sha256 {digest[:12]}, recorded {item["size"]} bytes sha256 {item["sha256"][:12]}')
+    return problems
+
+
+def _require_inputs(record, before):
+    """Stop before a paid step when the upload copies no longer match the record (finding 13)."""
+    problems = verify_upload_inputs(record)
+    if problems:
+        record.save('inputs_changed', inputs_problems=problems)
+        raise Stop(f'upload inputs differ from the recorded submission before {before} ({"; ".join(problems)}); '
+                   f'nothing was clicked, needs review')
 
 
 # --------------------------------------------------------------------------- cost guard
@@ -483,6 +632,9 @@ def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
         try:
             session.open_workspace()
             paths = [(name, Path(upload_plan['views_dir']) / name) for name in upload_plan['uploaded']]
+            changed = verify_upload_inputs(record)   # finding 13: re-hashed immediately before the upload
+            if changed:
+                not_submitted(record, f'the upload copies changed after they were hashed ({"; ".join(changed)})')
             prepared = session.prepare_multiview(paths, config) or {}
             record.save('uploaded', upload_info=prepared)
             session.screenshot('before_submit')
@@ -499,15 +651,17 @@ def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
             not_submitted(record, f'{type(exc).__name__} before the click: {str(exc).splitlines()[0][:200]}')
         if not balance:                         # 2026-10-27: clicked while the header still showed 0 -> refused
             not_submitted(record, f'the wallet still showed {balance!r} credits after {BALANCE_WAIT_S} s')
+        changed = verify_upload_inputs(record)  # and again before the click: what was uploaded is what the record says
+        if changed:
+            not_submitted(record, f'the upload copies changed during the upload ({"; ".join(changed)})')
         record.intent('free_preview')           # written before the click: never repeated
         session.click_free_preview()
         record.save('submission_clicked', status='submission_attempted', submit_clicked_at=now())
         url = session.wait_model_url(600)       # Rodin can sit on GENERATING for minutes when busy
         session.screenshot('after_submit')
         if url and model_id(url):
-            record.bind(url, resolve=False)
-            # the model is identified: the free intent is done (finding 1), in the same write as the status
-            record.resolve_free_preview('submit', status='submitted', after_submit_at=now())
+            # the model is identified: link, resolved free intent (finding 1) and status in ONE atomic write (finding 12)
+            record.bind(url, how='submit', after_submit_at=now())
         elif session.insufficient_balance():
             not_submitted(record, f'Hyper3D answered "{INSUFFICIENT}" to Free Preview')
         else:
@@ -524,6 +678,7 @@ def _step(record, session, config, kind, expected, allow_paid, accept_preview=Fa
         session.screenshot('review_required')
         raise Stop('Preview ready: inspect review_required.png / the model URL, then pass --accept-preview')
     paid_gate.check()          # the stage wait may have lasted minutes: a closed gate stops before anything is selected
+    _require_inputs(record, kind)   # finding 13: the uploaded evidence must still be the recorded one
     if prepare:
         prepare()
     cost, text = session.read_cost(kind)
@@ -536,9 +691,12 @@ def _step(record, session, config, kind, expected, allow_paid, accept_preview=Fa
     budget = config.get('budget_credits')
     if budget is not None and committed > budget:
         raise Stop(f'{kind}: committed credits {committed} would exceed budget_credits {budget}')
+    _require_inputs(record, kind)
     paid_gate.check()          # immediately before the intent (DESIGN_PHASE4 I.8): closed = no intent written
     before = json.loads(json.dumps(record.data))
-    record.intent(kind)
+    balances = record.data.get('balances') or []
+    record.intent(kind, observed_cost=cost, observed_cost_text=text, stage_before=record.data.get('stage'),
+                  balance_before=balances[-1].get('credits') if balances else None)
     record.save('credits_committed', credits_committed=committed)
     return before
 
@@ -552,6 +710,18 @@ def _click(record, session, kind, before):
         record.restore(before, f'{kind}_intent_withdrawn')
         raise
     session.click(kind)
+
+
+def _provider_action_id(session, kind):
+    """The provider's id of a paid action when the session can read one (`session.provider_action_id(kind)`), else None. The
+    live Hyper3D page shows none (2026-11-25); the model id is recorded with every confirmed action instead."""
+    reader = getattr(session, 'provider_action_id', None)
+    if not kind or reader is None:
+        return None
+    try:
+        return reader(kind) or None
+    except Exception:   # noqa: BLE001  an id that cannot be read is simply not recorded
+        return None
 
 
 def collect(out_dir, *, allow_paid=False, accept_preview=False, expected_costs=None,
@@ -587,9 +757,15 @@ def _collect_locked(out_dir, allow_paid, accept_preview, expected_costs, config,
         exclude = set()
         for _ in range(8):
             stage = session.wait_stage(STAGES_TO_ACT - exclude, timeout)
-            record.observed(stage)
+            balance = session.read_balance()
+            unresolved = record.observed(stage, balance=balance,
+                                         provider_action_id=_provider_action_id(session, record.data.get('pending_action')))
             record.save('balance', balances=record.data.get('balances', []) + [
-                {'stage': stage, 'credits': session.read_balance(), 'at': now()}])
+                {'stage': stage, 'credits': balance, 'at': now()}])
+            if unresolved:   # finding 8: the same stage is no evidence; never certified, never clicked again automatically
+                raise Stop(f'{unresolved} intent is unresolved and the model shows {stage}: the click may or may not have '
+                           f'happened; needs review (not repeated automatically; a later collect confirms it once the stage '
+                           f'has advanced)')
             exclude = {stage}
             if stage == 'geometry_preview':
                 # the raw option is selected before the cost is read: the price belongs to that choice
@@ -637,6 +813,8 @@ def _finish(record, export):
     if report['problems']:
         record.save('export_needs_review', status='export_needs_review')
         raise Stop('exported GLB failed checks: ' + '; '.join(report['problems']))
+    if record.data.get('pending_action') in PAID_STAGE_BEFORE:
+        record.observed('export_ready')   # an export exists: every paid stage lies behind it (confirmed, not just cleared)
     record.save('export_verified', status='exported', pending_action=None)
     return record.data
 
@@ -659,8 +837,9 @@ def _preview_locked(out_dir, config, session_factory):
         session.open_model(record.data['model_url'])
         stage = session.wait_stage({'geometry_preview', 'material_ready', 'material_preview', 'export_ready'},
                                    config.get('stage_timeout_s', 1800))
-        record.observed(stage)
-        info = {'stage': stage, 'balance': session.read_balance()}
+        balance = session.read_balance()
+        record.observed(stage, balance=balance)   # never clears a paid intent on the same stage (finding 8)
+        info = {'stage': stage, 'balance': balance}
         if stage == 'geometry_preview':
             session.screenshot('preview_default')
             cost, text = session.read_cost('geometry')

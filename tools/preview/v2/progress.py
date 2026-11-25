@@ -416,6 +416,11 @@ def unit_progress(root, set_name: str, unit: dict, job: dict | None, facts: Fact
             out.update(held_kind='excluded', held_reason='excluded', held_detail=f'excluded by {", ".join(info["exclude"])} in convert_sets.txt')
         elif info['state'] == 'unlisted':
             out.update(held_kind='convert_list', held_reason='not in convert list', held_detail='Release adds the set to convert_sets.txt')
+        else:    # listed, but the worker's dispatch check of the recorded owner refuses the job (DESIGN_PHASE4.md I.10)
+            refusal = convert_list.owner_refusal(root, job['name'], {'parent_set': job['parent_set']} if job.get('parent_set') else {},
+                                                 facts.patterns)
+            if refusal:
+                out.update(held_kind='owner', held_reason='owner not verified', held_detail=refusal)
     if job and status in ('ready', 'converting') and job['name'] in facts.job_locks:
         lock = Path(root) / 'models' / job['model_set'] / job['id'] / '.module_locks' / f'{race}__{module}.lock'
         holder = lock_holder(lock)
