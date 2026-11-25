@@ -27,6 +27,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from palette import Palette  # noqa: E402
 import views_omitted  # noqa: E402
+from claim_lock import claim_lock  # noqa: E402
 
 VIEWS = ('front', 'front_three_quarter', 'back', 'back_three_quarter')
 ARMOR = {'body_armor', 'right_gauntlet_boot'}
@@ -255,8 +256,16 @@ def stage_status(root: Path) -> dict:
 
 
 def claim(root: Path, set_name: str, base_views: Path | None = None) -> dict:
+    """Claim `approved/<set_name>` into a processing_views job. The whole claim runs under the cross-process claim lock
+    (claim_lock.py) so the preview app cannot unapprove / move the folder while its snapshot is being written;
+    a second claim of the same set waits up to a minute for the first."""
     if not clean_name(set_name):
         raise ValueError('Set name must be a single safe folder name')
+    with claim_lock(root, set_name, wait=60.0):
+        return _claim_locked(root, set_name, base_views)
+
+
+def _claim_locked(root: Path, set_name: str, base_views: Path | None = None) -> dict:
     if root == Path(__file__).resolve().parents[2] and shutil.which('systemctl'):   # no systemd on Windows: nothing to check
         service = subprocess.run(['systemctl', '--user', 'is-active', 'pixal3d-armor-queue.service'],
                                  capture_output=True, text=True, check=False)

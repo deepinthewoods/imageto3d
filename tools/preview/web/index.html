@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<!-- The server replaces the empty token below with the per-session write token (DESIGN.md section 4). -->
+<meta name="v2-token" content="">
+<title>Pipeline</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="style.css">
+<script type="importmap">
+{"imports":{"three":"./vendor/three/build/three.module.js","three/addons/":"./vendor/three/examples/jsm/"}}
+</script>
+</head>
+<body data-base="under">
+<header>
+  <div class="title">
+    <h1>Pipeline</h1>
+    <p id="status-line">Concept and model review</p>
+  </div>
+  <div class="head-tools">
+    <span id="size-ctl" class="size-ctl" title="Cards per row: minus = bigger previews, plus = more previews">
+      <button id="size-down" aria-label="Larger previews">&minus;</button>
+      <span id="size-count">auto</span>
+      <button id="size-up" aria-label="Smaller previews">+</button>
+    </span>
+    <button id="base-toggle" title="Race base behind concept fronts (B)">Base: under</button>
+    <button id="refresh" title="Reload the state now">Refresh</button>
+  </div>
+</header>
+<div id="banner" role="alert" hidden></div>
+<nav id="tabs" aria-label="Sections"></nav>
+<div id="filters" class="filters" aria-label="Filters"></div>
+<main id="grid" class="grid"></main>
+<div id="placeholder" hidden></div>
+<div id="empty" hidden></div>
+
+<div id="modal" class="modal" hidden>
+  <div class="shade"></div>
+  <article class="dialog" role="dialog" aria-modal="true" tabindex="-1">
+    <div class="modal-head">
+      <div>
+        <div id="modal-badges" class="badges"></div>
+        <h2 id="modal-title"></h2>
+      </div>
+      <div class="head-right">
+        <span class="set-nav">
+          <button id="prev-set" title="Previous (Left arrow)" aria-label="Previous">&lsaquo;</button>
+          <span id="set-pos"></span>
+          <button id="next-set" title="Next (Right arrow)" aria-label="Next">&rsaquo;</button>
+        </span>
+        <button id="close" aria-label="Close">&times;</button>
+      </div>
+    </div>
+    <div id="modal-body"></div>
+    <details id="info"><summary>Details</summary><div id="info-body"></div></details>
+    <div id="actions"></div>
+  </article>
+</div>
+<div id="toast" role="status"></div>
+<script type="module" src="main.js"></script>
+</body>
+</html>

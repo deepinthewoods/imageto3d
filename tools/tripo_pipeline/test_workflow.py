@@ -104,6 +104,36 @@ class WorkflowTest(unittest.TestCase):
             workflow.claim(self.root, 'incomplete')
         self.assertTrue((self.root / 'approved/incomplete').is_dir())
 
+    def test_claim_waits_for_the_claim_lock_and_writes_nothing_before_it(self):
+        """The preview app holds the same lock while it unapproves; a claim must not touch approved/<set> until it is free."""
+        import threading
+        import time
+        from claim_lock import ClaimBusy, claim_lock
+        self.make_set('locked01', workflow.OUTFIT)
+        outcome = {}
+
+        def run():
+            try:
+                outcome['job'] = workflow.claim(self.root, 'locked01')
+            except Exception as exc:     # pragma: no cover
+                outcome['error'] = exc
+        with claim_lock(self.root, 'locked01'):
+            with self.assertRaises(ClaimBusy):
+                with claim_lock(self.root, 'locked01'):
+                    pass
+            thread = threading.Thread(target=run)
+            thread.start()
+            time.sleep(0.5)
+            self.assertTrue(thread.is_alive())
+            self.assertFalse((self.root / 'approved/locked01/.base_views').exists())
+            self.assertFalse((self.root / 'approved/locked01/.tripo-job.json').exists())
+        thread.join(30)
+        self.assertNotIn('error', outcome)
+        self.assertFalse((self.root / 'approved/locked01').exists())
+        self.assertTrue((Path(outcome['job']['path']) / '.base_views').is_dir())
+        with claim_lock(self.root, 'locked01'):      # released again
+            pass
+
     def test_ready_uses_frozen_base_after_active_resolution_changes(self):
         self.make_set('old_resolution', workflow.OUTFIT)
         job = workflow.claim(self.root, 'old_resolution')

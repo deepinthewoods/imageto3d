@@ -604,6 +604,26 @@ class FlowTests(unittest.TestCase):
         again = rb.collect(self.out, config=CONFIG, session_factory=lambda: self.fail('browser opened'))
         self.assertEqual(again['status'], 'exported')
 
+    def test_collect_resumes_an_old_format_record_with_an_old_config_and_selects_best_quality(self):
+        """Regression (review of phase 1, finding 22): a record written before the mesh-mode fix (`settings.mesh_mode` "Triangle") and a
+        config of that time (legacy `mesh_mode_option` "Triangle", no `mesh_mode_card`) still resume collect: the geometry step selects the
+        Best Quality card and reaches the export."""
+        self.do_submit()
+        path = self.out / rb.RECORD
+        stored = json.loads(path.read_text())
+        stored['settings']['mesh_mode'] = 'Triangle'
+        path.write_text(json.dumps(stored))
+        old_config = {k: v for k, v in CONFIG.items() if k != 'mesh_mode_card'} | {'mesh_mode_option': 'Triangle'}
+        session = self.collect(['geometry_preview', 'material_ready', 'material_preview', 'export_ready'],
+                               costs={'geometry': 0.5, 'material_generate': None, 'material_confirm': None},
+                               config=old_config, allow_paid=True, accept_preview=True)
+        self.assertIn(('select_mesh_mode', 'Best Quality'), session.calls)
+        self.assertNotIn(('select_mesh_mode', 'Triangle'), session.calls)
+        data = self.record()
+        self.assertEqual(data['status'], 'exported')
+        self.assertEqual(data['credits_committed'], 0.5)
+        self.assertEqual([c[1] for c in session.calls if c[0] == 'click'], ['geometry', 'material_generate', 'material_confirm'])
+
     def test_crash_after_intent_never_repeats_click(self):
         self.do_submit()
         costs, expected = {'geometry': 0.5}, {'geometry': 0.5}
