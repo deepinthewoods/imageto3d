@@ -23,6 +23,7 @@ import serve  # noqa: E402  (tools/preview/serve.py, used as a library)
 import builds  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
+import progress  # noqa: E402
 import taskqueue  # noqa: E402
 
 monsters = serve.monsters
@@ -188,30 +189,20 @@ def model_sets(set_name: str, jobs: list[dict]) -> list[str]:
     return sorted({set_name} | {job['model_set'] for job in jobs if NAME.fullmatch(job['model_set'])})
 
 
-def _front_state(path: Path, deps: dict) -> str:
-    if serve._stamp(str(path), deps) is None:
-        return 'pending'
-    state = read_json(path).get('state')
-    return state if isinstance(state, str) else 'pending'
-
-
 def fronts_index(root: Path, races: list[str]) -> dict[str, dict[str, str]]:
     """{set id: {race: front task state}} of the supervisor's `fronts--<set>--<race>` tasks (status file = state, absent = pending).
-    A race with several tasks counts as `failed` only when every one of them failed."""
-    batch = root / '.codex_jobs' / '_batch'
+    A race with several tasks counts as `failed` only when every one of them failed. Reads progress.task_index (cached by the task / status
+    folders' mtimes: a warm call costs two stat calls instead of one per status file)."""
+    index = progress.task_index(root)
     out: dict[str, dict[str, str]] = {}
-    seen = set()
-    for name in sorted(serve._listing(str(batch / 'tasks')) or {}):
-        parts = name[:-5].split('--') if name.startswith('fronts--') and name.endswith('.json') else []
+    for name in sorted(index['tasks']):
+        parts = name.split('--') if name.startswith('fronts--') else []
         if len(parts) != 3 or parts[2] not in races:
             continue
-        path = batch / 'status' / name
-        seen.add(str(path))
-        state = serve._memo('v2front', root, path, lambda deps, p=path: _front_state(p, deps))
+        state = progress.state_of(index, name)['state']
         entry = out.setdefault(job_set(parts[1], races), {})
         if parts[2] not in entry or entry[parts[2]] == 'failed':
             entry[parts[2]] = state
-    serve._prune('v2front', root, seen)
     return out
 
 
@@ -408,8 +399,9 @@ def _amount_changed(dec: dict, kind: str, races: list[str]) -> bool:
 
 
 def derive_set(root: Path, set_name: str, jobs: list[dict], models: dict, races: list[str], fronts: dict | None = None,
-               intents: list[dict] | None = None) -> dict:
-    """The units, stage and decisions of one claimed set (DESIGN.md section 2). `intents` = the unresolved guard intents (read-only marker)."""
+               intents: list[dict] | None = None, facts: progress.Facts | None = None) -> dict:
+    """The units, stage and decisions of one claimed set (DESIGN.md section 2). `intents` = the unresolved guard intents (read-only marker).
+    `facts` (progress.Facts of the whole derivation) adds `unit["progress"]` (DESIGN_PHASE4.md H); derive_one leaves it None."""
     dec, dec_error = decisions.interpret(set_name, (models or {}).get('decisions'), (models or {}).get('decisions_error'))
     model_jobs = (models or {}).get('jobs', {})
     modules = sorted({m for job in jobs for _race, m in job['modules']}, key=lambda m: (MODULE_RANK.get(m, 99), m))
@@ -460,6 +452,9 @@ def derive_set(root: Path, set_name: str, jobs: list[dict], models: dict, races:
                 else:
                     unit['status'] = 'missing'
             units.append(unit)
+    for unit in units:
+        job = job_by_id.get(unit['job']) if unit['job'] else None
+        unit['progress'] = progress.unit_progress(root, set_name, unit, job, facts) if facts is not None else None
     live = [u for u in units if u['status'] != 'dropped']
     blocking = [u for u in live if u['status'] not in ('reduced', 'pin_missing')]
     kind = _kind_of(modules)
@@ -506,7 +501,8 @@ def _derive_all(root: Path) -> dict:
     models = scan_models(root, races, {name: model_sets(name, jobs[name]) for name in sorted(jobs)})
     fronts = fronts_index(root, races)
     intents = guard.list_intents(root)
-    sets = {name: derive_set(root, name, jobs[name], models.get(name), races, fronts.get(name), intents) for name in sorted(jobs)}
+    facts = progress.Facts(root, races, lambda prefix: job_set(prefix, races))
+    sets = {name: derive_set(root, name, jobs[name], models.get(name), races, fronts.get(name), intents, facts) for name in sorted(jobs)}
     return {'races': races, 'sets': sets, 'retired': retired}
 
 
@@ -567,8 +563,14 @@ def set_card(root: Path, info: dict) -> dict:
         badges.append({'text': 'recovering: read-only', 'tone': 'error'})
     if stage == 'approved':
         badges.append({'text': f'reduced {counts["reduced"]}/{len(live)}', 'tone': 'info'})
-        for status, tone in (('converting', 'info'), ('ready', 'info'), ('views', 'info'), ('held', 'warn'), ('failed', 'error'),
-                             ('missing', 'warn'), ('pin_missing', 'error')):
+        plain = (('converting', 'info'), ('ready', 'info'), ('views', 'info'), ('held', 'warn'), ('failed', 'error'), ('missing', 'warn'),
+                 ('pin_missing', 'error'))
+        if any(u.get('progress') for u in live):
+            # with unit progress (DESIGN_PHASE4.md H) views / converting / held / failed come as `views a/b`, `converting n/m`, `held n`,
+            # `not in convert list`, `excluded from convert list`, `failed n`; the plain status counts stay for the rest
+            badges += progress.card_badges(units)
+            plain = (('ready', 'info'), ('missing', 'warn'), ('pin_missing', 'error'))
+        for status, tone in plain:
             if counts[status]:
                 badges.append({'text': f'{status.replace("_", " ")} {counts[status]}', 'tone': tone})
     else:
@@ -615,8 +617,18 @@ def set_card(root: Path, info: dict) -> dict:
         kind = 'fallback' if thumbnail and model else None      # a model exists: the client renders the real thumbnail over it
     return {'id': f'set:{name}', 'type': 'character', 'kind': info['kind'], 'name': name, 'title': pretty(name), 'stage': stage,
             'thumbnail': thumbnail, 'thumbnail_kind': kind, 'model': model, 'races': info['races'], 'badges': badges, 'actions': [],
-            'progress': {race: {u['module']: u['status'] for u in units if u['race'] == race} for race in sorted({u['race'] for u in units})}
+            'progress': {race: {u['module']: card_progress(u) for u in units if u['race'] == race} for race in sorted({u['race'] for u in units})}
             if stage == 'approved' else None}
+
+
+def card_progress(unit: dict) -> dict | str:
+    """`card.progress[race][module]` (DESIGN_PHASE4.md H.1): the unit's progress record {status, views_done, views_total, held_reason,
+    converting_step, error}; just the status text when the derivation carried no progress (a fresh single-set derivation)."""
+    p = unit.get('progress')
+    if not p:
+        return unit['status']
+    return {'status': unit['status'], 'views_done': p['views_done'], 'views_total': p['views_total'], 'held_reason': p['held_reason'],
+            'converting_step': p['converting_step'], 'error': p['error']}
 
 
 def _concept_kind(raw: dict) -> str:
@@ -783,7 +795,8 @@ def set_item_of(root: Path, info: dict) -> dict:
                       'lod': unit['lod'], 'lod_saved': unit['lod_saved'], 'frozen': bool(unit.get('frozen')),
                       'source_changed': bool(unit.get('source_changed')), 'needs_review': bool(unit.get('needs_review')),
                       'error': unit['error'], 'backend': unit['backend'],
-                      'model_set': unit['model_set'], 'warnings': unit['warnings'], 'review_levels': unit['review_levels']})
+                      'model_set': unit['model_set'], 'warnings': unit['warnings'], 'review_levels': unit['review_levels'],
+                      'progress': unit.get('progress')})
     card = set_card(root, info)
     snaps = info.get('bare_snaps') or {}
     # the bare URLs and the bare build ids come from the SAME pointer read of this derivation (re-check R2)

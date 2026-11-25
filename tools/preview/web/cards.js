@@ -8,20 +8,56 @@ const TONE_OF_STATUS = {
   reduced: 'ok', converting: 'info', ready: 'info', views: 'info', held: 'warn', failed: 'error', missing: '', dropped: '',
 };
 
-/** Approved tab: how many units are in each state, with the per-race detail as tooltip. */
-function progressBadges(progress) {
+/**
+ * Approved tab. `progress` is {race: {module: X}} where X is either the unit's status text (older servers: "how many units are in each
+ * state") or its progress record {views_done, views_total, held_reason, converting_step, error} (phase 4: "views 3/11", "converting 2/11",
+ * "held", "not in convert list", "failed"). The per-race detail is the tooltip. A badge the server already put into `card.badges` is not
+ * drawn twice.
+ */
+function progressBadges(progress, existing = []) {
   const counts = {};
   const lines = [];
+  const sum = { done: 0, total: 0, converting: 0, held: 0, unlisted: 0, failed: 0, units: 0 };
+  let record = false;
   for (const [race, modules] of Object.entries(progress || {})) {
-    const parts = Object.entries(modules).map(([module, status]) => `${pretty(module)}: ${status}`);
+    const parts = [];
+    for (const [module, value] of Object.entries(modules || {})) {
+      if (value && typeof value === 'object') {
+        record = true;
+        sum.units += 1;
+        sum.done += Number(value.views_done) || 0;
+        sum.total += Number(value.views_total) || 0;
+        if (value.converting_step) sum.converting += 1;
+        if (value.held_reason === 'not in convert list') sum.unlisted += 1;
+        else if (value.held_reason) sum.held += 1;
+        if (value.error) sum.failed += 1;
+        const bits = [value.views_total ? `views ${value.views_done ?? 0}/${value.views_total}` : null,
+          value.converting_step ? `converting ${value.converting_step}` : null, value.held_reason ? `held: ${value.held_reason}` : null,
+          value.error ? `failed: ${value.error}` : null].filter(Boolean);
+        parts.push(`${pretty(module)}: ${bits.join(', ') || value.status || 'ok'}`);
+      } else {
+        parts.push(`${pretty(module)}: ${value}`);
+        counts[value] = (counts[value] || 0) + 1;
+      }
+    }
     lines.push(`${pretty(race)}: ${parts.join(', ')}`);
-    for (const status of Object.values(modules)) counts[status] = (counts[status] || 0) + 1;
   }
-  return Object.entries(counts).map(([status, n]) => {
-    const node = badge(`${status} ${n}`, TONE_OF_STATUS[status] ?? '');
+  const make = (text, tone) => {
+    const node = badge(text, tone);
     node.title = lines.join('\n');
     return node;
-  });
+  };
+  const out = Object.entries(counts).map(([status, n]) => make(`${status} ${n}`, TONE_OF_STATUS[status] ?? ''));
+  if (record) {
+    const have = kind => existing.some(b => String(b.text || '').toLowerCase().startsWith(kind));
+    const count = (n, of) => `${n}${of ? `/${of}` : ''}`;
+    if (sum.total && sum.done < sum.total && !have('views')) out.push(make(`views ${count(sum.done, sum.total)}`, 'info'));
+    if (sum.converting && !have('converting')) out.push(make(`converting ${count(sum.converting, sum.units)}`, 'info'));
+    if (sum.held && !have('held')) out.push(make(sum.held > 1 ? `held ${sum.held}` : 'held', 'warn'));
+    if (sum.unlisted && !have('not in convert list')) out.push(make('not in convert list', 'warn'));
+    if (sum.failed && !have('failed')) out.push(make(sum.failed > 1 ? `failed ${sum.failed}` : 'failed', 'error'));
+  }
+  return out;
 }
 
 function thumbnail(card) {
@@ -62,7 +98,7 @@ export function makeCard(card, tab, { onOpen, onAction }) {
   const tags = h('div', { class: 'badges' },
     h('span', { class: 'tag' + (monster ? ' tag-monster' : ''), text: monster ? 'Monster' : pretty(card.kind || '') }),
     ...(card.badges || []).map(b => badge(b.text, b.tone)),
-    ...(tab === 'approved' ? progressBadges(card.progress) : []));
+    ...(tab === 'approved' ? progressBadges(card.progress, card.badges || []) : []));
   const node = h('div', { class: 'card', tabIndex: 0, dataset: { id: card.id },
     onclick: () => onOpen(card),
     onkeydown: event => {

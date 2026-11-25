@@ -17,6 +17,7 @@ import { mountMix } from './mix.js';
 import { mountQueue } from './queue.js';
 import { showMonster3d } from './monster3d.js';
 import { showReview } from './review.js';
+import { drawChip } from './status.js';
 
 const TABS = GROUPS.flat().map(([key]) => key);
 const MODEL_TABS = ['3d', 'aligned', 'completed'];
@@ -65,6 +66,7 @@ function statusLine() {
   banner.hidden = !lines.length;
   banner.textContent = lines.join(' | ');
   banner.classList.toggle('read-only', !!state.server.read_only || queueErrors.length > 0);
+  drawChip($('status-chip'), state.status, queueErrors);
   $('status-line').textContent = parts.join(' · ') || 'Concept and model review';
   $('status-line').classList.toggle('error', !!state.error);
 }
@@ -233,6 +235,7 @@ function init() {
   $('size-down').onclick = () => stepSize(-1);
   $('size-up').onclick = () => stepSize(1);
   $('base-toggle').onclick = cycleBase;
+  $('status-chip').onclick = event => { event.preventDefault(); selectTab('queue'); };   // the header status chip opens the Queue tab
   $('refresh').onclick = () => refresh().then(() => toast('Refreshed', { ms: 1500 })).catch(error => toast(error.message));
   document.addEventListener('keydown', event => {
     if (event.key.toLowerCase() === 'b' && shortcutKey(event)) cycleBase();

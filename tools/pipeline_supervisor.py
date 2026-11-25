@@ -67,6 +67,7 @@ else:
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tools' / 'tripo_pipeline'))
 import views_omitted  # noqa: E402
+from claim_lock import ClaimBusy, claim_lock  # noqa: E402
 
 try:
     import psutil
@@ -83,6 +84,8 @@ SCREEN_ON_SCOPE = ('conversions', 'views')
 VIEWS_RUN_ACTIVE = 'user active (views keep running)'   # mode views-run: the user-active pause covers conversions only
 SIGSTOP, SIGCONT = getattr(signal, 'SIGSTOP', 'stop'), getattr(signal, 'SIGCONT', 'cont')   # Windows has no such signals
 STOP_FILE_NAME = 'supervisor.stop'
+CLAIM_LOCK_ENV = 'IMAGETO3D_CLAIM_LOCK_HELD'   # <set>: told to the `workflow.py claim` child of a caller that already holds the set's claim lock
+CLAIM_LOCK_WAIT = 20.0   # seconds gate 1 waits for the preview app (an unapprove) to release a set's claim lock before it tries again next pass
 LOCK_OFFSET = 1 << 20   # Windows: the single-instance lock is this byte, far past the pid text (a locked byte cannot be read)
 MODES = ('auto', 'pause', 'pause-conversions', 'views-run', 'run')   # pause-conversions: a manual pause that keeps views running
 AWAY_AFTER = 300   # seconds without keyboard/mouse input = away (GNOME's own idle-delay)
@@ -280,6 +283,7 @@ class Supervisor:
         self.state_file, self.advance_file = self.batch / 'supervisor_state.json', self.batch / 'advance.json'
         self.lock_file, self.stop_file = self.batch / 'supervisor.lock', self.batch / STOP_FILE_NAME
         self.paused, self.stop, self.last_error, self.screen_failed = self.pause_file.exists(), False, {}, False
+        self.claim_held = None   # set whose claim lock this process holds while its claim child runs
         self.write_lock, self.sizes, self.cache = threading.Lock(), {}, {}
         self.state = read_json(self.state_file, {}) or {}
         self.state.setdefault('holds', {})
@@ -327,6 +331,8 @@ class Supervisor:
             env['PYTHONUTF8'] = '1'
         else:
             env.setdefault('DBUS_SESSION_BUS_ADDRESS', f'unix:path=/run/user/{os.getuid()}/bus')
+        if self.claim_held:
+            env[CLAIM_LOCK_ENV] = self.claim_held
         return env
 
     def mode(self):
@@ -686,6 +692,22 @@ class Supervisor:
             self.clear_hold(key)
 
     def claim(self, set_id, entry, races, key=None):
+        """Move the race folders into approved/<set>, claim the set and queue its views. The set's claim lock
+        (claim_lock.py, the one `workflow.py claim` and the preview app's unapprove use) is held from before the
+        first move until the claim returns, so the preview app cannot take approved/<set> away half-claimed; the
+        claim child is told (CLAIM_LOCK_ENV) that its caller holds the lock. A set the app is unapproving right now
+        (lock busy) stays in concepts/ and is tried again on the next pass."""
+        try:
+            with claim_lock(self.root, set_id, wait=CLAIM_LOCK_WAIT):
+                self.claim_held = set_id
+                try:
+                    self.claim_locked(set_id, entry, races, key)
+                finally:
+                    self.claim_held = None
+        except ClaimBusy:
+            self.emit(f'HOLD {set_id}: claim lock busy (the preview app is changing this set); trying again next pass')
+
+    def claim_locked(self, set_id, entry, races, key=None):
         key = key or set_id
         approved = self.root / 'approved' / set_id
         approved.mkdir(parents=True)
@@ -712,6 +734,7 @@ class Supervisor:
                 job = Path(json.loads(run.stdout)['path'])
         except (ValueError, KeyError, subprocess.SubprocessError) as problem:
             error = error or repr(problem)
+        self.claim_held = None   # the add-views child below needs no claim lock
         if job is None:
             self.state['sets'][key] = {'claim_failed': True}
             self.save_state()

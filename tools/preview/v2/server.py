@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Preview app v2 server (phase 1): loopback HTTP, static web/ app, /files/ + /mfiles/ like serve.py, and /api/v2/*.
 
-    python tools/preview/v2/server.py [--port 8766] [--root <project root>] [--open]
+    python tools/preview/v2/server.py [--port 8766] [--root <project root>] [--open] [--read-only] [--no-orchestrator] [--manage-services]
+
+`--manage-services` (default OFF) lets this server adopt / start / stop / restart the pipeline services (supervisor, view runner, convert
+worker; DESIGN_PHASE4.md A and H). Without it the server never starts, stops or signals any of them, and the Queue tab's `service` op answers
+409; everything else (mode, settings, release, view retry, convert reset, balance check) still works.
 
 serve.py is imported as a library (its scans, caches and file rules); the old site keeps running unchanged on :8765.
 Safety rules (DESIGN.md section 6):
@@ -24,7 +28,9 @@ import os
 from pathlib import Path
 import re
 import secrets
+import shutil
 import subprocess
+import time
 import sys
 from urllib.parse import parse_qs, unquote, urlsplit
 import webbrowser
@@ -39,7 +45,10 @@ import builds  # noqa: E402
 import catalog  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
+import modes  # noqa: E402
 import orchestrator  # noqa: E402
+import progress  # noqa: E402
+import settings as app_settings  # noqa: E402
 import taskqueue  # noqa: E402
 
 WEB = HERE.parent / 'web'
@@ -55,6 +64,8 @@ PLACEHOLDER = ('<!doctype html><html><head><meta charset="utf-8"><title>Preview 
 META = re.compile(r'<meta\s+name="v2-token"[^>]*>', re.I)
 BAD_PATH_CHARS = re.compile(r'[<>:"|?*\x00-\x1f]')       # drive letters / alternate streams / wildcards: none belongs in a served path
 POST_PATHS = ('/api/v2/action', '/api/v2/lod', '/api/v2/thumbnail', '/api/v2/amount', '/api/v2/queue')
+SERVICES_OFF = 'service management is off (start the server with --manage-services)'
+CREDITS_TTL = 20.0               # seconds a credits snapshot (Hyper3D submission scan) is reused by GET /api/v2/queue
 
 
 def queue_health(root: Path) -> dict | None:
@@ -93,11 +104,7 @@ def discover_hosts(root: Path, run=subprocess.run) -> list[str]:
         names += [str(ip) for ip in me.get('TailscaleIPs') or []]
     except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
         pass
-    try:
-        configured = json.loads((Path(root) / guard.APP / 'settings.json').read_text(encoding='utf-8-sig')).get('allowed_hosts') or []
-        names += [str(n) for n in configured if isinstance(n, str)]
-    except (OSError, ValueError, AttributeError):
-        pass
+    names += list(app_settings.load(root)['allowed_hosts'])          # settings.load: the only settings reader (DESIGN_PHASE4.md H)
     return sorted({n.strip().lower() for n in names if n and n.strip()})
 
 
@@ -107,6 +114,47 @@ def host_set(port: int, extra: list[str], bind: str = '127.0.0.1') -> frozenset[
     for name in extra:
         hosts |= {name.lower(), f'{name.lower()}:{port}'}
     return frozenset(hosts)
+
+
+# ---------------------------------------------------------------------------------------------------------- phase 4 views
+
+def services_view(ctx: dict) -> dict:
+    manager = ctx.get('services')
+    if manager is None:
+        return {'managed': False, 'message': SERVICES_OFF, 'services': {}, 'convert_jobs': None, 'errors': [], 'problems': None}
+    return manager.view()
+
+
+def credits_view(root: Path, ctx: dict) -> dict:
+    """credits.snapshot, reused for CREDITS_TTL (the Hyper3D scan walks models/); a read-only server never writes credits.json."""
+    import credits
+    hit = ctx.get('_credits')
+    if hit and time.monotonic() - hit[0] < CREDITS_TTL and hit[1] == credits.read_cache(root).get('tripo'):
+        value = hit[2]
+    else:
+        value = credits.snapshot(root, persist=not ctx.get('read_only'))
+        ctx['_credits'] = (time.monotonic(), credits.read_cache(root).get('tripo'), value)
+    tripo = ctx.get('tripo')
+    return dict(value) | {'check': tripo.view() if tripo else None}
+
+
+def queue_extras(root: Path, ctx: dict) -> dict:
+    """The phase 4 keys of GET /api/v2/queue (DESIGN_PHASE4.md H): services, mode, credits, disk, views, conversions, holds, settings."""
+    races = serve._base_races(root)
+    try:
+        usage = shutil.disk_usage(root)
+        disk = {'free': usage.free, 'total': usage.total, 'path': str(root)}
+    except OSError as exc:
+        disk = {'free': None, 'total': None, 'error': str(exc)}
+    return {'services': services_view(ctx), 'mode': modes.snapshot(root), 'credits': credits_view(root, ctx), 'disk': disk,
+            'views': progress.views_section(root), 'conversions': progress.conversions_section(root),
+            'holds': progress.holds_section(root, lambda prefix: catalog.job_set(prefix, races)), 'settings': app_settings.load(root)}
+
+
+def status_of(root: Path, ctx: dict) -> dict:
+    """`state.status` (DESIGN_PHASE4.md H): the header chip. services_problems is None without --manage-services."""
+    manager = ctx.get('services')
+    return progress.status_summary(root, manager.problems() if manager else None, queue_health(root))
 
 
 # ------------------------------------------------------------------------------------------------------- path containment
@@ -248,6 +296,7 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
                 data['server'] = {'read_only': bool(ctx.get('read_only')), 'message': ctx.get('message'), 'notes': list(ctx.get('notes') or []),
                                   'orchestrator': bool(ctx.get('orchestrator'))}
                 data['queue_health'] = queue_health(root)
+                data['status'] = status_of(root, ctx)
                 self.send_json(200, data)
             elif path == '/api/v2/layers':
                 try:
@@ -255,7 +304,7 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
                 except catalog.NotFound as exc:
                     self.fail(404, str(exc))
             elif path == '/api/v2/queue':
-                self.send_json(200, orchestrator.queue_state(root, bool(ctx.get('orchestrator'))))
+                self.send_json(200, orchestrator.queue_state(root, bool(ctx.get('orchestrator'))) | queue_extras(root, ctx))
             elif path == '/api/v2/item':
                 try:
                     self.send_json(200, catalog.item(root, (query.get('id') or [''])[0]))
@@ -315,8 +364,12 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
                     return
                 body = json.loads(self.read_body(BODY_LIMIT))
                 handler = {'/api/v2/action': actions.perform, '/api/v2/lod': actions.set_lod, '/api/v2/amount': actions.set_amount,
-                           '/api/v2/queue': actions.queue_op}[split.path]
-                self.send_json(200, handler(root, body))
+                           '/api/v2/queue': lambda r, b: actions.queue_op(r, b, ctx)}[split.path]
+                result = handler(root, body)
+                if split.path == '/api/v2/queue' and isinstance(body, dict) and body.get('op') == 'settings' and ctx.get('hosts') is not None:
+                    # newly allowed host names are accepted at once (a removed one only after a restart)
+                    ctx['hosts'] = ctx['hosts'] | host_set(self.server.server_port, result['settings']['allowed_hosts'], self.server.server_address[0])
+                self.send_json(200, result)
             except guard.Conflict as exc:
                 catalog.invalidate()
                 extra = {k: v for k, v in (getattr(exc, 'extra', None) or {}).items() if k in ('changes',)}      # e.g. `changes` of 409 changed / stale
@@ -326,6 +379,8 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
                 self.fail(404, str(exc))
             except guard.ReadOnly as exc:
                 self.fail(503, str(exc), code='read_only')
+            except app_settings.SettingsError as exc:
+                self.fail(400, str(exc), problems=exc.problems)
             except (ValueError, KeyError, TypeError, OSError, RuntimeError) as exc:
                 self.fail(400, str(exc))
 
@@ -342,8 +397,12 @@ class Server(ThreadingHTTPServer):
     daemon_threads = True
     lock: guard.ServerLock | None = None
     orchestrator: orchestrator.Orchestrator | None = None
+    services: orchestrator.ServiceManager | None = None
 
     def server_close(self) -> None:
+        if self.services:
+            self.services.stop()               # the services thread only: the services themselves keep running
+            self.services = None
         if self.orchestrator:
             self.orchestrator.stop()           # the thread and its lock; running builds are detached and keep going
             self.orchestrator = None
@@ -354,11 +413,14 @@ class Server(ThreadingHTTPServer):
 
 
 def create_server(root: Path = DEFAULT_ROOT, host: str = '127.0.0.1', port: int = 0, token: str | None = None, web: Path = WEB,
-                  extra_hosts: list[str] | None = None, read_only: bool | None = None, run_orchestrator: bool = False) -> Server:
+                  extra_hosts: list[str] | None = None, read_only: bool | None = None, run_orchestrator: bool = False,
+                  manage_services: bool = False, services_interval: float = orchestrator.SERVICE_INTERVAL) -> Server:
     """`extra_hosts` = additional accepted Host names (None = discover the tailnet name and settings.json; [] = loopback only).
     `read_only` None = take the single-writer lock and serve read-only when another server holds it; True = never write.
     `run_orchestrator` starts the layer-build orchestrator thread, only in the server that holds the writer lock (and its own
-    orchestrator.lock: when another process holds that, this server is read-only with a banner)."""
+    orchestrator.lock: when another process holds that, this server is read-only with a banner).
+    `manage_services` (default False; `--manage-services`) starts the services thread (orchestrator.ServiceManager), only in a writer server.
+    Without it nothing here ever adopts, starts, stops or signals a pipeline service."""
     root = Path(root)
     token = token or secrets.token_urlsafe(18)
     ctx: dict = {'hosts': None, 'read_only': False, 'message': None, 'notes': []}
@@ -374,6 +436,7 @@ def create_server(root: Path = DEFAULT_ROOT, host: str = '127.0.0.1', port: int 
     else:
         server.lock = lock
         ctx['notes'] = actions.recover_at_start(root)
+        ctx['tripo'] = orchestrator.TripoCheck(root)
         if run_orchestrator:
             runner = orchestrator.Orchestrator(root)
             if runner.start():
@@ -382,6 +445,12 @@ def create_server(root: Path = DEFAULT_ROOT, host: str = '127.0.0.1', port: int 
             else:
                 ctx['read_only'] = True
                 ctx['message'] = 'Read-only: another process holds the orchestrator lock (.codex_jobs/_app/orchestrator.lock) and runs the builds'
+        if manage_services and not ctx['read_only']:
+            manager = orchestrator.ServiceManager(root, interval=services_interval)
+            manager.start()
+            server.services = manager
+            ctx['services'] = manager
+    ctx['manage_services'] = bool(ctx.get('services'))
     return server
 
 
@@ -392,10 +461,14 @@ def main() -> None:
     parser.add_argument('--open', action='store_true')
     parser.add_argument('--read-only', action='store_true')
     parser.add_argument('--no-orchestrator', action='store_true', help='do not run the layer-build orchestrator in this server')
+    parser.add_argument('--manage-services', action='store_true',
+                        help='adopt / start / stop / restart the pipeline services (supervisor, view runner, convert worker); default off')
     args = parser.parse_args()
-    server = create_server(args.root.resolve(), port=args.port, read_only=True if args.read_only else None, run_orchestrator=not args.no_orchestrator)
+    server = create_server(args.root.resolve(), port=args.port, read_only=True if args.read_only else None, run_orchestrator=not args.no_orchestrator,
+                           manage_services=args.manage_services)
     url = f'http://127.0.0.1:{server.server_port}/'
-    print(url, '(read-only)' if server.ctx['read_only'] else '', '(orchestrator)' if server.ctx.get('orchestrator') else '', flush=True)
+    print(url, '(read-only)' if server.ctx['read_only'] else '', '(orchestrator)' if server.ctx.get('orchestrator') else '',
+          '(services managed)' if server.ctx.get('services') else '', flush=True)
     for note in server.ctx['notes']:
         print('recovery:', note, flush=True)
     if args.open:

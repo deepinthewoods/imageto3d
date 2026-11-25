@@ -1,12 +1,14 @@
-// Queue tab (v0): the tasks of GET /api/v2/queue as a table: state, elapsed, attempts, the error tail, Retry / Cancel.
-// Refreshes every 3 s while the tab is visible (and the page is). Phase 4 adds services, modes and credits.
+// Queue tab: phase 4 sections above (services, mode / pause, credits and disk, views, conversions, holds, settings: queue_sections.js),
+// then the phase 3 "Layer builds" table: the tasks of GET /api/v2/queue with state, elapsed, attempts, the error tail, Retry / Cancel.
+// Refreshes every 3 s while the tab is visible (and the page is).
 // Phase 3 review fixes: a task that is `stalled` has "Kill & retry" (POST /api/v2/queue {op: 'kill_retry', id}); "Rebuild stale"
 // (POST /api/v2/queue {op: 'rebuild_stale'}) re-queues every stale layer build of the sets in Aligned / Completed / 3D; the queue's
 // own health errors (state.queue_health, or `queue_health` / `health` of the queue response) are shown at the top.
 import { api } from './api.js';
 import { state, refresh, subscribe, queueHealthErrors } from './state.js';
 import { toast } from './toast.js';
-import { badge, button, h, pretty } from './util.js';
+import { badge, blockRepeat, button, duration, h, pretty } from './util.js';
+import { createSections } from './queue_sections.js';
 
 // Phase 3 re-check: the queue response carries `totals` (every state, whole table) and `page` (what was cut); the active tasks (starting /
 // running / stalled / orphan) are always shown first with their controls; an `orphan` (an adopted builder whose wrapper died) has Kill.
@@ -20,12 +22,6 @@ const isActive = task => ACTIVE.includes(task.state);
 const staleSets = () => ['3d', 'aligned', 'completed'].flatMap(tab => state.tabs[tab] || [])
   .filter(card => (card.badges || []).some(b => /^stale\b/i.test(b.text || '')));
 const POLL_MS = 3000;
-
-const duration = seconds => {
-  if (seconds == null || Number.isNaN(+seconds)) return '';
-  const s = Math.max(0, Math.round(+seconds));
-  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
-};
 
 /** Build the page into `container`. Returns {unmount}. */
 export function mountQueue(container) {
@@ -41,7 +37,11 @@ export function mountQueue(container) {
   const health = h('div', { class: 'queue-note health', hidden: true, role: 'alert' });
   const bar = h('div', { class: 'queue-bar' });
   let data = null;
-  container.replaceChildren(h('div', { class: 'queue-page' }, summary, bar, health, note, table));
+  const sections = createSections({ reload: () => load() });
+  const page = h('div', { class: 'queue-page' }, health, note, sections.node,
+    h('section', { class: 'q-layers' }, h('h3', { class: 'q-heading', text: 'Layer builds' }), summary, bar, table));
+  blockRepeat(page);                  // a held Enter never repeats a write button
+  container.replaceChildren(page);
   let rebuilding = false;
 
   /** Queue health: the state's `queue_health` plus the one of the queue response, e.g. a damaged or unreadable queue database. */
@@ -137,11 +137,11 @@ export function mountQueue(container) {
     for (const t of tasks) counts[t.state] = (counts[t.state] || 0) + 1;
     const totals = data?.totals && typeof data.totals === 'object' ? data.totals : counts;     // the whole table, not the returned rows
     const cut = pageText(data?.page, tasks.length);
-    summary.replaceChildren(
+    summary.replaceChildren(...[
       h('strong', { text: 'Queue' }),
       ...Object.entries(totals).filter(([, n]) => n).map(([state, n]) => badge(`${state} ${n}`, TONE[state] || '')),
       workers ? h('span', { class: 'q-workers', text: `workers ${workers.running ?? 0}/${workers.limit ?? '?'} · ${workers.present ? 'you are at the PC' : 'away'}` }) : null,
-      cut ? h('span', { class: 'q-page', text: cut }) : null);
+      cut ? h('span', { class: 'q-page', text: cut }) : null].filter(Boolean));     // (a null child would be drawn as the text "null")
     table.replaceChildren(...(tasks.length ? tasks.map(row) : [h('div', { class: 'queue-empty', text: 'No tasks in the last 24 hours.' })]));
   }
 
@@ -151,8 +151,10 @@ export function mountQueue(container) {
       data = await api.queue();
       if (!alive) return;
       note.hidden = true;
-      const text = JSON.stringify(data);
+      const text = JSON.stringify({ ...data, services: undefined, mode: undefined, credits: undefined, disk: undefined, views: undefined,
+        conversions: undefined, holds: undefined, settings: undefined });    // the table redraws only for its own data
       if (text !== lastText) { lastText = text; draw(data); }
+      sections.update(data);
       drawHealth();
       drawBar();
     } catch (error) {

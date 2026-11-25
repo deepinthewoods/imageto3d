@@ -15,6 +15,8 @@ export const state = {
   queue: null,
   credits: null,
   paused: null,
+  /** GET /api/v2/state `status` (phase 4): {mode, paused, services, queue_health ...}, drawn as the header chip (status.js) */
+  status: null,
   /** {read_only, message, notes}: this server may be a read-only second instance (another one holds the writer lock) */
   server: { read_only: false, message: null, notes: [] },
   /** GET /api/v2/state `queue_health` as the server sent it, and its error texts (see queueHealthErrors) */
@@ -68,6 +70,7 @@ function derive() {
   state.queue = raw?.queue ?? null;
   state.credits = raw?.credits ?? null;
   state.paused = raw?.paused ?? null;
+  state.status = raw?.status ?? null;
   state.server = raw?.server ?? { read_only: false, message: null, notes: [] };
   state.queueHealth = raw?.queue_health ?? null;
   state.queueErrors = queueHealthErrors(state.queueHealth);

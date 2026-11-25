@@ -55,6 +55,7 @@ import builds  # noqa: E402
 import catalog  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
+import settings as app_settings  # noqa: E402
 import taskqueue  # noqa: E402
 
 try:
@@ -75,7 +76,6 @@ CREATE_TIME_TOLERANCE = 2.0
 KILL_WAIT = 10.0                      # seconds Kill & retry waits for a killed process to be gone
 ADOPT_CAP_S = 6 * 3600.0              # without psutil a pid cannot be proven to be the task's process: trust it for this long at most
 DEFAULTS = {'layer_workers_present': 1, 'layer_workers_away': 4, 'build_stall_minutes': 30}
-MINIMUM = {'layer_workers_present': 0, 'layer_workers_away': 0, 'build_stall_minutes': 1}
 TASK_ENV = {'BODY_FIT_GPU': '1', 'PYTHONUTF8': '1', 'OMP_NUM_THREADS': '1'}
 DETACHED = (getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'CREATE_NO_WINDOW', 0))
 NO_VERDICT = 'the builder exited 0 without a verdict on stdout'
@@ -154,17 +154,10 @@ def idle_seconds(now: float | None = None) -> float | None:
 
 
 def read_settings(root: Path) -> dict:
-    """`.codex_jobs/_app/settings.json`: the worker limits and `build_stall_minutes` (integers; invalid values take the default)."""
-    out = dict(DEFAULTS)
-    try:
-        raw = json.loads((Path(root) / guard.APP / 'settings.json').read_text(encoding='utf-8-sig'))
-    except (OSError, ValueError):
-        return out
-    if isinstance(raw, dict):
-        for key in DEFAULTS:
-            if isinstance(raw.get(key), int) and not isinstance(raw[key], bool) and raw[key] >= MINIMUM[key]:
-                out[key] = raw[key]
-    return out
+    """The worker limits and `build_stall_minutes` of `.codex_jobs/_app/settings.json`, read through `settings.load` (the only settings reader,
+    DESIGN_PHASE4.md H: invalid values take the default)."""
+    loaded = app_settings.load(root)
+    return {key: loaded[key] for key in DEFAULTS}
 
 
 def supervisor_mode(root: Path) -> str | None:
@@ -927,6 +920,216 @@ def scan_stale(root: Path) -> dict:
     builds.write_stale(root, data)
     catalog.invalidate()
     return data
+
+
+# ------------------------------------------------------------------------------------------------------ services (phase 4)
+
+SERVICE_INTERVAL = 30.0          # seconds between two services.tick passes (the first psutil scan takes ~6 s: never part of the 3 s loop)
+SERVICE_ACTIONS = ('start', 'stop', 'restart')
+EVENT_KEEP = 100
+
+
+class ServiceManager:
+    """The services thread of the writer server, only with `--manage-services` (DESIGN_PHASE4.md A and H). Every SERVICE_INTERVAL it runs
+    `services.tick(root, settings.load(root))` (adopt, crash restart, start missing enabled services) and keeps the last snapshot. Start / Stop /
+    Restart requests from the HTTP threads are queued and run HERE, never on an HTTP thread (`services.stop` waits): `request()` answers at once
+    with `{ok, pending: true, request}` and the outcome appears in `events` (and the queue's event log, kind `service`)."""
+
+    def __init__(self, root: Path, *, interval: float = SERVICE_INTERVAL, tick=None, settings_loader=None) -> None:
+        import services                                    # psutil is needed only when the services are managed
+        self.services = services
+        self.root = Path(root)
+        self.interval = interval
+        self._tick = tick or services.tick
+        self._settings = settings_loader or app_settings.load
+        self.cond = threading.Condition()
+        self.requests: list[dict] = []                    # waiting requests, oldest first
+        self.running: dict | None = None                  # the request being executed
+        self.events: list[dict] = []
+        self.statuses: dict | None = None                 # {name: services.status_one(...)} after the last tick / request
+        self.last_tick: float | None = None
+        self.ticks = 0
+        self.errors: list[str] = []
+        self._next_id = 1
+        self._next_tick = 0.0
+        self._wake = False
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    # ------------------------------------------------------------------------------------------------------- lifecycle
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return
+        self.stop_event.clear()
+        self.thread = threading.Thread(target=self._loop, name='services', daemon=True)
+        self.thread.start()
+
+    def stop(self, timeout: float = 30.0) -> None:
+        """Stop the thread (a request being executed finishes first). The services themselves are never stopped by this."""
+        self.stop_event.set()
+        with self.cond:
+            self.cond.notify_all()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout)
+
+    def wake(self) -> None:
+        """Run a tick now (after a settings change)."""
+        with self.cond:
+            self._wake = True
+            self.cond.notify_all()
+
+    # -------------------------------------------------------------------------------------------------------- requests
+    def request(self, name: object, action: object) -> dict:
+        """Queue a Start / Stop / Restart of `name`. A second request for a service that has one waiting or running is refused (409 busy)."""
+        if name not in self.services.SERVICES:
+            raise ValueError(f'name must be one of {list(self.services.SERVICES)}')
+        if action not in SERVICE_ACTIONS:
+            raise ValueError(f'action must be one of {list(SERVICE_ACTIONS)}')
+        with self.cond:
+            busy = [r for r in self.requests + ([self.running] if self.running else []) if r['name'] == name]
+            if busy:
+                raise guard.Busy(f'{name}: a {busy[0]["action"]} request is already in progress')
+            req = {'id': self._next_id, 'name': name, 'action': action, 'time': time.time()}
+            self._next_id += 1
+            self.requests.append(req)
+            self.cond.notify_all()
+        return {'ok': True, 'pending': True, 'request': req['id'], 'name': name, 'action': action}
+
+    def _event(self, kind: str, text: str, **extra) -> None:
+        self.events = (self.events + [{'time': time.time(), 'kind': kind, 'text': text} | extra])[-EVENT_KEEP:]
+        try:
+            taskqueue.for_root(self.root).event('service', text[:500])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _execute(self, req: dict) -> None:
+        name, action = req['name'], req['action']
+        settings = self._settings(self.root)
+        try:
+            if action == 'start':
+                self.services.start(self.root, name, settings)
+                outcome = {'ok': True, 'pending': False, 'message': f'{name} started'}
+            elif action == 'stop':
+                outcome = self.services.stop(self.root, name, settings=settings)
+            else:
+                outcome = self.services.restart(self.root, name, settings=settings)
+            ok, pending, message = True, bool(outcome.get('pending')), str(outcome.get('message') or '')
+        except self.services.ServiceError as exc:
+            ok, pending, message = False, False, str(exc)
+        except Exception as exc:  # noqa: BLE001
+            ok, pending, message = False, False, f'{type(exc).__name__}: {exc}'
+        self._refresh(settings)              # first: whoever sees the outcome event also sees the status it produced
+        self._event('request', f'{action} {name}: {message}', request=req['id'], name=name, action=action, ok=ok, pending=pending)
+
+    def _refresh(self, settings: dict | None = None) -> None:
+        try:
+            self.statuses = self.services.status(self.root, settings or self._settings(self.root), lines=0)['services']
+        except Exception as exc:  # noqa: BLE001
+            self.errors = (self.errors + [f'status: {type(exc).__name__}: {exc}'])[-20:]
+
+    # ------------------------------------------------------------------------------------------------------------ loop
+    def tick(self) -> dict:
+        """One manager pass (tests call it directly)."""
+        result = self._tick(self.root, self._settings(self.root))
+        self.last_tick = time.time()
+        self.ticks += 1
+        self.statuses = result.get('services')
+        for text in result.get('events') or []:
+            self._event('tick', str(text))
+        return result
+
+    def _loop(self) -> None:
+        while not self.stop_event.is_set():
+            with self.cond:
+                req = self.requests.pop(0) if self.requests else None
+                self.running = req
+            if req is not None:
+                try:
+                    self._execute(req)
+                finally:
+                    with self.cond:
+                        self.running = None
+                continue
+            if self._wake or time.monotonic() >= self._next_tick:
+                self._wake = False
+                try:
+                    self.tick()
+                except Exception as exc:  # noqa: BLE001
+                    self.errors = (self.errors + [f'tick: {type(exc).__name__}: {exc}'])[-20:]
+                    sys.stderr.write(traceback.format_exc())
+                self._next_tick = time.monotonic() + self.interval
+            with self.cond:
+                if not self.requests and not self._wake and not self.stop_event.is_set():
+                    self.cond.wait(max(0.05, self._next_tick - time.monotonic()))
+
+    # ------------------------------------------------------------------------------------------------------------ views
+    def problems(self) -> list[str]:
+        """The header's services problems from the last snapshot ([] before the first tick)."""
+        import progress
+        return progress.problems(self.statuses or {}) or []
+
+    def view(self, lines: int = 20) -> dict:
+        """`services` of GET /api/v2/queue: `services.status` (fresh from the records, with log tails) plus the manager's own state."""
+        try:
+            status = self.services.status(self.root, self._settings(self.root), lines=lines)
+        except Exception as exc:  # noqa: BLE001
+            status = {'services': self.statuses or {}, 'convert_jobs': None, 'errors': [f'status: {type(exc).__name__}: {exc}']}
+        with self.cond:
+            pending = [dict(r) for r in self.requests] + ([dict(self.running) | {'running': True}] if self.running else [])
+        return status | {'managed': True, 'scanned': self.last_tick is not None, 'last_tick': self.last_tick, 'interval': self.interval,
+                         'pending': pending, 'events': list(self.events[-30:]), 'manager_errors': list(self.errors[-5:]),
+                         'problems': self.problems()}
+
+
+class TripoCheck:
+    """The Queue tab's "Check balance" (DESIGN_PHASE4.md E.2 / H): `credits.check_tripo` on a worker thread. Refused (409 busy) while a check
+    runs or a `convert_job.py` of this checkout runs (it uses the same browser profile); the result lands in credits.json and `last`."""
+
+    def __init__(self, root: Path, run=None, busy=None) -> None:
+        self.root = Path(root)
+        self.run = run                                # injectable: run(root) -> (returncode, stdout, stderr); tests never start node
+        self.busy = busy                              # injectable: () -> [running convert_job instances]
+        self.lock = threading.Lock()
+        self.thread: threading.Thread | None = None
+        self.last: dict | None = None
+        self.started: float | None = None
+        self.finished: float | None = None
+
+    def _users(self) -> list[dict]:
+        if self.busy is not None:
+            return list(self.busy())
+        import services
+        return services.convert_job_running(self.root)
+
+    def request(self) -> dict:
+        """{ok: true, status: "running", pending: true} once the check started; {ok: false, status: "busy", message} (HTTP 200, the
+        credits.check_tripo shape) while a check runs or a convert_job.py uses the browser profile. The result goes to `view()["last"]`."""
+        with self.lock:
+            if self.thread and self.thread.is_alive():
+                return {'ok': False, 'status': 'busy', 'message': 'a balance check is already running'}
+            users = self._users()
+            if users:
+                return {'ok': False, 'status': 'busy',
+                        'message': f'convert_job.py is running (pid {users[0].get("pid")}) and uses the Tripo browser profile; check again after it'}
+            self.started, self.finished = time.time(), None
+            self.thread = threading.Thread(target=self._work, name='tripo-check', daemon=True)
+            self.thread.start()
+        return {'ok': True, 'status': 'running', 'pending': True}
+
+    def _work(self) -> None:
+        import credits
+        try:
+            self.last = credits.check_tripo(self.root, run=self.run)
+        except Exception as exc:  # noqa: BLE001
+            self.last = {'status': 'error', 'message': f'{type(exc).__name__}: {exc}'}
+        self.finished = time.time()
+        try:
+            taskqueue.for_root(self.root).event('op', f'check_tripo: {self.last.get("status")} {self.last.get("credits", self.last.get("message", ""))}'[:500])
+        except Exception:  # noqa: BLE001
+            pass
+
+    def view(self) -> dict:
+        return {'running': bool(self.thread and self.thread.is_alive()), 'started': self.started, 'finished': self.finished, 'last': self.last}
 
 
 # ----------------------------------------------------------------------------------------------------------- queue endpoint

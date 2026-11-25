@@ -23,6 +23,10 @@ races from processing/ to completed/ (flock-serialized, errors only logged).
 
 While .codex_jobs/_batch/PAUSE exists (tools/pipeline_supervisor.py) no job is started (PAUSED, once).
 
+Graceful stop (preview app v2): creating .codex_jobs/_batch/convert_worker.stop makes a worker exit before it takes its next
+job (it deletes the file, emits `STOP requested; exiting`, runs finish() like the idle exit); a conversion in flight completes
+first. A stop file left from before a worker started is removed at start.
+
 --backend pixal3d (user, 2026-11-18): convert every job with the free local Pixal3D backend only (no Tripo balance check, no
 Hyper3D); one generation at a time per machine (the backend's GPU lock), so one pixal3d worker is enough. --fallback pixal3d: use
 it instead of Hyper3D once the Tripo credits run out (--tripo-only still stops instead).
@@ -47,6 +51,8 @@ MAX_TRIES = 3
 LOGS = ROOT / '.codex_jobs' / '_batch' / 'convert_logs'
 LOCKS = ROOT / '.codex_jobs' / '_batch' / 'convert_locks'
 PAUSE = ROOT / '.codex_jobs' / '_batch' / 'PAUSE'   # written by tools/pipeline_supervisor.py while the screen is on
+STOP_FILE = ROOT / '.codex_jobs' / '_batch' / 'convert_worker.stop'   # graceful stop: written by the preview app (services.py)
+STOP_NAP = 5   # seconds: the longest a waiting worker sleeps before it looks at the stop file again
 sys.path.insert(0, str(ROOT / 'tools' / 'tripo_pipeline'))
 from convert_job import claim_module, lock_holder, module_converted, read_record  # noqa: E402
 import portable  # noqa: E402  (also puts PYTHONUTF8=1 into the environment of the convert_job children on Windows)
@@ -63,6 +69,13 @@ def emit(line):
     EVENTS.parent.mkdir(parents=True, exist_ok=True)
     with EVENTS.open('a', encoding='utf-8') as handle:
         handle.write(line + '\n')
+
+
+def nap(seconds):
+    """time.sleep in slices so a stop request is noticed within STOP_NAP seconds."""
+    end = time.time() + seconds
+    while time.time() < end and not STOP_FILE.exists():
+        time.sleep(min(STOP_NAP, max(0.0, end - time.time())))
 
 
 def tripo_balance():
@@ -183,7 +196,7 @@ def finish(job_name=None):
         emit(f'FINISH failed: {error!r}')
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--sets', default='', help='comma-separated set ids or fnmatch patterns')
     parser.add_argument('--sets-file', type=Path, help='one set id/pattern per line; re-read every loop, so sets can be added '
@@ -198,7 +211,7 @@ def main():
                         help='pixal3d: convert with the free local Pixal3D backend only (tools/pixal3d_pipeline)')
     parser.add_argument('--fallback', choices=('hyper3d', 'pixal3d'), default='hyper3d',
                         help='backend for the modules left when the Tripo credits run out (default hyper3d)')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     global TAG
     if args.worker > 1:
         TAG = f'[w{args.worker}] '
@@ -207,12 +220,18 @@ def main():
             raise SystemExit(f'missing profile clone {profile}')
         os.environ['HYPER3D_PROFILE'] = str(profile)
     sets, tripo_done, idle, low, paused = set(args.sets.split(',')), args.no_tripo, False, False, False
+    STOP_FILE.unlink(missing_ok=True)   # a stop requested before this start is stale
     while True:
+        if STOP_FILE.exists():
+            STOP_FILE.unlink(missing_ok=True)
+            emit('STOP requested; exiting')
+            finish()
+            return
         if PAUSE.exists():
             if not paused:
                 emit('PAUSED (PAUSE file); not starting conversions')
                 paused = True
-            time.sleep(min(args.poll, 30))
+            nap(min(args.poll, 30))
             continue
         paused = False
         free = shutil.disk_usage(ROOT).free
@@ -220,7 +239,7 @@ def main():
             if not low:
                 emit(f'LOW DISK: {free / 2**30:.1f} GB free (minimum {MIN_FREE // 2**30} GB); not starting conversions')
                 low = True
-            time.sleep(args.poll)
+            nap(args.poll)
             continue
         low = False
         if args.sets_file:
@@ -240,7 +259,7 @@ def main():
             if runner_gone and busy and not idle:
                 emit('IDLE: nothing staged, but conversions are in flight; waiting (runner gone)')
                 idle = True
-            time.sleep(args.poll)
+            nap(args.poll)
             continue
         idle = False
         emit(f'CONVERT {job.name}' + ('' if owner else ' (joining: free modules)'))

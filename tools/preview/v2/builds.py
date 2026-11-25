@@ -32,6 +32,7 @@ for _p in (HERE.parent, HERE):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 import guard  # noqa: E402
+import settings as app_settings  # noqa: E402
 
 REPO = HERE.parents[2]
 BUILD_PY = REPO / 'tools' / 'layers' / 'build.py'
@@ -411,10 +412,9 @@ STALL_DEFAULT = 30
 
 
 def stall_minutes(root: Path) -> int:
-    """settings.json `build_stall_minutes` (an integer >= 1, default 30): an attempt whose logs stop growing that long is `stalled`."""
-    raw = read_json(Path(root) / guard.APP / 'settings.json') or {}
-    value = raw.get('build_stall_minutes')
-    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else STALL_DEFAULT
+    """settings.json `build_stall_minutes` (an integer 1..1440, default 30; read through settings.load, the only settings reader): an attempt
+    whose logs stop growing that long is `stalled`."""
+    return app_settings.load(root)['build_stall_minutes']
 
 
 def last_output(task: dict) -> float | None:

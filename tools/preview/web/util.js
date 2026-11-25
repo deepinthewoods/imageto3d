@@ -109,3 +109,42 @@ export function fillSelect(select, options, value) {
   if (options.some(([v]) => v === value)) select.value = value;
   return select;
 }
+
+/** "42s", "3m 05s", "2h 10m" for a number of seconds ('' when it is not a number). */
+export function duration(seconds) {
+  if (seconds == null || Number.isNaN(+seconds)) return '';
+  const s = Math.max(0, Math.round(+seconds));
+  return s < 60 ? `${s}s` : s < 3600 ? `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s` : `${Math.floor(s / 3600)}h ${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+}
+
+/** "123.4 GB" for a byte count ('' when it is not a number). */
+export function bytesText(bytes) {
+  if (bytes == null || Number.isNaN(+bytes)) return '';
+  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+  let value = Math.max(0, +bytes);
+  let i = 0;
+  while (value >= 1024 && i < units.length - 1) { value /= 1024; i++; }
+  return `${value >= 100 || i === 0 ? Math.round(value) : value.toFixed(1)} ${units[i]}`;
+}
+
+/** "5 min ago" / "in 2 h" for an ISO time or epoch seconds ('' when unparseable). Times without a zone are read as local time. */
+export function ago(when, now = Date.now()) {
+  if (when == null || when === '') return '';
+  const ms = typeof when === 'number' ? when * 1000 : Date.parse(when);
+  if (Number.isNaN(ms)) return '';
+  const s = Math.round((now - ms) / 1000);
+  const a = Math.abs(s);
+  if (a < 5) return 'just now';
+  const text = a < 60 ? `${a} s` : a < 3600 ? `${Math.round(a / 60)} min` : a < 172800 ? `${Math.round(a / 3600)} h` : `${Math.round(a / 86400)} d`;
+  return s < 0 ? `in ${text}` : `${text} ago`;
+}
+
+/**
+ * A held Enter key repeats the click of a focused button (and the implicit submit of an input): swallow the repeats so a held key
+ * never fires a write twice. Put it on a container; it listens in the capture phase.
+ */
+export function blockRepeat(node) {
+  node.addEventListener('keydown', event => {
+    if (event.repeat && event.key === 'Enter' && event.target instanceof Element && event.target.closest('button, input')) event.preventDefault();
+  }, true);
+}

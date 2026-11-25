@@ -257,7 +257,8 @@ class StageTests(V2Case):
         self.assertIn('doubled', self.unit('s_err')[0]['error'])
         _, state = self.get('/api/v2/state')
         card = next(c for c in state['tabs']['approved'] if c['id'] == 'set:s_conv')
-        self.assertEqual(card['progress'], {'human_male': {'outfit': 'converting'}})
+        self.assertEqual(card['progress']['human_male']['outfit']['status'], 'converting')     # phase 4: the unit's progress record
+        self.assertEqual(set(card['progress']['human_male']['outfit']), {'status', 'views_done', 'views_total', 'held_reason', 'converting_step', 'error'})
         self.assertEqual((card['type'], card['kind'], card['stage'], card['actions']), ('character', 'outfit', 'approved', []))
 
     def test_reduced_beats_converting_and_set_reaches_3d(self):

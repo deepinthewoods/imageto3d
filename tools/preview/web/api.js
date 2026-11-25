@@ -32,7 +32,7 @@ function url(path, query) {
   return out.pathname + out.search;
 }
 
-async function request(path, { method = 'GET', query, json, blob } = {}) {
+async function request(path, { method = 'GET', query, json, blob, quiet = false } = {}) {
   const headers = {};
   let body;
   if (method !== 'GET') headers['X-Token'] = token;
@@ -54,7 +54,7 @@ async function request(path, { method = 'GET', query, json, blob } = {}) {
   try { data = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
   if (!response.ok) {
     const error = new ApiError(data?.error || `HTTP ${response.status}`, response.status, data);
-    if (error.conflict) conflictHandler?.(error);
+    if (error.conflict && !quiet) conflictHandler?.(error);   // quiet: the caller shows the 409's own message (the service manager's "off")
     throw error;
   }
   return data;
@@ -75,5 +75,10 @@ export const api = {
   queue: () => request('/queue'),
   /** op: retry | cancel | kill_retry | rebuild_stale. `extra` is merged into the body (kill_retry: {token} of the attempt the user saw). */
   queueOp: (op, id, extra) => request('/queue', { method: 'POST', json: { op, id, ...(extra || {}) } }),
+  /**
+   * Phase 4 Queue ops (service, mode, settings, check_tripo, release, view_retry, convert_reset): `body` = {op, ...args}. A 409 is NOT
+   * routed to the global conflict handler (it would toast "Changed elsewhere"): the caller shows the server's message.
+   */
+  queuePost: body => request('/queue', { method: 'POST', json: body, quiet: true }),
   thumbnail: (glbUrl, blob) => request('/thumbnail', { method: 'POST', query: { url: glbUrl }, blob }),
 };

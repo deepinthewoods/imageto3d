@@ -29,8 +29,11 @@ for _p in (HERE.parent, HERE):
 import serve  # noqa: E402  (tools/preview/serve.py, used as a library)
 import builds  # noqa: E402
 import catalog  # noqa: E402
+import convert_list  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
+import modes  # noqa: E402
+import settings as app_settings  # noqa: E402
 import taskqueue  # noqa: E402
 from claim_lock import ClaimBusy, claim_lock  # noqa: E402  (tools/tripo_pipeline on sys.path through guard.py)
 
@@ -552,12 +555,14 @@ def concept_action(root: Path, verb: str, item_id: str, args: dict) -> dict:
         result = hop_to_provisional(root, kind, name)
         return result | {'undo': _undo('unapprove', f'provisional:{name}', {'to': kind})}
     if verb == 'approve':
+        # approval = the processing request (DESIGN_PHASE4.md B / H): once the set is in approved/, it goes on the convert list
         if kind in ('concepts', 'archive'):
-            result = direct_approve(root, kind, name)
+            result = add_to_convert_list(root, name, direct_approve(root, kind, name))
             return result | {'undo': _undo('unapprove', f'approved:{name}', {'to': kind})}
         if kind == 'provisional':
-            return provisional_approve(root, name) | {'undo': _undo('unapprove', f'approved:{name}')}
+            return add_to_convert_list(root, name, provisional_approve(root, name)) | {'undo': _undo('unapprove', f'approved:{name}')}
         result = legacy_approve(root, kind, parts)
+        result = add_to_convert_list(root, (result.get('promoted') or {}).get('set'), result)
         return result | {'undo': _undo('restore', result['undo_id'])}
     if verb == 'unapprove':
         target = args.get('to') if isinstance(args.get('to'), str) else None
@@ -587,6 +592,25 @@ def concept_action(root: Path, verb: str, item_id: str, args: dict) -> dict:
         result = restore_legacy(root, parts) if kind == 'trashlegacy' else restore_set(root, name)
         return result | {'undo': None}
     raise ValueError(f'Unknown verb {verb}')
+
+
+def add_to_convert_list(root: Path, set_name: str | None, result: dict) -> dict:
+    """After a v2 approve landed `set_name` in approved/: `convert_list.add_sets(root, [set])` (lines `<set>` and `<set>_*`). The move stands
+    whatever happens here: a failure (or a `!` exclude that still matches the set) is a `warning` in the response."""
+    notes = []
+    try:
+        if not isinstance(set_name, str) or not set_name:
+            raise ValueError('the approved set id is unknown')
+        added = convert_list.add_sets(root, [set_name])
+        result['convert_list'] = added
+        if added['excluded']:
+            notes.append(f'{set_name} is on the convert list but excluded by {", ".join(added["excluded"][set_name])} in convert_sets.txt')
+    except Exception as exc:  # noqa: BLE001  (the approval itself already happened)
+        notes.append(f'convert list not updated ({type(exc).__name__}: {exc}); use Release in the Queue tab')
+        result['convert_list'] = None
+    if notes:
+        result['warning'] = '; '.join(([result['warning']] if result.get('warning') else []) + notes)
+    return result
 
 
 # ------------------------------------------------------------------------------------------------------------------ set verbs
@@ -1106,6 +1130,122 @@ def set_amount(root: Path, data: object) -> dict:
 
 
 QUEUE_OPS = ('retry', 'cancel', 'kill_retry', 'rebuild_stale')
+PIPELINE_OPS = ('service', 'mode', 'settings', 'check_tripo', 'release', 'view_retry', 'convert_reset')     # phase 4 (DESIGN_PHASE4.md H)
+MODE_VALUES = {'auto': 'views-run', 'pause-conversions': 'pause-conversions', 'pause': 'pause', 'run': 'run',
+               'views-run': 'views-run', 'pause_conversions': 'pause-conversions', 'pause_all': 'pause', 'run_now': 'run'}
+TASK_NAME = re.compile(r'[a-z]+(?:--[A-Za-z0-9_-]+){1,4}')
+JOB_NAME = re.compile(r'[a-z0-9][a-z0-9_]*--[0-9a-f]{6,32}')
+
+
+class ServicesOff(guard.Conflict):
+    """The `service` op on a server started without --manage-services (HTTP 409)."""
+    code = 'services_off'
+
+
+def _log_op(root: Path, op: str, detail: str) -> None:
+    """Every Queue-tab operation is an event of the queue's event log (best effort)."""
+    try:
+        taskqueue.for_root(root).event('op', f'{op}: {detail}'[:500])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _batch(root: Path) -> Path:
+    return Path(root) / '.codex_jobs' / '_batch'
+
+
+def view_retry(root: Path, name: object) -> dict:
+    """op view_retry: a FAILED view-runner task goes back to `pending` with attempts 0, its `jobs` kept (the runner's own resume path: it gives
+    the next job a fresh number and a resume note for the outputs already there). Anything but a failed task is refused."""
+    if not isinstance(name, str) or not TASK_NAME.fullmatch(name):
+        raise ValueError('name must be a view-runner task name')
+    if not (_batch(root) / 'tasks' / f'{name}.json').is_file():
+        raise catalog.NotFound(f'Unknown task {name}')
+    path = _batch(root) / 'status' / f'{name}.json'
+    try:
+        status = json.loads(path.read_text(encoding='utf-8-sig'))
+    except FileNotFoundError:
+        raise ValueError(f'{name} is pending; only a failed task can be retried') from None
+    except (OSError, ValueError) as exc:
+        raise ValueError(f'the status file of {name} cannot be read: {exc}') from None
+    if not isinstance(status, dict) or status.get('state') != 'failed':
+        raise ValueError(f'{name} is {status.get("state") if isinstance(status, dict) else "unreadable"}; only a failed task can be retried')
+    before = status.get('attempts')
+    status.update(state='pending', attempts=0)
+    guard.write_atomic(path, (json.dumps(status, indent=2) + '\n').encode('utf-8'))
+    return {'ok': True, 'name': name, 'state': 'pending', 'attempts_before': before, 'jobs': len(status.get('jobs') or [])}
+
+
+def convert_reset(root: Path, job: object) -> dict:
+    """op convert_reset: delete `convert_locks/<job>.fails` (the convert worker skips a job once it failed MAX_TRIES times)."""
+    if not isinstance(job, str) or not JOB_NAME.fullmatch(job):
+        raise ValueError('job must be a job folder name <set>--<id>')
+    path = _batch(root) / 'convert_locks' / f'{job}.fails'
+    try:
+        count = path.read_text(encoding='utf-8').strip()
+    except FileNotFoundError:
+        raise catalog.NotFound(f'{job} has no failure count') from None
+    path.unlink(missing_ok=True)
+    return {'ok': True, 'job': job, 'count_before': int(count) if count.isdigit() else count}
+
+
+def release_set(root: Path, set_id: object) -> dict:
+    """op release: `convert_list.add_sets(root, [set])` for a set the worker ignores (held: not in the convert list). The set must be a known
+    one: the set id of a staged job (or its base set) or a catalog set; an exclude that still matches is reported as a warning."""
+    if not isinstance(set_id, str) or not convert_list.SET_RE.match(set_id):
+        raise ValueError('set must be a set id')
+    staged = {job['set'] for job in convert_list.staged_jobs(root)}
+    known = set_id in staged or any(s.startswith(set_id + '_') for s in staged) or set_id in catalog.derive_all(root)['sets']
+    if not known:
+        raise catalog.NotFound(f'Unknown set {set_id}')
+    added = convert_list.add_sets(root, [set_id])
+    result = {'ok': True, 'set': set_id} | added
+    if added['excluded']:
+        result['warning'] = f'{set_id} is still excluded by {", ".join(added["excluded"][set_id])}: remove that line from convert_sets.txt by hand'
+    return result
+
+
+def pipeline_op(root: Path, data: dict, ctx: dict | None) -> dict:
+    """The phase 4 operations of POST /api/v2/queue (DESIGN_PHASE4.md H). `ctx` = the server context: `services` (the ServiceManager, only with
+    --manage-services) and `tripo` (the balance-check runner). Each is logged as a queue event."""
+    ctx = ctx or {}
+    op = data['op']
+    if op == 'service':
+        manager = ctx.get('services')
+        if manager is None:
+            raise ServicesOff('service management is off (start the server with --manage-services)')
+        result = manager.request(data.get('name'), data.get('action'))
+        detail = f'{data.get("action")} {data.get("name")} (request {result.get("request")})'
+    elif op == 'mode':
+        mode = data.get('mode')
+        if mode not in MODE_VALUES:
+            raise ValueError('mode must be auto, pause-conversions, pause or run')
+        result = {'ok': True, 'mode': modes.write_mode(root, MODE_VALUES[mode])}
+        detail = f'{mode} -> {result["mode"]["mode"]}'
+    elif op == 'settings':
+        result = {'ok': True, 'settings': app_settings.save(root, data.get('patch'))}     # SettingsError (400 with its problems) on a bad patch
+        detail = json.dumps(data.get('patch'))[:300]
+        manager = ctx.get('services')
+        if manager is not None:
+            manager.wake()                    # an enabled / disabled service is acted on now, not at the next 30 s tick
+    elif op == 'check_tripo':
+        checker = ctx.get('tripo')
+        if checker is None:
+            raise ValueError('the balance check is not available on this server')
+        result = checker.request()
+        detail = result['status'] + (f': {result["message"]}' if result.get('message') else '')
+    elif op == 'release':
+        result = release_set(root, data.get('set'))
+        detail = f'{data.get("set")}: added {result["added"]}'
+    elif op == 'view_retry':
+        result = view_retry(root, data.get('name'))
+        detail = str(data.get('name'))
+    else:
+        result = convert_reset(root, data.get('job'))
+        detail = f'{data.get("job")} (was {result["count_before"]})'
+    _log_op(root, op, detail)
+    catalog.invalidate()
+    return result
 
 
 def rebuild_stale(root: Path) -> dict:
@@ -1140,13 +1280,15 @@ def rebuild_stale(root: Path) -> dict:
     return {'ok': True, 'queued': queued, 'sets': sets}
 
 
-def queue_op(root: Path, data: object) -> dict:
+def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
     """POST /api/v2/queue {op: "retry" | "cancel" | "kill", id}: Retry puts a failed / cancelled task back in the queue (fresh attempts), only
     while its approval is still active (a withdrawn set's task is refused, review F6); Cancel stops a QUEUED one; Kill (& retry) flags a
     starting / running one (e.g. stalled): the orchestrator kills its builder, then its wrapper (each by PID after a command-line and
-    create-time check) and queues a fresh attempt (review F10). Phase 4 extends this."""
-    if not isinstance(data, dict) or data.get('op') not in QUEUE_OPS:
-        raise ValueError('op must be retry, cancel, kill_retry or rebuild_stale')
+    create-time check) and queues a fresh attempt (review F10). Phase 4 adds PIPELINE_OPS (`pipeline_op`, DESIGN_PHASE4.md H)."""
+    if not isinstance(data, dict) or data.get('op') not in QUEUE_OPS + PIPELINE_OPS:
+        raise ValueError('op must be one of ' + ', '.join(QUEUE_OPS + PIPELINE_OPS))
+    if data['op'] in PIPELINE_OPS:
+        return pipeline_op(root, data, ctx)
     if data['op'] == 'rebuild_stale':
         return rebuild_stale(root)
     task_id = data.get('id')
