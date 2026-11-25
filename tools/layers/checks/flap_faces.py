@@ -5,7 +5,7 @@ from collections import Counter
 
 import numpy as np
 
-sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/experiments/shell_slots_20261122')
+sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/tools/layers')
 sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
 import geodiv as gd  # noqa: E402
 import glbread2  # noqa: E402

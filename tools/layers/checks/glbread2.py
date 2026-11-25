@@ -1,4 +1,11 @@
-"""Minimal GLB reader for the prototype's own files: positions (optionally + a morph target at weight 1), faces, skin flag per face."""
+"""Minimal GLB reader for the layer builder's own files (shell_slots.glb_bytes): positions (optionally + a morph target at weight 1), faces and the
+material name ('role:prov') of every face; with colours=True also the material's baseColorFactor per face.
+
+    V, F, mats = read(path, morph='fill')                       mats: object array of material names
+    V, F, mats, rgba = read(path, colours=True)
+    skin = skin_mask(mats); roles, provs = split_names(mats)
+
+Vertices are returned in the builder's Z-up space (glTF Y-up converted back); a layer GLB is not indexed (three vertices per face, in face order)."""
 import json
 import struct
 
@@ -8,11 +15,9 @@ CT = {5120: np.int8, 5121: np.uint8, 5122: np.int16, 5123: np.uint16, 5125: np.u
 NC = {'SCALAR': 1, 'VEC2': 2, 'VEC3': 3, 'VEC4': 4}
 
 
-MATS = True
-
-
-def read(path, morph=None):
-    b = open(path, 'rb').read()
+def read(path, morph=None, colours=False):
+    with open(path, 'rb') as fh:
+        b = fh.read()
     n = struct.unpack_from('<I', b, 12)[0]
     js = json.loads(b[20:20 + n])
     off = 20 + n
@@ -27,7 +32,7 @@ def read(path, morph=None):
         k = NC[a['type']]
         return np.frombuffer(bin_, dt, a['count'] * k, o).reshape(a['count'], k) if k > 1 else np.frombuffer(bin_, dt, a['count'], o)
 
-    Vs, Fs, skin, off_v = [], [], [], 0
+    Vs, Fs, mats, cols, off_v = [], [], [], [], 0
     for node in js.get('nodes', []):
         if 'mesh' not in node:
             continue
@@ -38,11 +43,25 @@ def read(path, morph=None):
             if morph and morph in names and 'targets' in prim:
                 V = V + acc(prim['targets'][names.index(morph)]['POSITION'])
             F = acc(prim['indices']).astype(np.int64).reshape(-1, 3) if 'indices' in prim else np.arange(len(V)).reshape(-1, 3)
-            mat = js['materials'][prim['material']]['name'] if 'material' in prim else ''
+            m = js['materials'][prim['material']] if 'material' in prim else {}
             Vs.append(V)
             Fs.append(F + off_v)
-            skin.append(np.full(len(F), mat, dtype=object) if MATS else np.full(len(F), mat.split(':')[0] == 'skin'))
+            mats.append(np.full(len(F), m.get('name', ''), dtype=object))
+            rgba = (m.get('pbrMetallicRoughness') or {}).get('baseColorFactor', [1., 1., 1., 1.])
+            cols.append(np.tile(np.array(rgba, np.float64), (len(F), 1)))
             off_v += len(V)
     V = np.concatenate(Vs)
-    V = np.c_[V[:, 0], -V[:, 2], V[:, 1]]                     # glTF Y-up -> the prototype's Z-up
-    return V, np.concatenate(Fs), np.concatenate(skin)
+    V = np.c_[V[:, 0], -V[:, 2], V[:, 1]]                     # glTF Y-up -> the builder's Z-up
+    out = (V, np.concatenate(Fs), np.concatenate(mats))
+    return out + (np.concatenate(cols),) if colours else out
+
+
+def split_names(mats):
+    """(role, prov) arrays of the 'role:prov' material names."""
+    parts = [str(m).split(':', 1) + [''] for m in mats]
+    return np.array([p[0] for p in parts]), np.array([p[1] for p in parts])
+
+
+def skin_mask(mats):
+    """True where the face's role is 'skin' (the role part of the 'role:prov' material name)."""
+    return split_names(mats)[0] == 'skin'

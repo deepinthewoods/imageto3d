@@ -5,7 +5,7 @@ import sys
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/experiments/shell_slots_20261122')
+sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/tools/layers')
 sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
 import glbread2  # noqa: E402
 import visibility as vis  # noqa: E402

@@ -20,13 +20,11 @@ model has garment across the seam (a cuff over the elbow) there is no skin to jo
 The Amount morph ('fill'): generated skin inside the game body goes out onto it, then the garment is pushed out of the body (geodiv.fill_grouped)
 with garment layers kept in order and folds undone (pieces.py guards). Ring vertices never move.
 
-  python experiments/shell_slots_20261122/layers.py [--races ...] [--only <set substring>] [--workers 11] [--gpu]
-Writes out/layers/<race>/<slot>__<set>.glb (+ .json, scenes/*.npz), out/layers/index.json; out/layers/mix.html shows them together.
+Production tool (pipeline v2, tools/layers/): moved here from experiments/shell_slots_20261122/ unchanged in what it builds. The per-module API
+is `module_layers(module_dir, lod, out_dir)` and `bare_layers(race, out_dir)` below; `build.py` wraps them (fingerprint, atomic publish, CLI).
+Writes <out_dir>/<slot>.glb (+ <slot>.json, scenes/<slot>__a0.npz / __a100.npz).
 """
-import argparse
 import json
-import multiprocessing as mp
-import os
 import sys
 import time
 from pathlib import Path
@@ -34,7 +32,9 @@ from pathlib import Path
 import numpy as np
 
 HERE = Path(__file__).resolve().parent
-OUTL = HERE / 'out' / 'layers'
+if str(HERE) not in sys.path:                                         # `import geodiv` / `import pieces` below, from any cwd
+    sys.path.insert(0, str(HERE))
+OUT_DIR = None                                                        # where write_layer puts its files (set per build by module_layers / bare_layers)
 SEAM_SNAP_MM = 25.0         # an existing vertex this close to a seam (along the body) is MOVED onto it; an edge crossing the seam with no
                             # such vertex at either end is split where it crosses (sparse generated meshes: a 75 cm skin edge must not be dragged)
 SEAM_BAND = 0.8             # a removed/kept skin edge counts as the seam edge of a ring if it lies within this x the ring radius (+ 30 mm)
@@ -86,11 +86,6 @@ RING_CAPS = True            # every seam ring is capped like the neck: bare laye
 NECK_CAP_DOME = 0.15        # the cap bulges this x the ring radius away from its own side (a rounded stump, not a flat disc)
 
 
-def _setup():
-    sys.path.insert(0, str(HERE))
-    import geodiv  # noqa: F401
-
-
 def rings_of(body, slot, gd):
     """The slot's rings on the game body: ordered vertex loops with centre, unit axis pointing INTO the slot, radius and the parts on both sides."""
     from shell_slots import Mesh, boundary_loops
@@ -113,12 +108,6 @@ def rings_of(body, slot, gd):
         parts = sorted(set(body.part[touch].tolist()))
         out.append({'ids': lp, 'P': P, 'c': c, 'a': a, 'r': r, 'parts': parts})
     return out
-
-
-def _basis(a):
-    e1 = np.cross(a, [0., 0., 1.]) if abs(a[2]) < .9 else np.cross(a, [1., 0., 0.])
-    e1 /= np.linalg.norm(e1)
-    return e1, np.cross(a, e1)
 
 
 def ring_field(body, slot, rings):
@@ -947,7 +936,6 @@ def _seg_tri(P0, P1, T, params=False):
     return (hit, t, u, v) if params else hit
 
 
-
 def _bary(P, T):
     """Barycentric coordinates of points P (projected) in triangles T, per row."""
     v0, v1, v2 = T[:, 1] - T[:, 0], T[:, 2] - T[:, 0], P - T[:, 0]
@@ -1021,7 +1009,6 @@ def wall_crossings(X, F, side, reach=None):
     k, _ = _pair_hits(X, F, pi, po)
     k = np.unique(k)
     return pi[k], po[k]
-
 
 
 WALL_CLEAR = True            # the inner wall of a garment slab must stay behind the outer surface over it: where the polygon reduction (or the
@@ -1245,18 +1232,6 @@ def _strip(body, slot, R):
     return np.isin(body.part, slot) & np.isin(body.F, R['ids']).any(1)
 
 
-def _garment_over(m, slot, rings0, body, gd):
-    """Per ring: does the module's kept garment come within 40 mm of the body strip next to it?"""
-    keepG, _ = gd.kept_garment(m, slot, None, body)
-    G = np.flatnonzero(keepG & (m.role != gd.SKIN))
-    if not len(G):
-        return [False] * len(rings0)
-    gv = np.unique(m.F[G])
-    d, tri, _ = body.closest(m.V[gv])
-    close = np.abs(d) < .04
-    return [bool((_strip(body, slot, R)[tri] & close).any()) for R in rings0]
-
-
 def build_layer(m, slot, body, gd):
     """The layer, with BODY_BAND: at every seam its own skin reaches all round, with no garment over the body strip next to it, the layer's
     skin is cut at the body's NEXT row of vertices instead of the seam and the strip between is the game body's own faces (prov 'seamband'),
@@ -1384,6 +1359,9 @@ def _build_layer(m, slot, body, gd, rings0, use):
         t_ = np.clip(((lay.V[:, None] - A[None]) * AB[None]).sum(2) / np.maximum((AB ** 2).sum(1), 1e-18)[None], 0, 1)
         on_ring |= np.linalg.norm(A[None] + t_[..., None] * AB[None] - lay.V[:, None], axis=2).min(1) < 1e-7
     ring_v = np.flatnonzero(on_ring)
+    lq = {tuple(x) for x in np.round(lay.V * 1e7).astype(np.int64)}
+    orig = {tuple(x) for R in rings0 for x in np.round(R['P'] * 1e7).astype(np.int64)}    # the seam rings' own vertices (by position)
+    ring_orig_present = len(orig & lq)
     for R, nk in zip(rings, snotes['rings']):
         nk['ring_edges_joined'] = _joined(lay, R)
     blend_notes = seam_blend(lay, body, ring_v, gd)
@@ -1449,19 +1427,23 @@ def _build_layer(m, slot, body, gd, rings0, use):
         gnotes['wall_crossings_left'] = [int(len(wall_crossings(X, lay.F, side)[0])) for X in (lay.V, U1)]
     return lay, U1, {'select': selnotes, 'seams': snotes, 'amount': anotes, 'neck_caps': cnotes, 'end_caps': enotes, 'faces': int(len(lay.F)),
                      'band': band_notes, 'slider_fold_guard': gnotes, 'ring_vertices': int(len(ring_v)),
-                     'ring_vertices_expected': int(sum(len(R['P']) for R in rings0))}
+                     'ring_vertices_expected': int(sum(len(R['P']) for R in rings0)),
+                     'ring_original_merged': max(len(orig) - ring_orig_present, 0),               # seam-ring vertices that are no longer a vertex of the layer
+                     'ring_line_vertices': max(int(len(ring_v)) - ring_orig_present, 0)}          # other vertices ON a ring line / inner ring (inserted by the snap)
 
 
 def write_layer(race, slot_key, set_name, lay, U1, rec, gd):
+    """<OUT_DIR>/<slot>.glb (+ morph 'fill'), <slot>.json (the notes) and scenes/<slot>__a0.npz / __a100.npz (the arrays the check tools read:
+    gV positions, gF faces, gC role colours, gRole / gProv the role and provenance NAME of every face)."""
     from shell_slots import face_colours, glb_bytes
-    d = OUTL / race
+    d = Path(OUT_DIR)
     (d / 'scenes').mkdir(parents=True, exist_ok=True)
-    stem = f'{slot_key}__{set_name}'
+    stem = slot_key
     (d / f'{stem}.glb').write_bytes(glb_bytes(lay, U1))
     for tag, X in (('a0', lay.V), ('a100', U1 if U1 is not None else lay.V)):
         np.savez_compressed(d / 'scenes' / f'{stem}__{tag}.npz', gV=X.astype(np.float32), gF=lay.F.astype(np.int32),
-                            gC=face_colours(lay, 'role').astype(np.float32))
-    rec.update({'race': race, 'slot': slot_key, 'set': set_name, 'glb': f'{race}/{stem}.glb', 'faces': int(len(lay.F)), 'code_mtime': gd.CODE_MTIME})
+                            gC=face_colours(lay, 'role').astype(np.float32), gRole=lay.role.astype('<U10'), gProv=lay.prov.astype('<U8'))
+    rec.update({'race': race, 'slot': slot_key, 'set': set_name, 'glb': f'{stem}.glb', 'faces': int(len(lay.F)), 'code_mtime': gd.CODE_MTIME})
     (d / f'{stem}.json').write_text(json.dumps(rec, default=float, indent=1), encoding='utf-8')
 
 
@@ -1556,7 +1538,7 @@ def replane_limbs(body, gd):
     rp = gd.bf.BASE_CACHE / f'{race}_rig.npz'
     if not rp.is_file():
         return []
-    z = np.load(rp, allow_pickle=True)
+    z = gd.load_npz(rp, {'bone_names': 'US', 'bone_head': 'f', 'bone_tail': 'f'})
     bn = [str(x) for x in z['bone_names']]
     unit = lambda x: x / max(np.linalg.norm(x), 1e-12)               # noqa: E731
     done = []
@@ -1700,19 +1682,10 @@ def centre_legs(m, body, gd):
     return notes
 
 
-LOD_OVERRIDE = {                    # set -> reduction level used instead of shell_slots.LV ('0p4'), for every race and module of that set
-    'magic_plate_mail_15_phloem_shell': '0p2',      # user 2026-11-25: "try just process this one at lod 0.2" (right thigh)
-}
-
-
-def source_lod(mod):
-    return LOD_OVERRIDE.get(Path(mod).parts[-4])
-
-
-def prep(mod, body, race, gd):
-    """The aligned generated module (white-anchor alignment as before) with its skin labels cleaned; no rim snapping onto the game body."""
+def prep(mod, body, race, gd, lod):
+    """The aligned generated module at reduction level `lod` (white-anchor alignment as before) with its skin labels cleaned; no rim snapping onto the game body."""
     rig = gd.ab.Rig.from_npz(gd.bf.BASE_CACHE / f'{race}_rig.npz')
-    m, info = gd.load_shell(mod, gd.bf.get_body(race), rig, lv=source_lod(mod))
+    m, info = gd.load_shell(mod, gd.bf.get_body(race), rig, lv=lod)
     slots(body, gd)                                                   # makes sure the body's own part fixes are done
     for joint, n, ui, li in getattr(body, '_replanes', []):          # the module carries the base's part labels: same joint-plane fix
         sel = np.isin(m.part, [ui, li])
@@ -1724,10 +1697,35 @@ def prep(mod, body, race, gd):
     return m, info
 
 
-def task_bare(race):
+def _module_slots(module):
+    return {'outfit': ['outfit'], 'body_armor': ['torso'],
+            'right_gauntlet_boot': ['lower_arm.r', 'lower_arm.l', 'lower_leg.r', 'lower_leg.l']}.get(module, [])
+
+
+def _boundary_edges(F):
+    """Edges used by exactly one face (the open seams at the rings, plus anything left open)."""
+    E = np.sort(np.concatenate([F[:, [0, 1]], F[:, [1, 2]], F[:, [2, 0]]]), axis=1)
+    return int((np.unique(E, axis=0, return_counts=True)[1] == 1).sum())
+
+
+def _slot_metrics(lay, notes):
+    gf = notes['slider_fold_guard'].get('wall_crossings_left')
+    return {'faces': int(len(lay.F)), 'warnings': list(notes['amount'].get('warnings', [])),
+            'wall_crossings_left': [int(x) for x in gf] if gf is not None else None,
+            'boundary_edges': _boundary_edges(lay.F), 'ring_vertices': notes['ring_vertices'],
+            'ring_vertices_expected': notes['ring_vertices_expected'],
+            'ring_original_merged': notes['ring_original_merged'], 'ring_line_vertices': notes['ring_line_vertices']}
+
+
+def bare_layers(race, out_dir):
+    """The game body's own faces of every slot of `race` (head, torso, lower_arm.r/l, lower_leg.r/l) as layers in `out_dir`. Returns a result dict."""
     import geodiv as gd
+    global OUT_DIR
+    OUT_DIR = Path(out_dir)
+    t0 = time.monotonic()
     body = get_body(race, gd)
     S = slots(body, gd)
+    res = {'race': race, 'set': 'bare', 'module': 'bare', 'slots': {}, 'skipped': {}, 'expected': [k for k in S if k != 'outfit'], 'load': {}}
     for k, ids in S.items():
         if k == 'outfit':
             continue
@@ -1739,65 +1737,43 @@ def task_bare(race):
         elif NECK_CAP and k in ('head', 'torso'):
             g, _, cn = add_caps(g, None, neck_rings(ob, rings_of(ob, ids, gd), gd, head_slot=k == 'head'), gd)
         write_layer(race, k, 'bare', g, None, {'kind': 'bare', 'parts': [body.part_names[i] for i in ids], 'neck_caps': cn}, gd)
-    return f'{race}: bare layers'
+        res['slots'][k] = {'faces': int(len(g.F)), 'warnings': [], 'wall_crossings_left': None, 'boundary_edges': _boundary_edges(g.F)}
+    res['seconds'] = round(time.monotonic() - t0, 1)
+    return res
 
 
-def _remove_layer(race, slot_key, set_name):
-    """This run's own build products for one layer (glb, json, scene arrays), so a skipped or failed layer leaves no older copy behind."""
-    d = OUTL / race
-    stem = f'{slot_key}__{set_name}'
-    for q in (d / f'{stem}.glb', d / f'{stem}.json', d / 'scenes' / f'{stem}__a0.npz', d / 'scenes' / f'{stem}__a100.npz'):
-        if q.is_file():
-            q.unlink()
-
-
-def _module_slots(module):
-    return {'outfit': ['outfit'], 'body_armor': ['torso'],
-            'right_gauntlet_boot': ['lower_arm.r', 'lower_arm.l', 'lower_leg.r', 'lower_leg.l']}.get(module, [])
-
-
-def task_module(mod):
+def module_layers(mod, lod, out_dir):
+    """Every layer of one generated module at reduction level `lod` ('0p4' / '0p2' / '0p1'), written to `out_dir`:
+    outfit -> outfit; body_armor -> torso; right_gauntlet_boot -> lower_arm.r/l + lower_leg.r/l (the left ones mirrored from the right).
+    Returns a result dict: slots {slot: metrics}, skipped {slot: reason} (no garment in that slot), expected (the slots this module can make),
+    load (the loader's notes, with source_lod)."""
     import geodiv as gd
+    global OUT_DIR
+    OUT_DIR = Path(out_dir)
     mod = Path(mod).resolve()
-    s, j, race, module = gd.module_identity(mod)
-    written = []
-    try:
-        msg = _task_module(mod, written)
-    except Exception:
-        for k in _module_slots(module):                               # failed: none of this module's layers may look current
-            if k not in written:
-                _remove_layer(race, k, s)
-        raise
-    for k in _module_slots(module):                                   # skipped this time: an older copy must not stay in the index
-        if k not in written:
-            _remove_layer(race, k, s)
-    return msg
-
-
-def _task_module(mod, written):
-    import geodiv as gd
     t0 = time.monotonic()
     s, j, race, module = gd.module_identity(mod)
+    if module not in ('outfit', 'body_armor', 'right_gauntlet_boot'):
+        raise ValueError(f'unknown module {module!r} ({mod})')
     body = get_body(race, gd)
     S = slots(body, gd)
-    m, info = prep(mod, body, race, gd)
-    rel = mod.relative_to(gd.ROOT).as_posix()
-    made = []
+    m, info = prep(mod, body, race, gd, lod)
+    try:
+        rel = mod.relative_to(gd.ROOT).as_posix()
+    except ValueError:
+        rel = mod.as_posix()
+    res = {'race': race, 'set': s, 'job': j, 'module': module, 'module_path': rel, 'lod': lod, 'slots': {}, 'skipped': {},
+           'expected': [k for k in _module_slots(module) if k in S], 'load': info}
 
     def one(slot_key, mm, extra):
         lay, U1, notes = build_layer(mm, S[slot_key], body, gd)
         if lay is None:
-            made.append(f'{slot_key}: {notes["skipped"]}')
+            res['skipped'][slot_key] = notes['skipped']
             return
         write_layer(race, slot_key, s, lay, U1, {'kind': module, 'module': rel, 'notes': notes, 'load': info, **extra,
                                                  'warnings': notes['amount'].get('warnings', []),
                                                  'seconds': round(time.monotonic() - t0, 1)}, gd)
-        written.append(slot_key)
-        sn = notes['seams']
-        st = ' '.join(r.get('ring_edges_joined', '-') for r in sn['rings'])
-        made.append(f'{slot_key}: {notes["faces"]} faces, seams joined {st}, moved {sn["vertices_moved"]} (max {sn["max_move_mm"]} mm), '
-                    f'inserted {sn["triangles_inserted"]}, folded {sn["faces_folded"]}, slider flips fixed '
-                    f'{notes["slider_fold_guard"]["faces_turning_over"]}' + (f', WARN {notes["amount"]["warnings"]}' if notes['amount'].get('warnings') else ''))
+        res['slots'][slot_key] = _slot_metrics(lay, notes)
 
     if module == 'outfit':
         one('outfit', m, {})
@@ -1814,57 +1790,5 @@ def _task_module(mod, written):
             for limb in ('lower_arm', 'lower_leg'):
                 if f'{limb}.{side}' in S:
                     one(f'{limb}.{side}', mm, {'mirrored_from_right': side == 'l'})
-    return f'{race} {s} {module}: ' + '; '.join(made) + f' ({time.monotonic() - t0:.0f} s)'
-
-
-def _run(task):
-    kind, arg = task
-    try:
-        return task_bare(arg) if kind == 'bare' else task_module(arg)
-    except Exception as error:  # noqa: BLE001
-        import traceback
-        return f'FAILED {arg}: {type(error).__name__}: {error}\n{traceback.format_exc(limit=4)}'
-
-
-def write_index():
-    recs = []
-    for p in sorted(OUTL.glob('*/*.json')):
-        r = json.loads(p.read_text(encoding='utf-8'))
-        recs.append({k: r.get(k) for k in ('race', 'slot', 'set', 'glb', 'kind', 'faces', 'mirrored_from_right')})
-    (OUTL / 'index.json').write_text(json.dumps({'pieces': recs}, indent=0), encoding='utf-8')
-    return len(recs)
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('--races', default='')
-    ap.add_argument('--workers', type=int, default=6)
-    ap.add_argument('--gpu', action='store_true')
-    ap.add_argument('--only', default='')
-    a = ap.parse_args()
-    if a.gpu:
-        os.environ['BODY_FIT_GPU'] = '1'
-    os.environ.setdefault('OMP_NUM_THREADS', '1')
-    sys.path.insert(0, str(HERE))
-    import process_all as pa
-    races = [r for r in a.races.split(',') if r] or None
-    mods = []
-    for jb in pa.jobs(races):
-        for m in jb['modules']:
-            if a.only in m and m not in mods:
-                mods.append(m)
-    rs = sorted({m.split('/')[3] for m in mods} | set(races or []))
-    tasks = [('bare', r) for r in rs] + [('module', str(pa.ROOT / m)) for m in mods]
-    OUTL.mkdir(parents=True, exist_ok=True)
-    print(time.strftime('%H:%M:%S'), f'{len(tasks)} tasks, {a.workers} workers', flush=True)
-    failed = 0
-    with mp.Pool(a.workers, initializer=_setup) as pool:
-        for msg in pool.imap_unordered(_run, tasks):
-            failed += msg.startswith('FAILED')
-            print(time.strftime('%H:%M:%S'), msg, flush=True)
-    print(time.strftime('%H:%M:%S'), f'{failed} of {len(tasks)} tasks FAILED', flush=True)
-    print(time.strftime('%H:%M:%S'), 'index:', write_index(), 'layers', flush=True)
-
-
-if __name__ == '__main__':
-    main()
+    res['seconds'] = round(time.monotonic() - t0, 1)
+    return res

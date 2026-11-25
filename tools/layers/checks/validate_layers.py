@@ -1,16 +1,21 @@
-"""validate_mix.py [n per race] [seed]: random mixes of pieces per race at Amount 100 (fill morph): open edges AT the rings (must be 0), true
-poke-through (skin in front with garment within 40 mm behind it), and back faces seen (inside showing), as % of visible armour / garment pixels."""
+"""validate_layers.py [n per race] [seed] [races,]: random mixes of pieces per race at Amount 100 (fill morph): open edges AT the rings (must be 0), true
+poke-through (skin in front with garment within 40 mm behind it), and back faces seen (inside showing), as % of visible armour / garment pixels.
+
+Reads the prototype's flat layout (experiments/shell_slots_20261122/out/layers/index.json + <race>/<slot>__<set>.glb, read-only). The skin mask comes from the
+GLB's material names ('role:prov', glbread2); the seam rings are the ones layer generation uses (layers.get_body -> slots -> out_body -> rings_of, i.e. the
+output body with the part fixes and joint-plane corrections). The rows go to <system temp>/validate_layers_rows.json."""
 import json
 import random
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
 
 SP = __import__('os').path.dirname(__import__('os').path.abspath(__file__))
 sys.path.insert(0, SP)
-sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/experiments/shell_slots_20261122')
-import glbread  # noqa: E402
+sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/tools/layers')
+import glbread2  # noqa: E402
 import geodiv as gd  # noqa: E402
 import layers as LY  # noqa: E402
 import visibility as vis  # noqa: E402
@@ -26,7 +31,8 @@ px = .004
 def assemble(race, sel):
     Vs, Fs, Ss, off = [], [], [], 0
     for slot, s in sel:
-        V, F, sk = glbread.read(P / race / f'{slot}__{s}.glb', 'fill')
+        V, F, mats = glbread2.read(P / race / f'{slot}__{s}.glb', 'fill')
+        sk = glbread2.skin_mask(mats)
         Vs.append(V)
         Fs.append(F + off)
         Ss.append(sk)
@@ -82,9 +88,10 @@ def measure(V, F, sk):
 def main():
     rows = []
     for race in (RACES or sorted({p['race'] for p in idx})):
-        body = gd.game_body(race)
+        body = LY.get_body(race, gd)                                  # as layer generation: the race's game body with its part fixes, ...
         S = LY.slots(body, gd)
-        ringq = {tuple(x) for k in S if k != 'outfit' for R in LY.rings_of(body, S[k], gd) for x in np.round(R['P'] * 1e6).astype(np.int64)}
+        ob = LY.out_body(body, gd)                                    # ... the output mesh the seams are cut on, ...
+        ringq = {tuple(x) for k in S if k != 'outfit' for R in LY.rings_of(ob, S[k], gd) for x in np.round(R['P'] * 1e6).astype(np.int64)}   # ... and its rings
         have = lambda slot: sorted({p['set'] for p in idx if p['race'] == race and p['slot'] == slot and p['set'] != 'bare'})  # noqa: E731
         combos = []
         for _ in range(NPER):
@@ -110,7 +117,8 @@ def main():
             name = ' + '.join(s[:14] for k, s in c if s != 'bare' and not k.endswith('.l'))
             rows.append((race, kind, ring_open, poke, back, name, c))
             print(f'{race:16s} {kind:6s} ring open {ring_open:.3f} m | poke-through {poke:5.2f} % | inside showing {back:5.2f} % | {name}', flush=True)
-    json.dump([(x[0], x[1], x[3], x[4], x[6]) for x in rows], open(SP + '/validate_layers_rows.json', 'w'))
+    with open(Path(tempfile.gettempdir()) / 'validate_layers_rows.json', 'w', encoding='utf-8') as fh:
+        json.dump([(x[0], x[1], x[3], x[4], x[6]) for x in rows], fh)
     r = np.array([(x[2], x[3], x[4]) for x in rows])
     print(f'\n{len(rows)} mixes: ring open total {r[:, 0].sum():.3f} m; poke-through median {np.median(r[:, 1]):.2f} %, max {r[:, 1].max():.2f} %; '
           f'inside showing median {np.median(r[:, 2]):.2f} %, max {r[:, 2].max():.2f} %')

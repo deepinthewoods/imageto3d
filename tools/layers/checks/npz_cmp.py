@@ -6,7 +6,7 @@ import numpy as np
 import trimesh
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/experiments/shell_slots_20261122')
+sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/tools/layers')
 import visibility as vis  # noqa: E402
 
 out, title = sys.argv[1], sys.argv[2]

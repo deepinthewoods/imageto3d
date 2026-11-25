@@ -4,7 +4,7 @@ import numpy as np
 import sys
 
 os.environ['BODY_FIT_GPU'] = '1'
-sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/experiments/shell_slots_20261122')
+sys.path.insert(0, 'F:/godot/blender/characters/imageto3d/tools/layers')
 import geodiv as gd  # noqa: E402
 import layers as L  # noqa: E402
 
