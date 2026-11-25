@@ -1,4 +1,4 @@
-"""Monsters tab (monsters.py). Run with python -m unittest tools/preview/test_monsters.py."""
+"""Monster variant scan (monsters.py, used by v2 monsters_v2.py). Run with python -m unittest tools/preview/test_monsters.py."""
 import importlib.util
 import json
 import os
@@ -51,7 +51,7 @@ class MonsterTests(unittest.TestCase):
         self.assertTrue(card['image'].startswith('/mfiles/pipeline/Rust%20Monster/views/codex1/front.png'))
         self.assertTrue(card['source_image'].startswith('/mfiles/source.png'))
         self.assertEqual(card['roles'], [{'role': 'skin', 'hex': '#E61923', 'parts': ['body']}])
-        self.assertFalse(set(card) & {'races', 'views', 'jobs', 'entries'})        # keys app.js uses to pick an outfit view
+        self.assertFalse(set(card) & {'races', 'views', 'jobs', 'entries'})        # keys the old app.js used to pick an outfit view
         self.convert()
         card, = monsters.cards(self.project)
         self.assertEqual((card['status'], card['highpoly_faces'], card['lods']), ('converted', 1000000, {}))

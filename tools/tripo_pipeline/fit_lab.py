@@ -138,7 +138,7 @@ def expand_combos(spec):
 def sections_dir(set_name, job, race, module, out=None):
     """Folder of a module's body sections (body_sections.py --fast). Keyed by JOB since 2026-11-19: `<set>__<job>__<race>__<module>` (two jobs of one set / race / module
     used to overwrite each other's sections under `<set>__<race>__<module>`). The old name is still READ when it holds a record of this job (existing single-job modules
-    keep working; their next body_sections run writes the new name); a record of another job under the old name is never used. serve.py uses this too."""
+    keep working; their next body_sections run writes the new name); a record of another job under the old name is never used. The old preview site (serve.py) used this too until it was retired (2026-11-25)."""
     out = SECTIONS_OUT if out is None else Path(out)
     new = out / f'{set_name}__{job}__{race}__{module}'
     if (new / 'body_sections.json').is_file():

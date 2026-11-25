@@ -16,7 +16,7 @@ on the ALIGNED (unfitted) mesh. At runtime, for any mesh with this topology (ori
 
     p' = lerp(p, R(sum b_i * q_src_i), w)           (p, q in the viewer's scene space = node matrix applied to the GLB position, R = reflection in that space)
 
-and a vertex with weight 0 keeps its exact GLB position. The same math is `SymMap.mirror` here (used by `--bake`) and `tools/preview/fitsym.js` `mirror` (the viewer).
+and a vertex with weight 0 keeps its exact GLB position. The same math is `SymMap.mirror` here (used by `--bake`) and was `tools/preview/fitsym.js` `mirror` (the old site's viewer, removed 2026-11-25 with the fit lab UI).
 Welded: the map is per welded vertex plus `wid` (GLB vertex -> welded vertex), so duplicated seam vertices move together.
 
 Sections (`symmap.json` `sections.<l2r|r2l>.<limbs|whole>`): the body sections' states with the source side's `.l`/`.r` states copied onto the other side (limbs: only the
@@ -274,7 +274,7 @@ def process_module(module_dir, force=False, log=print):
     return {'module': P['rel'], 'status': 'done', 'seconds': doc['seconds'], 'bytes': len(blob) + P['map_json'].stat().st_size, 'sections': bool(doc['sections'])}
 
 
-# ----------------------------------------------------------------------------------------------- runtime math (mirrored by tools/preview/fitsym.js)
+# ----------------------------------------------------------------------------------------------- runtime math (was mirrored by tools/preview/fitsym.js, removed 2026-11-25)
 
 class SymMap:
     def __init__(self, doc, blob):

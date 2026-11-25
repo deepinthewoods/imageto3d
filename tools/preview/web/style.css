@@ -1,4 +1,4 @@
-/* Preview app v2. Same look as the old site (tools/preview/style.css): dark slate, blue accents. */
+/* Preview app v2. Same look as the retired old site (tools/preview/style.css, removed in phase 6): dark slate, blue accents. */
 :root{color-scheme:dark;font:15px/1.45 system-ui,sans-serif;background:#101319;color:#e9ecf2}
 *{box-sizing:border-box}
 html,body{height:100%;overflow:hidden}

@@ -1,7 +1,7 @@
 """Verbs of POST /api/v2/action and POST /api/v2/lod (DESIGN.md sections 4 and 6).
 
-v2 owns every folder move itself (it no longer wraps `serve.action`): the allowlist `ALLOWED` of (id type, verb) pairs is the whole
-write surface, so a request can never reach the old site's `model:` / `approvedmodel:` branches. What the moves guarantee:
+v2 owns every folder move itself (the old site's action handler in serve.py was retired in phase 6): the allowlist `ALLOWED` of (id type, verb) pairs
+is the whole write surface. What the moves guarantee:
 
 * anything that moves `approved/<set>` out of approved/ (unapprove, the withdrawal inside a legacy undo) holds the cross-process
   CLAIM LOCK of that set (tools/tripo_pipeline/claim_lock.py, the lock `workflow.py claim` holds for its whole run) without
@@ -81,7 +81,7 @@ def _rel(root: Path, path: Path) -> str:
 
 
 def _check(root: Path, dst: Path, result: dict) -> None:
-    """workflow.py check on the moved set; a failure is only a warning (the move stands), like serve.action."""
+    """workflow.py check on the moved set; a failure is only a warning (the move stands), as on the old site."""
     command = [sys.executable, str(root / 'tools' / 'tripo_pipeline' / 'workflow.py'), '--root', str(root), 'check', str(dst)]
     checked = subprocess.run(command, capture_output=True, text=True, check=False)
     if checked.returncode:
