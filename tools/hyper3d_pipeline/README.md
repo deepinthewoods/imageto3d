@@ -27,8 +27,8 @@ Flow (resumable by the server's stage, intents flushed before every click, never
    (config `directions`: front = Front, 3/4 from above = Front Left, 3/4 from below = Back Right, back = Back), and
    clicks only **Free Preview** (the Generate hover must read "Free Preview", true for Extreme-Low/Low/Medium).
    Records the model URL. Free, no flag needed. `--dry-run` fills the form and screenshots only.
-2. `collect`: reopens the model URL; geometry preview -> confirm in **Triangle** mode with Simplify off (unreduced
-   high-poly mesh; never Smart Low-poly) -> material Generate (De-light on) -> Confirm -> Pack: `.glb`, Base Model only,
+2. `collect`: reopens the model URL; geometry preview -> confirm the **Best Quality** card (the raw, unreduced
+   high-poly mesh, type Tri, slider 1M; never Clean Topology or Smart Low-poly) -> material Generate (De-light on) -> Confirm -> Pack: `.glb`, Base Model only,
    **PBR** only (Shaded off), 2K. The GLB is checked (one mesh object, UVs, image on base colour) and saved as
    `glb_*.glb` next to the record. Credit-capable clicks need `--allow-paid`; geometry also `--accept-preview`
    (look at `review_required.png` first); the displayed cost must equal `expected_costs.<kind>` (geometry 0.5,
@@ -60,8 +60,8 @@ Business. Nothing downloadable costs less than 0.5: Pack stays locked until geom
 | Smart Low-poly confirm instead | +1.5 |
 
 Recommended config for a high-poly, 4-view papercraft outfit at 0.5 credits (what `config.json` ships): Gen-2.5, effort Medium
-(best quality in the free-preview tier), four views with directions above, Triangle mode / Simplify off (raw faceted
-mesh, highest face count allowed, sharp planes), material effort High (default) with De-light on and 8K off, export
+(best quality in the free-preview tier), four views with directions above, the Best Quality geometry card (raw faceted
+mesh, Tri, 1M faces, sharp planes), material effort High (default) with De-light on and 8K off, export
 `.glb` 2K PBR only. If a preview looks poor, redo is free (x15) before paying the 0.5 confirm; only then re-try at High if
 the extra 0.5 is acceptable (`--effort` is a config edit).
 
@@ -96,9 +96,22 @@ Verified live on the first free run (2026-10-22): the Multi-view tab + 4-image u
 
 Verified live on the paid robe run (0.5 credits, balance 1310.5 -> 1310.0): Triangle at the 1M slider maximum, material at High with De-light, GLB 2K PBR-only export (1,000,000 triangles, single mesh, UVs, 3 images, front = -Y like Tripo).
 
-From the client's code only: 0.5-credit geometry Confirm, Triangle = raw mesh with Simplify off, Smart Low-poly 2.
+From the client's code only: 0.5-credit geometry Confirm, Smart Low-poly 2.
 
-**Not verified (needs a supervised run):** the geometry-confirm popover (Triangle / Simplify selectors; the 0.5 label),
+**Geometry confirm popover since November 2026 (live, 2026-11-21; first found by the monster pipeline's wrapper, now this
+backend's own `select_mesh_mode`).** The popover no longer offers "Triangle" / Simplify / Smart Low-poly. It has two cards:
+"Clean Topology" (server-side retopology: Quad / Tri / N-gon with a face slider) and "Best Quality" (the raw mesh; type Tri,
+face slider up to 1M). `select_mesh_mode` hovers the Confirm control, clicks the card named by config `mesh_mode_card`
+("Best Quality") if it is not already selected, and stops with a screenshot (`mesh_mode_missing` or `mesh_mode_not_raw`)
+unless that card reports `data-polygon-selected="true"` and its text reads `Tri` and `triangle_polycount_label` ("1M").
+Selecting is not a purchase: the Confirm click and its cost check (`expected_costs.geometry` 0.5, `budget_credits`) are
+unchanged, and the card text is saved in the record as `geometry_options_seen`. Config: `mesh_mode_card` (new),
+`triangle_polycount_label`; `mesh_mode_option` ("Triangle") is **legacy**, no longer read by the backend (kept in
+`config.json` and optional in `load_config`), and `mesh_simplify` is only recorded (the card has no Simplify toggle). Not
+yet exercised through the outfit pipeline's own run (offline tests use a fake driver); the monster wrapper
+(`monsters/aaa/tools/hyper3d_single.py`) now inherits this implementation.
+
+**Not verified (needs a supervised run):** the Best Quality card on an outfit (multi-view) model, the 0.5 label,
 the Symmetric setting (a selector in the Geometry card, default shown `Symmetric`), per-image directions (the upload-time picker never opened; the Geometry card has a Direction bar), the right direction for our 45-degree cameras, the
 multi-image limit, that a multi-view Generate keeps the same price as the empty-workspace hover, whether the GLB download
 is a ZIP, and that the exported GLB faces -Y like Tripo's (`reduce_model.py` applies no rotation, yaw 0).

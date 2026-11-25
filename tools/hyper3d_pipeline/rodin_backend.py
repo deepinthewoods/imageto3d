@@ -14,7 +14,8 @@ Cost safety (fail closed):
 - collect resumes from the server stage. Every credit-capable click (geometry confirm, material
   generate, material confirm) needs --allow-paid, geometry also --accept-preview, and the displayed
   credit cost must equal the expected cost from config.json / --expect-cost; unknown -> stop and report.
-- No Smart Low-poly: the geometry step selects config `mesh_mode_option` (raw / high-poly).
+- No Smart Low-poly: the geometry step selects the "Best Quality" card (config `mesh_mode_card`; raw, Tri, 1M) and stops
+  unless it reads selected / Tri / `triangle_polycount_label`. (`mesh_mode_option` "Triangle" is legacy, unused.)
 
 The browser part (SeleniumRodin) drives the native Firefox profile of this folder (see README.md) and
 is UNVERIFIED against a signed-in session; everything else is offline-tested with a fake session.
@@ -81,7 +82,7 @@ def not_submitted(record, why):
 
 def load_config(path=CONFIG):
     config = json.loads(Path(path).read_text())
-    for key in ('view_order', 'directions', 'mesh_mode_option', 'expected_costs', 'workspace_url'):
+    for key in ('view_order', 'directions', 'expected_costs', 'workspace_url'):   # mesh_mode_option is legacy, optional
         if key not in config:
             raise ValueError(f'config.json is missing {key!r}')
     return config
@@ -291,7 +292,7 @@ def _record_data(plan, config, views_dir, out_dir):
         'settings': {'workflow': 'Rodin / Image to 3D' + (' / Multi-view' if config.get('multi_view') else ''),
                      'model': config['model'], 'effort': config['effort'],
                      'directions': {k: config['directions'].get(k) for k in plan['uploaded']},
-                     'mesh_mode': config['mesh_mode_option'], 'mesh_simplify': config.get('mesh_simplify', False),
+                     'mesh_mode': config.get('mesh_mode_card') or 'Best Quality', 'mesh_simplify': config.get('mesh_simplify', False),
                      'smart_low_poly': False, 'export_checkboxes': config.get('export_checkboxes'),
                      'de_light': config.get('de_light', True), 'format': config['export_format_label'],
                      'texture': config['texture_resolution']},
@@ -769,46 +770,72 @@ class SeleniumRodin:
             'const e=arguments[0]; return ((e.matches("button")?e:e.parentElement)||e).textContent', control)
         return parse_cost(text), ' '.join(text.split())
 
-    def select_mesh_mode(self, config):
-        """Open the confirm popover and pick the Triangle (raw) mode with Simplify off. UNVERIFIED popover."""
-        wf, driver = self.wf, self.driver
+    MESH_CARD = 'Best Quality'   # the raw-mesh card; "Clean Topology" (retopology) must never be confirmed by this backend
+    MESH_CARD_JS = """const label=arguments[0];
+        const t=[...document.querySelectorAll('*')].find(e=>e.offsetWidth&&e.children.length===0&&e.innerText&&e.innerText.trim()===label);
+        if(!t) return null; let n=t; while(n&&!n.hasAttribute('data-polygon-selected')) n=n.parentElement;
+        return n ? {selected:n.getAttribute('data-polygon-selected'), text:n.innerText, title:t} : null"""
+
+    def _hover(self, element, *, nudge=False):
+        """Move the pointer onto `element`; `nudge` first leaves and re-enters it so the popover opens."""
         from selenium.webdriver.common.action_chains import ActionChains
+        chain = ActionChains(self.driver).move_to_element(element)
+        if nudge:
+            chain = chain.move_by_offset(-30, 0).move_to_element(element)
+        chain.perform()
+
+    def _click_element(self, element):
+        from selenium.webdriver.common.action_chains import ActionChains
+        ActionChains(self.driver).move_to_element(element).click().perform()
+
+    def select_mesh_mode(self, config):
+        """The geometry confirm popover as it is since November 2026 (live-verified 2026-11-21): two cards, "Clean
+        Topology" (server-side retopology: Quad / Tri / N-gon, face slider) and "Best Quality" (the raw, unreduced mesh;
+        type Tri, face slider up to 1M). The old "Triangle" option (config `mesh_mode_option`, now legacy and unused) no
+        longer exists. This picks the Best Quality card (config `mesh_mode_card` may only name it) and stops unless that
+        card reports itself selected (`data-polygon-selected="true"`), is titled Best Quality, reads Tri and the configured
+        polygon label (`triangle_polycount_label`, default 1M) and offers no Quad / N-gon. Only the title element found
+        INSIDE that card is ever clicked (a label elsewhere, e.g. inside the paid Confirm control, is never touched); a
+        missing card is retried without clicking. Selecting is not a purchase; the confirm click and its cost check stay
+        in `_step`. Returns the geometry card text plus the card's own text for the record."""
+        wf, driver = self.wf, self.driver
         control = self._control('geometry')
-        ActionChains(driver).move_to_element(control).move_by_offset(-30, 0).move_to_element(control).perform()
-        time.sleep(1)
-        option = wf.exact(driver, config['mesh_mode_option'])
-        if option is None:
+        card = config.get('mesh_mode_card') or self.MESH_CARD
+        if card != self.MESH_CARD:
+            raise Stop(f'config mesh_mode_card {card!r} is not allowed: this backend only confirms the raw {self.MESH_CARD!r} mesh')
+        want = config.get('triangle_polycount_label') or '1M'
+
+        def read():
+            self._hover(control, nudge=True)
+            time.sleep(1.5)
+            return driver.execute_script(self.MESH_CARD_JS, card)
+
+        state, clicked = None, False
+        for _ in range(3):
+            state, clicked = read(), False
+            if state and state.get('selected') == 'true':
+                break
+            if state and state.get('title') is not None:   # the card exists but is not selected: click its own title
+                self._click_element(state['title'])
+                clicked = True
+                time.sleep(1)
+        if clicked:   # the last attempt ended with a click: judge the state after it, not before
+            state = read()
+        if not state:
             self.screenshot('mesh_mode_missing')
-            raise Stop(f'Mesh option {config["mesh_mode_option"]!r} not offered')
-        ActionChains(driver).move_to_element(option).click().perform()
-        time.sleep(1)
-        card = driver.execute_script("""const x=[...document.querySelectorAll('*')].find(e=>e.children.length===0&&e.innerText&&e.innerText.includes('Detailed sharp triangular mesh')&&e.offsetWidth);
-            if(!x) return ''; let n=x; for(let i=0;i<3&&n.parentElement;i++) n=n.parentElement; return n.innerText""")
-        self.last_slider = parse_poly_label(card)
-        want = config.get('triangle_polycount_label')
-        if want and self.last_slider != want:
-            self.screenshot('triangle_slider_not_max')
-            raise Stop(f'Triangle polygon slider reads {self.last_slider!r}, expected {want!r}; not confirming')
-        simplify = wf.exact(driver, 'Simplify')
-        if simplify is not None and not config.get('mesh_simplify'):
-            node, state = simplify, None
-            for _ in range(4):                                    # the state sits on the label or an ancestor
-                state = node.get_attribute('aria-checked') or node.get_attribute('aria-pressed')
-                if state is not None:
-                    break
-                node = node.find_element('xpath', '..')
-            if state is None:
-                self.screenshot('simplify_state_unknown')
-                raise Stop('Cannot read the Simplify state; refusing to risk a reduced mesh')
-            if state == 'true':
-                node.click()
-                time.sleep(.5)
-                if node.get_attribute('aria-checked') == 'true' or node.get_attribute('aria-pressed') == 'true':
-                    raise Stop('Could not switch Simplify off')
-        ActionChains(driver).move_to_element(control).perform()
+            raise Stop(f'Geometry popover has no {card!r} card; the Hyper3D page changed again')
+        text = state.get('text') or ''
+        words = text.split()
+        first = text.strip().splitlines()[0].strip() if text.strip() else ''
+        if (state.get('selected') != 'true' or first != card or 'Tri' not in words or want not in words
+                or 'Quad' in words or 'N-gon' in words):
+            self.screenshot('mesh_mode_not_raw')
+            raise Stop(f'{card!r} card is not selected as Tri / {want}: selected={state.get("selected")!r}, text={text!r}')
+        self.last_slider = want
+        self._hover(control)
         time.sleep(1)
         scope = wf.scope(driver, wf.GEOMETRY)
-        return ((scope.text if scope else '') + f'\n[triangle slider: {self.last_slider}]')
+        return (scope.text if scope else '') + f' | {card} card: ' + ' '.join(words)
 
     def symmetric_value(self):
         e = next((x for x in self.driver.find_elements('xpath', '//*[starts-with(normalize-space(text()),"Symmetric")]')

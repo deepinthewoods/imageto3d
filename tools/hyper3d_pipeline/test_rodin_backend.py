@@ -106,7 +106,7 @@ class FakeSession:
         return stage
 
     def select_mesh_mode(self, config):
-        self.calls.append(('select_mesh_mode', config['mesh_mode_option']))
+        self.calls.append(('select_mesh_mode', config.get('mesh_mode_card') or 'Best Quality'))
         return 'popover text'
 
     def read_cost(self, kind):
@@ -298,6 +298,113 @@ class PageStateTests(unittest.TestCase):
         self.assertEqual(rb.parse_poly_label('Triangle 500 k'), '500K')
         self.assertIsNone(rb.parse_poly_label('Triangle mesh'))
 
+    def mesh_session(self, states, exact_card=True):
+        """A SeleniumRodin whose browser is replaced by recorded card states (one per read; the last one repeats) and
+        recorded actions. `wf.exact` finds a matching label anywhere on the page when `exact_card` (it must never be
+        clicked: only the title inside a verified card is)."""
+        session = rb.SeleniumRodin(CONFIG, tempfile.mkdtemp())
+        self.actions, self.shots, states = [], [], list(states)
+
+        class Driver:
+            def execute_script(self, js, *args):
+                self.args = args
+                return states.pop(0) if len(states) > 1 else states[0]
+
+        scope = mock.Mock(text='Geometry card text')
+        session.driver = Driver()
+        session.wf = mock.Mock(GEOMETRY='geo', scope=mock.Mock(return_value=scope),
+                               exact=mock.Mock(return_value='page label' if exact_card else None))
+        session._control = lambda kind: 'control'
+        session._hover = lambda element, nudge=False: self.actions.append(('hover', element, nudge))
+        session._click_element = lambda element: self.actions.append(('click', element))
+        session.screenshot = self.shots.append
+        return session
+
+    @staticmethod
+    def card(selected, text='Best Quality\nTri\n1M'):
+        return {'selected': selected, 'text': text, 'title': 'card title'}
+
+    def clicks(self):
+        return [a for a in self.actions if a[0] == 'click']
+
+    def test_select_mesh_mode_picks_best_quality_card(self):
+        session = self.mesh_session([self.card('true')])
+        with mock.patch('time.sleep'):
+            info = session.select_mesh_mode(CONFIG)
+        self.assertEqual(session.driver.args, ('Best Quality',))
+        self.assertEqual((session.last_slider, self.shots), ('1M', []))
+        self.assertEqual(info, 'Geometry card text | Best Quality card: Best Quality Tri 1M')
+        self.assertEqual(self.clicks(), [])                                    # already selected: no click
+        session = self.mesh_session([self.card('false'), self.card('true')])  # not selected yet: one click, then verified
+        with mock.patch('time.sleep'):
+            session.select_mesh_mode(CONFIG)
+        self.assertEqual(self.clicks(), [('click', 'card title')])           # the card's own title, nothing else
+
+    def test_select_mesh_mode_success_on_last_click(self):
+        # three unselected reads (three clicks); the card is selected only after the third click: judged after it
+        session = self.mesh_session([self.card('false')] * 3 + [self.card('true')])
+        with mock.patch('time.sleep'):
+            session.select_mesh_mode(CONFIG)
+        self.assertEqual((len(self.clicks()), self.shots), (3, []))
+
+    def test_select_mesh_mode_never_clicks_outside_the_card(self):
+        # the label exists elsewhere on the page (e.g. inside the paid Confirm control) but no card: zero clicks
+        session = self.mesh_session([None], exact_card=True)
+        with mock.patch('time.sleep'), self.assertRaisesRegex(rb.Stop, 'no .Best Quality. card'):
+            session.select_mesh_mode(CONFIG)
+        self.assertEqual((self.clicks(), self.shots), ([], ['mesh_mode_missing']))
+
+    def test_select_mesh_mode_rejects_clean_topology(self):
+        clean = {'selected': 'true', 'text': 'Clean Topology\nQuad Tri N-gon\n6K', 'title': 'card title'}
+        session = self.mesh_session([clean])
+        with mock.patch('time.sleep'), self.assertRaisesRegex(rb.Stop, 'not selected as Tri'):
+            session.select_mesh_mode(dict(CONFIG, triangle_polycount_label='6K'))
+        mixed = {'selected': 'true', 'text': 'Best Quality\nQuad Tri N-gon\n1M', 'title': 'card title'}
+        session = self.mesh_session([mixed])
+        with mock.patch('time.sleep'), self.assertRaisesRegex(rb.Stop, 'not selected as Tri'):
+            session.select_mesh_mode(CONFIG)
+        session = self.mesh_session([self.card('true')])
+        with mock.patch('time.sleep'), self.assertRaisesRegex(rb.Stop, 'not allowed'):
+            session.select_mesh_mode(dict(CONFIG, mesh_mode_card='Clean Topology'))
+
+    def test_select_mesh_mode_stops_on_missing_or_wrong_card(self):
+        with mock.patch('time.sleep'):
+            session = self.mesh_session([None], exact_card=False)
+            with self.assertRaisesRegex(rb.Stop, 'no .Best Quality. card'):
+                session.select_mesh_mode(CONFIG)
+            self.assertEqual(self.shots, ['mesh_mode_missing'])
+            session = self.mesh_session([self.card('false')])   # never becomes selected
+            with self.assertRaisesRegex(rb.Stop, 'not selected as Tri / 1M'):
+                session.select_mesh_mode(CONFIG)
+            self.assertEqual(self.shots, ['mesh_mode_not_raw'])
+            session = self.mesh_session([self.card('true', 'Best Quality\nQuad\n1M')])    # wrong type
+            with self.assertRaisesRegex(rb.Stop, 'not selected as Tri'):
+                session.select_mesh_mode(CONFIG)
+            session = self.mesh_session([self.card('true', 'Best Quality\nTri\n500K')])   # slider not at 1M
+            with self.assertRaisesRegex(rb.Stop, 'Tri / 1M'):
+                session.select_mesh_mode(CONFIG)
+            self.assertEqual(self.shots, ['mesh_mode_not_raw'])
+
+    def test_legacy_mesh_mode_option_is_optional(self):
+        config = {k: v for k, v in CONFIG.items() if k != 'mesh_mode_option'}
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder)
+        (folder / 'config.json').write_text(json.dumps(config))
+        self.assertNotIn('mesh_mode_option', rb.load_config(folder / 'config.json'))
+
+    def test_pre_phase0_config_still_selects_best_quality(self):
+        # a config written before the fix: legacy mesh_mode_option "Triangle", no mesh_mode_card
+        legacy = {k: v for k, v in CONFIG.items() if k != 'mesh_mode_card'} | {'mesh_mode_option': 'Triangle'}
+        folder = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, folder)
+        (folder / 'config.json').write_text(json.dumps(legacy))
+        loaded = rb.load_config(folder / 'config.json')
+        session = self.mesh_session([self.card('true')])
+        with mock.patch('time.sleep'):
+            info = session.select_mesh_mode(loaded)
+        self.assertEqual(session.driver.args, ('Best Quality',))
+        self.assertIn('Best Quality card', info)
+
     def test_derive_stage(self):
         self.assertEqual(rb.derive_stage('unknown', 'Pack ... Download', True, False), 'export_ready')
         self.assertEqual(rb.derive_stage('unknown', 'Unlock after Material confirmed', True, False), 'unknown')
@@ -305,7 +412,8 @@ class PageStateTests(unittest.TestCase):
         self.assertEqual(rb.derive_stage('material_preview', 'Pack', True, False), 'material_preview')
 
     def test_shipped_config_is_the_half_credit_path(self):
-        self.assertEqual((CONFIG['effort'], CONFIG['mesh_mode_option'], CONFIG['mesh_simplify']), ('Medium', 'Triangle', False))
+        self.assertEqual((CONFIG['effort'], CONFIG['mesh_mode_card'], CONFIG['mesh_simplify']), ('Medium', 'Best Quality', False))
+        self.assertEqual(CONFIG['triangle_polycount_label'], '1M')
         self.assertEqual((CONFIG['expected_costs']['geometry'], CONFIG['budget_credits']), (0.5, 0.5))
         self.assertEqual(CONFIG['export_checkboxes'], {'Base Model': True, 'LOD': False, 'Shaded': False, 'PBR': True})
 
@@ -380,7 +488,7 @@ class FlowTests(unittest.TestCase):
                          ('hyper3d', 'submitted', MODEL, URL))
         self.assertEqual(data['images_uploaded'], CONFIG['view_order'])
         self.assertEqual(data['input_resolution'], [8, 6])
-        self.assertEqual((data['settings']['mesh_mode'], data['settings']['smart_low_poly'], data['settings']['mesh_simplify']), ('Triangle', False, False))
+        self.assertEqual((data['settings']['mesh_mode'], data['settings']['smart_low_poly'], data['settings']['mesh_simplify']), ('Best Quality', False, False))
         self.assertTrue((self.out / 'events.jsonl').exists())
 
     def test_submit_waits_for_the_wallet_and_sets_the_record_aside_when_it_shows_zero(self):
@@ -488,7 +596,7 @@ class FlowTests(unittest.TestCase):
         self.assertTrue(Path(data['exports']['GLB']['path']).is_file())
         self.assertEqual(data['exports']['GLB']['inspection']['problems'], [])
         self.assertEqual(set(data['actions']), {'free_preview', 'geometry', 'material_generate', 'material_confirm'})
-        self.assertIn(('select_mesh_mode', 'Triangle'), session.calls)
+        self.assertIn(('select_mesh_mode', 'Best Quality'), session.calls)
         self.assertIn(('set_delight',), session.calls)
         clicks = [c[1] for c in session.calls if c[0] == 'click']
         self.assertEqual(clicks, ['geometry', 'material_generate', 'material_confirm'])

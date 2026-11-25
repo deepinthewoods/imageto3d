@@ -7,6 +7,7 @@
 !/CLAUDE.md
 !/PROMPTING_GUIDE.md
 !/TRIPO_HANDOFF.md
+!/PIPELINE_V2_PLAN.md
 !/tools/
 # The shell/slot/layer prototype's processing code + viewer pages (user 2026-11-24: "I just wanna be able to go back to this");
 # its generated outputs (out/ GLBs, scenes, renders) stay local
@@ -15,6 +16,7 @@
 !/experiments/shell_slots_20261122/
 /experiments/shell_slots_20261122/*
 !/experiments/shell_slots_20261122/*.py
+!/experiments/shell_slots_20261122/README.md
 !/experiments/shell_slots_20261122/checks/
 /experiments/shell_slots_20261122/checks/*
 !/experiments/shell_slots_20261122/checks/*.py
