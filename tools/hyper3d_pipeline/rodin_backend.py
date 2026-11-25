@@ -19,8 +19,11 @@ Cost safety (fail closed):
 
 The browser part (SeleniumRodin) drives the native Firefox profile of this folder (see README.md) and
 is UNVERIFIED against a signed-in session; everything else is offline-tested with a fake session.
+SeleniumRodin.__enter__ first takes the cross-process browser lock `.codex_jobs/_batch/browser_hyper3d.lock` (BrowserLock;
+waits up to $HYPER3D_LOCK_WAIT seconds, default 600, then Stop 'Hyper3D profile busy'); the monster wrappers inherit it.
 """
 import argparse
+import contextlib
 import hashlib
 import importlib.util
 import json
@@ -40,16 +43,17 @@ from job_state import BASE, atomic_json, model_id, now  # noqa: E402
 CONFIG = HERE / 'config.json'
 
 
-def _load_views_omitted():
-    """tools/tripo_pipeline/views_omitted.py (three-view module marker), loaded by path so that folder never joins sys.path
+def _load_tripo_module(name):
+    """tools/tripo_pipeline/<name>.py (stdlib-only helpers), loaded by path so that folder never joins sys.path
     (it has its own workflow.py/palette.py that must not shadow this folder's modules)."""
-    spec = importlib.util.spec_from_file_location('views_omitted', HERE.parent / 'tripo_pipeline' / 'views_omitted.py')
+    spec = importlib.util.spec_from_file_location(name, HERE.parent / 'tripo_pipeline' / f'{name}.py')
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-views_omitted = _load_views_omitted()
+views_omitted = _load_tripo_module('views_omitted')   # three-view module marker
+claim_lock = _load_tripo_module('claim_lock')         # try_lock / release_lock: the OS byte lock of workflow.py claim
 RECORD = 'studio_submission.json'
 COST_KINDS = ('geometry', 'material_generate', 'material_confirm')
 STAGES_TO_ACT = {'geometry_preview', 'material_ready', 'material_preview', 'export_ready'}
@@ -57,6 +61,91 @@ STAGES_TO_ACT = {'geometry_preview', 'material_ready', 'material_preview', 'expo
 
 class Stop(Exception):
     """A fail-closed stop: nothing wrong happened, a guard or a missing permission halted the run."""
+
+
+# --------------------------------------------------------------------------- browser lock
+
+# The Hyper3D Firefox profile admits ONE browser, and the outfit conversion (convert_job.py -> this file), the monster
+# wrappers (monsters/aaa/tools/hyper3d_*.py subclass SeleniumRodin) and the preview app's monster lane all start separate
+# processes. SeleniumRodin.__enter__ therefore takes this cross-process OS byte lock (the kernel frees it if the holder
+# dies; the lock file itself is never deleted) before it looks at or launches the profile. It is always the imageto3d
+# root's file, whoever the caller is.
+LOCK_FILE = HERE.parents[1] / '.codex_jobs' / '_batch' / 'browser_hyper3d.lock'
+LOCK_FILE_ENV = 'HYPER3D_BROWSER_LOCK'       # test hook: a different lock file
+LOCK_WAIT_ENV = 'HYPER3D_LOCK_WAIT'          # seconds to wait for a busy browser (0 = fail at once)
+LOCK_WAIT_S = 600
+LOCK_POLL_S = 1.0
+LOCK_BUSY = 'Hyper3D profile busy (another conversion holds the browser)'
+
+
+def lock_wait_seconds():
+    try:
+        return max(0.0, float(os.environ[LOCK_WAIT_ENV]))
+    except (KeyError, ValueError):
+        return float(LOCK_WAIT_S)
+
+
+class BrowserLock:
+    """Exclusive cross-process lock on the Hyper3D browser profile. `acquire` polls for `wait` seconds (default
+    $HYPER3D_LOCK_WAIT or 600) and then raises Stop(LOCK_BUSY); `release` is idempotent. The holder's pid is written at
+    the start of the file for the waiter's message (informational only: the OS lock is the authority)."""
+
+    def __init__(self, path=None, wait=None):
+        self.path = Path(path or os.environ.get(LOCK_FILE_ENV) or LOCK_FILE)
+        self.wait = lock_wait_seconds() if wait is None else float(wait)
+        self.handle = None
+
+    def _holder(self):
+        try:
+            return self.path.read_text(errors='replace').strip().splitlines()[0][:80]
+        except (OSError, IndexError):
+            return None
+
+    def acquire(self):
+        if self.handle:
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = os.fdopen(os.open(self.path, os.O_RDWR | os.O_CREAT, 0o666), 'r+b')
+        try:
+            deadline = time.monotonic() + self.wait
+            announced = False
+            while not claim_lock.try_lock(handle):
+                if time.monotonic() >= deadline:
+                    holder = self._holder()
+                    raise Stop(LOCK_BUSY + (f'; held by {holder}' if holder else '') + f'; waited {self.wait:g} s')
+                if not announced:
+                    print(f'{LOCK_BUSY}; waiting up to {self.wait:g} s ({self.path})', file=sys.stderr, flush=True)
+                    announced = True
+                time.sleep(min(LOCK_POLL_S, max(0.05, deadline - time.monotonic())))
+            handle.seek(0)
+            handle.truncate()
+            handle.write(f'pid {os.getpid()} since {now()}\n'.encode())
+            handle.flush()
+            self.handle = handle
+            return self
+        except BaseException:
+            handle.close()
+            raise
+
+    def release(self):
+        handle, self.handle = self.handle, None
+        if handle is None:
+            return
+        try:
+            handle.seek(0)
+            handle.truncate()
+            handle.flush()
+            claim_lock.release_lock(handle)
+        except OSError:
+            pass
+        finally:
+            handle.close()
+
+    def __enter__(self):
+        return self.acquire()
+
+    def __exit__(self, *exc):
+        self.release()
 
 
 BALANCE_WAIT_S = 60   # the header balance loads late (0, then the real one); Generate with 0 shown = "Insufficient Balance"
@@ -101,7 +190,10 @@ def png_info(path):
 def validate_views(views_dir, config):
     """Check the module's views exist, are 8-bit RGBA PNGs of identical size; returns the upload plan.
 
-    With multi_view false only the first view (front) is used. Never resizes anything.
+    With multi_view false only the first view (front) is used. Never resizes anything. A config with `allow_mixed_sizes`
+    (only the monster multi-view wrapper sets it; Hyper3D's acceptance of mixed sizes is unverified) skips the
+    identical-size rule; the plan then also carries `input_resolutions` {name: [w, h]} (`input_resolution` stays the
+    first view's).
 
     Three-view modules: a `views_omitted.json` marker in `views_dir` (tools/tripo_pipeline/views_omitted.py) drops that
     view from the plan, so its slot is simply not uploaded; `images` and `uploaded` list the views that exist and
@@ -114,13 +206,15 @@ def validate_views(views_dir, config):
         if not (views_dir / name).is_file():
             raise ValueError(f'Missing {name}')
     dims = [png_info(views_dir / name) for name in names]
-    if any(d != dims[0] for d in dims):
+    mixed = any(d != dims[0] for d in dims)
+    if mixed and not config.get('allow_mixed_sizes'):
         raise ValueError(f'Multi-view inputs have different native dimensions: {dims}')
     used = names if config.get('multi_view') else names[:1]
     if config.get('max_images') and len(used) > config['max_images']:
         raise ValueError(f'{len(used)} views exceed the max_images={config["max_images"]} of this config')
     return {'views_dir': str(views_dir.resolve()), 'images': names, 'uploaded': used,
-            'input_resolution': list(dims[0]), 'views_omitted': omitted}
+            'input_resolution': list(dims[0]), 'views_omitted': omitted,
+            **({'input_resolutions': {n: list(d) for n, d in zip(names, dims)}} if mixed else {})}
 
 
 def sha256_file(path):
@@ -289,6 +383,7 @@ def _record_data(plan, config, views_dir, out_dir):
         'backend': 'hyper3d', 'source': plan['views_dir'], 'images': plan['images'],
         'images_uploaded': plan['uploaded'], 'input_resolution': plan['input_resolution'],
         **({'views_omitted': plan['views_omitted']} if plan.get('views_omitted') else {}),
+        **({'input_resolutions': plan['input_resolutions']} if plan.get('input_resolutions') else {}),
         'settings': {'workflow': 'Rodin / Image to 3D' + (' / Multi-view' if config.get('multi_view') else ''),
                      'model': config['model'], 'effort': config['effort'],
                      'directions': {k: config['directions'].get(k) for k in plan['uploaded']},
@@ -310,7 +405,13 @@ def submit(views_dir, out_dir, *, config=None, session_factory=None, dry_run=Fal
     out_dir.mkdir(parents=True, exist_ok=True)
     record = Record.create(out_dir / RECORD, _record_data(plan, config, views_dir, out_dir))
     session_factory = session_factory or (lambda: SeleniumRodin(config, out_dir))
-    with session_factory() as session:
+    with contextlib.ExitStack() as stack:
+        try:
+            session = stack.enter_context(session_factory())
+        except Stop as exc:                     # e.g. the browser lock is busy: nothing was opened, a re-run submits again
+            not_submitted(record, str(exc))
+        except Exception as exc:
+            not_submitted(record, f'{type(exc).__name__} starting the browser: {str(exc).splitlines()[0][:200]}')
         try:
             session.open_workspace()
             paths = [(name, Path(plan['views_dir']) / name) for name in plan['uploaded']]
@@ -505,7 +606,19 @@ class SeleniumRodin:
         self.downloads = self.out / 'downloads'
         self.driver = None
 
+    lock = None
+
     def __enter__(self):
+        # One browser on the profile across processes: the lock comes before anything looks at or launches it, and a
+        # failed start releases it again (__exit__ is not called when __enter__ raises).
+        self.lock = BrowserLock().acquire()
+        try:
+            return self._start()
+        except BaseException:
+            self.lock.release()
+            raise
+
+    def _start(self):
         import workflow as wf
         from native_browser import PROFILE, BINARY, check_profile, firefox_service, firefox_extra_args
         from selenium import webdriver
@@ -539,8 +652,12 @@ class SeleniumRodin:
         return self
 
     def __exit__(self, *exc):
-        if self.driver:
-            self.driver.quit()
+        try:
+            if self.driver:
+                self.driver.quit()
+        finally:
+            if self.lock:
+                self.lock.release()
 
     # -- helpers
     def screenshot(self, label):

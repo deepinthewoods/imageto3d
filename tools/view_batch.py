@@ -15,6 +15,12 @@ is sooner, and probes again. The task is re-run later for its missing outputs on
 regenerated or overwritten. A finished task runs tools/check_framing.py on each output; flags are recorded and
 reported, never acted on: Claude reviews every image before `workflow.py ready` (see CLAUDE.md).
 
+A task may carry `"launcher": "monsters"` (the preview app's monster extra views): its jobs are then launched by the monster
+pipeline's own script, `<monster root>/tools/codex_imagegen.sh`, with the monster root as working directory, and tracked in
+`<monster root>/.codex_jobs/<job>/` (.done, exit_code, log.txt). The monster root is `characters/monsters/aaa` beside this
+project, or `$IMAGETO3D_MONSTERS` (tests). Without the field (or `"launcher": "imageto3d"`) nothing changes. The runner reads a
+new task field only when it is (re)started.
+
 While .codex_jobs/_batch/PAUSE exists with "views" in its scope (tools/pipeline_supervisor.py: a manual pause; a screen-on
 pause only stops conversions) no new job starts (PAUSED, once); running ones continue.
 
@@ -32,6 +38,8 @@ from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+MONSTERS_ENV = 'IMAGETO3D_MONSTERS'   # as tools/preview/monsters.py: the monster pipeline root (tests use a temp one)
+LAUNCHERS = ('imageto3d', 'monsters')
 BATCH = ROOT / '.codex_jobs' / '_batch'
 TASKS, STATUS, EVENTS = BATCH / 'tasks', BATCH / 'status', BATCH / 'events.log'
 PAUSE = BATCH / 'PAUSE'   # written by tools/pipeline_supervisor.py while the screen is on: start nothing new
@@ -538,12 +546,30 @@ def views_paused():
 SHELL = [os.environ.get('GIT_BASH') or 'C:/Program Files/Git/bin/bash.exe'] if os.name == 'nt' else []
 
 
-def job_alive(job, status):
+def monsters_root():
+    """`characters/monsters/aaa` beside this project (`$IMAGETO3D_MONSTERS` overrides, like tools/preview/monsters.py)."""
+    override = os.environ.get(MONSTERS_ENV)
+    return Path(override) if override else ROOT.parent / 'monsters' / 'aaa'
+
+
+def launcher_root(task):
+    """The project a task's Codex jobs run in: this one, or the monster pipeline for `"launcher": "monsters"`. Its
+    `tools/codex_imagegen.sh` is the launcher, its working directory and `.codex_jobs/<job>/` the job folder."""
+    launcher = task.get('launcher') or 'imageto3d'
+    if launcher == 'imageto3d':
+        return ROOT
+    if launcher == 'monsters':
+        return monsters_root()
+    raise ValueError(f'unknown launcher {launcher!r} (expected one of {LAUNCHERS})')
+
+
+def job_alive(job, status, root=None):
     """A job this runner did not start (runner restarted): pgrep on Linux; on Windows it counts as alive until its
-    .done marker appears or its timeout (CODEX_TIMEOUT 5400 s + 10 min) has passed since it started."""
+    .done marker appears or its timeout (CODEX_TIMEOUT 5400 s + 10 min) has passed since it started. `root` is the
+    launcher's project (ROOT by default)."""
     if os.name != 'nt':
         return subprocess.run(['pgrep', '-f', f'codex_imagegen.sh {job} '], capture_output=True).returncode == 0
-    if (ROOT / '.codex_jobs' / job / '.done').exists():
+    if ((root or ROOT) / '.codex_jobs' / job / '.done').exists():
         return False
     try:
         started = datetime.fromisoformat(status['jobs'][-1]['started'])
@@ -565,8 +591,12 @@ def run(args):
             if status['state'] != 'running':
                 continue
             job = status['jobs'][-1]['job']
-            jobdir = ROOT / '.codex_jobs' / job
-            alive = (name in procs and procs[name].poll() is None) or (name not in procs and job_alive(job, status))
+            try:
+                root = launcher_root(task)
+            except ValueError:   # the task file was edited after the job started: fall back to this project
+                root = ROOT
+            jobdir = root / '.codex_jobs' / job
+            alive = (name in procs and procs[name].poll() is None) or (name not in procs and job_alive(job, status, root))
             if not (jobdir / '.done').exists() and alive:
                 continue
             procs.pop(name, None)
@@ -623,9 +653,19 @@ def run(args):
             low_disk = False
             for task in pending[:max(0, args.parallel - len(running))]:
                 status = statuses[task['name']]
+                try:
+                    root = launcher_root(task)
+                    if task.get('launcher', 'imageto3d') != 'imageto3d' and not (root / 'tools' / 'codex_imagegen.sh').is_file():
+                        raise ValueError(f'launcher script missing: {root / "tools" / "codex_imagegen.sh"}')
+                except ValueError as exc:   # a misspelt launcher or a missing monster root must not crash the runner
+                    status['state'] = 'failed'
+                    save(STATUS / f'{task["name"]}.json', status)
+                    emit(f'FAILED {task["name"]}: {exc}')
+                    continue
                 existing = [o for o in task['outputs'] if Path(o).exists()]
                 missing = [o for o in task['outputs'] if not Path(o).exists()]
-                prompt = current_paths(task['prompt'])
+                fix = current_paths if root == ROOT else str   # monster tasks name no processing_views job folders
+                prompt = fix(task['prompt'])
                 if existing:
                     prompt = (f'RESUME NOTE: a previous run of this task already saved {existing}. Keep those files '
                               f'unchanged (do not regenerate or overwrite them, but use them as references where the '
@@ -633,16 +673,16 @@ def run(args):
                               f'records instead of replacing them. Attempt limits apply to THIS run only: attempts recorded by earlier runs do '
                               f'not count, so you have the full number of fresh attempts for each missing output.\n\n') + prompt
                 number = len(status['jobs']) + 1
-                while (ROOT / '.codex_jobs' / f'{task["name"]}-a{number:02d}').exists():
+                while (root / '.codex_jobs' / f'{task["name"]}-a{number:02d}').exists():
                     number += 1   # a re-created task (e.g. a redone gnome) must not adopt an old run's finished job folder
                 job = f'{task["name"]}-a{number:02d}'
                 prompt_file = BATCH / 'prompts' / f'{job}.md'
                 prompt_file.parent.mkdir(parents=True, exist_ok=True)
                 prompt_file.write_text(prompt)
                 procs[task['name']] = subprocess.Popen(
-                    [*SHELL, str(ROOT / 'tools/codex_imagegen.sh'), job, str(prompt_file),
-                     *(current_paths(r) for r in task['refs'])],
-                    cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    [*SHELL, str(root / 'tools/codex_imagegen.sh'), job, str(prompt_file),
+                     *(fix(r) for r in task['refs'])],
+                    cwd=root, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                     env={**os.environ, 'CODEX_TIMEOUT': '5400'})
                 status['state'] = 'running'
                 status['jobs'].append({'job': job, 'started': datetime.now().isoformat(timespec='seconds')})

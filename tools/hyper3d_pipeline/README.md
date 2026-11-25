@@ -45,6 +45,23 @@ Flow (resumable by the server's stage, intents flushed before every click, never
    - In both cases the record is renamed to `studio_submission.not_submitted_<time>.json` (status `not_submitted`), so a re-run submits again.
    - `export_glb` also tolerates Firefox renaming a download while it is being listed; that crashed a collect on 2026-10-27.
 
+### Browser lock (2026-11-25)
+
+The Hyper3D Firefox profile admits one browser, and several processes now use it (outfit `convert_job.py`, the monster
+wrappers in `characters/monsters/aaa/tools/hyper3d_{single,twoview,multiview}.py`, the preview app's monster lane).
+`SeleniumRodin.__enter__` therefore takes the cross-process OS lock `<imageto3d root>/.codex_jobs/_batch/browser_hyper3d.lock`
+(`BrowserLock`: `msvcrt.locking` on Windows, `fcntl.flock` elsewhere, the helpers of `tools/tripo_pipeline/claim_lock.py`)
+BEFORE the profile check and launch, and releases it in `__exit__` (and when the start fails). The kernel frees it if the
+holder dies; the file is never deleted and holds the holder's pid for the waiter's message. A busy lock is polled for
+`$HYPER3D_LOCK_WAIT` seconds (default 600, 0 = fail at once), then `Stop('Hyper3D profile busy (another conversion holds the
+browser)')`, exit code 3, the same as any deliberate stop. Wrappers that subclass `SeleniumRodin` inherit it. If `submit`
+stops there it sets its record aside as `not_submitted` (nothing was generated), so a re-run submits again; `collect` just
+stops and resumes later. `$HYPER3D_BROWSER_LOCK` points the lock at another file (tests). Tests:
+`test_browser_lock.py` (two real processes) and `test_monster_wrappers.py`.
+
+Config `allow_mixed_sizes` (only the monster multi-view wrapper sets it) lets `validate_views` accept images of different
+pixel sizes; the plan and record then carry `input_resolutions`. Hyper3D's acceptance of mixed sizes is unverified.
+
 ### Credit costs and the 0.5-credit configuration (2026-10-22)
 
 Gen-2.5 Generate hover, read live per effort: Extreme-Low / Low / Medium **Free Preview**, High **0.5**, Extreme-High **1**.
