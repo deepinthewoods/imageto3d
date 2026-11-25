@@ -1552,9 +1552,14 @@ def glb_bytes(m, U1=None, colour='role', extra=None):
         cr = np.cross(T0.reshape(-1, 3, 3)[:, 1] - T0.reshape(-1, 3, 3)[:, 0], T0.reshape(-1, 3, 3)[:, 2] - T0.reshape(-1, 3, 3)[:, 0])
         nrm = cr / np.maximum(np.linalg.norm(cr, axis=1, keepdims=True), 1e-30)
         prim = {'attributes': {'POSITION': add(T0, minmax=True), 'NORMAL': add(np.repeat(nrm, 3, axis=0).astype(np.float32))}, 'material': len(mats)}
-        if targets:
-            prim['targets'] = [{'POSITION': add((bf.bl_to_gl(U[m.F[sel]].reshape(-1, 3)).astype(np.float32) - T0).astype(np.float32), minmax=True)}
-                               for _, U in targets]
+        if targets:                                                  # POSITION and NORMAL deltas (flat normals of the target's triangles), so a
+            prim['targets'] = []                                     # face that tilts under the slider is lit as it ends up
+            for _, U in targets:
+                T1 = bf.bl_to_gl(U[m.F[sel]].reshape(-1, 3)).astype(np.float32)
+                c1 = np.cross(T1.reshape(-1, 3, 3)[:, 1] - T1.reshape(-1, 3, 3)[:, 0], T1.reshape(-1, 3, 3)[:, 2] - T1.reshape(-1, 3, 3)[:, 0])
+                n1 = c1 / np.maximum(np.linalg.norm(c1, axis=1, keepdims=True), 1e-30)
+                prim['targets'].append({'POSITION': add((T1 - T0).astype(np.float32), minmax=True),
+                                        'NORMAL': add(np.repeat(n1 - nrm, 3, axis=0).astype(np.float32))})
         prims.append(prim)
         rgb = ROLE_RGB.get(role, (.5, .5, .5))
         mats.append({'name': f'{role}:{prov}', 'doubleSided': True, 'pbrMetallicRoughness': {'baseColorFactor': [*rgb, 1.], 'metallicFactor': 0., 'roughnessFactor': .9}})

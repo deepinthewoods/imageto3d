@@ -2067,6 +2067,19 @@ def clear_of_pieces(out, body, game_parts):
 LIMB_GROUPS = {'arm.l': ('arm_stretch.l', 'forearm_stretch.l', 'hand.l'), 'arm.r': ('arm_stretch.r', 'forearm_stretch.r', 'hand.r')}
 
 
+def keep_winding(sub, F):
+    """bf.Body orients a mesh by its signed volume about the origin, which means nothing for an OPEN piece (an arm without the torso: the sign
+    depends on where the arm is, so a whole group could come out inside-out). Give the piece back the winding its faces have on the closed body."""
+    F = np.asarray(F, np.int64)
+    if len(sub.F) != len(F) or np.array_equal(sub.F, F) or not np.array_equal(sub.F, F[:, [0, 2, 1]]):
+        return sub
+    sub.F = F.copy()
+    sub.B, sub.C = sub.C, sub.B
+    sub.tri_n = -sub.tri_n
+    sub.vn = -sub.vn
+    return sub
+
+
 def fill_grouped(out, body, margin):
     """The Amount slider's fill, per limb group: a sleeve is pushed out of its own arm only, the rest out of the body without the arms (so arms that
     hang close to the torso do not push sleeves sideways off it). Returns (U1, info)."""
@@ -2089,10 +2102,12 @@ def fill_grouped(out, body, margin):
         fm = np.isin(body.part, ids)
         if fm.sum() < 4:
             continue
-        sub = bf.Body(body.V, body.F[fm], body.part[fm], body.part_names)
+        sub = keep_winding(bf.Body(body.V, body.F[fm], body.part[fm], body.part_names), body.F[fm])
         sub.H, sub.o = body.H, body.o
         keep = out.copy()
-        mask_f = ~np.isin(out.F, np.flatnonzero(~sel)).any(1)       # only this group's garment is free
+        # free in this group's pass: garment faces with ANY vertex of the group (a shoulder face with corners in the arm and the core is free in
+        # both passes; each vertex takes the move of its own group). All-vertices made it pinned skin in both: never pushed out
+        mask_f = np.isin(out.F, np.flatnonzero(sel)).any(1)
         keep.role = np.where(mask_f | (out.role == SKIN), out.role, SKIN)
         try:
             Ug, gi = fill(keep, sub, margin)

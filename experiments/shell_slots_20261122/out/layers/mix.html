@@ -57,7 +57,8 @@ const loader=new GLTFLoader();const group=new THREE.Group();scene.add(group);let
 function resize(){const w=main.clientWidth,h=main.clientHeight;renderer.setSize(w,h,false);camera.aspect=w/h;camera.updateProjectionMatrix()}
 new ResizeObserver(resize).observe(main);resize();
 (function frame(){controls.update();renderer.render(scene,camera);requestAnimationFrame(frame)})();
-const P=(await (await fetch('index.json?v='+Date.now())).json()).pieces;
+const STAMP=Date.now();   // layer GLBs are rebuilt in place: never reuse a browser-cached copy from an earlier page load
+const P=(await (await fetch('index.json?v='+STAMP)).json()).pieces;
 const races=[...new Set(P.map(p=>p.race))].sort();
 const short=s=>s==='bare'?'bare':s.replace(/_(outfit|armor|armour)_?/,' ').replace(/_/g,' ');
 const setsFor=(race,slot)=>[...new Set(P.filter(p=>p.race===race&&p.slot===slot&&p.set!=='bare').map(p=>p.set))].sort();
@@ -99,7 +100,7 @@ function styleAll(){let k=0;group.children.forEach(root=>{const tint=TINTS[(k++)
   n.material=new THREE.MeshStandardMaterial({color:col,flatShading:true,roughness:.85,side:THREE.DoubleSide,wireframe:$('wire').checked});
   if($('inside').checked)backRed(n.material);})})}
 function amount(){const v=+$('amt').value;$('amtv').textContent=v;group.traverse(n=>{if(n.isMesh&&n.morphTargetInfluences){const d=n.morphTargetDictionary||{};if('fill' in d)n.morphTargetInfluences[d.fill]=v/100}})}
-async function show(){const t=++token;const recs=chosen();const roots=await Promise.all(recs.map(r=>loader.loadAsync(r.glb).then(g=>g.scene)));if(t!==token)return;
+async function show(){const t=++token;const recs=chosen();const roots=await Promise.all(recs.map(r=>loader.loadAsync(r.glb+'?v='+STAMP).then(g=>g.scene)));if(t!==token)return;
  group.clear();roots.forEach(r=>group.add(r));styleAll();amount();
  const box=new THREE.Box3().setFromObject(group),size=box.getSize(new THREE.Vector3());
  if(first&&size.length()>0){const c=box.getCenter(new THREE.Vector3()),r=size.length();camera.position.set(c.x+r*.25,c.y+r*.15,c.z+r*1.25);controls.target.copy(c);first=false}
