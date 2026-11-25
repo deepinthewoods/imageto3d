@@ -1,6 +1,6 @@
 // Approved modal for monster variants (`monster:<Monster>/<variant>` cards in the Approved tab): the four views large (front / left /
 // back / right) with an Enabled tick each, the state of the Codex task per view (queued / running / failed + Retry), "Use enabled views"
-// (verb `convert`: freezes the ticks and queues the Hyper3D conversion), the frozen state, and the conversion progress
+// (verb `convert`: confirms the exact ticked files, then freezes them and queues the Hyper3D conversion), the frozen state, and the conversion progress
 // (submit / preview / collect / reduce, paid flag, error, record status and screenshots, "waiting: ..." with Run now, Retry of a failed
 // conversion). A flat pick made before v2 (`importable`) shows Import instead. Item shape: tools/preview/v2/DESIGN_PHASE5.md section H.
 import { api } from './api.js';
@@ -8,6 +8,7 @@ import { confirmDialog } from './confirm.js';
 import { showImage } from './modal.js';
 import { toast } from './toast.js';
 import { refresh } from './state.js';
+import { conflictMessage, damageText, isDamaged, viewFile } from './monster_common.js';
 import { ago, badge, blockRepeat, button, h, pretty } from './util.js';
 
 const NAMES = ['front', 'left', 'back', 'right'];
@@ -54,21 +55,24 @@ export async function showMonsterViews(modal, host) {
   modal.body.append(root);
   let item = null;
   let timer = null;
-  let converting = false;            // "Use enabled views" / Import is on the wire
+  let converting = false;            // "Use enabled views" / Import is on the wire (the item is not refreshed meanwhile)
+  let preparing = false;             // "Use enabled views" waits for a tick write / its confirmation
   let runningNow = false;
   let retryingConversion = false;
   const retrying = new Set();
   let writes = Promise.resolve();    // tick writes go out in order
   let pendingWrites = 0;
   let epoch = 0;                     // bumped by every tick / convert: an item fetched before it is stale and dropped
-  const local = {};                  // ticks the user set whose write has not finished
+  const local = {};                  // ticks the user set; dropped when a refreshed item (which carries them) is applied, or when their write failed
   const figs = new Map();
 
   const views = () => item?.views || [];
   const viewOf = name => views().find(v => v.name === name);
   const importing = () => item?.importable === true;
-  const ticked = view => (view.name in local && pendingWrites ? local[view.name] : view.enabled) === true && hasFile(view);
+  const ticked = view => (view.name in local ? local[view.name] : view.enabled) === true && hasFile(view);
   const enabledNames = () => views().filter(ticked).map(v => v.name);
+  const enabledFiles = () => views().filter(ticked).map(viewFile);
+  const damaged = () => isDamaged(item);
   const tickMap = () => Object.fromEntries(views().filter(hasFile).map(v => [v.name, ticked(v)]));   // only views that exist: the server merges it
 
   // ---- the four views ----------------------------------------------------------------------------------------------
@@ -107,7 +111,7 @@ export async function showMonsterViews(modal, host) {
       fig.holder.replaceChildren(h('div', { class: 'mv-pending', text }));
     }
     fig.tick.checked = ticked(view);
-    fig.tick.disabled = !hasFile(view) || importing();
+    fig.tick.disabled = !hasFile(view) || importing() || damaged();
     fig.label.title = importing() ? 'Import the pick first' : hasFile(view) ? 'Use this view for the conversion' : 'The picture does not exist yet';
     const task = view.task;
     const frozenHas = !!item?.frozen && frozenNames().includes(name);
@@ -117,7 +121,7 @@ export async function showMonsterViews(modal, host) {
     ].filter(Boolean));
     fig.error.hidden = !(task?.state === 'failed');
     fig.error.textContent = task?.state === 'failed' ? `Failed after ${task.attempts ?? '?'} attempt${task.attempts === 1 ? '' : 's'}${task.error ? `: ${task.error}` : ''}` : '';
-    fig.retry.hidden = !view.retry;
+    fig.retry.hidden = !view.retry || damaged();
     fig.retry.disabled = retrying.has(name);
     fig.node.classList.toggle('disabled', hasFile(view) && !ticked(view));
   }
@@ -135,8 +139,7 @@ export async function showMonsterViews(modal, host) {
         if (!error.conflict) toast(`Ticks not saved: ${error.message}`);
         delete local[name];
       } finally {
-        pendingWrites -= 1;
-        if (!pendingWrites) for (const key of Object.keys(local)) delete local[key];
+        pendingWrites -= 1;            // `local` stays until the refreshed item is applied: the ticks never fall back to stale item data
       }
       if (!pendingWrites) await load();
     });
@@ -172,11 +175,12 @@ export async function showMonsterViews(modal, host) {
   /** Why "Use enabled views" cannot be pressed now (null = it can). */
   function convertBlock() {
     if (!item) return 'Loading...';
+    if (damaged()) return damageText(item);
     if (item.stage && item.stage !== 'approved') return `This variant is already in ${pretty(item.stage)}`;
     if (item.frozen && !refreezable()) return 'The views are frozen; Reconvert is in the 3D tab';
     if (!views().length) return 'This variant has no view choice';
     if (!enabledNames().length) return 'Tick at least one view';
-    if (converting) return 'Starting...';
+    if (converting || preparing) return 'Starting...';
     return null;
   }
 
@@ -190,34 +194,49 @@ export async function showMonsterViews(modal, host) {
 
   async function convert() {
     if (convertBlock()) return;
-    const busy = views().filter(generating);
-    if (busy.length) {
+    preparing = true;
+    syncAll();
+    try {
+      // a tick write still on the wire is waited for (its refresh included): the list below is then what the server holds
+      if (pendingWrites) await writes;
+      if (!host.isCurrent()) return;
+      const blocked = convertBlock();
+      if (blocked && blocked !== 'Starting...') { toast(blocked); return; }
+      // the exact list the user confirms: captured here, together with the views revision it belongs to, never rebuilt from item data later
+      const files = enabledFiles();
+      const names = enabledNames();
+      const viewsRev = item.views_rev;
+      if (!files.length) { toast('Use enabled views: tick at least one view'); return; }
+      const busy = views().filter(generating);
       const ok = await confirmDialog({
-        title: 'Use the views that exist now?',
-        lines: [`${busy.map(v => pretty(v.name)).join(', ')} ${busy.length === 1 ? 'is' : 'are'} still being drawn. The conversion uses only the ticked views that exist now; a view that arrives later is not used.`],
+        title: 'Use these views for the conversion?',
+        lines: [`Exactly these pictures are used: ${files.join(', ')}. The conversion is a Hyper3D job (0.5 credits).`,
+          ...(busy.length ? [`${busy.map(v => pretty(v.name)).join(', ')} ${busy.length === 1 ? 'is' : 'are'} still being drawn; a view that arrives later is not used.`] : [])],
         confirm: 'Use enabled views',
       });
       if (!ok || !host.isCurrent()) return;
-    }
-    converting = true;
-    epoch += 1;
-    syncAll();
-    try {
-      await writes;
-      const names = enabledNames();
-      const result = await api.action(card.id, 'convert', { args: { enabled: tickMap() } });
-      toast(`Using ${names.length} view${names.length === 1 ? '' : 's'} (${names.join(', ')}): the conversion is queued${result?.warning ? ` · Warning: ${result.warning}` : ''}`, { ms: 6000 });
-    } catch (error) {
-      if (!error.conflict) toast(`Use enabled views failed: ${error.message}`);
+      converting = true;
+      epoch += 1;
+      syncAll();
+      try {
+        const result = await api.action(card.id, 'convert', { args: { files, views_rev: viewsRev }, quiet: true });
+        toast(`Using ${names.length} view${names.length === 1 ? '' : 's'} (${names.join(', ')}): the conversion is queued${result?.warning ? ` · Warning: ${result.warning}` : ''}`, { ms: 6000 });
+      } catch (error) {
+        if (error.conflict) toast(conflictMessage(error, 'views'), { ms: 6000 });
+        else toast(`Use enabled views failed: ${error.message}`);
+      } finally {
+        converting = false;
+      }
     } finally {
-      converting = false;
+      preparing = false;
+      if (item && host.isCurrent()) syncAll();
     }
     refresh().catch(() => {});
     await load();
   }
 
   async function importPick() {
-    if (!importing() || converting) return;
+    if (!importing() || converting || damaged()) return;
     const tick = h('input', { type: 'checkbox', id: 'mv-import-unattended' });
     const content = h('label', { class: 'mc-unattended', title: 'Skip the "Choose views" step for this variant' },
       tick, h('span', null, h('b', { text: 'Unattended: convert straight away with all views' }),
@@ -247,7 +266,7 @@ export async function showMonsterViews(modal, host) {
   // ---- conversion ---------------------------------------------------------------------------------------------------
   async function runNow() {
     const conversion = item?.conversion;
-    if (!conversion?.task_id || runningNow) return;
+    if (!conversion?.task_id || runningNow || damaged()) return;
     runningNow = true;
     draw();
     try {
@@ -266,7 +285,7 @@ export async function showMonsterViews(modal, host) {
   /** Retry of a failed conversion (the queue's Retry): it resumes from the Hyper3D record and never pays a step twice. */
   async function retryConversion() {
     const conversion = item?.conversion;
-    if (!conversion?.task_id || retryingConversion) return;
+    if (!conversion?.task_id || retryingConversion || damaged()) return;
     retryingConversion = true;
     draw();
     try {
@@ -297,7 +316,7 @@ export async function showMonsterViews(modal, host) {
       c.paid ? badge(`paid${c.credits != null ? ` ${c.credits} credits` : ''}`, 'warn') : badge('nothing paid yet', ''),
       c.run_now ? badge('run now', 'info') : null);
     const nodes = [head, steps];
-    if (c.state === 'waiting') {
+    if (c.state === 'waiting' && !damaged()) {
       const run = button(runningNow ? 'Starting...' : 'Run now', runNow, 'primary', 'Start this conversion now');
       run.disabled = runningNow || !c.task_id || c.run_now && c.waiting_reason === 'held';
       run.dataset.action = 'run-now';
@@ -315,7 +334,7 @@ export async function showMonsterViews(modal, host) {
         return img;
       })));
     }
-    if (failed && c.task_id) {
+    if (failed && c.task_id && !damaged()) {
       const retry = button(retryingConversion ? 'Retrying...' : 'Retry', retryConversion, 'primary', 'Queue the conversion again; it resumes from the Hyper3D record');
       retry.disabled = retryingConversion;
       retry.dataset.action = 'retry-conversion';
@@ -348,7 +367,7 @@ export async function showMonsterViews(modal, host) {
 
   function syncAll() {
     for (const name of NAMES) syncFigure(name);
-    importButton.hidden = !importing();
+    importButton.hidden = !importing() || damaged();
     importButton.disabled = converting;
     useButton.hidden = importing();
     const block = importing() ? null : convertBlock();
@@ -367,11 +386,12 @@ export async function showMonsterViews(modal, host) {
         : item.legacy ? badge('converted before views existed', '') : badge(item.frozen ? 'frozen' : 'choose views', item.frozen ? 'ok' : 'info'),
       item.unattended ? badge('unattended', 'warn') : null,
       item.library_hint && !(card.badges || []).some(b => b.text === item.library_hint) ? badge(item.library_hint, 'warn') : null);
+    const damage = damaged() ? h('div', { class: 'unit-error', dataset: { note: 'damaged' }, text: damageText(item) }) : null;
     const moved = item.stage && item.stage !== 'approved'
       ? h('div', { class: 'held-block' }, h('span', { text: `This variant is now in ${pretty(item.stage)}.` }), button(`Open in ${pretty(item.stage)}`, () => host.openIn?.(item.stage), 'primary'))
       : null;
     const grid = h('div', { class: 'mv-views' }, NAMES.map(name => { syncFigure(name); return figs.get(name).node; }));
-    root.replaceChildren(...[head, moved, views().length ? grid : h('p', { class: 'mv-note', text: 'No views recorded for this variant.' }), frozenBlock(), conversionBlock()].filter(Boolean));
+    root.replaceChildren(...[head, damage, moved, views().length ? grid : h('p', { class: 'mv-note', text: 'No views recorded for this variant.' }), frozenBlock(), conversionBlock()].filter(Boolean));
     syncAll();
   }
 
@@ -385,12 +405,13 @@ export async function showMonsterViews(modal, host) {
   }
 
   async function load() {
-    if (pendingWrites || converting) return;          // do not redraw under a tick that is being saved
+    if (pendingWrites || converting) return;          // do not redraw under a tick that is being saved / a conversion request on the wire
     const started = epoch;
     try {
       const next = await api.item(card.id);
       if (!host.isCurrent() || started !== epoch || pendingWrites || converting) return;   // a tick or convert happened meanwhile: this copy is stale
       item = next;
+      for (const key of Object.keys(local)) delete local[key];      // the item carries the saved ticks now
       draw();
     } catch (error) {
       if (host.isCurrent() && !item) root.replaceChildren(h('p', { text: `Details not available: ${error.message}` }));

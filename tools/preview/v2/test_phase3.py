@@ -2204,6 +2204,67 @@ class Phase4ReviewTests(Phase3Case):
         claim = json.loads((base / 'io.claim.json').read_text())
         self.assertEqual(claim['builder_pid'], result['builder_pid'])
 
+    # ------------------------------------------------------------------------------------------- phase 5 review, row 12
+    def early_receipt(self, key, token):
+        """A running attempt whose wrapper died after writing a failure receipt while its builder still runs: (task id, builder Popen)."""
+        builder = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(lambda: (builder.kill(), builder.wait()))
+        dead = subprocess.Popen([sys.executable, '-c', 'pass'])
+        dead.wait()
+        q = taskqueue.for_root(self.root)
+        task = self.running_row(key, dead.pid, token, builder=builder)
+        orchestrator.result_path(q.get(task)).write_text(json.dumps(
+            {'token': token, 'attempt': 1, 'exit': -1, 'last_json': None, 'finished': time.time(), 'start_error': 'OSError: no space left',
+             'builder_pid': builder.pid, 'builder_create': orchestrator.create_time(builder.pid), 'builder_exited': None}))
+        return task, builder
+
+    @unittest.skipIf(psutil is None, 'needs psutil')
+    def test_row12_a_verified_orphan_with_an_early_receipt_honours_kill_and_retry(self):
+        q = taskqueue.for_root(self.root)
+        task, builder = self.early_receipt('receipt-kill', 'tok-k')
+        orch = self.orch(raw=True)
+        self.started.append(orch)
+        self.idle_value = 5.0
+        orch.tick()
+        self.assertEqual(q.get(task)['state'], 'orphan')
+        status, body = self.post('/api/v2/queue', {'op': 'kill_retry', 'id': task, 'token': 'tok-k'})
+        self.assertEqual(status, 200, body)
+        mode = self.root / '.codex_jobs' / '_batch' / 'supervisor_mode.json'
+        mode.parent.mkdir(parents=True, exist_ok=True)
+        mode.write_text(json.dumps({'mode': 'pause'}))                                 # (nothing starts in this tick: the row stays visible)
+        orch.tick()
+        builder.wait(10)                                                               # the builder the receipt names was killed
+        self.assertEqual(q.get(task)['state'], 'queued')
+        self.assertIn('killed by the user', q.get(task)['error'])
+
+    @unittest.skipIf(psutil is None, 'needs psutil')
+    def test_row12_repair_adopts_an_early_receipt_whose_builder_survives(self):
+        """The rebuilt queue applies the intact queue's liveness rule: a receipt whose builder still runs is adopted as orphan (its slot
+        stays taken), never skipped."""
+        q = taskqueue.for_root(self.root)
+        task, builder = self.early_receipt('receipt-repair', 'tok-rp')
+        row = q.get(task)
+        logs = self.logs()
+        claim_file = logs / f'{task}-a1.claim.json'
+        claim = json.loads(claim_file.read_text())
+        full = {'key': 'receipt-repair', 'lane': 'layers', 'set': 's', 'unit': 'human_male/outfit', 'args': row['args'], 'max_attempts': 3}
+        claim_file.write_text(json.dumps(claim | {'task': full}))
+        (logs / f'{task}-a1.task.json').write_text(json.dumps({'id': task, 'attempt': 1, 'token': 'tok-rp', 'log': row['log'], 'task': full}))
+        orch = self.orch(raw=True)
+        out = orch.repair_queue()                                                      # the damaged-database path
+        self.assertEqual(out['adopted'], 1, out)
+        adopted = q.by_key('receipt-repair')
+        self.assertEqual((adopted['state'], adopted['token'], adopted['builder_pid']), ('orphan', 'tok-rp', builder.pid))
+        self.assertEqual(q.count(taskqueue.ACTIVE), 1)                                 # the slot is taken
+        orch.tick()
+        self.assertEqual(q.by_key('receipt-repair')['state'], 'orphan')
+        builder.kill()
+        builder.wait(10)
+        orch.tick()
+        self.assertNotIn(q.by_key('receipt-repair')['state'], taskqueue.ACTIVE)       # settled from its receipt once the builder is gone
+        # a receipt whose builder is gone is still skipped by a rebuild
+        self.assertEqual(orch.repair_queue()['adopted'], 0)
+
 
 if __name__ == '__main__':
     unittest.main()

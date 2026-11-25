@@ -139,12 +139,19 @@ export function ago(when, now = Date.now()) {
   return s < 0 ? `in ${text}` : `${text} ago`;
 }
 
+/** Enter and Space are the keys that activate a focused button (Enter on keydown, Space on keyup). */
+export const isActivationKey = event => event.key === 'Enter' || event.key === ' ' || event.key === 'Spacebar';
+
+/** A repeat (held key) of an activation key: it must never activate anything. */
+export const activationRepeat = event => event.repeat === true && isActivationKey(event);
+
 /**
- * A held Enter key repeats the click of a focused button (and the implicit submit of an input): swallow the repeats so a held key
- * never fires a write twice. Put it on a container; it listens in the capture phase.
+ * A held Enter (or Space) key repeats the click of a focused button (and the implicit submit of an input): swallow the repeats so a held
+ * key never fires a write twice. Put it on a container; it listens in the capture phase. A handler on `document` that stops the event
+ * (confirm.js) must call `activationRepeat` itself: the event never reaches a container below it.
  */
 export function blockRepeat(node) {
   node.addEventListener('keydown', event => {
-    if (event.repeat && event.key === 'Enter' && event.target instanceof Element && event.target.closest('button, input')) event.preventDefault();
+    if (activationRepeat(event) && event.target instanceof Element && event.target.closest('button, input')) event.preventDefault();
   }, true);
 }

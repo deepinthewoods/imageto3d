@@ -1143,5 +1143,380 @@ class ReviewActionsTest(V2Case):
         self.assertIsNone(state['status']['services'])
 
 
+# ======================================================================== phase 5 review, table "Phase 4 review fixes at 8ebc5cd"
+
+from datetime import datetime  # noqa: E402
+
+SUPERVISOR_ONLY = {'services': {'supervisor': True, 'views': False, 'convert': False}}
+SLEEP_CHILD = ['-c', 'import time; time.sleep(60)']
+
+
+class Phase5ServicesTest(TempRoot):
+    """Rows 2, 6, 17 (the view runner side) and 20 against the fake services of a temp root."""
+    popen, hold, sup, lock_holder = ReviewServicesTest.popen, ReviewServicesTest.hold, ReviewServicesTest.sup, ReviewServicesTest.lock_holder
+
+    def event(self, text):
+        with open(self.root / '.codex_jobs/_batch/convert_events.log', 'a', encoding='utf-8') as handle:
+            handle.write(f'{datetime.now():%m-%d %H:%M:%S} {text}\n')
+
+    def legacy_convert(self):
+        """A running worker of the code before the per-worker stop file (I.2 legacy rule), adopted by the manager."""
+        settings.save(self.root, CONVERT_ONLY)
+        old = self.spawn('convert')
+        self.ctl('convert_queue', {'ignore_stop': True})
+        script = self.root / 'tools/convert_queue.py'
+        os.utime(script, (time.time() + 600, time.time() + 600))
+        services.tick(self.root)
+        return old
+
+    def children(self, pid):
+        try:
+            return psutil.Process(pid).children()
+        except psutil.Error:
+            return []
+
+    def kill_children(self, pid):
+        for child in self.children(pid):
+            try:
+                child.kill()
+                child.wait(10)
+            except psutil.Error:
+                pass
+
+    def not_suspended(self, pid):
+        return psutil.Process(pid).status() != psutil.STATUS_STOPPED
+
+    # ---------------------------------------------------------------------------------------------------------------- row 2
+    def test_row2_a_tick_of_the_outgoing_supervisor_never_releases_the_hold(self):
+        """The supervisor a stop was sent to keeps ticking while its stop is pending: its ticks never release the hold; only a supervisor
+        started after it does."""
+        settings.save(self.root, SUPERVISOR_ONLY)
+        old = self.spawn('supervisor')
+        services.tick(self.root)
+        self.ctl('pipeline_supervisor', {'ignore_stop': True})                      # it does not exit yet, and keeps ticking
+        result = services.stop(self.root, 'supervisor', wait=0.5)
+        self.assertTrue(result['pending'])
+        hold = self.hold()
+        self.assertEqual([r['pid'] for r in hold['retiring']], [old.pid])
+        self.wait_for(lambda: services.supervisor_ticked(self.root, self.sup(), hold['since_unix']), what='a tick of the outgoing supervisor')
+        for _ in range(2):
+            events = services.tick(self.root)['events']
+            self.assertFalse(any('released' in e for e in events), events)
+        self.assertTrue(self.hold())
+        self.assertIn(str(old.pid), services.hold_state(self.root)['message'])
+        # even once its stop record is gone (a failed stop command, a lost record) the retiring generation never releases it
+        rec = services.read_record(self.root, 'supervisor')
+        services.write_record(self.root, 'supervisor', rec | {'stop_requested': None})
+        self.assertIsNone(services.release_hold(self.root, self.sup()))
+        services.write_record(self.root, 'supervisor', rec)
+        self.ctl('pipeline_supervisor', {})                                          # it honours the stop now
+        old.wait(10)
+        services.tick(self.root)
+        self.assertTrue(self.hold())                                                 # no supervisor: still held
+        services.start(self.root, 'supervisor')
+        self.wait_for(lambda: 'conversion hold released' in ' '.join(services.tick(self.root)['events']), what='the successor tick')
+        self.assertIsNone(self.hold())
+
+    def test_row2_a_manager_restart_keeps_the_retiring_generation(self):
+        outgoing = self.popen(*SLEEP_CHILD)
+        ident = {'pid': outgoing.pid, 'create_time': psutil.Process(outgoing.pid).create_time()}
+        services.assert_hold(self.root, 'supervisor restart', renew=True, retiring=ident)
+        services.begin_management(self.root)                                         # a new manager renews the hold: the outgoing one stays named
+        self.assertEqual([r['pid'] for r in self.hold()['retiring']], [outgoing.pid])
+        (self.root / '.codex_jobs/_batch/supervisor_tick.json').write_text(json.dumps({'pid': outgoing.pid, 'create_time': ident['create_time'],
+                                                                                      'time': time.time() + 60}))
+        self.assertTrue(services.supervisor_ticked(self.root, ident, self.hold()['since_unix']))
+        self.assertIsNone(services.release_hold(self.root, ident))
+        self.assertTrue(self.hold())
+        outgoing.kill()
+        outgoing.wait(10)
+        services.begin_management(self.root)
+        self.assertNotIn('retiring', self.hold())                                     # a dead generation is pruned on the next write
+
+    # ---------------------------------------------------------------------------------------------------------------- row 6
+    def test_row6_a_legacy_drain_holds_first_and_never_stops_a_woken_worker(self):
+        old = self.legacy_convert()
+        services.hold_path(self.root).unlink(missing_ok=True)                         # (as if a supervisor had released the startup hold)
+        self.event('PAUSED (PAUSE file); not starting conversions')                  # its log says it sleeps ...
+        self.ctl('convert_queue', {'ignore_stop': True, 'child': SLEEP_CHILD})       # ... but it woke and launched a child since
+        self.addCleanup(self.kill_children, old.pid)
+        self.wait_for(lambda: self.children(old.pid), what='the woken worker child')
+        result = services.stop(self.root, 'convert', wait=0.5)
+        self.assertTrue(result['pending'], result)
+        self.assertIn('child process', result['message'])
+        self.assertIn('legacy convert worker drain', self.hold()['reason'])         # the hold was written before anything else
+        self.assertTrue(services.read_record(self.root, 'convert')['drain_hold'])
+        self.assertEqual([i['pid'] for i in self.running('convert')], [old.pid])     # not stopped
+        self.assertTrue(self.not_suspended(old.pid))                                  # and resumed after the frozen check
+        self.assertIn('drained', services.release_blocker(self.root, None))          # no supervisor tick releases the hold meanwhile
+        self.kill_children(old.pid)
+        self.ctl('convert_queue', {'ignore_stop': True})
+        lock = self.root / '.codex_jobs/_batch/convert_locks/s--abc123.lock'           # between claim and conversion: it holds a job lock
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        lock.write_text(str(old.pid), encoding='utf-8')
+        services.tick(self.root)
+        self.assertEqual([i['pid'] for i in self.running('convert')], [old.pid])
+        self.assertIn('job lock', services.status(self.root)['services']['convert']['message'])
+        self.assertTrue(self.not_suspended(old.pid))
+        lock.unlink()
+        result = services.tick(self.root)
+        self.assertTrue(any('verified while suspended' in e for e in result['events']), result['events'])
+        old.wait(10)
+        self.assertEqual(self.running('convert'), [])
+        self.assertFalse(services.read_record(self.root, 'convert').get('drain_hold'))
+        self.assertIsNone(services.release_blocker(self.root, None))
+
+    def test_row6_the_frozen_check_runs_while_the_worker_is_suspended(self):
+        old = self.legacy_convert()
+        self.event('IDLE: no staged job; waiting')
+        seen = []
+        real = services._worker_idle_problem
+
+        def spy(root, proc, inst):
+            seen.append(proc.status())
+            return real(root, proc, inst)
+        with mock.patch.object(services, '_worker_idle_problem', side_effect=spy):
+            result = services.stop(self.root, 'convert', wait=0.5)
+        self.assertFalse(result['pending'], result)
+        self.assertEqual(seen, [psutil.STATUS_STOPPED])
+        old.wait(10)
+
+    # --------------------------------------------------------------------------------------------- row 17 (view runner)
+    def test_row17_an_older_view_runner_is_stopped_only_while_it_launches_nothing(self):
+        settings.save(self.root, VIEWS_ONLY)
+        runner = self.spawn('views')
+        services.tick(self.root)
+        self.assertTrue(services.legacy_runner(self.root, self.running('views')[0]))   # no view_runner.lock, no launch reservation
+        job = 'views--s--human_male--outfit-a01'
+        self.ctl('view_batch', {'child': SLEEP_CHILD + ['tools/codex_imagegen.sh', job, 'prompt.md']})
+        self.addCleanup(self.kill_children, runner.pid)
+        self.wait_for(lambda: self.children(runner.pid), what='the launched Codex job')
+        codex = self.children(runner.pid)[0]
+        self.addCleanup(lambda: codex.is_running() and codex.kill())
+        result = services.stop(self.root, 'views', wait=0.5)
+        self.assertTrue(result['pending'], result)
+        self.assertIn(f'launching Codex job {job}', result['message'])
+        self.assertEqual([i['pid'] for i in self.running('views')], [runner.pid])
+        self.assertTrue(self.not_suspended(runner.pid))
+        self.assertEqual(services.status(self.root)['services']['views']['state'], 'stopping')
+        status = self.root / '.codex_jobs/_batch/status'
+        status.mkdir(parents=True, exist_ok=True)
+        (status / 'views--s--human_male--outfit.json').write_text(json.dumps({'state': 'running', 'attempts': 0, 'jobs': [{'job': job}]}))
+        result = services.tick(self.root)                                             # recorded now: the next runner adopts it
+        self.assertTrue(any('older view runner stopped' in e for e in result['events']), result['events'])
+        runner.wait(10)
+        self.assertTrue(codex.is_running())                                           # the Codex job itself continues
+        self.assertEqual(result['completed'][0]['action'], 'stop')
+
+    # ------------------------------------------------------------------------------- Tripo profile reservation (agent A's lock)
+    def test_the_balance_check_holds_the_profile_reservation_and_passes_its_env(self):
+        import tripo_browser_lock
+        seen = {}
+
+        def fake_run(cmd, **kwargs):
+            seen.update(env=kwargs.get('env') or {}, cmd=cmd)
+            return subprocess.CompletedProcess(cmd, 0, '{"credits": 12}\n', '')
+        with mock.patch.object(credits.subprocess, 'run', side_effect=fake_run):
+            result = credits.check_tripo(self.root)
+        self.assertEqual((result['status'], result['credits']), ('ok', 12))
+        lock = seen['env'].get(tripo_browser_lock.PROFILE_LOCK_ENV)
+        self.assertEqual(Path(lock), tripo_browser_lock.profile_lock_path())          # the resolved profile of this (temp) environment
+        self.assertTrue(str(lock).startswith(str(self.root)))                          # never the real profile in a test
+        self.assertTrue(seen['env'].get(tripo_browser_lock.PROFILE_TOKEN_ENV))
+        holder = self.lock_holder(tripo_browser_lock.profile_lock_path())              # another checkout / a manual studio.mjs
+        self.assertTrue(credits.tripo_browser_busy(self.root))
+        busy = credits.check_tripo(self.root, run=lambda root: (0, '{"credits": 5}', ''))
+        self.assertEqual(busy['status'], 'busy')
+        holder.kill()
+        holder.wait(10)
+        self.assertFalse(credits.tripo_browser_busy(self.root))
+
+    # ---------------------------------------------------------------------------------------------------------------- row 20
+    def test_row20_a_held_job_lock_with_every_module_free_is_no_work(self):
+        job = self.root / 'multiview_ready/new_set--abc123'
+        job.mkdir(parents=True)
+        (job / '.tripo-job.json').write_text(json.dumps({'set': 'new_set', 'job_id': 'abc123', 'state': 'ready',
+                                                         'modules': [{'race_gender': 'human_male', 'module': 'outfit'}]}))
+        convert_list.add_sets(self.root, ['new_set'])
+        holder = self.popen(*SLEEP_CHILD)
+        lock = self.root / '.codex_jobs/_batch/convert_locks/new_set--abc123.lock'
+        lock.parent.mkdir(parents=True)
+        lock.write_text(str(holder.pid), encoding='utf-8')
+        with mock.patch.object(convert_list, 'worker_predicate', return_value=None):
+            self.assertEqual(convert_list.eligible_jobs(self.root), [])               # cannot be claimed, nothing to join
+            self.assertFalse(services.has_work(self.root))
+            lock.unlink()
+            self.assertEqual([j['job'] for j in convert_list.eligible_jobs(self.root)], ['new_set--abc123'])
+        calls = []
+
+        def predicate(root, name):
+            calls.append((Path(root), name))
+            return False, 'the worker says no'
+        with mock.patch.object(convert_list, 'worker_predicate', return_value=predicate):
+            self.assertEqual(convert_list.eligible_jobs(self.root), [])               # the worker's own predicate decides
+        self.assertEqual(calls, [(self.root, 'new_set--abc123')])
+
+    def test_row20_the_workers_own_predicate_is_used(self):
+        self.assertIsNotNone(convert_list.worker_predicate())                          # tools/convert_queue.py job_eligible
+        job = self.root / 'multiview_ready/new_set--abc123'
+        job.mkdir(parents=True)
+        (job / '.tripo-job.json').write_text(json.dumps({'set': 'new_set', 'job_id': 'abc123', 'state': 'ready',
+                                                         'modules': [{'race_gender': 'human_male', 'module': 'outfit'}]}))
+        convert_list.add_sets(self.root, ['new_set'])
+        holder = self.popen(*SLEEP_CHILD)
+        lock = self.root / '.codex_jobs/_batch/convert_locks/new_set--abc123.lock'
+        lock.parent.mkdir(parents=True)
+        lock.write_text(str(holder.pid), encoding='utf-8')
+        self.assertEqual(convert_list.eligible_jobs(self.root), [])
+        lock.unlink()
+        self.assertEqual([j['job'] for j in convert_list.eligible_jobs(self.root)], ['new_set--abc123'])
+
+    def test_row20_a_joinable_job_in_processing_is_work(self):
+        job = self.root / 'processing/new_set--abc123'
+        job.mkdir(parents=True)
+        (job / '.tripo-job.json').write_text(json.dumps({'set': 'new_set', 'job_id': 'abc123', 'state': 'converting', 'modules': [
+            {'race_gender': 'human_male', 'module': 'outfit'}, {'race_gender': 'dwarf_male', 'module': 'outfit'}]}))
+        convert_list.add_sets(self.root, ['new_set'])
+        holder = self.popen(*SLEEP_CHILD)
+        locks = self.root / '.codex_jobs/_batch/convert_locks'
+        locks.mkdir(parents=True)
+        (locks / 'new_set--abc123.lock').write_text(str(holder.pid), encoding='utf-8')
+        module_lock = self.root / 'models/new_set/abc123/.module_locks/human_male__outfit.lock'
+        module_lock.parent.mkdir(parents=True)
+        module_lock.write_text(str(holder.pid), encoding='utf-8')                       # another worker converts one module: join the other
+        with mock.patch.object(convert_list, 'worker_predicate', return_value=None):
+            found = convert_list.eligible_jobs(self.root)
+        self.assertEqual([(j['job'], j['free'], j['reason']) for j in found], [('new_set--abc123', 1, 'joinable')])
+
+
+class Phase5ManagerTest(TempRoot):
+    """Row 18 (the server side) and the startup-hold event the monster dispatcher waits for."""
+    manager, result_of = ServiceManagerTest.manager, ServiceManagerTest.result_of
+
+    def setUp(self):
+        super().setUp()
+        self.managers = []
+
+    def tearDown(self):
+        for manager in self.managers:
+            manager.stop()
+        super().tearDown()
+
+    def test_row18_a_pending_stop_keeps_its_request_id_to_the_terminal_event(self):
+        worker = self.spawn('convert')
+        self.ctl('convert_queue', {'busy': True})                                     # it acknowledges, then finishes its job first
+        manager = self.manager(CONVERT_ONLY)
+        wait_for(lambda: manager.statuses, what='first tick')
+        answer = manager.request('convert', 'stop')
+        first = self.result_of(manager, answer['request'])
+        self.assertTrue(first['ok'] and first['pending'], first)
+        self.assertIn(answer['request'], [p['id'] for p in manager.view()['pending']])    # still pending in the view (never "lost")
+        self.ctl('convert_queue', {})
+        worker.wait(15)
+        manager.wake()
+        final = wait_for(lambda: next((e for e in manager.events if e['kind'] == 'request' and e.get('request') == answer['request']
+                                       and e.get('pending') is False), None), what='the terminal event')
+        self.assertTrue(final['ok'])
+        self.assertEqual((final['name'], final['action']), ('convert', 'stop'))
+        self.assertIn('stopped', final['text'])
+        self.assertNotIn(answer['request'], [p['id'] for p in manager.view()['pending']])
+
+    def test_row18_a_new_request_supersedes_a_pending_one(self):
+        self.spawn('convert')
+        self.ctl('convert_queue', {'busy': True})
+        manager = self.manager(CONVERT_ONLY)
+        wait_for(lambda: manager.statuses, what='first tick')
+        first = manager.request('convert', 'stop')['request']
+        self.assertTrue(self.result_of(manager, first)['pending'])
+        second = manager.request('convert', 'restart')['request']
+        ended = wait_for(lambda: next((e for e in manager.events if e.get('request') == first and e.get('pending') is False), None),
+                         what='the superseded outcome')
+        self.assertIn(f'superseded by request {second}', ended['text'])
+        self.ctl('convert_queue', {})
+
+    def test_the_startup_hold_is_signalled_before_the_first_tick(self):
+        order = []
+        manager = orchestrator.ServiceManager(self.root, interval=3600.0, tick=lambda root, cfg: order.append(manager.hold_asserted.is_set())
+                                              or {'services': {}, 'events': []})
+        self.managers.append(manager)
+        self.assertFalse(manager.hold_asserted.is_set())
+        manager.start()
+        wait_for(lambda: order, what='the first tick')
+        self.assertEqual(order[0], True)
+        self.assertTrue(services.read_hold(self.root))
+
+    def test_a_failed_startup_hold_is_retried_before_anything_runs(self):
+        calls, ticks = [], []
+        real = services.begin_management
+
+        def flaky(root):
+            calls.append(1)
+            if len(calls) == 1:
+                raise OSError('disk busy')
+            return real(root)
+        manager = orchestrator.ServiceManager(self.root, interval=3600.0, tick=lambda root, cfg: ticks.append(1) or {'services': {}, 'events': []})
+        self.managers.append(manager)
+        with mock.patch.object(services, 'begin_management', side_effect=flaky):
+            manager.start()
+            self.assertFalse(ticks)
+            wait_for(lambda: ticks, what='the first tick (after the 5 s retry)')
+        self.assertGreaterEqual(len(calls), 2)
+        self.assertTrue(manager.hold_asserted.is_set())
+        self.assertTrue(any('begin: OSError' in e for e in manager.errors))
+
+
+class Phase5ActionsTest(V2Case):
+    """Row 3: the family namespace of a set is reserved at approval and recorded for the catalog."""
+
+    def lines(self):
+        path = self.root / '.codex_jobs/_batch/convert_sets.txt'
+        return path.read_text(encoding='utf-8').splitlines() if path.exists() else []
+
+    def test_row3_a_set_named_like_another_sets_family_id_is_refused(self):
+        self.concept('cape')
+        status, result = self.act('concepts:cape', 'approve')
+        self.assertEqual(status, 200, result)
+        self.assertIn('cape_human_male', self.lines())                                # cape's pre-authorized family entry
+        self.assertEqual(convert_list.owner_of(self.root, 'cape_human_male'), 'cape')
+        self.concept('cape_human_male')
+        status, body = self.act('concepts:cape_human_male', 'approve')
+        self.assertEqual((status, body['code']), (409, 'namespace'), body)
+        self.assertTrue((self.root / 'concepts/cape_human_male').is_dir())            # nothing moved
+        self.assertIn('reserved', body['error'])
+
+    def test_row3_a_set_whose_family_id_is_an_existing_set_is_refused(self):
+        self.concept('wrap_dwarf_male')
+        status, result = self.act('concepts:wrap_dwarf_male', 'approve')
+        self.assertEqual(status, 200, result)
+        self.concept('wrap')
+        status, body = self.act('concepts:wrap', 'approve')
+        self.assertEqual((status, body['code']), (409, 'namespace'), body)
+        self.assertIn('wrap_dwarf_male exists', body['error'])
+        self.assertNotIn('wrap', self.lines())
+        # without the reservation add_sets still never writes another set's id as a family id
+        added = convert_list.add_sets(self.root, ['wrap'])
+        self.assertNotIn('wrap_dwarf_male', added['added'])
+        self.assertEqual([s['id'] for s in added['skipped']['wrap']], ['wrap_dwarf_male'])
+
+    def test_row3_the_catalog_uses_the_recorded_owner_not_the_suffix(self):
+        self.concept('wrap_dwarf_male')
+        self.assertEqual(self.act('concepts:wrap_dwarf_male', 'approve')[0], 200)
+        self.job('wrap_dwarf_male', 'a1b2c3d4e5f6', 'processing_views', units=(('dwarf_male', 'outfit'),))
+        catalog.invalidate()
+        sets = catalog.derive_all(self.root)['sets']
+        self.assertIn('wrap_dwarf_male', sets)                                       # its own set, not "wrap"
+        self.assertNotIn('wrap', sets)
+        self.assertEqual(catalog.job_set('wrap_dwarf_male--a1b2c3d4e5f6', ['dwarf_male', 'human_male']), 'wrap')   # the legacy suffix rule
+        self.assertEqual(catalog.job_set('zz--a1b2c3d4e5f6', ['dwarf_male'], self.root, 'cape'), 'cape')          # a record's parent_set wins
+
+    def test_row3_an_unrelated_name_and_a_re_approval_are_fine(self):
+        self.concept('cape_dwarf')                                                    # not a race suffix
+        self.assertIsNone(convert_list.namespace_conflict(self.root, 'cape_dwarf'))
+        self.concept('hood')
+        self.assertEqual(self.act('concepts:hood', 'approve')[0], 200)
+        self.assertEqual(self.act('approved:hood', 'unapprove')[0], 200)
+        self.assertIsNone(convert_list.namespace_conflict(self.root, 'hood'))          # its own family ids never block it
+
+
 if __name__ == '__main__':
     unittest.main()

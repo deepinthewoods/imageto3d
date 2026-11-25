@@ -148,14 +148,14 @@ def run(args):
             raise ValueError("No desktop display found. Set DISPLAY to your local desktop display.")
         if not FIREFOX:
             raise ValueError("Firefox not found. Install it or set HYPER3D_FIREFOX to firefox.exe.")
-        with BrowserLock():   # held until the sign-in window closes (Linux: until exec, see below)
+        with BrowserLock():   # held by this waiting process until the sign-in window closes, on every OS
             check_profile(profile)
             print("Opening normal Firefox for manual Hyper3D/Google sign-in. No automation is attached.", flush=True)
             print("After Hyper3D is signed in, close this Firefox window before inspect or prepare.", flush=True)
-            if WINDOWS:   # no exec(): it would not wait for the window to close
-                sys.exit(subprocess.call([FIREFOX, "-no-remote", "-profile", str(profile), LOGIN]))
-            # Linux: the lock's descriptor is close-on-exec, so the lock ends here; the profile's own lock covers the window
-            os.execv(FIREFOX, [FIREFOX, "--no-remote", "--profile", str(profile), LOGIN])
+            # no exec() (phase-4 finding 15): the lock's descriptor is close-on-exec, so an exec'd Firefox would run without it
+            flags = ["-no-remote", "-profile"] if WINDOWS else ["--no-remote", "--profile"]
+            code = subprocess.call([FIREFOX, *flags, str(profile), LOGIN])
+        sys.exit(code)
 
     from selenium import webdriver
     from selenium.webdriver.firefox.options import Options

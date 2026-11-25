@@ -195,12 +195,13 @@ This section replaces the two working notes of the phase (`PHASE5_INTEGRATION.md
     stage, pending_action, credits_committed, why, model_url, images_uploaded, actions: [names]}`; `screenshots` = `/mfiles/` URLs of the
     record folder's PNGs, newest first. A record without a task (a hand conversion that stopped) is state `failed` with that as error.
   - `library` (`{known, mapped, folder}`), `library_hint`, `pick` (the variant_names entry).
-- Verbs: `views` (`args.enabled`, a partial map of views with an image; 400 for a view without one), `convert` (`args.enabled`; 400 when
-  nothing is enabled; 409 `busy` while a conversion of the variant is queued / running; 409 `frozen` once a record / GLB / reduced/
-  exists: converting again is Reconvert), `reconvert` (`args.confirm: true` required, else 400; optional `args.enabled`; 409 `approved`
-  while approved; 400 when there is nothing to redo; moves `hyper3d` and `reduced` to `*_prev_<time>`), `view_retry` (`args.view`: a
-  failed task back to pending, or the missing task file written), `import` (`args.unattended`), `approve` (`args.lod`; 409 `approved`
-  when approved already), `unapprove` (completed -> 3d; on a v2 pick whose views have not started it undoes the pick).
+- Verbs (superseded in detail by H.10): `views` (`args.enabled`, a partial map of views with a valid image; 400 for a view without one),
+  `convert` (`args.files` + `args.views_rev`; `args.enabled` is 400; 409 `busy` while a conversion of the variant is active; 409 `changed`
+  / `missing`; 409 `frozen` once a record / GLB / reduced/ exists: converting again is Reconvert), `reconvert` (`args.files`,
+  `args.views_rev`, `args.confirm: true`; 409 `approved` while approved; 400 when there is nothing to redo; moves `hyper3d` and `reduced`
+  to `*_prev_<time>` as one journaled transaction), `view_retry` (`args.view`), `import` (`args.unattended`), `approve` (`args.lod` +
+  `args.glb_sha256`; 409 `approved` / `changed` / `unverified` / `busy`), `unapprove` (completed -> 3d; on a v2 pick whose views have not
+  started it undoes the pick).
 - `convert` is allowed while a view is still being drawn (the UI asks "use the views that exist now?"): a stuck view runner must not
   block a conversion with the front alone. It is also allowed again on a frozen list whose conversion never started (no record, GLB or
   reduced/: nothing was paid), which replaces the frozen list; the old task is then cancelled by the lane.
@@ -222,8 +223,12 @@ This section replaces the two working notes of the phase (`PHASE5_INTEGRATION.md
   (`paused`, overridden only by a confirmed Run now) > in mode `auto` / `views-run` the supervisor's "user active" PAUSE or idle < 300 s
   (`user_present`, overridden by Run now). Mode `run` skips the idle gate. The driver re-checks the gate before every step with the
   real presence (a gate that closed mid-run = verdict `waiting` = requeue after 60 s).
-- `finish_outcome`: `done` needs exit 0, verdict `ok` and the five reduced levels; `busy` (Hyper3D profile busy) requeues after 300 s;
-  anything else fails, and a failed task is never retried automatically (max_attempts 1; Retry resumes from the record).
+- `finish_outcome`: `done` needs exit 0, verdict `ok` and the lane's verified reduction of the task's generation (`v2_reduce_ok.json`,
+  H.10 F12); `busy` (Hyper3D profile busy, or another driver / a live child of the variant) requeues after 300 s; `waiting` (the gate,
+  also a wrapper child's click-time exit 4) after 60 s; anything else fails (its disposition persisted first, H.10 F4), and a failed task
+  is never retried automatically (max_attempts 1; Retry resumes from the record).
+- A confirmed Run now overrides only the pause it was confirmed for (H.10 F4); the gate is also re-checked by every wrapper child right
+  before each credit-capable click (H.10 F2).
 
 ### H.6 Migration
 - `python tools/preview/v2/migrate.py --monsters` writes the report `.codex_jobs/_app/monster_migration_report.{json,md}` only;
@@ -260,3 +265,99 @@ This section replaces the two working notes of the phase (`PHASE5_INTEGRATION.md
 ### H.9 Before the first real pick
 - Restart the view runner (Queue tab, Restart views): it reads `"launcher": "monsters"` only after a restart.
 - The Hyper3D browser lock (`rodin_backend.SeleniumRodin.__enter__`) is in place; nothing else is needed.
+
+### H.10 Phase 5 review fixes, monster backend (review_v2_phase5_20261125, findings 1-18; as built)
+- **F1 free preview.** The lane resumes a `submitted` record whose `pending_action` is `free_preview` when its model is identified
+  (`model_id` set and part of `model_url`: `monster_lane.free_preview_resolved`); the backend now resolves such intents itself
+  (`Record.resolve_free_preview`). Any other pending click (a paid one, or a free one without a bound model) stays refused. A record left
+  `submission_needs_review` is a real needs-review state (collect refuses it; the lane shows the error). Regression: `RealRecordTest`
+  drives the REAL `rodin_backend` submit / collect (fake browser session) through the lane.
+- **F2 click-time gate.** Every wrapper child of the driver gets `paid_gate.env_for(root, override_pause = run_now or a bound override,
+  cmd = [python, -X, utf8, v2/monster_lane.py, gate, --root, R, --task-args, {run_now, override_pause}, (--idle N)])`;
+  `monster_lane.py gate` exits 0 when open, else 1 with the reason on stdout. A child exit 4 (`paid_gate.EXIT_GATE_CLOSED`, stderr
+  `PAID GATE CLOSED: ...`) is verdict `waiting` (requeue after 60 s), never a failure. With `--manage-services` the server builds the
+  ServiceManager first and passes its `hold_asserted` Event to `Orchestrator(monster_ready=...)`: `_start_monsters` starts nothing until
+  the manager asserted the startup hold. Without managed services the CONVERT_HOLD / PAUSE files decide.
+- **F4 dispositions.** views.json `conversion[<generation>] = {state: cancelled | failed, reason, key, time}` (generation = the 12-hex
+  frozen digest = the task key suffix), written BEFORE the queue row changes: Cancel (`monster_lane.cancel_task`, Queue op `cancel`) and a
+  failed / lost attempt (`monster_lane.record_failure`, orchestrator `_finish` / `_lost`). An ordinary Retry (`monster_lane.retry_task`, also
+  Run now of a failed / cancelled row) clears it first. `tick` looks each frozen generation up by its EXACT key (`TaskQueue.by_key`;
+  `TaskQueue.enqueue_once` never revives a cancelled / failed row); no row + a disposition = the row is restored in that terminal state
+  (`TaskQueue.restore_terminal`), never queued; a queued row of a generation with a disposition is cancelled by the plan. Run now's
+  override is the KEY of the confirmed pause (`monster_lane.pause_key`: mode + its `since`, else the manual PAUSE's `since` + reason), kept
+  as `args.override_pause`; a different pause needs a new confirmation; `TaskQueue.retry` clears `run_now` and the override. The run_now
+  answer carries `pause_key`.
+- **F5 paid accounting.** `paid_log.jsonl` entries are per provider action: `{time, kind: hyper3d, id: "hyper3d:<model id>:<action>",
+  action, status: confirmed | uncertain, credits (the OBSERVED cost, null when not observed; never assumed), monster, variant, views,
+  record, model_id}`; actions observed at cost 0 are not logged. confirmed = the backend observed the next stage (its intent was cleared);
+  uncertain = the intent is still pending. `reconcile_paid` runs on EVERY driver run (also exported / reduced records) and after collect;
+  the last entry per id counts (older id-less entries count as confirmed). A write error goes to `.codex_jobs/_app/paid_log_errors.json`,
+  shows in `lane_status.paid.errors`, the verdict's `accounting_error` and the item's `conversion.accounting_error`, and is retried by
+  every tick until it succeeds. `paid_summary` = `{count, credits (confirmed), unknown_amounts, uncertain: {count, credits}, recent,
+  errors}`; item `conversion.paid` = a confirmed paid action, `paid_uncertain` = the uncertain ones, `credits` = the confirmed observed
+  amount or null.
+- **F6 Reconvert.** Under the monster lock AND the LOD lock of 3D approve (`models/<v>/.pipeline_v2.lock`; approve takes both, same
+  order): an unreadable chosen_lod.json is 409 `unreadable`; an active conversion (a queued / running row, a driver holding
+  `.codex_jobs/_app/locks/mconvert/<variant key>.lock`, or a live recorded child) is 409 `busy`; an unreadable queue is 409 `unreadable`
+  (`monster_lane.active_reason`). The new freeze is validated and hashed first; then `models/<v>/.v2_reconvert.json` {moves, generation} is
+  written, hyper3d/ and reduced/ are renamed and views.json gets the freeze; an error rolls the moves back; a crash leaves the journal,
+  which recovery (any later mutation of the variant, every tick: `recover_reconverts`) completes when views.json carries its generation and
+  rolls back otherwise.
+- **F7 inputs.** Before submit the driver copies the frozen files to `models/<v>/hyper3d/inputs_<generation>/` (read-only, each sha256
+  verified; an existing folder is re-verified or rebuilt) and passes THAT folder to the wrapper (the backend copies it again to
+  `upload_inputs/` and records `inputs: [{name, sha256, size}]`). On every resume the record's `inputs` must equal the frozen files and
+  digests in order, else verdict failed `check` before anything is spent; a record without `inputs` is accepted only when it uploaded the
+  frozen names from this generation's verified snapshot (`source`).
+- **F8 explicit files.** `convert` args `{files: [ordered view files], views_rev}`; Reconvert `{files, views_rev, confirm: true}`. `files`
+  is authoritative (nothing is merged in); `args.enabled` is 400 for both. `views_rev` (item field, an int below 2**53) covers the frozen
+  generation, the planned views, the pick generation and every view PNG / provenance file (size + mtime), NOT the draft ticks; a mismatch
+  is 409 `changed`; a listed file that is absent or invalid is 409 `missing` with `file` (the first) and `files` in the body. Order of the
+  checks: active conversion (409 `busy`), views_rev, files. The `views` verb answers `views_rev` too.
+- **F9 unattended freeze** only when EVERY planned view task is terminal (`done` / `failed` / `cancelled`; a never-written task is not),
+  re-checked with the outputs under the monster lock; it freezes the valid views. The item phase `generating` uses the same rule (a PNG
+  that appears while its job runs does not end it).
+- **F10 guard and publication.** views.json `pick_gen` (uuid) is the pick generation; every view task carries `guard: {file: <abs
+  views.json>, key: pick_gen, value}` (the runner spawns only while it matches; withdrawn = `cancelled`). Pick / import write their tasks
+  while holding the monster lock. Withdraw renames the views folder (the guard file) FIRST, re-checks the task states (a launch reserved
+  meanwhile restores everything and is 409) and only then renames the task files.
+- **F11 ledgers and journal.** `variant_names.json` is validated (an object; `variants` / `retired` objects of objects); every mutation reads
+  it strictly (409 `unreadable`; the file is never replaced); a damaged ledger makes the migration skip the folder. Pick / import are
+  journaled in `.codex_jobs/_app/monster_journal/<monster key>.json` (written once the temp folder is complete): recovery
+  (`recover_journals`, every tick; inline for the same monster / folder, else 409 `recovering`) completes the SAME variant (names entry,
+  views folder, concept state, tasks); when neither the temp nor the views folder exists, the published number is retired instead.
+- **F12 verified reduction.** After reduce_monster.py the lane validates the outputs (5 LOD GLBs, a manifest object, a materials.json
+  object) and writes `models/<v>/reduced/v2_reduce_ok.json` `{schema, generation, frozen_time, files: {name: {sha256, size}}, materials:
+  true, time}`. Completed = approved AND a verified reduction (`reduce_status`: the record of the CURRENT generation, sizes checked, sha256
+  at approve; a legacy variant without views.json by the explicit rule manifest + 5 GLBs + materials.json, item `legacy: true`, card badge
+  `legacy reduction`). An approved but unverified variant stays in 3D with an error badge and Unapprove. 3D approve takes `args.lod` +
+  `args.glb_sha256` (item `lods[<level>].sha256`; `lods` stays a dict keyed by level): 409 `changed` when the file differs, 409 `unverified`
+  without a verified reduction, 409 `busy` while a conversion is active. chosen_lod.json gains `glb_sha256`, `generation`, `legacy`; the
+  undo of Unapprove carries `{lod, glb_sha256}`.
+- **F13 identity.** Names refuse trailing dots / spaces and Windows device names (CON, NUL, COM1, ...); a monster / variant must match its
+  on-disk folder exactly (a case alias is 400); persisted ids of `.v2_state.json` are validated (else the state is unreadable); every
+  mutation target is checked against the monster root at mutation time (`contained`: lexical and resolved containment, no symlink or
+  junction below the root). Locks are keyed by the casefolded name. View task names are
+  `mviews--<monster slug>--<variant slug>--<canonical digest 8>--<view>`; a task file that names another monster / variant is `foreign`
+  (ignored for state, 409 on publication).
+- **F14 process tree.** The driver starts each child with Popen and records it in `.codex_jobs/_app/monster_lane/<variant key>.children.json`
+  (pid, create time, argv) until it exits. While a recorded child lives, the attempt keeps its slot (orchestrator `_monster_tree_hold`,
+  checked before the receipt; wrapper dead = orphan), no new driver of the variant starts (verdict `busy`) and the plan counts it as active.
+  Kill & retry of a monster attempt collects the whole tree first (psutil children, recursive, of the builder, the wrapper and every
+  recorded child), stops builder and wrapper, kills the tree and waits; any survivor = `kill_failed` (slot kept). The generic repair /
+  early-receipt adoption is agent C's orchestrator change.
+- **F15 migration mappings.** Import also takes a variant only the migration knows (a sha256 / override mapping in `.v2_state.json`; its
+  variant_names entry is made from the concept, `how: migration ...`) and War Horse base fronts in `pipeline/War Horse/first round/`.
+  `<n>-<armour>` variants are never importable (manual). An approved concept whose variant has no views / models folder and nothing to
+  import is a read-only manual-only card (badge with its source; item `phase: manual`). The migration report lists the mapped importable
+  picks (with `how`).
+- **F16 damaged state.** views.json is schema-validated (`views_problem`); a damaged file raises `guard.Unreadable` (409 for a mutation)
+  and is never replaced. The catalog builds every variant on its own: a damaged one is a read-only card (badge `damaged: ...`, no actions,
+  `damaged: {error}`) and its item carries `damaged: {error}` and `state: "damaged"` (healthy items `damaged: null`). The tick, the
+  auto-freeze and the frozen scan isolate per-variant errors (shown in the orchestrator errors); a lane task whose variant cannot be read
+  waits (never started, never cancelled).
+- **F17 view validation.** View tasks carry `validate: "rgba_png"` and `provenance: ["<view>.prompts.json"]`. v2 treats a view as valid only
+  when its PNG decodes as 8-bit RGBA with a transparent pixel and (extra views) its provenance record is a JSON object (`view_problem`);
+  only valid views can be ticked or frozen. Retry (`view_retry`) is offered for a failed / cancelled task and for a finished one with an
+  invalid output: the invalid file and its record are renamed `<file>.invalid-<time>` and the task goes back to pending. The Codex job
+  prompt no longer asks for a framing inspection or redraw (a technical format check only).
+- **F18 Run now first.** The plan considers every queued row of the lane, Run now rows first (then priority, id).

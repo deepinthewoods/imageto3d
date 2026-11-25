@@ -21,6 +21,7 @@ for _p in (HERE.parent, HERE):
         sys.path.insert(0, str(_p))
 import serve  # noqa: E402  (tools/preview/serve.py, used as a library)
 import builds  # noqa: E402
+import convert_list  # noqa: E402
 import decisions  # noqa: E402
 import guard  # noqa: E402
 import monsters_v2  # noqa: E402  (phase 5: monster concept and variant cards / items)
@@ -150,6 +151,7 @@ def _job_scan(folder: Path, deps: dict) -> dict:
             if levels:
                 review_levels[key] = levels
     return {'record_set': record.get('set') if isinstance(record.get('set'), str) and NAME.fullmatch(record['set']) else None,
+            'parent_set': record.get('parent_set') if isinstance(record.get('parent_set'), str) and NAME.fullmatch(record['parent_set']) else None,
             'job_id': record.get('job_id') if isinstance(record.get('job_id'), str) and NAME.fullmatch(record['job_id']) else None,
             'state': record.get('state') if isinstance(record.get('state'), str) else None, 'conversion': record.get('conversion'),
             'retired': retired, 'modules': sorted(set(modules)), 'views': by_view, 'errors': errors, 'backends': backends,
@@ -158,13 +160,22 @@ def _job_scan(folder: Path, deps: dict) -> dict:
 
 def _broken_job(error: str) -> dict:
     """What a job folder whose scan failed contributes (F14): nothing but the error, so the set is shown as damaged."""
-    return {'record_set': None, 'job_id': None, 'state': None, 'conversion': None, 'retired': False, 'modules': [], 'views': {}, 'errors': {},
+    return {'record_set': None, 'parent_set': None, 'job_id': None, 'state': None, 'conversion': None, 'retired': False, 'modules': [], 'views': {}, 'errors': {},
             'backends': {}, 'warnings': {}, 'review_levels': {}, 'converted': [], 'problems': [], 'scan_error': error}
 
 
-def job_set(name: str, races: list[str]) -> str:
-    """Set id of a job folder name: `serve._job_set` (a trailing `_<race>` belongs to the base set) plus the documented gnome family
-    suffix `_gnome` (tools/tripo_pipeline/finish_sets.py `set_of`; other family suffixes could be part of a real set name)."""
+def job_set(name: str, races: list[str], root: Path | None = None, parent: str | None = None) -> str:
+    """Set id of a job folder name. A RECORDED owner wins (phase 5 review row 3): the job record's `parent_set` (`parent`), else, with `root`,
+    convert_list.owner_of (set_namespace.json: an id approved / released as a set of its own is its own set, an id written as a family id
+    belongs to the set it was written for). Without a record: `serve._job_set` (a trailing `_<race>` belongs to the base set) plus the
+    documented gnome family suffix `_gnome` (tools/tripo_pipeline/finish_sets.py `set_of`; other family suffixes could be part of a real set
+    name)."""
+    if isinstance(parent, str) and NAME.fullmatch(parent):
+        return parent
+    if root is not None:
+        owner = convert_list.owner_of(root, name.split('--')[0])
+        if owner:
+            return owner
     base = serve._job_set(name, races)
     if base == name.split('--')[0]:
         for family in sorted({r.rsplit('_', 1)[0] for r in races if r.startswith('gnome') and '_' in r}, key=len, reverse=True):
@@ -188,7 +199,7 @@ def scan_jobs(root: Path, races: list[str]) -> tuple[dict[str, list[dict]], list
                 info = serve._memo('v2job', root, folder, lambda deps, f=folder: _job_scan(f, deps))
             except Exception as exc:  # noqa: BLE001  (one damaged job never stops the scan of the others, F14)
                 info = _broken_job(f'{stage}/{name}: scan failed ({type(exc).__name__}: {exc})')
-            set_name = job_set(name, races)
+            set_name = job_set(name, races, root, info.get('parent_set'))
             job_id = info['job_id'] or name.partition('--')[2]
             job = info | {'name': name, 'stage': stage, 'rel': f'{stage}/{name}', 'id': job_id, 'set': set_name,
                           'model_set': info['record_set'] or name.split('--')[0]}
@@ -214,7 +225,7 @@ def fronts_index(root: Path, races: list[str]) -> dict[str, dict[str, str]]:
         if len(parts) != 3 or parts[2] not in races:
             continue
         state = progress.state_of(index, name)['state']
-        entry = out.setdefault(job_set(parts[1], races), {})
+        entry = out.setdefault(job_set(parts[1], races, root), {})
         if parts[2] not in entry or entry[parts[2]] == 'failed':
             entry[parts[2]] = state
     return out
@@ -554,7 +565,7 @@ def _derive_all(root: Path) -> dict:
     models = scan_models(root, races, {name: model_sets(name, jobs[name]) for name in sorted(jobs)})
     fronts = fronts_index(root, races)
     intents = guard.list_intents(root)
-    facts = progress.Facts(root, races, lambda prefix: job_set(prefix, races))
+    facts = progress.Facts(root, races, lambda prefix: job_set(prefix, races, root))
     sets = {name: _derive_or_damaged(root, name, jobs[name], models.get(name), races, fronts.get(name), intents, facts) for name in sorted(jobs)}
     return {'races': races, 'sets': sets, 'retired': retired}
 

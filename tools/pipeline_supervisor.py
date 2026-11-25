@@ -73,9 +73,12 @@ else:
     import fcntl
 
 ROOT = Path(__file__).resolve().parents[1]
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+import proc_cmdline  # noqa: E402  (tools/proc_cmdline.py: the interpreter entry-point parser)
 sys.path.insert(0, str(ROOT / 'tools' / 'tripo_pipeline'))
 import views_omitted  # noqa: E402
-from claim_lock import ClaimBusy, claim_lock  # noqa: E402
+from claim_lock import ClaimBusy, claim_lock, release_lock, try_lock  # noqa: E402
 
 try:
     import psutil
@@ -112,6 +115,34 @@ def atomic_write(path, data):
     tmp = path.with_name(path.name + '.tmp')
     tmp.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8', newline='\n')
     tmp.replace(path)
+
+
+class advance_lock:
+    """The byte lock of .codex_jobs/_batch/advance.lock around every read-modify-write of advance.json (shared with the preview
+    app's drift Accept, tools/preview/v2/actions.py; same claim_lock byte convention). Waits up to `wait` seconds."""
+
+    def __init__(self, advance_file, wait=30.0):
+        self.path, self.wait, self.handle = Path(advance_file).with_name('advance.lock'), wait, None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(self.path, 'a+b')
+        deadline = time.monotonic() + self.wait
+        while not try_lock(handle):
+            if time.monotonic() >= deadline:
+                handle.close()
+                raise TimeoutError(f'{self.path}: another process is writing advance.json')
+            time.sleep(0.05)
+        self.handle = handle
+        return self
+
+    def __exit__(self, *exc):
+        handle, self.handle = self.handle, None
+        if handle:
+            try:
+                release_lock(handle)
+            finally:
+                handle.close()
 
 
 def read_json(path, default=None):
@@ -241,8 +272,11 @@ def resume_fully(proc):
 
 
 def script_of(row):
-    # Windows command lines carry interpreter options before the script (python -X utf8 -u script.py)
-    return next((a for a in row['cmdline'][1:6 if IS_WIN else 4] if a.endswith('.py')), '')
+    """The script a python row's interpreter actually runs, '' when none (phase-4 finding 7): its command line is parsed like the
+    interpreter does (tools/proc_cmdline.py): options such as `-X utf8 -u` are skipped, `-c` / `-m` / stdin run no script file, and
+    an argument after the script (e.g. a checkout path given to another program as data) is never taken for it."""
+    script, _ = proc_cmdline.python_script(row.get('cmdline') or [])
+    return script or ''
 
 
 def row_cwd(row):
@@ -444,7 +478,8 @@ class Supervisor:
         return read_json(self.pids_file, []) or []
 
     def freeze(self, rows=None):
-        """SIGSTOP the running heavy descendants of convert_job.py; returns the newly frozen rows."""
+        """SIGSTOP the running heavy descendants of convert_job.py; returns the newly frozen rows. Each signal is sent only after the
+        pid is verified to be the same process (create time) as the table row (send(..., start=))."""
         rows = process_table() if rows is None else rows
         kept = [r for r in self.recorded() if any(same_process(row, r) for row in rows)]
         new = []
@@ -455,7 +490,7 @@ class Supervisor:
             if row['stopped'] or any(same_process(row, r) for r in kept):
                 continue
             try:
-                self.send(row['pid'], SIGSTOP)
+                self.send(row['pid'], SIGSTOP, start=row['start'])
             except OSError:
                 continue
             kept.append({'pid': row['pid'], 'start': row['start'], 'comm': row['comm']})
@@ -469,19 +504,24 @@ class Supervisor:
         supervisor suspended); a stopped process it did not record is never touched. Returns the pids resumed."""
         rows = process_table() if rows is None else rows
         records = self.recorded()
-        targets = {row['pid'] for row in rows if any(same_process(row, r) for r in records)}
+        targets = {row['pid']: row['start'] for row in rows if any(same_process(row, r) for r in records)}
         for pid in sorted(targets):
             try:
-                self.send(pid, SIGCONT)
+                self.send(pid, SIGCONT, start=targets[pid])
             except OSError:
                 pass
         self.pids_file.unlink(missing_ok=True)
         return sorted(targets)
 
-    def send(self, pid, sig):
+    def send(self, pid, sig, start=None):
+        """Deliver SIGSTOP / SIGCONT to `pid`. With `start` (the process table's create time of the process meant) the identity is
+        verified right before delivery, on the handle that delivers it: a pid reused by another process raises OSError and nothing
+        is signalled (phase-4 finding 7)."""
         if IS_WIN:   # SIGSTOP/SIGCONT: suspend/resume the process (psutil errors become OSError, as os.kill raises)
             try:
                 proc = psutil.Process(pid)
+                if start is not None and abs(proc.create_time() - start) >= 1:
+                    raise OSError(f'pid {pid} is no longer the process that was meant (create time changed)')
                 if sig == SIGSTOP:
                     proc.suspend()
                 else:
@@ -489,6 +529,19 @@ class Supervisor:
             except psutil.Error as error:
                 raise OSError(str(error)) from error
             return
+        if start is not None:
+            if psutil:
+                try:
+                    proc = psutil.Process(pid)
+                    if abs(proc.create_time() - start) >= 1:
+                        raise OSError(f'pid {pid} is no longer the process that was meant (create time changed)')
+                    proc.send_signal(sig)   # psutil re-checks that the handle's process is still running before it signals
+                except psutil.Error as error:
+                    raise OSError(str(error)) from error
+                return
+            fields = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()   # OSError when it is gone
+            if int(fields[19]) != start:
+                raise OSError(f'pid {pid} is no longer the process that was meant (start time changed)')
         os.kill(pid, sig)
 
     def tick_screen(self):
@@ -914,10 +967,13 @@ class Supervisor:
                 continue
             digest = sha256(Path(r['image']))
             if not self.dry_run:   # a dry run changes nothing, advance.json included
-                config.setdefault('accepted_drift', []).append(
-                    {'sha256': digest, 'image': r['image'], 'note': 'auto-waived view colour drift (unattended run, '
-                     'known generator hue repaint); framing checks unaffected'})
-                atomic_write(self.advance_file, config)
+                with advance_lock(self.advance_file):   # re-read under the lock: the app's drift Accept may have written meanwhile
+                    current = read_json(self.advance_file, {}) or {}
+                    entries = current.setdefault('accepted_drift', [])
+                    if digest not in {e.get('sha256') for e in entries if isinstance(e, dict)}:
+                        entries.append({'sha256': digest, 'image': r['image'], 'note': 'auto-waived view colour drift (unattended '
+                                        'run, known generator hue repaint); framing checks unaffected'})
+                        atomic_write(self.advance_file, current)
             accepted.add(digest)
             self.emit(f'ACCEPTED colour drift {Path(r["image"]).name} (auto, hash-bound; see advance.json)')
         return problems
@@ -1092,6 +1148,11 @@ class Supervisor:
 
 
 def accept_drift(advance_file, images, note):
+    with advance_lock(advance_file):
+        return _accept_drift(advance_file, images, note)
+
+
+def _accept_drift(advance_file, images, note):
     data = read_json(advance_file, {}) or {}
     entries = data.setdefault('accepted_drift', [])
     have = {e.get('sha256') for e in entries}

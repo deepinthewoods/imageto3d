@@ -38,7 +38,8 @@ import psutil  # noqa: E402
 
 
 FAKE = textwrap.dedent('''
-    import datetime, json, os, pathlib, sys, time
+    import datetime, json, os, pathlib, subprocess, sys, time
+    child = None                                         # ctl {"child": [args]}: start ONE child `python <args>` (a job it launched)
     stem = pathlib.Path(__file__).stem
     root = pathlib.Path.cwd()
     batch, app = root / '.codex_jobs' / '_batch', root / '.codex_jobs' / '_app'
@@ -64,8 +65,14 @@ FAKE = textwrap.dedent('''
             return False
     if stem == 'convert_queue' and (json.loads(ctl_path.read_text()) if ctl_path.exists() else {}).get('sleep_event'):
         event('PAUSED (PAUSE file); not starting conversions')
+    ctl = {}
     while True:
-        ctl = json.loads(ctl_path.read_text()) if ctl_path.exists() else {}
+        try:
+            ctl = json.loads(ctl_path.read_text()) if ctl_path.exists() else {}
+        except (OSError, ValueError):                     # (read while the test rewrites it: keep the last one)
+            pass
+        if ctl.get('child') and child is None:
+            child = subprocess.Popen([sys.executable, *ctl['child']])
         if stem == 'pipeline_supervisor' and not ctl.get('no_tick'):     # the supervisor's end-of-tick record (DESIGN_PHASE4 I.1)
             tmp = batch / f'supervisor_tick.{os.getpid()}.tmp'
             tmp.write_text(json.dumps({'pid': os.getpid(), 'time': time.time(), 'mode': 'auto', 'paused': False}))
@@ -104,6 +111,9 @@ class TempRoot(unittest.TestCase):
     def setUp(self):
         warnings.simplefilter('ignore', ResourceWarning)   # the manager's detached Popen objects are dropped on purpose; tearDown kills them
         self.root = Path(tempfile.mkdtemp(prefix='v2p4_')).resolve()
+        xdg = mock.patch.dict(os.environ, {'XDG_DATA_HOME': str(self.root / '_xdg')})   # the Tripo profile reservation of the temp root
+        xdg.start()
+        self.addCleanup(xdg.stop)
         for rel in SCRIPTS.values():
             path = self.root / rel
             path.parent.mkdir(parents=True, exist_ok=True)

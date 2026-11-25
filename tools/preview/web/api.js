@@ -63,9 +63,9 @@ async function request(path, { method = 'GET', query, json, blob, quiet = false 
 export const api = {
   state: () => request('/state'),
   item: id => request('/item', { query: { id } }),
-  /** Concept-stage and set verbs. `rev` is the item revision the user saw (set verbs). */
-  action: (id, verb, { rev, args } = {}) =>
-    request('/action', { method: 'POST', json: { id, verb, ...(rev != null ? { rev } : {}), ...(args ? { args } : {}) } }),
+  /** Concept-stage and set verbs. `rev` is the item revision the user saw (set verbs). `quiet`: a 409 is not routed to the global conflict handler (the caller words it). */
+  action: (id, verb, { rev, args, quiet } = {}) =>
+    request('/action', { method: 'POST', json: { id, verb, ...(rev != null ? { rev } : {}), ...(args ? { args } : {}) }, quiet: quiet === true }),
   /** One unit: {id, race, module, lod, rev}; every unit: {id, lod, all: true, rev}; monsters: {id, lod}. */
   lod: body => request('/lod', { method: 'POST', json: body }),
   /** Set an Amount: {id, race, group: outfit|body|limbs, value: 0..100, rev}. */

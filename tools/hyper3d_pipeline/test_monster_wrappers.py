@@ -327,6 +327,36 @@ class PrepareMultiviewTests(Temp):
         self.assertEqual(driver.input.sent, '\n'.join(str(self.views / n) for n in ('front.png', 'back.png')))
 
 
+class WrapperGateTests(Temp):
+    """Phase 5 review finding 2: a monster wrapper's collect stops at a closed paid gate with exit 4 (resumable, no click)."""
+
+    def test_collect_exits_4_at_a_closed_gate_and_resumes(self):
+        self.make(**{'front.png': (8, 6), 'back.png': (8, 6)})
+        config = mv.multi_view_config(['front.png', 'back.png'])
+        rb.submit(self.views, self.out, config=config, session_factory=lambda: FakeSession(self.out))
+        gate_root = self.root / 'gate_root'
+        (gate_root / '.codex_jobs' / '_batch').mkdir(parents=True)
+        hold = gate_root / '.codex_jobs' / '_batch' / 'CONVERT_HOLD'
+
+        class Waiting(FakeSession):
+            def wait_stage(self, stages, timeout):
+                hold.write_text('{"reason": "supervisor restart"}')       # set while the collector waits for the stage
+                return super().wait_stage(stages, timeout)
+        sessions = []
+
+        def session_class(cfg, out):
+            sessions.append(Waiting(out, stages=['geometry_preview'], costs={'geometry': 0.5}))
+            return sessions[-1]
+        main = lambda argv: single.main(argv, make_config=mv.config_from_args, session_class=session_class)   # noqa: E731
+        with mock.patch.dict('os.environ', rb.paid_gate.env_for(gate_root)):
+            code, _, err = cli(main, 'collect', str(self.out), '--allow-paid', '--accept-preview')
+        self.assertEqual(code, rb.EXIT_GATE_CLOSED)
+        self.assertIn('PAID GATE CLOSED: conversions are held', err)
+        self.assertFalse([c for c in sessions[0].calls if c[0] == 'click'])
+        data = json.loads((self.out / rb.RECORD).read_text())
+        self.assertEqual((data['pending_action'], list(data['actions'])), (None, ['free_preview']))
+
+
 class WrapperLockTests(unittest.TestCase):
     def test_wrapper_sessions_inherit_the_backends_browser_lock(self):
         self.assertTrue(issubclass(mv.MultiViewRodin, rb.SeleniumRodin))

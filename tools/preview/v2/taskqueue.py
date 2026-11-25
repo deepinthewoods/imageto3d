@@ -260,6 +260,46 @@ class TaskQueue:
             return row['id']
         return self._tx(work)
 
+    def enqueue_once(self, lane: str, key: str, set_name: str | None, unit: str | None, args: dict | None = None, priority: int = 5,
+                     max_attempts: int = 3) -> tuple[int, bool]:
+        """(id, created): insert a QUEUED row only when the key has no row at all; an existing row (whatever its state, a cancelled or failed one
+        included) is returned unchanged in the same transaction (the monster lane: a cancelled / failed generation is never revived here, phase 5
+        review F4)."""
+        if lane not in LANES:
+            raise ValueError(f'unknown lane {lane!r}')
+        now = time.time()
+
+        def work(conn):
+            row = conn.execute('SELECT id FROM tasks WHERE key=?', (key,)).fetchone()
+            if row is not None:
+                return row['id'], False
+            cursor = conn.execute(
+                'INSERT INTO tasks(lane,key,set_name,unit,args,state,priority,attempts,max_attempts,created,updated,not_before) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?,0)', (lane, key, set_name, unit, json.dumps(args or {}), 'queued', priority, 0, max_attempts, now, now))
+            self._event(conn, cursor.lastrowid, 'enqueue', key)
+            return cursor.lastrowid, True
+        return self._tx(work)
+
+    def restore_terminal(self, lane: str, key: str, set_name: str | None, unit: str | None, args: dict, state: str, error: str,
+                         priority: int = 5, max_attempts: int = 3) -> int | None:
+        """A rebuilt queue gets back the row of a generation whose disposition was persisted outside the queue (the monster lane, F4): inserted
+        directly in its terminal state (`cancelled` / `failed`, never queued). None when the key already has a row."""
+        if lane not in LANES or state not in ('cancelled', 'failed'):
+            raise ValueError(f'cannot restore {lane!r} / {state!r}')
+        now = time.time()
+
+        def work(conn):
+            if conn.execute('SELECT id FROM tasks WHERE key=?', (key,)).fetchone() is not None:
+                return None
+            cursor = conn.execute(
+                'INSERT INTO tasks(lane,key,set_name,unit,args,state,priority,attempts,max_attempts,created,updated,finished,not_before,error,cancel_gen) '
+                'VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)',
+                (lane, key, set_name, unit, json.dumps(args or {}), state, priority, 0, max_attempts, now, now, now, error,
+                 'manual' if state == 'cancelled' else None))
+            self._event(conn, cursor.lastrowid, 'restore', f'{state}: {error}')
+            return cursor.lastrowid
+        return self._tx(work)
+
     @staticmethod
     def _requeue_sql(conn: sqlite3.Connection, task_id: int, now: float, reset: bool, not_before: float = 0.0, error: str | None = None) -> None:
         conn.execute('UPDATE tasks SET state=?, pid=NULL, pid_create=NULL, builder_pid=NULL, builder_create=NULL, token=NULL, kill_requested=0, cancel_gen=NULL, '
@@ -382,15 +422,24 @@ class TaskQueue:
 
     def retry(self, task_id: int, approval_gen: str | None = None) -> bool:
         """A failed or cancelled task goes back to queued with a fresh attempts count (the Retry button; it clears a manual cancel). False when it
-        is in another state. `approval_gen` (when given) re-tags the row for that approval."""
+        is in another state. `approval_gen` (when given) re-tags the row for that approval. An ordinary Retry also clears a monster row's Run now
+        and its pause override (`args.run_now` / `args.override_pause`, phase 5 review F4): they belonged to the earlier attempt."""
         now = time.time()
 
         def work(conn):
-            row = conn.execute('SELECT state FROM tasks WHERE id=?', (task_id,)).fetchone()
+            row = conn.execute('SELECT state, args FROM tasks WHERE id=?', (task_id,)).fetchone()
             if row is None:
                 raise ValueError(f'unknown task {task_id}')
             if row['state'] not in ('failed', 'cancelled'):
                 return False
+            try:
+                args = json.loads(row['args'] or '{}')
+            except ValueError:
+                args = None
+            if isinstance(args, dict) and ('run_now' in args or 'override_pause' in args):
+                args.pop('override_pause', None)
+                args['run_now'] = False
+                conn.execute('UPDATE tasks SET args=? WHERE id=?', (json.dumps(args), task_id))
             self._requeue_sql(conn, task_id, now, reset=True)
             if approval_gen is not None:
                 conn.execute('UPDATE tasks SET approval_gen=? WHERE id=?', (approval_gen, task_id))
@@ -398,9 +447,10 @@ class TaskQueue:
             return True
         return self._tx(work)
 
-    def mark_run_now(self, task_id: int, override_pause: bool = False, detail: str = '') -> bool:
-        """Run now (Queue tab / Approved modal, monster lane): a QUEUED task gets `args.run_now` (and `args.override_pause` when the user
-        confirmed it while paused) and its backoff is cleared. False when the task is not queued (any more)."""
+    def mark_run_now(self, task_id: int, override_pause: str | None = None, detail: str = '') -> bool:
+        """Run now (Queue tab / Approved modal, monster lane): a QUEUED task gets `args.run_now` and its backoff is cleared. `override_pause` = the
+        key of the manual pause the user confirmed it for (monster_lane.pause_key; phase 5 review F4): stored as `args.override_pause`, which
+        overrides only that pause; without one an earlier override is dropped. False when the task is not queued (any more)."""
         now = time.time()
 
         def work(conn):
@@ -409,8 +459,9 @@ class TaskQueue:
                 return False
             args = json.loads(row['args'] or '{}')
             args['run_now'] = True
-            if override_pause:
-                args['override_pause'] = True
+            args.pop('override_pause', None)
+            if isinstance(override_pause, str) and override_pause:
+                args['override_pause'] = override_pause
             conn.execute('UPDATE tasks SET args=?, not_before=0, updated=? WHERE id=?', (json.dumps(args), now, task_id))
             self._event(conn, task_id, 'run_now', detail or ('override pause' if override_pause else 'override idle'))
             return True

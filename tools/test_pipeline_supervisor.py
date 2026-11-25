@@ -167,7 +167,7 @@ def test_heavy_ignores_already_stopped_in_freeze(root, monkeypatch):
     rows[3]['stopped'] = True
     sent = []
     sup = make_sup(root)
-    monkeypatch.setattr(sup, 'send', lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(sup, 'send', lambda pid, sig, start=None: sent.append((pid, sig)))
     frozen = sup.freeze(rows)
     assert sorted(r['pid'] for r in frozen) == [112, 118, 120]
     assert all(sig == ps.SIGSTOP for _, sig in sent)
@@ -178,7 +178,7 @@ def test_pause_resume_transitions(root, monkeypatch):
     sup = make_sup(root)
     monkeypatch.setattr(ps, 'process_table', lambda: rows)
 
-    def send(pid, sig):
+    def send(pid, sig, start=None):
         sent.append((pid, sig))
         for row in rows:
             if row['pid'] == pid:
@@ -231,7 +231,7 @@ def test_idle_user_counts_as_away_even_with_the_screen_unlocked(root, monkeypatc
 def test_resume_skips_reused_pid(root, monkeypatch):
     sup = make_sup(root)
     sent = []
-    monkeypatch.setattr(sup, 'send', lambda pid, sig: sent.append(pid))
+    monkeypatch.setattr(sup, 'send', lambda pid, sig, start=None: sent.append(pid))
     ps.atomic_write(sup.pids_file, [{'pid': 111, 'start': 5.0, 'comm': 'blender'}])   # started at 1111 now: another process
     rows = table()
     assert sup.resume(rows) == []
@@ -288,7 +288,7 @@ def test_release_all_on_exit(root, monkeypatch):
     rows, sent = table(root), []
     monkeypatch.setattr(ps, 'process_table', lambda: rows)
     sup = make_sup(root)
-    monkeypatch.setattr(sup, 'send', lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(sup, 'send', lambda pid, sig, start=None: sent.append((pid, sig)))
     sup.run_cmd.screen = '(false,)\n'
     sup.tick_screen()
     for row in rows:
@@ -701,12 +701,16 @@ class FakePsutil:
 
     log = []
     missing = set()
+    created = {}   # pid -> create time when it differs from table()'s 1000 + pid (a reused pid)
 
     class Process:
         def __init__(self, pid):
             if pid in FakePsutil.missing:
                 raise FakePsutil.NoSuchProcess(pid)
             self.pid = pid
+
+        def create_time(self):
+            return FakePsutil.created.get(self.pid, 1000.0 + self.pid)
 
         def suspend(self):
             FakePsutil.log.append(('suspend', self.pid))
@@ -853,7 +857,7 @@ def test_startup_resumes_processes_left_suspended_by_a_killed_instance(root, mon
     monkeypatch.setattr(ps, 'process_table', lambda: rows)
     monkeypatch.setattr(ps.Supervisor, 'user_away', lambda self: True)
     sent = []
-    monkeypatch.setattr(ps.Supervisor, 'send', lambda self, pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(ps.Supervisor, 'send', lambda self, pid, sig, start=None: sent.append((pid, sig)))
     ps.atomic_write(root / '.codex_jobs' / '_batch' / 'paused_pids.json',
                     [{'pid': 111, 'start': rows[3]['start'], 'comm': 'blender'}])
     sup = make_sup(root)
@@ -919,7 +923,7 @@ def test_freeze_and_resume_never_touch_another_checkouts_processes(root, tmp_pat
     monkeypatch.setattr(ps, 'IS_WIN', True)
     rows, sent = other_checkout_rows(root, other), []
     sup = make_sup(root)
-    monkeypatch.setattr(sup, 'send', lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(sup, 'send', lambda pid, sig, start=None: sent.append((pid, sig)))
     assert sorted(r['pid'] for r in sup.freeze(rows)) == [111, 531]
     assert sorted(p for p, s in sent if s == ps.SIGSTOP) == [111, 531]
     for row in rows:
@@ -936,7 +940,7 @@ def test_resume_at_start_continues_only_recorded_identities(root, monkeypatch):
         row['stopped'] = row['pid'] in (111, 112, 118, 120)
     sent = []
     sup = make_sup(root)
-    monkeypatch.setattr(sup, 'send', lambda pid, sig: sent.append((pid, sig)))
+    monkeypatch.setattr(sup, 'send', lambda pid, sig, start=None: sent.append((pid, sig)))
     ps.atomic_write(sup.pids_file, [{'pid': 111, 'start': 1111.0, 'comm': 'blender'},
                                     {'pid': 112, 'start': 5.0, 'comm': 'python3'}])   # 112: pid reused since
     assert sup.resume(rows) == [111]
@@ -1039,3 +1043,80 @@ def test_a_stop_ends_the_advance_pass_before_the_next_gate(root):
     sup.stop = True
     sup.advance()
     assert not sup.run_cmd.of('claim')
+
+
+# ---------------------------------------------------------------- review_v2_phase4 finding 7 (re-check): entry point + signal identity
+def test_script_of_is_the_script_the_interpreter_runs():
+    def row(*cmd):
+        return {'pid': 1, 'ppid': 0, 'comm': 'python.exe', 'cmdline': list(cmd), 'stopped': False, 'start': 1.0}
+    assert ps.script_of(row('python', '-X', 'utf8', '-u', 'tools/tripo_pipeline/convert_job.py', 'j')) == 'tools/tripo_pipeline/convert_job.py'
+    assert ps.script_of(row('python', '-Xutf8', '-uB', 'a.py')) == 'a.py'
+    # an unrelated program given the checkout's script as DATA is not the conversion parent (the reviewer's case)
+    assert ps.script_of(row('python', 'tools/other_tool.py', 'tools/tripo_pipeline/convert_job.py')) == 'tools/other_tool.py'
+    assert ps.script_of(row('python', '-m', 'pytest', 'tools/tripo_pipeline/convert_job.py')) == ''
+    assert ps.script_of(row('python', '-c', 'pass', 'tools/tripo_pipeline/convert_job.py')) == ''
+    assert ps.script_of(row('python', '-', 'tools/tripo_pipeline/convert_job.py')) == ''
+    assert ps.script_of(row('python')) == ''
+
+
+def test_heavy_processes_ignore_convert_job_given_as_data(root):
+    script = str(root / 'tools' / 'tripo_pipeline' / 'convert_job.py')
+
+    def row(pid, ppid, comm, *cmd):
+        return {'pid': pid, 'ppid': ppid, 'comm': comm, 'cmdline': list(cmd), 'stopped': False, 'start': 1000.0 + pid,
+                'cwd': str(root)}
+    rows = [row(10, 1, 'python3', 'python3', '-m', 'pytest', script),                   # -m: no script file runs
+            row(11, 10, 'blender', 'blender', '-b'),
+            row(20, 1, 'python3', 'python3', str(root / 'tools' / 'lint.py'), script),  # the script path is only an argument
+            row(21, 20, 'blender', 'blender', '-b'),
+            row(30, 1, 'python3', 'python3', '-X', 'utf8', script, 'job--1'),           # the real conversion parent
+            row(31, 30, 'blender', 'blender', '-b')]
+    assert [r['pid'] for r in ps.heavy_processes(rows, root)] == [31]
+
+
+def test_freeze_verifies_the_identity_at_delivery(root, monkeypatch):
+    FakePsutil.log, FakePsutil.missing, FakePsutil.created = [], set(), {112: 5.0}   # pid 112 now belongs to another process
+    monkeypatch.setattr(ps, 'IS_WIN', True)
+    monkeypatch.setattr(ps, 'psutil', FakePsutil)
+    sup = make_sup(root)
+    try:
+        frozen = sup.freeze(table(root))
+        assert sorted(r['pid'] for r in frozen) == [111, 118, 120]             # 112 not signalled, not recorded
+        assert sorted(p for a, p in FakePsutil.log if a == 'suspend') == [111, 118, 120]
+        assert sorted(r['pid'] for r in json.loads(sup.pids_file.read_text())) == [111, 118, 120]
+        with pytest.raises(OSError):
+            sup.send(112, ps.SIGSTOP, start=1112.0)
+    finally:
+        FakePsutil.created = {}
+
+
+def test_resume_rechecks_identity_on_the_handle(root, monkeypatch):
+    """The table still matched the recorded pid 111, but by delivery time the pid belongs to another process: not resumed."""
+    FakePsutil.log, FakePsutil.missing, FakePsutil.created = [], set(), {}
+    monkeypatch.setattr(ps, 'IS_WIN', True)
+    monkeypatch.setattr(ps, 'psutil', FakePsutil)
+    sup = make_sup(root)
+    try:
+        sup.freeze(table(root))
+        FakePsutil.log.clear()
+        FakePsutil.created = {111: 9.0}                                         # reused between the table read and the signal
+        sup.resume(table(root))
+        resumed = [p for a, p in FakePsutil.log if a == 'resume']
+        assert 111 not in resumed and sorted(resumed) == [112, 118, 120]
+    finally:
+        FakePsutil.created = {}
+
+
+def test_proc_cmdline_agrees_with_the_preview_apps_parser():
+    import proc_cmdline
+    sys.path.insert(0, str(Path(ps.__file__).resolve().parent / 'preview' / 'v2'))
+    try:
+        import services
+    except Exception:   # noqa: BLE001  the preview app is optional here
+        pytest.skip('tools/preview/v2/services.py not importable')
+    finally:
+        sys.path.pop(0)
+    for cmd in (['python', 'a.py', 'x'], ['python', '-X', 'utf8', '-u', 'a.py'], ['python', '-Xutf8', 'a.py'], ['python', '-m', 'x'],
+                ['python', '-c', 'x', 'a.py'], ['python', '-'], ['python'], ['python', '--help'], ['python', '-W', 'ignore', 'a.py'],
+                ['python', '--check-hash-based-pycs', 'never', 'a.py'], ['python', '-uB', 'a.py'], ['python', '--', 'a.py']):
+        assert proc_cmdline.python_script(cmd) == services.python_script(cmd), cmd

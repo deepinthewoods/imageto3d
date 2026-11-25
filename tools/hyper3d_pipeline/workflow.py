@@ -30,6 +30,21 @@ PACK = '.rodin-pack-panel'
 
 NETERROR_TRIES, NETERROR_WAIT_S = 6, 30   # 2026-10-27: the VPN resolver loses hyper3d.ai for a minute at a time
 
+def _load_paid_gate():
+    # tools/paid_gate.py (DESIGN_PHASE4 I.8), shared through sys.modules so every importer sees one GateClosed class
+    import importlib.util
+    import sys
+    if 'paid_gate' not in sys.modules:
+        spec = importlib.util.spec_from_file_location('paid_gate', ROOT.parent / 'paid_gate.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules['paid_gate'] = module
+        spec.loader.exec_module(module)
+    return sys.modules['paid_gate']
+
+
+paid_gate = _load_paid_gate()   # checked right before each paid intent; without $IMAGETO3D_PAID_GATE (a manual run) it is open
+
+
 
 def navigate(driver, url, tries=NETERROR_TRIES, wait=NETERROR_WAIT_S):
     for attempt in range(1, tries + 1):
@@ -166,6 +181,7 @@ def confirm_geometry(driver, job, allow_paid, accept_preview, wait=True):
     if '2 Credits' not in control.text:
         raise RuntimeError('Expected 2-credit confirmation; stopping on price/UI change')
     screenshot(driver, job, 'before_paid_confirmation')
+    paid_gate.check()   # a caller's paid gate, right before the intent and the click
     job.intent('geometry_confirm')
     control.click()
     job.save('submission_clicked', stage='geometry_processing')
@@ -186,6 +202,7 @@ def generate_material(driver, job, wait=True):
     # Let the De-light state update settle before submitting its React form.
     time.sleep(1)
     generate = exact(scope(driver, MATERIAL), 'Generate')
+    paid_gate.check()   # a caller's paid gate, right before the intent and the click
     job.intent('material_generate')
     generate.click()
     job.save('submission_clicked', stage='material_processing')
@@ -195,6 +212,7 @@ def generate_material(driver, job, wait=True):
 
 def confirm_material(driver, job, wait=True):
     confirm = exact(scope(driver, MATERIAL), 'Confirm')
+    paid_gate.check()   # a caller's paid gate, right before the intent and the click
     job.intent('material_confirm')
     confirm.click()
     job.save('submission_clicked', stage='material_confirming')

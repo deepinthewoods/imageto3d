@@ -1,8 +1,9 @@
 // A confirmation dialog over the whole page (the Queue tab's Stop / Restart / Run now). Keyboard rules: focus starts on Cancel (so a
 // stray or held Enter can only cancel), Esc cancels, Tab stays inside, and no key of the page behind it (arrows, shortcuts) gets through.
-// Nothing is confirmed by a key repeat: the Confirm button is only activated by a click, or by Enter / Space on it after the user tabbed there
-// (and a repeated Enter is swallowed by blockRepeat, see util.js).
-import { blockRepeat, button, h } from './util.js';
+// Nothing is confirmed by a key repeat: the Confirm button is only activated by a click, or by ONE fresh Enter / Space press on it after the
+// user tabbed there. A held Enter / Space (event.repeat) is swallowed by the document capture handler below (it stops every key, so the
+// overlay's own blockRepeat never sees the event); the click that a held Space ends in on release is ignored too.
+import { activationRepeat, blockRepeat, button, h, isActivationKey } from './util.js';
 
 let current = null;
 
@@ -15,20 +16,24 @@ export function confirmDialog({ title, lines = [], confirm = 'Confirm', danger =
   return new Promise(resolve => {
     const previous = document.activeElement;
     let overlay = null;
+    let held = false;                // an activation key repeated since its last fresh press: the click it ends in is not a decision
     const done = value => {
       if (!overlay) return;
       overlay.remove();
       overlay = null;
       document.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('keyup', onKeyUp, true);
       current = null;
       if (previous instanceof HTMLElement && previous.isConnected) previous.focus({ preventScroll: true });
       resolve(value);
     };
     const cancel = button('Cancel', () => done(false), '', 'Esc');
-    const ok = button(confirm, () => done(true), danger ? 'danger' : 'primary');
+    const ok = button(confirm, event => { if (!(held && event?.detail === 0)) done(true); }, danger ? 'danger' : 'primary');
     cancel.dataset.fk = 'confirm-cancel';
     ok.dataset.fk = 'confirm-ok';
     function onKey(event) {
+      if (activationRepeat(event)) { held = true; event.preventDefault(); }          // a held Enter / Space never activates a button
+      else if (isActivationKey(event)) held = false;                                    // a fresh press starts over
       if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); done(false); return; }
       if (event.key === 'Tab') {
         event.preventDefault();
@@ -39,6 +44,9 @@ export function confirmDialog({ title, lines = [], confirm = 'Confirm', danger =
       }
       event.stopPropagation();           // the page behind (modal arrows, A, Enter, B ...) must not see any key while this is open
     }
+    function onKeyUp(event) {            // releasing a held Space would click the focused button: that click is ignored, then the flag clears
+      if (isActivationKey(event) && held) { event.preventDefault(); setTimeout(() => { held = false; }); }
+    }
     overlay = h('div', { class: 'q-confirm', role: 'alertdialog', 'aria-modal': 'true', 'aria-label': title },
       h('div', { class: 'confirm-box' },
         h('h3', { text: title }),
@@ -48,6 +56,7 @@ export function confirmDialog({ title, lines = [], confirm = 'Confirm', danger =
     blockRepeat(overlay);
     current = overlay;
     document.addEventListener('keydown', onKey, true);
+    document.addEventListener('keyup', onKeyUp, true);
     document.body.append(overlay);
     cancel.focus();
   });

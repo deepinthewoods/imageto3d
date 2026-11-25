@@ -153,7 +153,7 @@ def queue_extras(root: Path, ctx: dict) -> dict:
         hold = {'reason': f'unknown ({type(exc).__name__}: {exc})'}
     return {'services': services_view(ctx), 'mode': modes.snapshot(root), 'credits': credits_view(root, ctx), 'disk': disk,
             'views': progress.views_section(root), 'conversions': progress.conversions_section(root),
-            'holds': progress.holds_section(root, lambda prefix: catalog.job_set(prefix, races)), 'settings': app_settings.load(root),
+            'holds': progress.holds_section(root, lambda prefix: catalog.job_set(prefix, races, root)), 'settings': app_settings.load(root),
             'settings_health': app_settings.health(root, reload=False), 'convert_hold': hold}
 
 
@@ -379,7 +379,7 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
                 self.send_json(200, result)
             except guard.Conflict as exc:
                 catalog.invalidate()
-                extra = {k: v for k, v in (getattr(exc, 'extra', None) or {}).items() if k in ('changes',)}      # e.g. `changes` of 409 changed / stale
+                extra = {k: v for k, v in (getattr(exc, 'extra', None) or {}).items() if k in ('changes', 'file', 'files')}   # `changes` of 409 changed / stale; `file(s)` of a monster 409 missing
                 extra |= {'rev': exc.current} if isinstance(exc, decisions.RevConflict) else {}
                 self.send_json(409, {'ok': False, 'error': str(exc), 'code': exc.code, 'item': self.current_item(body)} | extra)
             except catalog.NotFound as exc:
@@ -448,16 +448,18 @@ def create_server(root: Path = DEFAULT_ROOT, host: str = '127.0.0.1', port: int 
         server.lock = lock
         ctx['notes'] = actions.recover_at_start(root)
         ctx['tripo'] = orchestrator.TripoCheck(root)
+        # with --manage-services the manager exists first: the monster dispatcher waits for its `hold_asserted` (set once the startup conversion
+        # hold exists), so no monster conversion starts before the hold (phase 5 review F2); without it the CONVERT_HOLD / PAUSE files decide
+        manager = orchestrator.ServiceManager(root, interval=services_interval) if manage_services else None
         if run_orchestrator:
-            runner = orchestrator.Orchestrator(root)
+            runner = orchestrator.Orchestrator(root, monster_ready=getattr(manager, 'hold_asserted', None))
             if runner.start():
                 server.orchestrator = runner
                 ctx['orchestrator'] = True
             else:
                 ctx['read_only'] = True
                 ctx['message'] = 'Read-only: another process holds the orchestrator lock (.codex_jobs/_app/orchestrator.lock) and runs the builds'
-        if manage_services and not ctx['read_only']:
-            manager = orchestrator.ServiceManager(root, interval=services_interval)
+        if manager is not None and not ctx['read_only']:
             manager.start()
             server.services = manager
             ctx['services'] = manager

@@ -317,3 +317,70 @@ These names and semantics are fixed. Both the daemon-side fixes and the v2-side 
   cancelling or revoking because of it).
 - **Progress (F19)**: a unit's views task must write into the unit's own job folder (its outputs' `<job>/<race>/<module>/<view>.png`); a failed
   task's log is read under the launcher's project (`"launcher": "monsters"` = `$IMAGETO3D_MONSTERS` or `characters/monsters/aaa`).
+
+### I.8 Click-time paid gate (phase 5 review finding 2): `tools/paid_gate.py`
+- **Why.** A caller's gate check before spawning is not enough: the child can wait minutes for the browser profile or a provider
+  stage before it clicks.
+- **The re-check.** Every paid-capable child calls `paid_gate.check()` immediately before writing a credit-capable intent and before
+  the click. That covers the Hyper3D submit/geometry/texture clicks in rodin_backend, and the Tripo submit in studio.mjs callers.
+- **How the caller passes the gate.** Through the env var `IMAGETO3D_PAID_GATE` (`paid_gate.env_for(root, override_pause, cmd)`):
+  - The base checks are CONVERT_HOLD (never overridable) and PAUSE covering conversions (ignored only with `override_pause`).
+  - The optional `cmd` adds an extra check. The monster lane passes its mode/idle/Run-now gate as a CLI here.
+  - No env var means a manual run: the explicit `--allow-paid` is the authority.
+- **On a closed gate.** The child raises `GateClosed`, leaves the record unchanged (no intent written, nothing clicked) and exits
+  `paid_gate.EXIT_GATE_CLOSED` (4).
+  - `convert_job.py` treats exit 4 as "wait for the gate and resume".
+  - The monster lane requeues the task (not a failure; waiting reason shown).
+
+### I.9 As built: phase 4 review rows left open at 8ebc5cd (review_v2_phase5_20261125 rows 2, 3, 6, 12, 17, 18, 20; v2 side)
+- **Hold release bound to the supervisor generation (row 2, amends I.1).** The hold file gains `retiring: [{pid, create_time}]`: every
+  supervisor a stop / restart is sent to is named there BEFORE `pipeline_supervisor.py stop` runs (`services.assert_hold(..., retiring=inst)`);
+  a rewrite (a renew, a manager start, a stale replacement) keeps the entries whose process still lives. `release_hold` removes the hold only
+  when, besides the I.1 tick rule, the ticking supervisor is NOT a retiring one, the supervisor record has no stop pending for that very
+  process (the restart transition completed) and no legacy convert drain needs the hold (`services.release_blocker`). A failed `stop`
+  command leaves its supervisor in `retiring` (fail closed: Restart it, or start a successor). `hold_state` adds `retiring: [pid]` and its
+  message names the generation it waits to be replaced.
+- **Startup hold before the monster dispatcher (finding 2 coordination).** `ServiceManager.hold_asserted` (threading.Event) is set by the
+  services thread right after the startup hold exists (ours, or a live other owner's); a failed write is retried every 5 s before any tick or
+  request runs. The monster dispatcher waits for it.
+- **Family namespace (row 3, amends I.6).** Approve (direct, provisional -> approved, and the legacy promote's set id) refuses a set id with
+  **409 `code: "namespace"`** (`actions.NamespaceTaken`, `convert_list.namespace_conflict`) when the id is a recorded family id of another
+  set, ends in `_<race>` / `_<gnome family>` of an existing set (a concept-stage folder, a recorded set, a job's set prefix or a models/
+  folder), or when an independent set `<id>_<race>` exists (a concept-stage folder or a recorded set). `add_sets` records the approved /
+  released sets and the family ids it writes in `.codex_jobs/_app/set_namespace.json` = `{sets: {S: time}, families: {S_<race>: S}}` and never
+  writes a family id that is an independent set or another set's family id: such ids come back in `skipped: {set: [{id, reason}]}` (the
+  approve response turns them into a `warning`). `catalog.job_set(name, races, root, parent)` uses a recorded owner first: the job record's
+  `parent_set` (when a claim writes one), else set_namespace.json; only an unrecorded id falls back to the suffix rule.
+- **Legacy worker drain (row 6, amends I.2).** For a legacy worker the manager writes the conversion hold FIRST (record `drain_hold: true`;
+  release_blocker keeps the hold while the drain is pending), waits until no convert_job.py of this checkout runs and the event log says the
+  worker sleeps, then `services.frozen_stop`: the verified handle is SUSPENDED, the frozen worker is re-checked (no child process, no
+  convert_job.py, no `convert_locks/*.lock` naming its pid, still asleep in its log) and only then terminated; if anything shows it woke it is
+  resumed untouched and the stop stays pending. Nothing is killed on a timeout.
+- **Older view runner (row 17).** `services.legacy_runner` = no launch reservation (`'launching'` missing from view_batch.py, started before
+  the file was written, or view_runner.lock not held). Its Stop / Restart goes through `frozen_stop` too: allowed only while every child is a
+  `codex_imagegen.sh <job>` that a status file already records as running / launching and there is no other child; otherwise pending, and
+  every tick re-evaluates a pending views stop. A current runner is still stopped at once (its reservation covers the gap). CUTOVER.md orders
+  the cut-over: drain the legacy convert worker, replace the view runner, only then restart the supervisor; its listener stop and its drain /
+  runner checks are a script (exactly one listener; script path resolved against the process's cwd = this checkout).
+- **Queue repair liveness (row 12, amends F12).** `orchestrator.receipt_builder(result, claim, row, now)` is the one rule for "a receipt whose
+  builder may still run", used by `_check_active` and by `adopt_claims` (a replaced / repaired database): an attempt with such a receipt is
+  adopted as `orphan` with the receipt's builder recorded (slot taken), never skipped. A `kill_requested` orphan with an early receipt is
+  killed (`_kill(task, result)` targets the builder the receipt names) instead of being held as `alive`.
+- **Service request ids to the end (row 18, server side).** A request whose first outcome is `pending: true` stays in `queue.services.pending`
+  (`{id, name, action, time, running: true, waiting: true}`) until it ends. `services.tick` returns `completed: [{name, request, action, ok,
+  pending: false, text}]` for pending stops / restarts that ended (the request id is the record's `stop_request_id`); the manager turns each
+  into the terminal `events` entry `{kind: "request", request, name, action, ok, pending: false, text}`. A request that ends without such a
+  record (the service no longer shows `stop_pending`) gets its terminal event from the status; a new request for the same service supersedes
+  a pending one (terminal text `superseded by request N`). Drift decisions: `accept_drift` writes advance.json under the byte lock
+  `.codex_jobs/_batch/advance.lock` (claim_lock style, offset 1 << 20) and re-reads its digests after the write; the supervisor takes the same
+  lock around its own advance.json read-modify-writes (auto-waiver, `accept-drift`).
+- **Tripo profile reservation (finding 8 follow-up, amends I.3 / I.7).** `credits.check_tripo` and `tripo_browser_busy` use
+  `tripo_browser_lock.tripo_browser_lock(root, wait=0)` (the checkout lock AND the reservation keyed by the resolved Firefox profile; busy at
+  once) and pass the env it yields (`IMAGETO3D_TRIPO_PROFILE_LOCK` / `_TOKEN`) to the `node studio.mjs balance` child; the old bare byte lock
+  around a bare node call would make studio.mjs wait on its own reservation. Tests set `XDG_DATA_HOME` to the temp root, so they never touch
+  the real profile's reservation. `services.python_script` is `tools/proc_cmdline.python_script` (loaded by path; the local copy is the
+  fallback), the parser the supervisor uses.
+- **Wake-up predicate (row 20).** `convert_list.eligible_jobs` asks the worker's own read-only predicate `convert_queue.job_eligible(root,
+  job_name) -> (bool, reason)` (imported lazily, `worker_predicate`); without it, its copy of the rule: a free module AND (no live job-lock
+  holder, or in processing/ another worker's convert_job holds one of its modules). A held job lock with every module free is no work. Each
+  entry adds `reason`.

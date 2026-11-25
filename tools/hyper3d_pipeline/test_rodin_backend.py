@@ -1,4 +1,6 @@
 """Offline tests for rodin_backend.py and the convert_job.py backend dispatch (browser is faked)."""
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
@@ -659,6 +661,214 @@ class FlowTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             record.bind('https://hyper3d.ai/workspace/rodin/' + '0' * 8 + '-0000-0000-0000-' + 'f' * 12)
         self.assertEqual(rb.parse_expect(['geometry=2']), {'geometry': 2})
+
+
+class Phase5Tests(unittest.TestCase):
+    """Phase 5 review: finding 1 (free preview resolved once its model is identified), finding 2 (click-time paid gate: a gate
+    closed during the stage wait stops before the intent and the click, exit 4, resumable) and finding 7 (recorded inputs)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.views = make_views(self.root / 'views')
+        self.out = self.root / 'out'
+        self.gate_root = self.root / 'gate_root'
+        self.batch = self.gate_root / '.codex_jobs' / '_batch'
+        self.batch.mkdir(parents=True)
+        env = mock.patch.dict(os.environ, rb.paid_gate.env_for(self.gate_root))
+        env.start()
+        self.addCleanup(env.stop)
+
+    def record(self):
+        return json.loads((self.out / rb.RECORD).read_text())
+
+    def hold(self):
+        (self.batch / 'CONVERT_HOLD').write_text(json.dumps({'since': 'x', 'reason': 'supervisor restart'}))
+
+    def submit(self, **kw):
+        session = FakeSession(self.out, **kw)
+        session.uploaded = []
+        session.prepare_multiview = lambda paths, config: session.uploaded.extend(paths)
+        rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        return session
+
+    # -- finding 1
+    def test_a_submit_with_a_model_url_resolves_the_free_preview(self):
+        self.submit()
+        data = self.record()
+        self.assertEqual((data['status'], data['pending_action']), ('submitted', None))
+        entry = data['actions']['free_preview']
+        self.assertEqual((entry['model_id'], entry['resolved_by']), (MODEL, 'submit'))
+        self.assertIn('intent_at', entry)
+        self.assertIn('done_at', entry)
+
+    def old_record(self):
+        """A record as the pre-fix writer left it: submitted, bound to a model, pending_action still free_preview."""
+        self.submit()
+        path = self.out / rb.RECORD
+        data = json.loads(path.read_text())
+        data['pending_action'] = 'free_preview'
+        data['actions']['free_preview'] = {'intent_at': data['actions']['free_preview']['intent_at']}
+        path.write_text(json.dumps(data))
+
+    def test_an_existing_bound_record_is_resolved_by_inspect(self):
+        self.old_record()
+        rb.inspect_only(self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out))
+        data = self.record()
+        self.assertEqual(data['pending_action'], None)
+        self.assertEqual(data['actions']['free_preview']['resolved_by'], 'inspect')
+        self.assertEqual(data['last_observation'], {'stage': 'geometry_preview'})
+
+    def test_an_existing_bound_record_is_resolved_on_load_by_collect_and_preview(self):
+        for how, run in (('collect', lambda: rb.collect(self.out, config=CONFIG, session_factory=lambda: FakeSession(
+                              self.out, stages=['export_ready']))),
+                         ('preview', lambda: rb.preview(self.out, config=CONFIG, session_factory=lambda: FakeSession(
+                              self.out, stages=['export_ready'])))):
+            shutil.rmtree(self.out, ignore_errors=True)
+            self.old_record()
+            run()
+            data = self.record()
+            self.assertEqual((data['actions']['free_preview']['resolved_by'], data['pending_action']), (how, None), how)
+
+    def test_an_unidentified_click_stays_pending_until_bind(self):
+        self.submit(url=None)
+        data = self.record()
+        self.assertEqual((data['status'], data['pending_action']), ('submission_needs_review', 'free_preview'))
+        rb.inspect_only(self.out, config=CONFIG, session_factory=lambda: self.fail('no model to open'))
+        self.assertEqual(self.record()['pending_action'], 'free_preview')        # ambiguous: still protected
+        rb.bind(self.out, URL)
+        data = self.record()
+        self.assertEqual((data['pending_action'], data['actions']['free_preview']['resolved_by']), (None, 'bind'))
+        self.assertEqual(data['model_id'], MODEL)
+
+    def test_a_pending_paid_action_is_never_resolved_as_free(self):
+        self.submit()
+        path = self.out / rb.RECORD
+        data = json.loads(path.read_text())
+        data['pending_action'] = 'geometry'
+        path.write_text(json.dumps(data))
+        record = rb.Record(path)
+        self.assertFalse(record.resolve_free_preview('test'))
+        self.assertEqual(self.record()['pending_action'], 'geometry')
+
+    # -- finding 7
+    def test_submit_records_and_uploads_the_exact_input_bytes(self):
+        session = self.submit()
+        data = self.record()
+        upload = Path(data['upload_dir'])
+        self.assertEqual(upload, (self.out / rb.UPLOAD_DIR).resolve())
+        self.assertEqual([n for n, _ in session.uploaded], CONFIG['view_order'])
+        self.assertTrue(all(Path(p).parent.resolve() == upload for _, p in session.uploaded))   # the copies went up
+        inputs = rb.record_inputs(rb.Record(self.out / rb.RECORD))
+        self.assertEqual([i['name'] for i in inputs], CONFIG['view_order'])
+        for item in inputs:
+            self.assertEqual(item['sha256'], rb.sha256_file(self.views / item['name']))
+            self.assertEqual(item['size'], (self.views / item['name']).stat().st_size)
+        self.assertEqual(rb.record_inputs(self.out), inputs)
+        self.assertEqual(rb.record_inputs(data), inputs)
+        self.assertEqual(data['source'], str(self.views.resolve()))
+
+    def test_record_inputs_of_an_old_or_damaged_record(self):
+        self.assertIsNone(rb.record_inputs({'status': 'submitted'}))            # written before the field: unknown
+        for bad in ('x', [{'name': 'a'}], [{'name': 'a', 'sha256': 'z' * 64, 'size': 1}],
+                    [{'name': 'a', 'sha256': '0' * 64, 'size': True}]):
+            with self.assertRaises(ValueError):
+                rb.record_inputs({'inputs': bad})
+
+    def test_an_existing_record_keeps_its_upload_snapshot(self):
+        self.submit()
+        before = rb.sha256_file(self.out / rb.UPLOAD_DIR / 'front.png')
+        (self.views / 'front.png').write_bytes((self.views / 'front.png').read_bytes() + b'changed')
+        with self.assertRaisesRegex(rb.Stop, 'already exists'):
+            self.submit()
+        self.assertEqual(rb.sha256_file(self.out / rb.UPLOAD_DIR / 'front.png'), before)
+
+    # -- finding 2
+    def collect(self, session):
+        return rb.collect(self.out, config=CONFIG, allow_paid=True, accept_preview=True, session_factory=lambda: session)
+
+    def paid_costs(self):
+        return {'geometry': 0.5, 'material_generate': None, 'material_confirm': None}
+
+    def test_a_hold_set_during_the_stage_wait_stops_before_the_intent_and_the_click(self):
+        """The reviewer's scenario: CONVERT_HOLD appears while the collector waits for the provider stage."""
+        self.submit()
+        hold = self.hold
+
+        class Waiting(FakeSession):
+            def wait_stage(self, stages, timeout):
+                hold()                                        # the app holds conversions during the wait
+                return super().wait_stage(stages, timeout)
+        session = Waiting(self.out, stages=['geometry_preview'], costs=self.paid_costs())
+        with self.assertRaisesRegex(rb.GateClosed, 'CONVERT_HOLD'):
+            self.collect(session)
+        self.assertFalse([c for c in session.calls if c[0] == 'click'])
+        self.assertNotIn(('select_mesh_mode', 'Best Quality'), session.calls)   # stopped before anything was selected
+        data = self.record()
+        self.assertEqual((data['status'], data['pending_action'], list(data['actions'])), ('submitted', None, ['free_preview']))
+        self.assertNotIn('credits_committed', data)
+        # resumable: once the hold is gone the same record collects normally
+        (self.batch / 'CONVERT_HOLD').unlink()
+        session = FakeSession(self.out, stages=['geometry_preview', 'material_ready', 'material_preview', 'export_ready'],
+                              costs=self.paid_costs())
+        self.collect(session)
+        self.assertEqual([c[1] for c in session.calls if c[0] == 'click'], ['geometry', 'material_generate', 'material_confirm'])
+        self.assertEqual((self.record()['status'], self.record()['credits_committed']), ('exported', 0.5))
+
+    def test_a_gate_closing_between_the_intent_and_the_click_withdraws_the_intent(self):
+        self.submit()
+        hold = self.hold
+
+        class Late(FakeSession):
+            def symmetric_value(self):
+                hold()                                        # after the intent, before the click
+                return 'Symmetric'
+        session = Late(self.out, stages=['geometry_preview'], costs=self.paid_costs())
+        with self.assertRaises(rb.GateClosed):
+            self.collect(session)
+        self.assertFalse([c for c in session.calls if c[0] == 'click'])
+        data = self.record()
+        self.assertEqual((data['pending_action'], list(data['actions'])), (None, ['free_preview']))
+        self.assertNotIn('credits_committed', data)
+        events = [json.loads(l)['event'] for l in (self.out / 'events.jsonl').read_text().splitlines()]
+        self.assertEqual(events[events.index('geometry_intent_withdrawn') - 3:events.index('geometry_intent_withdrawn') + 1],
+                         ['submission_intent', 'credits_committed', 'symmetric_selector', 'geometry_intent_withdrawn'])
+        (self.batch / 'CONVERT_HOLD').unlink()
+        session = FakeSession(self.out, stages=['geometry_preview', 'export_ready'], costs=self.paid_costs())
+        self.collect(session)                                 # not refused as "already submitted"
+        self.assertEqual([c[1] for c in session.calls if c[0] == 'click'], ['geometry'])
+
+    def test_a_pause_closes_the_gate_unless_run_now_overrides_it(self):
+        self.submit()
+        (self.batch / 'PAUSE').write_text(json.dumps({'reason': 'manual pause-conversions', 'scope': ['conversions']}))
+        with self.assertRaisesRegex(rb.GateClosed, 'PAUSE'):
+            self.collect(FakeSession(self.out, stages=['geometry_preview'], costs=self.paid_costs()))
+        with mock.patch.dict(os.environ, rb.paid_gate.env_for(self.gate_root, override_pause=True)):
+            session = FakeSession(self.out, stages=['geometry_preview', 'export_ready'], costs=self.paid_costs())
+            self.collect(session)
+        self.assertIn(('click', 'geometry'), session.calls)
+
+    def test_the_cli_exits_4_and_names_the_gate(self):
+        self.submit()
+        self.hold()
+        session = FakeSession(self.out, stages=['geometry_preview'], costs=self.paid_costs())
+        err = io.StringIO()
+        with mock.patch.object(rb, 'SeleniumRodin', lambda config, out: session), contextlib.redirect_stderr(err):
+            with self.assertRaises(SystemExit) as caught:
+                rb.main(['collect', str(self.out), '--allow-paid', '--accept-preview'])
+        self.assertEqual(caught.exception.code, rb.EXIT_GATE_CLOSED)
+        self.assertIn('PAID GATE CLOSED: conversions are held', err.getvalue())
+        self.assertFalse([c for c in session.calls if c[0] == 'click'])
+
+    def test_no_gate_variable_means_a_manual_run(self):
+        self.submit()
+        self.hold()
+        with mock.patch.dict(os.environ):
+            os.environ.pop(rb.paid_gate.ENV)
+            session = FakeSession(self.out, stages=['geometry_preview', 'export_ready'], costs=self.paid_costs())
+            self.collect(session)
+        self.assertIn(('click', 'geometry'), session.calls)
 
 
 class DispatchTests(unittest.TestCase):

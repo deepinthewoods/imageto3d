@@ -24,7 +24,7 @@ const DISK_WARN = 30 * 1024 ** 3;
 const DISK_ERROR = 10 * 1024 ** 3;
 const SERVICE_OFF_TEXT = 'service management is off';
 const UNMANAGED_TEXT = 'Service management is off - the server was started without --manage-services';
-const LOST_MS = 20000;           // a service request that is neither pending nor in the events after this long: outcome not recorded
+const LOST_MS = 60000;           // a service request that is neither pending (services.pending) nor draining (the service's stop_pending) for this long: outcome not recorded
 const CHECK_MS = 330000;         // a Tripo balance check runs up to ~300 s
 const REQ_VERB = { start: 'start', stop: 'stop', restart: 'restart' };
 const REQ_TONE = { requested: 'info', pending: 'warn', done: 'ok', failed: 'error', lost: 'warn' };
@@ -193,7 +193,7 @@ export function createSections({ reload }) {
   // for the current job). The outcome is the `queue.services.events` entry with the same `request` id; until then the id is in
   // `queue.services.pending`. Requests sent from this page are tracked; pending ones of other tabs / earlier page loads are listed too.
   function trackRequest(id, name, action) {
-    requests.push({ id, name, action, sent: Date.now(), status: 'requested', text: '' });
+    requests.push({ id, name, action, sent: Date.now(), quietSince: Date.now(), status: 'requested', text: '' });
     while (requests.length > 8) { const at = requests.findIndex(r => r.final); requests.splice(at < 0 ? 0 : at, 1); }
   }
 
@@ -201,6 +201,7 @@ export function createSections({ reload }) {
     const svc = asMap(d?.services);
     const pending = asList(svc.pending);
     const events = asList(svc.events);
+    const map = serviceMap(d) || {};
     for (const r of requests) {
       if (r.final) continue;
       const id = String(r.id);
@@ -208,11 +209,15 @@ export function createSections({ reload }) {
       const last = mine[mine.length - 1];
       const outcome = [...mine].reverse().find(e => e.ok === false || (e.ok === true && !e.pending));
       const entry = pending.find(p => String(p?.id) === id);
+      const draining = r.action !== 'start' && !!map[r.name]?.stop_pending;      // a long Stop / Restart that still drains is not lost, whatever the pending list says
+      if (entry || draining) r.quietSince = null;
+      else if (r.quietSince == null) r.quietSince = Date.now();
       let status;
       let detail = '';
       if (outcome) { status = outcome.ok === false ? 'failed' : 'done'; detail = text(outcome.text); }
       else if (entry) { status = 'pending'; detail = last ? text(last.text) : entry.running ? 'running' : 'waiting in the queue'; }
-      else if (Date.now() - r.sent > LOST_MS) { status = 'lost'; detail = last ? text(last.text) : ''; }
+      else if (draining) { status = 'pending'; detail = last ? text(last.text) : 'draining (waiting for the work in flight)'; }
+      else if (Date.now() - r.quietSince > LOST_MS) { status = 'lost'; detail = last ? text(last.text) : ''; }
       else if (last?.pending) { status = 'pending'; detail = text(last.text); }
       else status = 'requested';
       r.status = status;

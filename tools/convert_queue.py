@@ -33,6 +33,15 @@ never marks Tripo as used up: the job is held (`HOLD <job>: Tripo balance unread
 released, and the balance is read again before the next submission. The last good reading is kept in memory and named in the
 message.
 
+Partial jobs (phase 5 review finding 3): when convert_job stops after `--max-submits` (exit 3, modules left unsubmitted) the
+balance is read again. Unreadable: the job is held and retried (never the fallback backend, Tripo stays on). Still enough for a
+module (balance - reserve >= 25): the job continues on Tripo at the next loop. Only a VERIFIED shortfall (a numeric balance below
+the per-module cost, also when the first reading already was) or the explicit policy (--no-tripo) sends the rest to the fallback
+backend (--tripo-only: STOP instead).
+
+`job_eligible(root, job_name) -> (bool, reason)` is the read-only form of the worker's claim/join rules (fewer than MAX_TRIES fails,
+at least one free module, the job lock free or joinable) for the preview app's convert list (phase-4 finding 20).
+
 Graceful stop (DESIGN_PHASE4 I.2): the preview app writes .codex_jobs/_batch/convert_worker<N>.stop = {pid, create_time,
 request, time} naming ONE worker process. Worker N honours only a file naming its own pid and create_time (worker 2 never
 touches worker 1's file): between jobs it writes convert_worker<N>.stopping = {pid, time}, emits `STOP requested; exiting`,
@@ -208,9 +217,10 @@ def read_tripo_balance(wait=None):
     wait = BALANCE_LOCK_WAIT if wait is None else wait
     try:
         with tripo_browser_lock(ROOT, what=f'convert_queue balance (worker {WORKER})', wait=wait,
-                                announce=lambda text: emit(f'BALANCE: {text}')):
+                                announce=lambda text: emit(f'BALANCE: {text}')) as reservation:
             run = subprocess.run(['node', str(ROOT / 'tools/tripo_pipeline/studio.mjs'), 'balance'],
-                                 capture_output=True, text=True, encoding='utf-8', errors='replace', cwd=ROOT, timeout=300)
+                                 capture_output=True, text=True, encoding='utf-8', errors='replace', cwd=ROOT, timeout=300,
+                                 env={**os.environ, **(reservation or {})})
     except TripoBrowserBusy as error:
         return None, str(error)
     except subprocess.TimeoutExpired:
@@ -235,8 +245,8 @@ def tripo_balance():
     return read_tripo_balance()[0]
 
 
-def fails(name):
-    path = LOCKS / f'{name}.fails'
+def fails(name, locks=None):
+    path = (LOCKS if locks is None else locks) / f'{name}.fails'
     return int(path.read_text(encoding='utf-8')) if path.exists() else 0
 
 
@@ -251,9 +261,9 @@ def release(name):
         lock.unlink(missing_ok=True)
 
 
-def free_modules(job, record):
+def free_modules(job, record, root=None):
     """Modules of the job nobody has converted or is converting (module locks are written by convert_job)."""
-    base = ROOT / 'models' / record['set'] / record['job_id']
+    base = (ROOT if root is None else root) / 'models' / record['set'] / record['job_id']
     free, busy = 0, 0
     for entry in record['modules']:
         race, module = entry['race_gender'], entry['module']
@@ -266,6 +276,21 @@ def free_modules(job, record):
     return free, busy
 
 
+def candidate(job, root=None):
+    """(free, busy) modules of a staged job folder when the worker would consider it at all, else (None, reason): its record is
+    readable, it is not `converted*` in processing/, and at least one module is neither converted nor held (free)."""
+    try:
+        record = read_record(job / '.tripo-job.json')
+    except (OSError, ValueError) as error:
+        return None, f'job record unreadable ({type(error).__name__})'
+    if stage_of(job) == 'processing' and str(record.get('state', '')).startswith('converted'):
+        return None, f'already {record.get("state")}'
+    free, busy = free_modules(job, record, root)
+    if not free:
+        return None, ('every unconverted module is being converted by another worker' if busy else 'no module left to convert')
+    return (free, busy), None
+
+
 def next_job(sets):
     """Returns (job, owner): an unheld job first (taking its lock), else a free module of a job another worker holds."""
     candidates = []
@@ -276,15 +301,9 @@ def next_job(sets):
             excluded = any(fnmatch.fnmatchcase(set_id, pattern[1:]) for pattern in sets if pattern.startswith('!'))
             if not allowed or excluded:
                 continue
-            try:
-                record = read_record(job / '.tripo-job.json')
-            except (OSError, ValueError):
-                continue
-            if stage == 'processing' and str(record.get('state', '')).startswith('converted'):
-                continue
-            free, busy = free_modules(job, record)
-            if free:
-                candidates.append((job, free, busy))
+            counts, _ = candidate(job)
+            if counts:
+                candidates.append((job, *counts))
     for max_fails in (0, MAX_TRIES - 1):
         for job, free, busy in candidates:
             if fails(job.name) <= max_fails and job.exists() and claim(job.name):
@@ -295,6 +314,35 @@ def next_job(sets):
         if joinable:
             return max(joinable)[1], False
     return None, False
+
+
+def job_eligible(root, job_name):
+    """(eligible, reason): whether a worker would start or join `job_name` now, by exactly next_job's rules but read-only (no lock
+    is taken, nothing is written): the job folder is in processing/ or multiview_ready/, its record is readable and not
+    `converted*`, at least one module is free, it has failed fewer than MAX_TRIES times, and its job lock is free (or held by a
+    dead process: claim takes it over) or, held by a live worker, the job is joinable (in processing/ with a module a live worker
+    is converting). The convert list (set patterns) and the PAUSE / CONVERT_HOLD gate are the caller's to check."""
+    root = Path(root)
+    locks = root / '.codex_jobs' / '_batch' / 'convert_locks'
+    job = next((root / stage / job_name for stage in ('processing', 'multiview_ready') if (root / stage / job_name).is_dir()), None)
+    if job is None:
+        return False, 'not staged (no folder in processing/ or multiview_ready/)'
+    counts, why = candidate(job, root)
+    if not counts:
+        return False, why
+    free, busy = counts
+    try:
+        failed = fails(job_name, locks)
+    except (OSError, ValueError):
+        return False, 'failure count unreadable'
+    if failed > MAX_TRIES - 1:
+        return False, f'failed {failed} times (MAX_TRIES {MAX_TRIES})'
+    holder = lock_holder(locks / f'{job_name}.lock')
+    if holder is None or holder == os.getpid():
+        return True, f'{free} free module(s); job lock free'
+    if busy and stage_of(job) == 'processing':
+        return True, f'{free} free module(s); joinable (job lock held by pid {holder}, {busy} module(s) in progress)'
+    return False, f'job lock held by pid {holder} and the job is not joinable (no module in progress)'
 
 
 def stage_of(job):
@@ -432,15 +480,32 @@ def main(argv=None):
             last_balance = (balance, datetime.now().isoformat(timespec='seconds'))
             emit(f'BALANCE tripo {balance}')
             submits = max(0, (balance - args.reserve) // TRIPO_COST)
-            if submits:
+            if not submits:
+                tripo_done = True    # a verified shortfall: a numeric balance below the per-module cost
+            else:
                 code = convert(job, ['--max-submits', str(submits)])
-            if balance - args.reserve < TRIPO_COST * 2:
-                after, problem = read_tripo_balance()
-                if after is None:
-                    emit(f'BALANCE tripo unreadable after {job.name} ({problem}); Tripo stays on, read again before the next job')
-                else:
-                    last_balance = (after, datetime.now().isoformat(timespec='seconds'))
-                    tripo_done = after - args.reserve < TRIPO_COST
+                if code == 3 or balance - args.reserve < TRIPO_COST * 2:
+                    after, problem = read_tripo_balance()
+                    if after is None and code == 3:
+                        # phase 5 finding 3: a partial job on an unknown balance is held, never sent to the fallback backend
+                        emit(f'HOLD {job.name}: Tripo balance unreadable after a partial job ({problem}); not switching to '
+                             f'{args.fallback}, Tripo stays on, retrying in {min(args.poll, BALANCE_RETRY)} s'
+                             + (f'; last good balance {last_balance[0]} at {last_balance[1]}' if last_balance else ''))
+                        balance_hold = problem
+                        release(job.name)
+                        nap(min(args.poll, BALANCE_RETRY))
+                        continue
+                    if after is None:
+                        emit(f'BALANCE tripo unreadable after {job.name} ({problem}); Tripo stays on, read again before the next job')
+                    else:
+                        last_balance = (after, datetime.now().isoformat(timespec='seconds'))
+                        emit(f'BALANCE tripo {after} after {job.name}')
+                        tripo_done = after - args.reserve < TRIPO_COST
+                        if code == 3 and not tripo_done:
+                            # still affordable: the rest stays on Tripo (the next loop claims the job again); not a failure
+                            emit(f'PARTIAL {job.name}: Tripo balance {after} still covers a module; continuing on Tripo')
+                            release(job.name)
+                            continue
         name = job.name
         if code == 3 and args.tripo_only and args.backend == 'tripo':
             emit(f'STOP {name}: Tripo credits exhausted and --tripo-only is set; no Hyper3D fallback, worker exiting')

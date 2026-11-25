@@ -331,6 +331,22 @@ class EntryPointTests(unittest.TestCase):
         self.assertEqual((calls, self.log), ([True], [('check', True)]))
         self.assertFalse(held_elsewhere(self.lock_file))
 
+    def test_native_browser_login_on_linux_waits_holding_the_lock_instead_of_exec(self):
+        """Phase-4 finding 15: os.execv dropped the close-on-exec lock before Firefox took the profile; the login now waits for
+        the window while it holds the lock, as on Windows."""
+        args = types.SimpleNamespace(profile=str(self.profile), command='login')
+        calls = []
+        with mock.patch.object(self.nb, 'WINDOWS', False), mock.patch.object(self.nb, 'FIREFOX', '/usr/bin/firefox'), \
+                mock.patch.dict(os.environ, {'DISPLAY': ':0'}), \
+                mock.patch.object(self.nb.os, 'execv', side_effect=AssertionError('exec drops the lock')), \
+                mock.patch.object(self.nb.subprocess, 'call', lambda cmd: calls.append((cmd[1:3], held_elsewhere(self.lock_file))) or 0), \
+                contextlib.redirect_stdout(open(os.devnull, 'w')):
+            with self.assertRaises(SystemExit) as caught:
+                self.nb.run(args)
+        self.assertEqual(caught.exception.code, 0)
+        self.assertEqual(calls, [(['--no-remote', '--profile'], True)])
+        self.assertFalse(held_elsewhere(self.lock_file))
+
     def test_native_browser_stops_while_another_process_holds_the_profile(self):
         holder = subprocess.Popen([sys.executable, '-c', HOLDER.format(here=str(HERE))], stdin=subprocess.PIPE,
                                   stdout=subprocess.PIPE, text=True,

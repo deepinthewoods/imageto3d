@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import sys
 import threading
 import time
@@ -77,7 +78,16 @@ MONSTER_VERBS = ('convert', 'views', 'approve', 'unapprove', 'reconvert', 'view_
 ALLOWED = frozenset({('mconcept', v) for v in CONCEPT_VERBS} | {('monster', v) for v in MONSTER_VERBS})
 PROMPT_FIELDS = ('design', 'notes', 'colour_variant', 'job', 'date', 'attempts', 'size', 'mode', 'prompt')   # item.prompt (the dialog)
 INTENT_FIELDS = ('adjective', 'direction', 'local_description', 'user_guidance', 'set')                     # prompt json -> item.intent
-RUNNER_STATE = {'pending': 'queued', 'launching': 'running', 'running': 'running', 'done': 'done', 'failed': 'failed'}
+RUNNER_STATE = {'pending': 'queued', 'launching': 'running', 'running': 'running', 'done': 'done', 'failed': 'failed',
+                'cancelled': 'cancelled'}
+TERMINAL_VIEW_STATES = ('done', 'failed', 'cancelled')              # a view task that will not change by itself any more
+# Windows reserved device names (with or without an extension) are never a monster / variant / folder name (phase 5 review F13)
+RESERVED = re.compile(r'^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\$|conout\$)(\..*)?$', re.IGNORECASE)
+ARMOUR_VARIANT = re.compile(r'^\d+-.+$')                            # War Horse `<n>-<armour>` ids: manual, never imported (B.1)
+FLAT_SUBFOLDERS = ('first round',)                                  # War Horse base picks keep their flat fronts here (F15)
+REDUCE_OK = 'v2_reduce_ok.json'                                     # models/<v>/reduced/: the lane's success record (F12)
+RECONVERT_JOURNAL = '.v2_reconvert.json'                            # models/<v>/: the journal of a Reconvert's moves (F6)
+VIEW_VALIDATE = 'rgba_png'                                          # view task field of tools/view_batch.py (F17)
 _CACHE_LOCK = threading.Lock()
 
 
@@ -85,9 +95,17 @@ class Frozen(guard.Conflict):
     """Use enabled views on a variant whose frozen views were converted already: converting again is Reconvert (3D tab, paid). HTTP 409."""
     code = 'frozen'
 
+
+class Missing(guard.Conflict):
+    """A view the request names is not (or no longer) a valid image of the variant (HTTP 409 `missing`; phase 5 review F8)."""
+    code = 'missing'
+
+
 _FOLDER_CACHE: dict[str, tuple] = {}
 _INTENT_CACHE: dict[str, tuple] = {}
 _LIBRARY_CACHE: dict[str, tuple] = {}
+_PNG_CACHE: dict[str, tuple] = {}
+_SHA_CACHE: dict[str, tuple] = {}
 
 
 # ------------------------------------------------------------------------------------------------------------------- basics
@@ -142,27 +160,94 @@ def sha256_file(path: Path) -> str:
 
 
 def slug(name: str) -> str:
-    """A task / lock name part: [A-Za-z0-9_-] (spaces and the rest become `_`)."""
+    """A task / lock name part: [A-Za-z0-9_-] (spaces and the rest become `_`). NOT an identity: two names can share a slug, so every
+    name built from it also carries `canon_digest` (phase 5 review F13)."""
     return re.sub(r'[^A-Za-z0-9_-]', '_', name).strip('_') or 'x'
 
 
+def canon(name: str) -> str:
+    """The canonical identity of a monster / variant / folder name on Windows (case-insensitive file system): casefolded."""
+    return name.casefold()
+
+
+def canon_digest(*names: str) -> str:
+    """8 hex of the canonical identity of a name (or of a monster/variant pair): the part of a task / lock / journal name that makes it
+    unique where the slug is not (`Giant Rat` and `Giant_Rat` share a slug, never a digest)."""
+    return hashlib.sha1('/'.join(canon(n) for n in names).encode('utf-8')).hexdigest()[:8]
+
+
 def safe_part(name: object, what: str) -> str:
-    """A folder name used as ONE path segment: no separators, no `..`, no leading dot, no reserved characters."""
+    """A folder name used as ONE path segment: no separators, no `..`, no leading dot, no reserved characters, no trailing dot or space,
+    no Windows device name (CON, NUL, COM1, ...)."""
     if not isinstance(name, str) or not name or name != name.strip() or name in ('.', '..') or name.startswith('.') or \
-            any(c in FORBIDDEN_CHARS or ord(c) < 32 for c in name) or name.endswith('.'):
+            any(c in FORBIDDEN_CHARS or ord(c) < 32 for c in name) or name.endswith(('.', ' ')) or len(name) > 120 or \
+            RESERVED.match(name):
         raise ValueError(f'Invalid {what}')
     return name
 
 
 def check_variant(variant: object) -> str:
-    if not isinstance(variant, str) or not VARIANT.fullmatch(variant) or '..' in variant:
+    if not isinstance(variant, str) or not VARIANT.fullmatch(variant) or '..' in variant or variant.endswith('.') or \
+            RESERVED.match(variant):
         raise ValueError('Invalid variant')
     return variant
 
 
+def exact_entry(parent: Path, name: str, what: str) -> bool:
+    """Whether `parent/<name>` exists under exactly that name. A case alias of an existing entry (`giant rat` for `Giant Rat`) is
+    refused: one physical folder must never have two identities for locks, tasks or queue keys (phase 5 review F13)."""
+    names = _names(parent)
+    if name in names:
+        return True
+    alias = [n for n in names if canon(n) == canon(name)]
+    if alias:
+        raise ValueError(f'Invalid {what}: {name!r} names {alias[0]!r} with a different case; use the exact name')
+    return False
+
+
+def _is_link(path: Path) -> bool:
+    """A symlink or a Windows junction / other reparse point."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0x400))
+
+
+def contained(base: Path, *targets: Path) -> None:
+    """Mutation-time containment (phase 5 review F13): every target lies inside `base` both lexically and after resolving, and no
+    existing component between `base` and the target is a symlink or junction (a junction could redirect a write elsewhere). ValueError
+    otherwise. `base` itself may be a link (the monster root of a checkout can be one); it is resolved once."""
+    base = Path(base)
+    try:
+        real = base.resolve(strict=True)
+    except OSError as exc:
+        raise ValueError(f'the monster root {base} cannot be resolved: {exc}') from None
+    for target in targets:
+        target = Path(target)
+        try:
+            rel = target.relative_to(base)
+        except ValueError:
+            raise ValueError(f'{target} is outside {base}') from None
+        cur = base
+        for part in rel.parts:
+            if part in ('.', '..'):
+                raise ValueError(f'{target}: relative parts are not allowed')
+            cur = cur / part
+            if _is_link(cur):
+                raise ValueError(f'{cur} is a link or junction; refusing to write through it')
+        try:
+            target.resolve().relative_to(real)
+        except (OSError, ValueError):
+            raise ValueError(f'{target} resolves outside the monster root') from None
+
+
 def lock_path(root: Path, kind: str, name: str) -> Path:
-    short = hashlib.sha1(name.encode('utf-8')).hexdigest()[:8]
-    return Path(root) / guard.APP / 'locks' / kind / f'{slug(name)[:40]}-{short}.lock'
+    """The lock file of a name: keyed by its CANONICAL identity (case aliases share one lock; phase 5 review F13)."""
+    short = hashlib.sha1(canon(name).encode('utf-8')).hexdigest()[:8]
+    return Path(root) / guard.APP / 'locks' / kind / f'{slug(canon(name))[:40]}-{short}.lock'
 
 
 def folder_lock(root: Path, folder: str) -> guard.OsLock:
@@ -290,8 +375,14 @@ def state_problem(raw) -> str | None:
             return f'invalid concept key {key!r}'
         if not isinstance(entry, dict) or entry.get('stage') not in STAGES:
             return f'{key}: invalid entry'
-        if entry['stage'] == 'approved' and not (isinstance(entry.get('monster'), str) and isinstance(entry.get('variant'), str)):
-            return f'{key}: an approved entry needs monster and variant'
+        if entry['stage'] == 'approved':
+            if not (isinstance(entry.get('monster'), str) and isinstance(entry.get('variant'), str)):
+                return f'{key}: an approved entry needs monster and variant'
+            try:                                                # persisted ids are validated before anything trusts them (F13)
+                safe_part(entry['monster'], 'monster')
+                check_variant(entry['variant'])
+            except ValueError:
+                return f'{key}: invalid monster / variant {entry["monster"]!r} / {entry["variant"]!r}'
     return None
 
 
@@ -323,6 +414,7 @@ def write_state(fdir: Path, data: dict) -> None:
     problem = state_problem(clean)
     if problem:
         raise ValueError(f'refusing to write an invalid state: {problem}')
+    contained(Path(fdir).parents[1], Path(fdir) / STATE_FILE)            # concepts/<Folder>/.v2_state.json of the monster root (F13)
     guard.write_atomic(Path(fdir) / STATE_FILE, dump(clean))
 
 
@@ -467,16 +559,19 @@ def concept_cards(root: Path) -> dict[str, list[dict]]:
     mroot = mroot_of(root)
     tabs: dict[str, list[dict]] = {s: [] for s in SHOWN_STAGES}
     for folder in _dirs(mroot / 'concepts'):
-        fdir = mroot / 'concepts' / folder
-        state = read_state(fdir, strict=False)
-        monster = monster_for_folder(mroot, folder)
-        facts = None
-        for concept in scan_folder(fdir):
-            entry = state['concepts'].get(concept['key'])
-            stage = entry['stage'] if isinstance(entry, dict) else 'concepts'
-            if stage in tabs:
-                facts = facts or folder_facts(mroot, monster)
-                tabs[stage].append(concept_card(mroot, folder, monster, concept, entry, state.get('error'), facts))
+        try:                                                    # one damaged folder never hides the others (F16)
+            fdir = mroot / 'concepts' / folder
+            state = read_state(fdir, strict=False)
+            monster = monster_for_folder(mroot, folder)
+            facts = None
+            for concept in scan_folder(fdir):
+                entry = state['concepts'].get(concept['key'])
+                stage = entry['stage'] if isinstance(entry, dict) else 'concepts'
+                if stage in tabs:
+                    facts = facts or folder_facts(mroot, monster)
+                    tabs[stage].append(concept_card(mroot, folder, monster, concept, entry, state.get('error'), facts))
+        except Exception:  # noqa: BLE001  (a folder that cannot be listed shows nothing; the rest stay)
+            continue
     return tabs
 
 
@@ -518,20 +613,55 @@ def variant_names_path(mroot: Path, monster: str) -> Path:
     return mroot / 'pipeline' / monster / 'variant_names.json'
 
 
-def read_variant_names(mroot: Path, monster: str) -> dict:
-    data = read_obj(variant_names_path(mroot, monster))
-    if not isinstance(data.get('variants'), dict):
-        data['variants'] = {}
-    if 'retired' in data and not isinstance(data['retired'], dict):
-        data['retired'] = {}
-    return data
+def names_problem(raw) -> str | None:
+    """None when `variant_names.json` has the structure v2 relies on: an object whose `variants` / `retired` (when present) map names
+    to objects (phase 5 review F11)."""
+    if not isinstance(raw, dict):
+        return 'not an object'
+    for key in ('variants', 'retired'):
+        if key not in raw:
+            continue
+        value = raw[key]
+        if not isinstance(value, dict):
+            return f'{key} is not an object'
+        for name, rec in value.items():
+            if not isinstance(name, str) or not name.strip():
+                return f'{key}: invalid variant name {name!r}'
+            if not isinstance(rec, dict):
+                return f'{key}[{name!r}] is not an object'
+    return None
 
 
-def used_variant_names(mroot: Path, monster: str) -> set[str]:
+def read_variant_names(mroot: Path, monster: str, strict: bool = False) -> dict:
+    """`pipeline/<M>/variant_names.json` ({variants, retired?, note?}); absent = empty. An existing file that cannot be read or has the
+    wrong structure is NEVER replaced (its `retired` numbers must stay unused): strict -> guard.Unreadable (HTTP 409; every mutation reads
+    strict); not strict -> the empty ledger with `error` set (display only)."""
+    path = variant_names_path(mroot, monster)
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {'variants': {}}
+    except OSError as exc:
+        data, problem = None, f'cannot read variant_names.json: {exc}'
+    else:
+        try:
+            data = json.loads(raw.decode('utf-8-sig'))
+            problem = names_problem(data)
+        except (UnicodeDecodeError, ValueError) as exc:
+            data, problem = None, f'variant_names.json is not valid JSON: {exc}'
+    if problem is None:
+        data.setdefault('variants', {})
+        return data
+    if strict:
+        raise guard.Unreadable(f'pipeline/{monster}/variant_names.json: {problem}; repair it by hand before changing this monster')
+    return {'variants': {}, 'error': problem}
+
+
+def used_variant_names(mroot: Path, monster: str, names: dict | None = None) -> set[str]:
     """Every variant name the monster has used: variant_names.json `variants` and `retired`, views/ and models/ folders (withdrawn and
-    `*_prev_*` ones too) and the flat `<k>-front*` / `<k>-back*` files."""
+    `*_prev_*` ones too) and the flat `<k>-front*` / `<k>-back*` files (also in `first round/`)."""
     pdir = mroot / 'pipeline' / monster
-    names = read_variant_names(mroot, monster)
+    names = read_variant_names(mroot, monster) if names is None else names
     used = set(names['variants']) | set(names.get('retired') or {})
     for sub in ('views', 'models'):
         for name in _names(pdir / sub):
@@ -540,18 +670,20 @@ def used_variant_names(mroot: Path, monster: str) -> set[str]:
                 used.add(match.group(1))
             elif not name.startswith('.'):
                 used.add(name)
-    for name in _names(pdir):
-        match = re.match(r'^(.+?)-(front|back)[._]', name)
-        if match:
-            used.add(match.group(1))
+    for folder in (pdir, *(pdir / sub for sub in FLAT_SUBFOLDERS)):
+        for name in _names(folder):
+            match = re.match(r'^(.+?)-(front|back)[._]', name)
+            if match:
+                used.add(match.group(1))
     return used
 
 
-def next_variant(mroot: Path, monster: str) -> str:
+def next_variant(mroot: Path, monster: str, names: dict | None = None) -> str:
     """B.1: a brand-new monster gets `main`; one that has `main` keeps it and gets the next number from 2 (main counts as 1); a numbered
-    one gets max numeric + 1 (leading numbers of `<n>-<armour>` ids count, retired numbers too); never reused."""
+    one gets max numeric + 1 (leading numbers of `<n>-<armour>` ids count, retired numbers too); never reused. `names` = the ledger the
+    caller read (strictly, for a pick)."""
     pdir = mroot / 'pipeline' / monster
-    used = used_variant_names(mroot, monster) if pdir.is_dir() else set()
+    used = used_variant_names(mroot, monster, names) if pdir.is_dir() else set()
     has_main = 'main' in used or (pdir / 'front.png').is_file()
     if not used and not has_main:
         return 'main'
@@ -577,25 +709,150 @@ def parse_monster_id(item_id: str) -> tuple[str, str]:
     return safe_part(monster, 'monster'), check_variant(variant)
 
 
+def canonical_variant(mroot: Path, monster: str, variant: str) -> tuple[str, str]:
+    """The exact on-disk identity of a monster / variant pair (F13): the monster folder exists under exactly this name, and a variant
+    folder that exists in views/ or models/ is named exactly so (case aliases are refused)."""
+    if not exact_entry(mroot / 'pipeline', monster, 'monster'):
+        raise not_found(f'Unknown monster {monster}')
+    for sub in ('views', 'models'):
+        exact_entry(mroot / 'pipeline' / monster / sub, variant, 'variant')
+    return monster, variant
+
+
 def view_file(name: str) -> str:
     return f'{name}.png'
 
 
-def available_views(vdir: Path) -> list[str]:
+def existing_views(vdir: Path) -> list[str]:
+    """The views whose PNG file exists (valid or not)."""
     return [n for n in VIEW_ORDER if (Path(vdir) / view_file(n)).is_file()]
 
 
-def read_views_json(vdir: Path) -> dict | None:
-    """views.json of a variant (None for a legacy variant without one). Malformed entries are dropped, never trusted."""
-    raw = read_json(Path(vdir) / VIEWS_JSON, None)
+def _cached(cache: dict, path: Path, compute):
+    """(`compute(path)` cached by the file's (size, mtime_ns), found); found is False when the file cannot be stat'ed."""
+    try:
+        st = Path(path).stat()
+    except OSError:
+        return None, False
+    key, sig = str(path), (st.st_size, st.st_mtime_ns)
+    with _CACHE_LOCK:
+        hit = cache.get(key)
+    if hit and hit[0] == sig:
+        return hit[1], True
+    value = compute(Path(path))
+    with _CACHE_LOCK:
+        cache[key] = (sig, value)
+    return value, True
+
+
+def _png_problem(path: Path) -> str | None:
+    try:
+        head = path.read_bytes()[:26]
+    except OSError as exc:
+        return f'cannot be read: {exc}'
+    if len(head) < 26 or head[:8] != b'\x89PNG\r\n\x1a\n' or head[12:16] != b'IHDR':
+        return 'is not a PNG'
+    if head[24] != 8 or head[25] != 6:
+        return 'is not an 8-bit RGBA PNG'
+    try:
+        from PIL import Image
+    except ImportError:
+        return 'cannot be decoded here (Pillow is not installed)'
+    try:
+        with Image.open(path) as img:
+            img.load()
+            if img.mode != 'RGBA':
+                return f'decodes as {img.mode}, not RGBA'
+            low, _high = img.getchannel('A').getextrema()
+    except Exception as exc:  # noqa: BLE001  (any decoder error = an invalid image)
+        return f'cannot be decoded ({type(exc).__name__}: {exc})'
+    if low >= 255:
+        return 'has no transparent pixel (an opaque background)'
+    return None
+
+
+def png_problem(path: Path) -> str | None:
+    """None when `path` is a decodable 8-bit RGBA PNG with at least one transparent pixel (cached by size + mtime)."""
+    value, found = _cached(_PNG_CACHE, path, _png_problem)
+    return value if found else 'is missing'
+
+
+def view_problem(vdir: Path, name: str) -> str | None:
+    """None when the view is usable for a conversion (phase 5 review F17): its PNG decodes as 8-bit RGBA with transparency and, for an
+    extra view (left / back / right), its provenance record `<view>.prompts.json` is a JSON object."""
+    path = Path(vdir) / view_file(name)
+    if not path.is_file():
+        return 'no image'
+    problem = png_problem(path)
+    if problem:
+        return f'{view_file(name)} {problem}'
+    if name != 'front' and not isinstance(read_json(Path(vdir) / f'{name}.prompts.json', None), dict):
+        return f'{name}.prompts.json (the provenance record) is missing or not a JSON object'
+    return None
+
+
+def available_views(vdir: Path) -> list[str]:
+    """The views that can be chosen for a conversion: the image exists AND is valid (view_problem)."""
+    return [n for n in existing_views(vdir) if view_problem(vdir, n) is None]
+
+
+def views_problem(raw) -> str | None:
+    """None when views.json has the structure v2 relies on (phase 5 review F16); a damaged file is never trusted or replaced."""
     if not isinstance(raw, dict):
+        return 'not an object'
+    if raw.get('schema') != 1:
+        return f'schema {raw.get("schema")!r} is not 1'
+    views = raw.get('views')
+    if not isinstance(views, list):
+        return 'views is not a list'
+    seen = set()
+    for entry in views:
+        if not isinstance(entry, dict) or entry.get('name') not in VIEW_ORDER or entry['name'] in seen or \
+                not isinstance(entry.get('enabled', True), bool):
+            return f'invalid views entry {entry!r}'
+        seen.add(entry['name'])
+    if not isinstance(raw.get('unattended', False), bool):
+        return 'unattended is not a boolean'
+    planned = raw.get('planned')
+    if planned is not None and (not isinstance(planned, list) or any(v not in EXTRA_VIEWS for v in planned)):
+        return 'planned is not a list of extra views'
+    frozen = raw.get('frozen')
+    if frozen is not None:
+        if not isinstance(frozen, dict):
+            return 'frozen is not an object'
+        files, digests = frozen.get('files'), frozen.get('sha256')
+        if not isinstance(files, list) or not 1 <= len(files) <= 4 or len(set(map(str, files))) != len(files) or \
+                any(f not in [view_file(n) for n in VIEW_ORDER] for f in files):
+            return 'frozen.files is not a list of 1 to 4 view files'
+        if not isinstance(digests, dict) or any(not isinstance(digests.get(f), str) for f in files):
+            return 'frozen.sha256 does not cover the frozen files'
+    if 'pick_gen' in raw and not isinstance(raw['pick_gen'], str):
+        return 'pick_gen is not a string'
+    conv = raw.get('conversion')
+    if conv is not None and (not isinstance(conv, dict) or any(not isinstance(v, dict) for v in conv.values())):
+        return 'conversion is not an object of objects'
+    return None
+
+
+def read_views_json(vdir: Path) -> dict | None:
+    """views.json of a variant: None when absent (a legacy variant). A file that exists but cannot be read or fails views_problem raises
+    guard.Unreadable (HTTP 409 for a mutation; a read-only damaged card for the catalog, F16): it is never replaced by defaults."""
+    path = Path(vdir) / VIEWS_JSON
+    try:
+        raw_bytes = path.read_bytes()
+    except FileNotFoundError:
         return None
-    views = []
-    for entry in raw.get('views') or []:
-        if isinstance(entry, dict) and entry.get('name') in VIEW_ORDER:
-            views.append({'name': entry['name'], 'file': view_file(entry['name']), 'enabled': entry.get('enabled') is not False})
-    frozen = raw.get('frozen') if isinstance(raw.get('frozen'), dict) else None
-    return raw | {'views': views, 'unattended': raw.get('unattended') is True, 'frozen': frozen}
+    except OSError as exc:
+        raise guard.Unreadable(f'{VIEWS_JSON} of {Path(vdir).name}: cannot be read: {exc}') from None
+    try:
+        raw = json.loads(raw_bytes.decode('utf-8-sig'))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise guard.Unreadable(f'{VIEWS_JSON} of {Path(vdir).name}: not valid JSON: {exc}') from None
+    problem = views_problem(raw)
+    if problem:
+        raise guard.Unreadable(f'{VIEWS_JSON} of {Path(vdir).name}: {problem}')
+    views = [{'name': e['name'], 'file': view_file(e['name']), 'enabled': e.get('enabled') is not False} for e in raw['views']]
+    return raw | {'views': views, 'unattended': raw.get('unattended') is True, 'frozen': raw.get('frozen')}
 
 
 def ticks_of(vj: dict | None, available: list[str]) -> dict[str, bool]:
@@ -606,13 +863,36 @@ def ticks_of(vj: dict | None, available: list[str]) -> dict[str, bool]:
 
 def write_views_json(vdir: Path, data: dict) -> None:
     """views.json = {"schema":1,"views":[{name,file,enabled}],"unattended","frozen", ...}; other keys of `data` (planned, created, by,
-    concept, imported, legacy) are kept after those."""
+    concept, imported, legacy, pick_gen, conversion) are kept after those. Refused when the result would not pass views_problem."""
     order = {n: i for i, n in enumerate(VIEW_ORDER)}
     views = sorted(({'name': v['name'], 'file': view_file(v['name']), 'enabled': bool(v['enabled'])} for v in data['views']),
                    key=lambda v: order[v['name']])
     out = {'schema': 1, 'views': views, 'unattended': bool(data.get('unattended')), 'frozen': data.get('frozen')}
     out |= {k: v for k, v in data.items() if k not in out}
-    guard.write_atomic(Path(vdir) / VIEWS_JSON, dump(out))
+    problem = views_problem(out)
+    if problem:
+        raise ValueError(f'refusing to write an invalid {VIEWS_JSON}: {problem}')
+    vdir = Path(vdir)
+    if vdir.parent.name == 'views' and len(vdir.parents) > 3:               # views/<v> (or a temp pick folder) of a pipeline monster
+        contained(vdir.parents[3], vdir / VIEWS_JSON)
+    guard.write_atomic(vdir / VIEWS_JSON, dump(out))
+
+
+def views_rev(vdir: Path, vj: dict | None) -> int:
+    """The revision of what the Choose views dialog shows (phase 5 review F8): the frozen generation, the planned views, the pick
+    generation and every view image / provenance file (size + mtime). Draft ticks are NOT part of it (the convert request names its files
+    itself). `convert` / `reconvert` answer 409 `changed` when the request's `views_rev` is not this one."""
+    files = {}
+    for name in VIEW_ORDER:
+        for fname in (view_file(name), f'{name}.prompts.json'):
+            try:
+                st = (Path(vdir) / fname).stat()
+            except OSError:
+                continue
+            files[fname] = [st.st_size, st.st_mtime_ns]
+    basis = {'frozen': frozen_digest((vj or {}).get('frozen')), 'planned': (vj or {}).get('planned'),
+             'pick_gen': (vj or {}).get('pick_gen'), 'files': files, 'legacy': vj is None}
+    return int(hashlib.sha256(json.dumps(basis, sort_keys=True).encode('utf-8')).hexdigest()[:12], 16)   # an int below 2**48 (JS-safe)
 
 
 def frozen_digest(frozen: dict | None) -> str | None:
@@ -622,7 +902,11 @@ def frozen_digest(frozen: dict | None) -> str | None:
 
 
 def freeze(vdir: Path, files: list[str]) -> dict:
-    """The frozen view list {time, files, sha256} of `files` (front-first view order)."""
+    """The frozen view list {time, files, sha256} of `files` (in the given order); every file must be a valid view (Missing otherwise)."""
+    for f in files:
+        problem = view_problem(vdir, str(f)[:-4]) if str(f).endswith('.png') else 'not a view file'
+        if problem:
+            raise Missing(f'{f}: {problem}', file=str(f), files=[str(f)])
     return {'time': now(), 'files': list(files), 'sha256': {f: sha256_file(Path(vdir) / f) for f in files}}
 
 
@@ -640,9 +924,82 @@ def frozen_problem(vdir: Path, frozen: dict | None) -> str | None:
     return None
 
 
-def reduced_complete(mdir: Path) -> bool:
+LEVEL_FILES = tuple(f'lod_error_{lv}.glb' for lv in LOD_LEVELS)
+
+
+def reduced_files_problem(mdir: Path) -> str | None:
+    """None when reduced/ holds the five LOD GLBs, a manifest object and a materials.json object (the reducer's LAST write)."""
     red = Path(mdir) / 'reduced'
-    return (red / 'manifest.json').is_file() and all((red / f'lod_error_{lv}.glb').is_file() for lv in LOD_LEVELS)
+    for name in LEVEL_FILES:
+        try:
+            if (red / name).stat().st_size <= 0:
+                return f'reduced/{name} is empty'
+        except OSError:
+            return f'reduced/{name} is missing'
+    if not isinstance(read_json(red / 'manifest.json', None), dict):
+        return 'reduced/manifest.json is missing or invalid'
+    if not isinstance(read_json(red / 'materials.json', None), dict):
+        return 'reduced/materials.json is missing or invalid (the reducer did not finish)'
+    return None
+
+
+def reduced_complete(mdir: Path) -> bool:
+    """The reduced outputs are all there (the files only; a conversion of the lane is verified by reduce_status)."""
+    return reduced_files_problem(mdir) is None
+
+
+def write_reduce_ok(mdir: Path, frozen: dict) -> dict:
+    """The lane's generation-bound success record `reduced/v2_reduce_ok.json` (phase 5 review F12), written only after every output
+    validated: {schema, generation (the frozen digest), frozen_time, files {name: {sha256, size}}, materials: true, time}."""
+    mdir = Path(mdir)
+    problem = reduced_files_problem(mdir)
+    if problem:
+        raise ValueError(problem)
+    red = mdir / 'reduced'
+    files = {name: {'sha256': sha256_file(red / name), 'size': (red / name).stat().st_size}
+             for name in (*LEVEL_FILES, 'manifest.json', 'materials.json')}
+    record = {'schema': 1, 'generation': frozen_digest(frozen), 'frozen_time': frozen.get('time'), 'files': files, 'materials': True,
+              'time': now(), 'by': 'v2 monster lane'}
+    if len(mdir.parents) > 3:
+        contained(mdir.parents[3], red / REDUCE_OK)
+    guard.write_atomic(red / REDUCE_OK, dump(record))
+    return record
+
+
+def file_sha256(path: Path) -> str | None:
+    """sha256 of a file, cached by size + mtime (the LOD digests of the 3D modal)."""
+    value, found = _cached(_SHA_CACHE, path, sha256_file)
+    return value if found else None
+
+
+def reduce_status(mdir: Path, generation: str | None = None, deep: bool = False) -> dict:
+    """{ok, legacy, problem} of a variant's reduction (F12). With the lane's record: valid when its generation is `generation` (when given)
+    and every listed file still has its size (and, `deep`, its sha256). Without a record: a variant the lane converts (`generation` given)
+    is NOT verified; a legacy result (generation None) is accepted by the explicit compatibility rule manifest + 5 LOD GLBs + materials.json
+    and flagged `legacy`."""
+    red = Path(mdir) / 'reduced'
+    rec = read_json(red / REDUCE_OK, None)
+    if rec is not None:
+        if not isinstance(rec, dict) or not isinstance(rec.get('files'), dict):
+            return {'ok': False, 'legacy': False, 'problem': f'reduced/{REDUCE_OK} is invalid'}
+        if generation is not None and rec.get('generation') != generation:
+            return {'ok': False, 'legacy': False, 'problem': 'the reduction belongs to another choice of views'}
+        missing = [n for n in (*LEVEL_FILES, 'materials.json') if n not in rec['files']]
+        if missing:
+            return {'ok': False, 'legacy': False, 'problem': f'reduced/{REDUCE_OK} does not list {", ".join(missing)}'}
+        for name, meta in rec['files'].items():
+            path = red / str(name)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                return {'ok': False, 'legacy': False, 'problem': f'reduced/{name} is missing'}
+            if not isinstance(meta, dict) or meta.get('size') != size or (deep and file_sha256(path) != meta.get('sha256')):
+                return {'ok': False, 'legacy': False, 'problem': f'reduced/{name} changed after the reduction was verified'}
+        return {'ok': True, 'legacy': False, 'problem': None, 'generation': rec.get('generation')}
+    if generation is not None:
+        return {'ok': False, 'legacy': False, 'problem': f'the reduction has no success record (reduced/{REDUCE_OK})'}
+    problem = reduced_files_problem(mdir)
+    return {'ok': problem is None, 'legacy': problem is None, 'problem': problem}
 
 
 def record_of(mdir: Path) -> dict | None:
@@ -659,51 +1016,96 @@ def conversion_started(mdir: Path) -> bool:
 
 # ------------------------------------------------------------------------------------------------------------- view tasks
 
+FAULTS: dict = {}            # tests: {stage: fn()} called at named points of a pick / import / reconvert (a crash is a BaseException)
+
+
+def _fault(stage: str) -> None:
+    hook = FAULTS.get(stage)
+    if hook:
+        hook()
+
+
 def batch_dir(root: Path) -> Path:
     return Path(root) / '.codex_jobs' / '_batch'
 
 
 def view_task_name(monster: str, variant: str, view: str) -> str:
-    return f'{VIEW_TASK_KIND}--{slug(monster)}--{slug(variant)}--{view}'
+    """`mviews--<monster slug>--<variant slug>--<canonical digest 8>--<view>`: the digest makes the name unique where the slugs are not
+    (`Giant Rat` / `Giant_Rat`; phase 5 review F13)."""
+    return f'{VIEW_TASK_KIND}--{slug(monster)[:40]}--{slug(variant)[:24]}--{canon_digest(monster, variant)}--{view}'
 
 
-def view_task_state(root: Path, name: str) -> dict:
-    """{exists, state, attempts, job, started}: the view runner's status of a task (absent status file = pending)."""
+def view_task_state(root: Path, name: str, owner: tuple[str, str] | None = None) -> dict:
+    """{exists, foreign, state, attempts, job, started, exit}: the view runner's status of a task (absent status file = pending). `owner`
+    (monster, variant): a descriptor that names another monster / variant is `foreign` (never counted as this variant's task, F13)."""
     tasks, status = batch_dir(root) / 'tasks' / f'{name}.json', batch_dir(root) / 'status' / f'{name}.json'
+    exists = tasks.is_file()
+    foreign = False
+    if exists and owner is not None:
+        desc = read_json(tasks, None)
+        foreign = not (isinstance(desc, dict) and isinstance(desc.get('monster'), str) and isinstance(desc.get('variant'), str) and
+                       (canon(desc['monster']), canon(desc['variant'])) == (canon(owner[0]), canon(owner[1])))
     raw = read_json(status, None)
     raw = raw if isinstance(raw, dict) else {}
     jobs = raw.get('jobs') if isinstance(raw.get('jobs'), list) else []
     last = jobs[-1] if jobs and isinstance(jobs[-1], dict) else {}
-    return {'name': name, 'exists': tasks.is_file(), 'state': raw.get('state') if isinstance(raw.get('state'), str) else 'pending',
+    return {'name': name, 'exists': exists, 'foreign': foreign,
+            'state': raw.get('state') if isinstance(raw.get('state'), str) else 'pending',
             'attempts': raw.get('attempts') if isinstance(raw.get('attempts'), int) else 0, 'jobs': len(jobs), 'job': last.get('job'),
-            'started': last.get('started'), 'exit': last.get('exit')}
+            'started': last.get('started'), 'exit': last.get('exit'),
+            'error': next((raw[k] for k in ('error', 'reason') if isinstance(raw.get(k), str) and raw[k]), None)}   # runner: error / guard reason
 
 
 def task_started(st: dict) -> bool:
-    return st['state'] != 'pending' or st['jobs'] > 0
+    """The runner reserved, ran or finished a launch of the task (a `cancelled` task that never launched has not started)."""
+    return st['state'] in ('launching', 'running', 'done', 'failed') or st['jobs'] > 0
 
 
-def view_task(root: Path, mroot: Path, monster: str, variant: str, view: str) -> dict:
-    """The view-runner task of one extra view (DESIGN_PHASE5.md C): launcher monsters, no checks, 2 attempts, priority 3."""
+def task_terminal(st: dict | None) -> bool:
+    return bool(st and st['exists'] and not st.get('foreign') and st['state'] in TERMINAL_VIEW_STATES)
+
+
+def view_task(root: Path, mroot: Path, monster: str, variant: str, view: str, pick_gen: str) -> dict:
+    """The view-runner task of one extra view (DESIGN_PHASE5.md C): launcher monsters, no checks, 2 attempts, priority 3. `validate` /
+    `provenance` make the runner fail an attempt whose PNG is not a decodable RGBA PNG with transparency or whose `<view>.prompts.json` is
+    missing (F17); `guard` lets it spawn only while views.json still carries this pick's generation (withdrawn = cancelled, F10)."""
     vdir = views_dir(mroot, monster, variant)
     colours = read_obj(vdir / 'colours.json')
     front, out = vdir / 'front.png', vdir / view_file(view)
     return {'name': view_task_name(monster, variant, view), 'priority': VIEW_PRIORITY,
             'prompt': monster_prompts.job_prompt(view, monster, variant, front, out, colours),
             'refs': [front.as_posix()], 'outputs': [out.as_posix()], 'checks': [], 'max_attempts': VIEW_MAX_ATTEMPTS,
+            'validate': VIEW_VALIDATE, 'provenance': [monster_prompts.record_name(view)],
+            'guard': {'file': str(vdir / VIEWS_JSON), 'key': 'pick_gen', 'value': pick_gen},
             'launcher': 'monsters', 'monster': monster, 'variant': variant, 'view': view, 'created': now(), 'by': 'v2'}
 
 
+def _ensure_pick_gen(vdir: Path) -> str:
+    """The pick generation of views.json (written when an older views.json has none). Caller holds the monster lock."""
+    vj = read_views_json(vdir)
+    if vj is None:
+        raise ValueError(f'{vdir.name} has no {VIEWS_JSON}')
+    if not vj.get('pick_gen'):
+        vj['pick_gen'] = uuid.uuid4().hex
+        write_views_json(vdir, vj)
+    return vj['pick_gen']
+
+
 def queue_view_tasks(root: Path, mroot: Path, monster: str, variant: str, views=EXTRA_VIEWS) -> list[str]:
-    """Write the task files of the extra views whose image does not exist yet (an existing task file is kept). Returns the names written."""
+    """Write the task files of the extra views whose image does not exist yet (an existing task file of THIS variant is kept; one that
+    names another variant is a Conflict). The caller holds the monster lock (publication and withdrawal never interleave, F10).
+    Returns the names written."""
     vdir = views_dir(mroot, monster, variant)
+    pick_gen = _ensure_pick_gen(vdir)
     written = []
     for view in views:
         if (vdir / view_file(view)).is_file():
             continue
-        task = view_task(root, mroot, monster, variant, view)
+        task = view_task(root, mroot, monster, variant, view, pick_gen)
         path = batch_dir(root) / 'tasks' / f'{task["name"]}.json'
         if path.exists():
+            if view_task_state(root, task['name'], (monster, variant))['foreign']:
+                raise guard.Conflict(f'{task["name"]}.json belongs to another monster / variant; not overwritten')
             continue
         guard.write_atomic(path, dump(task))
         written.append(task['name'])
@@ -711,7 +1113,7 @@ def queue_view_tasks(root: Path, mroot: Path, monster: str, variant: str, views=
 
 
 def view_states(root: Path, mroot: Path, monster: str, variant: str) -> dict[str, dict]:
-    return {view: view_task_state(root, view_task_name(monster, variant, view)) for view in EXTRA_VIEWS}
+    return {view: view_task_state(root, view_task_name(monster, variant, view), (monster, variant)) for view in EXTRA_VIEWS}
 
 
 def planned_views(vj: dict | None) -> list[str]:
@@ -721,14 +1123,15 @@ def planned_views(vj: dict | None) -> list[str]:
 
 
 def view_waiting(vdir: Path, view: str, st: dict | None) -> bool:
-    """A planned view is still coming: no image yet and its task is pending / running, or not written yet (Retry writes it)."""
-    if (Path(vdir) / view_file(view)).is_file():
-        return False
-    return st is None or not st['exists'] or st['state'] in ('pending', 'running')
+    """A planned view is still coming: its task (of this variant) is not terminal yet (done / failed / cancelled), whether or not a PNG
+    appeared meanwhile (phase 5 review F9); without a task file, until a valid image exists (Retry writes the task)."""
+    if st is not None and st['exists'] and not st.get('foreign'):
+        return st['state'] not in TERMINAL_VIEW_STATES
+    return view_problem(vdir, view) is not None
 
 
 def views_phase(root: Path, mroot: Path, monster: str, variant: str, vj: dict | None = None, states: dict | None = None) -> str:
-    """legacy (no views.json) | generating (a planned view is still coming) | choose (the planned views are there or failed, nothing
+    """legacy (no views.json) | generating (a planned view is still coming) | choose (every planned view task is terminal, nothing
     frozen) | frozen."""
     vdir = views_dir(mroot, monster, variant)
     vj = read_views_json(vdir) if vj is None else vj
@@ -745,7 +1148,12 @@ def views_phase(root: Path, mroot: Path, monster: str, variant: str, vj: dict | 
 # -------------------------------------------------------------------------------------------------------------- the pick
 
 def _write_names(mroot: Path, monster: str, data: dict) -> None:
-    guard.write_atomic(variant_names_path(mroot, monster), dump(data))
+    problem = names_problem(data)
+    if problem:
+        raise ValueError(f'refusing to write an invalid variant_names.json: {problem}')
+    path = variant_names_path(mroot, monster)
+    contained(mroot, path)
+    guard.write_atomic(path, dump(data))
 
 
 def _restore(path: Path, before: bytes | None) -> None:
@@ -767,28 +1175,165 @@ def _withdrawn_name(vdir: Path) -> Path:
     return out
 
 
+def _rmtree_own(path: Path) -> None:
+    """Remove a temp folder v2 created itself (read-only snapshot files included)."""
+    def unlock(func, p, _exc):
+        try:
+            os.chmod(p, stat.S_IWRITE)
+            func(p)
+        except OSError:
+            pass
+    shutil.rmtree(path, onerror=unlock)
+
+
+# The journal of a pick / import publication (phase 5 review F11): `.codex_jobs/_app/monster_journal/<monster key>.json`, written once the
+# temp folder is complete and before variant_names.json, the views folder and the concept state change; deleted when all are done.
+# A journal that survives (the process died) is COMPLETED by recovery (the same variant: names entry, views folder, concept state, view
+# tasks); only when neither the temp folder nor the views folder exists any more is the published names entry retired instead.
+
+def journal_dir(root: Path) -> Path:
+    return Path(root) / guard.APP / 'monster_journal'
+
+
+def journal_path(root: Path, monster: str) -> Path:
+    return journal_dir(root) / f'{slug(canon(monster))[:40]}-{canon_digest(monster)}.json'
+
+
+def _write_journal(root: Path, monster: str, data: dict) -> None:
+    guard.write_atomic(journal_path(root, monster), dump(data | {'schema': 1, 'time': now()}))
+
+
+def _drop_journal(root: Path, monster: str) -> None:
+    journal_path(root, monster).unlink(missing_ok=True)
+
+
+def _recover_locked(root: Path, mroot: Path, monster: str, held_folder: str | None) -> str | None:
+    """Complete (or, when impossible, retire) an interrupted pick / import of `monster`. The caller holds the monster lock and, for a
+    pick, the lock of `held_folder`; a pick journal of another folder is refused (the orchestrator tick recovers it with both locks).
+    Returns 'completed' / 'rolled back' / None (no journal)."""
+    path = journal_path(root, monster)
+    j = read_json(path, None)
+    if j is None:
+        return None
+    if not isinstance(j, dict) or j.get('op') not in ('pick', 'import') or canon(str(j.get('monster'))) != canon(monster):
+        raise guard.Unreadable(f'{path.name}: an unreadable publication journal; check {monster} by hand and delete it')
+    variant = check_variant(j.get('variant'))
+    if j['op'] == 'pick' and j.get('folder') != held_folder:
+        raise guard.Recovering(f'an interrupted pick of {monster} waits for recovery (the orchestrator completes it); try again shortly')
+    names = read_variant_names(mroot, monster, strict=True)
+    vdir = views_dir(mroot, monster, variant)
+    tmp_name = str(j.get('tmp') or '')
+    tmp = vdir.parent / tmp_name if tmp_name.startswith('.v2_pick_') and '/' not in tmp_name and '\\' not in tmp_name else None
+    contained(mroot, vdir, *( [tmp] if tmp else []))
+    fdir = None
+    if j['op'] == 'pick':
+        fdir = mroot / 'concepts' / safe_part(j.get('folder'), 'concept folder')
+    if not vdir.exists() and not (tmp and (tmp / VIEWS_JSON).is_file()):
+        # nothing to publish any more: retire a published names entry (its number is never used again) and undo the concept state
+        if names['variants'].get(variant) == j.get('names_entry'):
+            prev = j.get('names_prev')
+            if isinstance(prev, dict):
+                names['variants'][variant] = prev
+            else:
+                names['variants'].pop(variant, None)
+                names.setdefault('retired', {})[variant] = dict(j.get('names_entry') or {}) | {
+                    'retired': now(), 'reason': 'interrupted v2 publication rolled back'}
+            _write_names(mroot, monster, names)
+        if fdir is not None:
+            state = read_state(fdir)
+            entry = state['concepts'].get(str(j.get('key')))
+            if isinstance(entry, dict) and entry.get('stage') == 'approved' and entry.get('variant') == variant:
+                state['concepts'][j['key']] = {'stage': j.get('origin') if j.get('origin') in STAGES[:2] + ('archive',) else 'concepts',
+                                               'time': now(), 'from': 'approved', 'recovered': 'interrupted pick rolled back'}
+                write_state(fdir, state)
+        if tmp and tmp.exists():
+            _rmtree_own(tmp)
+        _drop_journal(root, monster)
+        return 'rolled back'
+    if names['variants'].get(variant) != j.get('names_entry'):
+        names['variants'][variant] = dict(j.get('names_entry') or {})
+        _write_names(mroot, monster, names)
+    if not vdir.exists():
+        os.rename(tmp, vdir)
+    if fdir is not None:
+        state = read_state(fdir)
+        entry = state['concepts'].get(str(j.get('key')))
+        if not (isinstance(entry, dict) and entry.get('stage') == 'approved' and entry.get('variant') == variant):
+            state['concepts'][j['key']] = dict(j.get('state_entry') or {}) | {'recovered': now()}
+            write_state(fdir, state)
+    try:
+        queue_view_tasks(root, mroot, monster, variant)
+    except (OSError, ValueError, guard.Conflict):
+        pass                                                    # Retry writes a missing task file
+    _drop_journal(root, monster)
+    return 'completed'
+
+
+def recover_journals(root: Path) -> list[str]:
+    """HOOK (monster_lane.tick): complete every interrupted pick / import (each under its folder and monster locks; one bad journal never
+    stops the others). Returns `<monster>: completed | rolled back | error ...` lines."""
+    out = []
+    root, mroot = Path(root), mroot_of(root)
+    try:
+        paths = sorted(journal_dir(root).glob('*.json'))
+    except OSError:
+        return out
+    for path in paths:
+        j = read_json(path, None)
+        try:
+            if not isinstance(j, dict):
+                raise guard.Unreadable(f'{path.name} is unreadable')
+            monster = safe_part(j.get('monster'), 'monster')
+            if path != journal_path(root, monster):
+                raise guard.Unreadable(f'{path.name} does not belong to {monster}')
+            if j.get('op') == 'pick':
+                folder = safe_part(j.get('folder'), 'concept folder')
+                with folder_lock(root, folder), monster_lock(root, monster):
+                    done = _recover_locked(root, mroot, monster, folder)
+            else:
+                with monster_lock(root, monster):
+                    done = _recover_locked(root, mroot, monster, None)
+                if done == 'completed' and isinstance(j.get('names_entry'), dict):
+                    _mark_concept_of_pick(root, mroot, monster, j['variant'], j['names_entry'])
+            if done:
+                out.append(f'{monster}: {done}')
+        except Exception as exc:  # noqa: BLE001  (kept for the next pass; shown in the orchestrator errors)
+            out.append(f'{path.name}: error {type(exc).__name__}: {exc}')
+    return out
+
+
 def pick(root: Path, folder: str, key: str, unattended: bool = False) -> dict:
-    """Approve = pick (B.1-B.6) of `concepts/<folder>/<key>-front.png` from stage concepts / provisional / archive."""
+    """Approve = pick (B.1-B.6) of `concepts/<folder>/<key>-front.png` from stage concepts / provisional / archive. Journaled (F11): the
+    temp folder is complete before anything is published; the view tasks are written under the same monster lock (F10)."""
     root, mroot = Path(root), mroot_of(root)
     fdir = concept_dir(mroot, folder)
+    exact_entry(mroot / 'concepts', folder, 'concept folder')
     concept = concept_files(fdir, key)
-    monster = monster_for_folder(mroot, folder)
+    monster = safe_part(monster_for_folder(mroot, folder), 'monster')
     with folder_lock(root, folder):
-        state = read_state(fdir)
-        origin = stage_of(state, key)
-        if origin not in CONCEPT_VERBS['approve']:
-            raise ValueError(f'{folder}/{key} is in {origin}; only a concept in concepts, provisional or archive can be approved')
         with monster_lock(root, monster):
+            _recover_locked(root, mroot, monster, folder)
+            state = read_state(fdir)
+            origin = stage_of(state, key)
+            if origin not in CONCEPT_VERBS['approve']:
+                raise ValueError(f'{folder}/{key} is in {origin}; only a concept in concepts, provisional or archive can be approved')
             pdir = mroot / 'pipeline' / monster
-            variant = next_variant(mroot, monster)
+            if pdir.exists():
+                exact_entry(mroot / 'pipeline', monster, 'monster')
+            names = read_variant_names(mroot, monster, strict=True)
+            variant = next_variant(mroot, monster, names)
             vdir, mdir = views_dir(mroot, monster, variant), models_dir(mroot, monster, variant)
+            names_path = variant_names_path(mroot, monster)
+            contained(mroot, pdir / 'views', vdir, mdir, names_path)
             if vdir.exists() or mdir.exists():
                 raise guard.Conflict(f'{monster}/{variant} already has a views or models folder')
             tmp = pdir / 'views' / f'.v2_pick_{variant}_{uuid.uuid4().hex[:8]}'
             tmp.mkdir(parents=True)
-            names_path = variant_names_path(mroot, monster)
             names_before = guard.read_bytes_or_none(names_path)
-            moved = False
+            names_entry = {'was': key, 'concept': f'{key}-front.png', 'picked': now(), 'by': 'v2'}
+            state_entry = {'stage': 'approved', 'time': now(), 'monster': monster, 'variant': variant, 'from': origin,
+                           'unattended': bool(unattended)}
+            moved = journaled = False
             try:
                 shutil.copyfile(concept['png'], tmp / 'front.png')
                 if concept['colours']:
@@ -796,35 +1341,41 @@ def pick(root: Path, folder: str, key: str, unattended: bool = False) -> dict:
                 if concept['prompt']:
                     shutil.copyfile(concept['prompt'], tmp / 'prompts.json')
                 write_views_json(tmp, {'views': [{'name': 'front', 'enabled': True}], 'unattended': bool(unattended), 'frozen': None,
-                                       'planned': list(EXTRA_VIEWS), 'created': now(), 'by': 'v2',
+                                       'planned': list(EXTRA_VIEWS), 'created': now(), 'by': 'v2', 'pick_gen': uuid.uuid4().hex,
                                        'concept': f'concepts/{folder}/{key}-front.png'})
-                names = read_variant_names(mroot, monster)
+                _write_journal(root, monster, {'op': 'pick', 'monster': monster, 'variant': variant, 'folder': folder, 'key': key,
+                                               'origin': origin, 'tmp': tmp.name, 'names_entry': names_entry, 'names_prev': None,
+                                               'state_entry': state_entry})
+                journaled = True
                 if not names_before:
                     names = {'note': 'Written by the v2 preview app: a pick (approve of a concept) adds variants[<v>] (DESIGN_PHASE5.md B); '
                                      'an undone pick moves to retired[<v>], so its number is never used again.'} | names
-                names['variants'][variant] = {'was': key, 'concept': f'{key}-front.png', 'picked': now(), 'by': 'v2'}
+                names['variants'][variant] = names_entry
                 _write_names(mroot, monster, names)
+                _fault('pick_names')
                 os.rename(tmp, vdir)
                 moved = True
-                entry = {'stage': 'approved', 'time': now(), 'monster': monster, 'variant': variant, 'from': origin,
-                         'unattended': bool(unattended)}
-                state['concepts'][key] = entry
+                _fault('pick_renamed')
+                state['concepts'][key] = state_entry
                 write_state(fdir, state)
-            except BaseException:
+            except Exception:
                 _restore(names_path, names_before)
                 if moved and vdir.exists():
                     try:
-                        os.rename(vdir, _withdrawn_name(vdir))
+                        os.rename(vdir, tmp)
                     except OSError:
                         pass
                 if tmp.exists():
-                    shutil.rmtree(tmp, ignore_errors=True)       # our own temp folder
+                    _rmtree_own(tmp)                            # our own temp folder
+                if journaled and not vdir.exists():
+                    _drop_journal(root, monster)
                 raise
-    warning = None
-    try:
-        tasks = queue_view_tasks(root, mroot, monster, variant)
-    except OSError as exc:
-        tasks, warning = [], f'the view tasks could not be written ({exc}); use Retry on each view'
+            warning = None
+            try:
+                tasks = queue_view_tasks(root, mroot, monster, variant)
+            except (OSError, ValueError, guard.Conflict) as exc:
+                tasks, warning = [], f'the view tasks could not be written ({exc}); use Retry on each view'
+            _drop_journal(root, monster)
     result = {'ok': True, 'monster': monster, 'variant': variant, 'id': f'monster:{monster}/{variant}', 'from': origin,
               'views': f'pipeline/{monster}/views/{variant}', 'tasks': tasks,
               'library': library_info(mroot, monster)}
@@ -834,8 +1385,10 @@ def pick(root: Path, folder: str, key: str, unattended: bool = False) -> dict:
 
 
 def withdraw(root: Path, folder: str, key: str, to: str | None = None) -> dict:
-    """Undo of a pick: allowed only while no view task has started, nothing is frozen and no conversion exists. Task files are renamed
-    `.json.withdrawn-<time>`, the views folder to `views/.v2_withdrawn_<v>_<time>`, the variant_names entry moves to `retired`."""
+    """Undo of a pick: allowed only while no view task has started, nothing is frozen and no conversion exists. The views folder is renamed
+    `views/.v2_withdrawn_<v>_<time>` FIRST (the runner's guard then refuses to spawn any of its tasks, F10), the task states are checked
+    again (a launch reserved meanwhile restores everything and refuses), then the task files are renamed `.json.withdrawn-<time>` and the
+    variant_names entry moves to `retired`."""
     root, mroot = Path(root), mroot_of(root)
     target = to or 'provisional'
     if target not in ('provisional', 'concepts', 'archive'):
@@ -846,25 +1399,37 @@ def withdraw(root: Path, folder: str, key: str, to: str | None = None) -> dict:
         entry = state['concepts'].get(key)
         if stage_of(state, key) != 'approved':
             raise ValueError(f'{folder}/{key} is not approved')
-        monster, variant = entry['monster'], entry['variant']
+        monster, variant = safe_part(entry['monster'], 'monster'), check_variant(entry['variant'])
         with monster_lock(root, monster):
+            _recover_locked(root, mroot, monster, folder)
+            canonical_variant(mroot, monster, variant)
             names_path = variant_names_path(mroot, monster)
             names_before = guard.read_bytes_or_none(names_path)
-            names = read_variant_names(mroot, monster)
+            names = read_variant_names(mroot, monster, strict=True)
             pick_rec = names['variants'].get(variant)
             if not isinstance(pick_rec, dict) or pick_rec.get('by') != 'v2' or pick_rec.get('was') != key:
                 raise guard.Conflict(f'{monster}/{variant} was not picked by v2 from {key} (a pick made before v2 is undone by hand)')
             vdir, mdir = views_dir(mroot, monster, variant), models_dir(mroot, monster, variant)
+            contained(mroot, vdir, mdir, names_path)
             if mdir.exists():
                 raise guard.Conflict(f'{monster}/{variant} has a models folder: the conversion has started')
             vj = read_views_json(vdir)
             if vj and vj.get('frozen'):
                 raise guard.Conflict(f'{monster}/{variant}: the views were chosen for conversion')
-            started = [st['name'] for st in view_states(root, mroot, monster, variant).values() if task_started(st)]
-            if started:
-                raise guard.Conflict(f'{monster}/{variant}: a view task has started ({", ".join(started)}); the pick can no longer be undone')
+
+            def started() -> list[str]:
+                return [st['name'] for st in view_states(root, mroot, monster, variant).values() if not st['foreign'] and task_started(st)]
+            if started():
+                raise guard.Conflict(f'{monster}/{variant}: a view task has started ({", ".join(started())}); the pick can no longer be undone')
             renamed: list[tuple[Path, Path]] = []
             try:
+                if vdir.exists():
+                    dst = _withdrawn_name(vdir)
+                    os.rename(vdir, dst)
+                    renamed.append((dst, vdir))
+                late = started()
+                if late:
+                    raise guard.Conflict(f'{monster}/{variant}: a view task started meanwhile ({", ".join(late)}); the pick stays')
                 for view in EXTRA_VIEWS:
                     task = batch_dir(root) / 'tasks' / f'{view_task_name(monster, variant, view)}.json'
                     if task.exists():
@@ -876,10 +1441,6 @@ def withdraw(root: Path, folder: str, key: str, to: str | None = None) -> dict:
                 names['variants'].pop(variant, None)
                 names['retired'] = retired
                 _write_names(mroot, monster, names)
-                if vdir.exists():
-                    dst = _withdrawn_name(vdir)
-                    os.rename(vdir, dst)
-                    renamed.append((dst, vdir))
                 state['concepts'][key] = {'stage': target, 'time': now(), 'from': 'approved', 'withdrawn': f'{monster}/{variant}'}
                 write_state(fdir, state)
             except BaseException:
@@ -895,71 +1456,141 @@ def withdraw(root: Path, folder: str, key: str, to: str | None = None) -> dict:
 
 def flat_pick_files(mroot: Path, monster: str, variant: str) -> dict[str, Path]:
     """The flat files of an already-picked variant: `<k>-front.png` (+ .colours.json / .prompts.json, `<k>-back.*`), or the plain
-    `front.*` / `back.*` of a single-variant (`main`) monster. {target name in views/<k>/: source path}."""
+    `front.*` / `back.*` of a single-variant (`main`) monster; in the monster folder, else in `first round/` (the War Horse base picks,
+    F15). {target name in views/<k>/: source path}."""
     pdir = mroot / 'pipeline' / monster
     prefix = '' if variant == 'main' else f'{variant}-'
     pairs = {'front.png': f'{prefix}front.png', 'colours.json': f'{prefix}front.colours.json', 'prompts.json': f'{prefix}front.prompts.json',
              'back.png': f'{prefix}back.png', 'back.colours.json': f'{prefix}back.colours.json', 'back.prompts.json': f'{prefix}back.prompts.json'}
-    return {dst: pdir / src for dst, src in pairs.items() if (pdir / src).is_file()}
+    for folder in (pdir, *(pdir / sub for sub in FLAT_SUBFOLDERS)):
+        if (folder / pairs['front.png']).is_file():
+            return {dst: folder / src for dst, src in pairs.items() if (folder / src).is_file()}
+    return {}
+
+
+def _approved_concepts_of(mroot: Path, monster: str) -> dict[str, dict]:
+    """{variant: {key, folder, entry}} of the concepts whose state says approved as `monster`/<variant> (the migration's mapping too)."""
+    folder = folder_for_monster(mroot, monster)
+    if not folder:
+        return {}
+    state = read_state(mroot / 'concepts' / folder, strict=False)
+    out = {}
+    for key, entry in state['concepts'].items():
+        if entry.get('stage') == 'approved' and canon(str(entry.get('monster'))) == canon(monster) and isinstance(entry.get('variant'), str):
+            out.setdefault(entry['variant'], {'key': key, 'folder': folder, 'entry': entry})
+    return out
+
+
+def import_sources(mroot: Path, monster: str, names: dict | None = None) -> dict[str, dict]:
+    """{variant: {rec, files, how}} of the picks made before v2 that can be imported (no views/ or models/ folder yet, a flat front):
+    every variant_names.json variant, plus a variant that only the migration knows (a sha256-identical flat front, F15: its record is made
+    from the approved concept). War Horse `<n>-<armour>` variants stay manual (B.1)."""
+    names = read_variant_names(mroot, monster) if names is None else names
+    candidates = {v: (rec, 'variant_names') for v, rec in names['variants'].items() if isinstance(rec, dict)}
+    for variant, info in _approved_concepts_of(mroot, monster).items():
+        if variant not in candidates:
+            candidates[variant] = ({'was': info['key'], 'concept': f'{info["key"]}-front.png',
+                                    'how': f'migration {info["entry"].get("how") or "mapping"}'}, 'migration')
+    out = {}
+    for variant, (rec, how) in sorted(candidates.items()):
+        if not VARIANT.fullmatch(variant) or ARMOUR_VARIANT.fullmatch(variant):
+            continue
+        if views_dir(mroot, monster, variant).exists() or models_dir(mroot, monster, variant).exists():
+            continue
+        files = flat_pick_files(mroot, monster, variant)
+        if 'front.png' in files:
+            out[variant] = {'rec': rec, 'files': files, 'how': how}
+    return out
 
 
 def importable(mroot: Path, monster: str) -> list[str]:
-    """Variants of variant_names.json picked before v2 (flat files) that have no views/ or models/ folder yet."""
-    names = read_variant_names(mroot, monster)
-    out = []
-    for variant in sorted(names['variants']):
-        if not VARIANT.fullmatch(variant) or views_dir(mroot, monster, variant).exists() or models_dir(mroot, monster, variant).exists():
+    """Variants picked before v2 (flat files) that have no views/ or models/ folder yet (import_sources)."""
+    return list(import_sources(mroot, monster))
+
+
+def manual_picks(mroot: Path, monster: str) -> dict[str, dict]:
+    """{variant: {key, folder, source}} of the concepts approved as a variant that has no views/ or models/ folder and nothing to import
+    from (no flat front, or a War Horse armour id): shown as a manual-only card with its source, never hidden (F15)."""
+    sources = import_sources(mroot, monster)
+    out = {}
+    for variant, info in _approved_concepts_of(mroot, monster).items():
+        if variant in sources or views_dir(mroot, monster, variant).exists() or models_dir(mroot, monster, variant).exists():
             continue
-        if 'front.png' in flat_pick_files(mroot, monster, variant):
-            out.append(variant)
+        try:
+            check_variant(variant)
+        except ValueError:
+            continue
+        out[variant] = {'key': info['key'], 'folder': info['folder'], 'source': f'concepts/{info["folder"]}/{info["key"]}-front.png',
+                        'reason': 'a War Horse armour variant (manual)' if ARMOUR_VARIANT.fullmatch(variant) else 'no flat front to import'}
     return out
 
 
 def import_pick(root: Path, monster: str, variant: str, unattended: bool = False) -> dict:
     """The "import pick" path (G.1): `views/<k>/` from the flat files of a variant picked before v2, with the rules of B.2-B.4 and no
-    renumbering. A flat back view comes along as back.png (its task is then not needed). Queues the missing extra views."""
+    renumbering. A flat back view comes along as back.png (its task is then not needed). Queues the missing extra views. Journaled like a
+    pick (F11); the view tasks are written under the monster lock (F10)."""
     root, mroot = Path(root), mroot_of(root)
     monster, variant = safe_part(monster, 'monster'), check_variant(variant)
-    if not (mroot / 'pipeline' / monster).is_dir():
-        raise not_found(f'Unknown monster {monster}')
+    if ARMOUR_VARIANT.fullmatch(variant):
+        raise ValueError(f'{monster}/{variant}: armour variants (<n>-<armour>) stay manual')
+    canonical_variant(mroot, monster, variant)
     with monster_lock(root, monster):
-        names = read_variant_names(mroot, monster)
-        rec = names['variants'].get(variant)
-        if not isinstance(rec, dict):
-            raise ValueError(f'{monster}/{variant} is not a picked variant (variant_names.json)')
-        vdir = views_dir(mroot, monster, variant)
-        if vdir.exists() or models_dir(mroot, monster, variant).exists():
+        _recover_locked(root, mroot, monster, None)
+        names = read_variant_names(mroot, monster, strict=True)
+        vdir, mdir = views_dir(mroot, monster, variant), models_dir(mroot, monster, variant)
+        names_path = variant_names_path(mroot, monster)
+        contained(mroot, vdir, mdir, names_path)
+        if vdir.exists() or mdir.exists():
             raise guard.Conflict(f'{monster}/{variant} already has a views or models folder')
-        files = flat_pick_files(mroot, monster, variant)
-        if 'front.png' not in files:
-            raise ValueError(f'{monster}/{variant} has no flat front image')
+        source = import_sources(mroot, monster, names).get(variant)
+        if source is None:
+            if variant in names['variants']:
+                raise ValueError(f'{monster}/{variant} has no flat front image')
+            raise ValueError(f'{monster}/{variant} is not a picked variant (variant_names.json)')
+        files, rec = source['files'], source['rec']
         tmp = vdir.parent / f'.v2_pick_{variant}_{uuid.uuid4().hex[:8]}'
         tmp.mkdir(parents=True)
-        names_path = variant_names_path(mroot, monster)
         names_before = guard.read_bytes_or_none(names_path)
+        names_prev = names['variants'].get(variant)
+        names_entry = dict(rec) | {'imported': now(), 'imported_by': 'v2'}
+        moved = journaled = False
         try:
             for dst, src in files.items():
                 shutil.copyfile(src, tmp / dst)
             views = [{'name': 'front', 'enabled': True}] + ([{'name': 'back', 'enabled': True}] if 'back.png' in files else [])
             write_views_json(tmp, {'views': views, 'unattended': bool(unattended), 'frozen': None,
                                    'planned': [v for v in EXTRA_VIEWS if view_file(v) not in files], 'created': now(), 'by': 'v2',
-                                   'imported': {dst: src.name for dst, src in files.items()}})
-            names['variants'][variant] = dict(rec) | {'imported': now(), 'imported_by': 'v2'}
+                                   'pick_gen': uuid.uuid4().hex,
+                                   'imported': {dst: src.relative_to(mroot / 'pipeline' / monster).as_posix() for dst, src in files.items()}})
+            _write_journal(root, monster, {'op': 'import', 'monster': monster, 'variant': variant, 'tmp': tmp.name,
+                                           'names_entry': names_entry, 'names_prev': names_prev})
+            journaled = True
+            names['variants'][variant] = names_entry
             _write_names(mroot, monster, names)
+            _fault('import_names')
             os.rename(tmp, vdir)
-        except BaseException:
+            moved = True
+        except Exception:
             _restore(names_path, names_before)
+            if moved and vdir.exists():
+                try:
+                    os.rename(vdir, tmp)
+                except OSError:
+                    pass
             if tmp.exists():
-                shutil.rmtree(tmp, ignore_errors=True)               # our own temp folder
+                _rmtree_own(tmp)                                # our own temp folder
+            if journaled and not vdir.exists():
+                _drop_journal(root, monster)
             raise
-    concept = _mark_concept_of_pick(root, mroot, monster, variant, rec)
-    warning = None
-    try:
-        tasks = queue_view_tasks(root, mroot, monster, variant)
-    except OSError as exc:
-        tasks, warning = [], f'the view tasks could not be written ({exc}); use Retry on each view'
+        warning = None
+        try:
+            tasks = queue_view_tasks(root, mroot, monster, variant)
+        except (OSError, ValueError, guard.Conflict) as exc:
+            tasks, warning = [], f'the view tasks could not be written ({exc}); use Retry on each view'
+        _drop_journal(root, monster)
+    concept = _mark_concept_of_pick(root, mroot, monster, variant, names_entry)
     out = {'ok': True, 'monster': monster, 'variant': variant, 'id': f'monster:{monster}/{variant}', 'copied': sorted(files),
-           'tasks': tasks, 'concept': concept, 'library': library_info(mroot, monster), 'undo': None}
+           'tasks': tasks, 'concept': concept, 'library': library_info(mroot, monster), 'undo': None, 'how': source['how']}
     if warning:
         out['warning'] = warning
     return out
@@ -1056,12 +1687,20 @@ def concept_action(root: Path, verb: str, item_id: str, args: dict) -> dict:
 
 # --------------------------------------------------------------------------------------------------------- variant verbs
 
+class Unverified(guard.Conflict):
+    """3D approve of a reduction the lane did not verify (no generation-bound v2_reduce_ok.json, F12). HTTP 409."""
+    code = 'unverified'
+
+
 def _variant_paths(root: Path, item_id: str) -> tuple[Path, str, str, Path, Path]:
+    """(monster root, monster, variant, views dir, models dir) of a `monster:` id, resolved against the monster root at mutation time:
+    exact on-disk names, contained paths, no link or junction in between (F13)."""
     mroot = mroot_of(root)
     monster, variant = parse_monster_id(item_id)
-    if not (mroot / 'pipeline' / monster).is_dir():
-        raise not_found(f'Unknown monster {monster}')
-    return mroot, monster, variant, views_dir(mroot, monster, variant), models_dir(mroot, monster, variant)
+    canonical_variant(mroot, monster, variant)
+    vdir, mdir = views_dir(mroot, monster, variant), models_dir(mroot, monster, variant)
+    contained(mroot, vdir, mdir)
+    return mroot, monster, variant, vdir, mdir
 
 
 def _enabled_arg(raw: object) -> dict[str, bool]:
@@ -1073,12 +1712,39 @@ def _enabled_arg(raw: object) -> dict[str, bool]:
     return dict(raw)
 
 
+def _files_arg(raw: object) -> list[str]:
+    """args.files of convert / reconvert: the exact ordered list of the ticked view files (1 to 4 of front.png, left.png, back.png,
+    right.png, no repeats). It is authoritative: nothing else is merged in (phase 5 review F8)."""
+    allowed = [view_file(n) for n in VIEW_ORDER]
+    if not isinstance(raw, list) or not raw or any(not isinstance(f, str) or f not in allowed for f in raw) or len(set(raw)) != len(raw):
+        raise ValueError('args.files must be the ticked view files in upload order (1 to 4 of front.png, left.png, back.png, right.png)')
+    return list(raw)
+
+
 def _draft(vdir: Path, vj: dict | None) -> dict:
     """views.json of a variant, created in memory for a legacy variant (every available view listed, attended)."""
     if vj is not None:
         return vj
     return {'views': [{'name': n, 'enabled': True} for n in available_views(vdir)], 'unattended': False, 'frozen': None,
             'created': now(), 'by': 'v2', 'legacy': True}
+
+
+def read_choice(mdir: Path) -> dict:
+    """chosen_lod.json ({} when absent). An existing file that cannot be read is NEVER treated as empty (guard.Unreadable, HTTP 409)."""
+    path = Path(mdir) / CHOICE
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise guard.Unreadable(f'{CHOICE}: cannot be read: {exc}') from None
+    try:
+        value = json.loads(raw.decode('utf-8-sig'))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise guard.Unreadable(f'{CHOICE}: not valid JSON: {exc}') from None
+    if not isinstance(value, dict):
+        raise guard.Unreadable(f'{CHOICE}: not an object')
+    return value
 
 
 def set_ticks(root: Path, item_id: str, enabled: object) -> dict:
@@ -1088,139 +1754,295 @@ def set_ticks(root: Path, item_id: str, enabled: object) -> dict:
     if not vdir.is_dir():
         raise not_found(f'{monster}/{variant} has no views folder')
     with monster_lock(root, monster):
-        vj = _draft(vdir, read_views_json(vdir))
+        raw = read_views_json(vdir)
+        vj = _draft(vdir, raw)
         available = available_views(vdir)
         missing = [n for n in enabled if n not in available]
         if missing:
-            raise ValueError(f'no such view image yet: {", ".join(missing)}')
+            raise ValueError(f'no such valid view image: {", ".join(missing)}')
         before = ticks_of(vj, available)
         ticks = before | enabled
         vj['views'] = [{'name': n, 'enabled': ticks[n]} for n in VIEW_ORDER if n in ticks]
         write_views_json(vdir, vj)
+        rev = views_rev(vdir, vj)
     frozen = vj.get('frozen') if isinstance(vj.get('frozen'), dict) else None
     differs = frozen is not None and [n for n in VIEW_ORDER if ticks.get(n)] != [str(f)[:-4] for f in frozen.get('files') or []]
-    return {'ok': True, 'ticks': ticks, 'draft_differs': differs,
+    return {'ok': True, 'ticks': ticks, 'draft_differs': differs, 'views_rev': rev,
             'undo': {'verb': 'views', 'id': item_id, 'args': {'enabled': {n: before[n] for n in enabled if n in before}}}}
 
 
-def _open_conversion(root: Path, monster: str, variant: str) -> dict | None:
+def _owner(root: Path, monster: str, variant: str) -> str | None:
+    """Why a conversion of the variant is active (a queued / running lane task, a live driver, a live child of a previous attempt), else
+    None. An unreadable queue raises guard.Unreadable: it never means "nothing is running" (F6)."""
     import monster_lane
-    return monster_lane.open_task(root, monster, variant)
+    return monster_lane.active_reason(root, monster, variant)
+
+
+# Reconvert (F6) moves hyper3d/ and reduced/ aside as ONE journaled transaction: `models/<v>/.v2_reconvert.json` {moves: [[sub, dst]],
+# generation: the new frozen digest} is written before the first rename and deleted after views.json carries the new freeze. Recovery
+# (any later mutation of the variant, and the orchestrator tick) completes a journal whose generation views.json already has, and rolls
+# the moves back otherwise.
+
+def _recover_reconvert_locked(mdir: Path, vdir: Path) -> str | None:
+    path = Path(mdir) / RECONVERT_JOURNAL
+    j = read_json(path, None)
+    if j is None:
+        return None
+    if not isinstance(j, dict) or not isinstance(j.get('moves'), list):
+        raise guard.Unreadable(f'{RECONVERT_JOURNAL} of {Path(mdir).name} is unreadable; check the hyper3d / reduced folders by hand')
+    moves = [(str(m[0]), str(m[1])) for m in j['moves'] if isinstance(m, list) and len(m) == 2 and m[0] in ('hyper3d', 'reduced') and
+             re.fullmatch(r'(hyper3d|reduced)_prev_[0-9T_]+', str(m[1]))]
+    vj = read_views_json(vdir)
+    done = vj is not None and frozen_digest(vj.get('frozen')) == j.get('generation')
+    for sub, dst in moves:
+        src, aside = Path(mdir) / sub, Path(mdir) / dst
+        if done and src.exists() and not aside.exists():
+            os.rename(src, aside)                                # complete a move the crash interrupted
+        elif not done and aside.exists() and not src.exists():
+            os.rename(aside, src)                                # roll back
+    path.unlink(missing_ok=True)
+    return 'completed' if done else 'rolled back'
+
+
+def recover_reconverts(root: Path) -> list[str]:
+    """HOOK (monster_lane.tick): finish or roll back every interrupted Reconvert (each under its monster and LOD locks)."""
+    root, mroot = Path(root), mroot_of(root)
+    out = []
+    for monster in pipeline_monsters(mroot):
+        for variant in _dirs(mroot / 'pipeline' / monster / 'models'):
+            mdir = models_dir(mroot, monster, variant)
+            if not (mdir / RECONVERT_JOURNAL).exists():
+                continue
+            try:
+                with monster_lock(root, monster), guard.os_lock(mdir / LOD_LOCK):
+                    done = _recover_reconvert_locked(mdir, views_dir(mroot, monster, variant))
+                if done:
+                    out.append(f'{monster}/{variant}: reconvert {done}')
+            except Exception as exc:  # noqa: BLE001
+                out.append(f'{monster}/{variant}: reconvert recovery error {type(exc).__name__}: {exc}')
+    return out
 
 
 def convert(root: Path, item_id: str, args: dict, reconvert: bool = False) -> dict:
-    """Verb `convert` ("Use enabled views") and `reconvert` (3D tab, paid): freeze views.json {time, files, sha256} and queue the conversion
-    (monster_lane). `convert` refuses once a conversion record / GLB / reduced/ exists; `reconvert` moves hyper3d/ and reduced/ aside to
-    `*_prev_<time>` first and needs `args.confirm: true`."""
+    """Verb `convert` ("Use enabled views") and `reconvert` (3D tab, paid): freeze views.json {time, files, sha256} with EXACTLY
+    `args.files` (in that order) and queue the conversion (monster_lane). `args.views_rev` must be the item's `views_rev` (409 `changed`
+    otherwise); a listed file that is absent or invalid is 409 `missing`; `args.enabled` is refused (400). `convert` refuses once a
+    conversion record / GLB / reduced/ exists (409 `frozen`); `reconvert` needs `args.confirm: true`, validates the new freeze first, then
+    (under the monster lock AND the LOD lock of 3D approve) moves hyper3d/ and reduced/ aside to `*_prev_<time>` as one journaled
+    transaction. Both refuse while a conversion of the variant is active (409 `busy`) or the queue cannot be read (409 `unreadable`)."""
     import monster_lane
     mroot, monster, variant, vdir, mdir = _variant_paths(root, item_id)
     if not vdir.is_dir():
         raise not_found(f'{monster}/{variant} has no views folder')
+    if 'enabled' in args:
+        raise ValueError('args.enabled is not accepted here: send args.files (the ticked files in upload order) and args.views_rev')
+    files = _files_arg(args.get('files'))
+    rev = args.get('views_rev')
+    if isinstance(rev, bool) or not isinstance(rev, int):
+        raise ValueError('args.views_rev is required: the views_rev of the item the choice was made on')
     if reconvert and args.get('confirm') is not True:
         raise ValueError('Reconvert pays for a new Hyper3D conversion (0.5 credits): send args.confirm = true')
-    moved = []
+    moved: list[str] = []
     with monster_lock(root, monster):
-        vj = _draft(vdir, read_views_json(vdir))
-        available = available_views(vdir)
-        ticks = ticks_of(vj, available)
-        if 'enabled' in args:
-            enabled = _enabled_arg(args['enabled'])
-            missing = [n for n, on in enabled.items() if on and n not in available]
+        lod_lock = guard.os_lock(mdir / LOD_LOCK) if reconvert and mdir.is_dir() else None
+        if lod_lock is not None:
+            lod_lock.__enter__()
+        try:
+            if mdir.is_dir():
+                _recover_reconvert_locked(mdir, vdir)
+            raw = read_views_json(vdir)
+            owner = _owner(root, monster, variant)
+            if owner:
+                raise guard.Busy(f'{monster}/{variant}: {owner}')
+            current = views_rev(vdir, raw)
+            if rev != current:
+                raise guard.Changed(f'the views of {monster}/{variant} changed since they were shown; look at them again',
+                                    changes=['views'])
+            missing = [f for f in files if view_problem(vdir, f[:-4])]
             if missing:
-                raise ValueError(f'no such view image: {", ".join(missing)}')
-            ticks |= {n: v for n, v in enabled.items() if n in available}
-        files = [view_file(n) for n in VIEW_ORDER if ticks.get(n)]
-        if not files:
-            raise ValueError('enable at least one view')
-        if len(files) > 4:
-            raise ValueError('at most four views')
-        if _open_conversion(root, monster, variant):
-            raise guard.Busy(f'{monster}/{variant} has a conversion queued or running')
-        if reconvert:
-            choice = read_obj(mdir / CHOICE)
-            if choice.get('approved') is True:
-                raise guard.AlreadyApproved(f'{monster}/{variant} is approved; unapprove it first')
-            if not conversion_started(mdir):
-                raise ValueError(f'{monster}/{variant} has no conversion to redo; use Use enabled views')
-            for sub in ('hyper3d', 'reduced'):
-                src = mdir / sub
-                if src.exists():
-                    dst = mdir / f'{sub}_prev_{stamp()}'
-                    n = 2
-                    while dst.exists():
-                        dst = mdir / f'{sub}_prev_{stamp()}_{n}'
-                        n += 1
-                    os.rename(src, dst)
-                    moved.append(dst.name)
-        elif conversion_started(mdir):
-            raise Frozen(f'{monster}/{variant} has a conversion already; converting again is Reconvert (3D tab, paid)')
-        vj['views'] = [{'name': n, 'enabled': ticks[n]} for n in VIEW_ORDER if n in ticks]
-        vj['frozen'] = freeze(vdir, files)
-        if reconvert:
-            vj['frozen']['reconvert'] = True
-            vj['frozen']['moved'] = moved
-        write_views_json(vdir, vj)
+                raise Missing(f'not a valid view of {monster}/{variant}: ' + ', '.join(f'{f} ({view_problem(vdir, f[:-4])})' for f in missing),
+                              file=missing[0], files=missing)
+            vj = _draft(vdir, raw)
+            if reconvert:
+                if lod_lock is None:
+                    raise ValueError(f'{monster}/{variant} has no conversion to redo; use Use enabled views')
+                if read_choice(mdir).get('approved') is True:
+                    raise guard.AlreadyApproved(f'{monster}/{variant} is approved; unapprove it first')
+                if not conversion_started(mdir):
+                    raise ValueError(f'{monster}/{variant} has no conversion to redo; use Use enabled views')
+            elif conversion_started(mdir):
+                raise Frozen(f'{monster}/{variant} has a conversion already; converting again is Reconvert (3D tab, paid)')
+            frozen = freeze(vdir, files)                       # validated and hashed BEFORE anything moves (F6)
+            moves = []
+            if reconvert:
+                taken = set(_names(mdir))
+                for sub in ('hyper3d', 'reduced'):
+                    if (mdir / sub).exists():
+                        dst, n = f'{sub}_prev_{stamp()}', 2
+                        while dst in taken:
+                            dst, n = f'{sub}_prev_{stamp()}_{n}', n + 1
+                        taken.add(dst)
+                        moves.append([sub, dst])
+                moved = [dst for _sub, dst in moves]
+                frozen |= {'reconvert': True, 'moved': moved}
+            vj['views'] = [{'name': n, 'enabled': view_file(n) in files} for n in VIEW_ORDER if n in available_views(vdir)]
+            vj['frozen'] = frozen
+            if reconvert:
+                journal = mdir / RECONVERT_JOURNAL
+                guard.write_atomic(journal, dump({'schema': 1, 'moves': moves, 'generation': frozen_digest(frozen), 'time': now()}))
+                done: list[tuple[str, str]] = []
+                try:
+                    for sub, dst in moves:
+                        os.rename(mdir / sub, mdir / dst)
+                        done.append((sub, dst))
+                        _fault('reconvert_moved')
+                    write_views_json(vdir, vj)
+                except Exception:
+                    for sub, dst in reversed(done):
+                        try:
+                            os.rename(mdir / dst, mdir / sub)
+                        except OSError:
+                            raise                            # the journal stays: recovery rolls back what is left
+                    journal.unlink(missing_ok=True)
+                    raise
+                journal.unlink(missing_ok=True)
+            else:
+                write_views_json(vdir, vj)
+        finally:
+            if lod_lock is not None:
+                lod_lock.__exit__(None, None, None)
     warning = None
     try:
         task = monster_lane.enqueue(root, monster, variant, vj['frozen'])
     except Exception as exc:  # noqa: BLE001  (the freeze stands; the lane tick queues it again)
         task, warning = None, f'the conversion could not be queued yet ({type(exc).__name__}: {exc}); the lane queues it on its next pass'
-    out = {'ok': True, 'monster': monster, 'variant': variant, 'frozen': vj['frozen'], 'task': task, 'moved': moved, 'undo': None}
+    out = {'ok': True, 'monster': monster, 'variant': variant, 'frozen': vj['frozen'], 'task': task, 'moved': moved, 'undo': None,
+           'views_rev': views_rev(vdir, vj)}
     if warning:
         out['warning'] = warning
     return out
 
 
-def write_choice(root: Path, item_id: str, approved: bool, lod: object = None) -> dict:
-    """3D Approve / Completed Unapprove: chosen_lod.json {lod, reduced, approved, updated} under the variant's `.pipeline_v2.lock`
-    (the lock of decisions.write_monster_lod)."""
-    mroot, monster, variant, _vdir, mdir = _variant_paths(root, item_id)
+def write_choice(root: Path, item_id: str, approved: bool, lod: object = None, glb_sha256: object = None) -> dict:
+    """3D Approve / Completed Unapprove: chosen_lod.json {lod, reduced, approved, glb_sha256, generation, legacy, updated} under the monster
+    lock and the variant's `.pipeline_v2.lock` (the lock of decisions.write_monster_lod and of Reconvert, F6). Approve needs `lod` and the
+    `glb_sha256` the modal showed (item `lods[lod].sha256`: 409 `changed` when the file is another one now), a reduction the lane verified
+    (or a legacy one by the compatibility rule; 409 `unverified` otherwise) and no active conversion (409 `busy`)."""
+    mroot, monster, variant, vdir, mdir = _variant_paths(root, item_id)
     if not mdir.is_dir():
         raise not_found(f'{monster}/{variant} has no models folder')
-    with guard.os_lock(mdir / LOD_LOCK):
-        record = read_obj(mdir / CHOICE)
+    with monster_lock(root, monster), guard.os_lock(mdir / LOD_LOCK):
+        _recover_reconvert_locked(mdir, vdir)
+        record = read_choice(mdir)
         previous = {'lod': record.get('lod'), 'approved': record.get('approved') is True}
         if approved:
             if record.get('approved') is True:
                 raise guard.AlreadyApproved(f'{monster}/{variant} is approved already')
-            level = lod if lod is not None else record.get('lod')
-            if level not in LOD_LEVELS:
-                raise ValueError('choose a LOD before approving')
-            if not (mdir / 'reduced' / f'lod_error_{level}.glb').is_file():
+            if lod not in LOD_LEVELS:
+                raise ValueError('args.lod (the level shown) is required')
+            if not isinstance(glb_sha256, str) or not glb_sha256:
+                raise ValueError('args.glb_sha256 (the digest of the level shown, item lods[].sha256) is required')
+            owner = _owner(root, monster, variant)
+            if owner:
+                raise guard.Busy(f'{monster}/{variant}: {owner}')
+            vj = read_views_json(vdir)
+            generation = frozen_digest(vj.get('frozen')) if vj and vj.get('frozen') else None
+            status = reduce_status(mdir, generation, deep=True)
+            if not status['ok']:
+                raise Unverified(f'{monster}/{variant}: the reduction is not verified ({status["problem"]})')
+            path = mdir / 'reduced' / f'lod_error_{lod}.glb'
+            if not path.is_file():
                 raise ValueError('that LOD has no file')
-            record |= {'lod': level, 'reduced': f'reduced/lod_error_{level}.glb', 'approved': True}
+            actual = sha256_file(path)
+            if actual != glb_sha256:
+                raise guard.Changed(f'{monster}/{variant}: lod_error_{lod}.glb is not the model you looked at any more; look again',
+                                    changes=[f'lod {lod}'])
+            record |= {'lod': lod, 'reduced': f'reduced/lod_error_{lod}.glb', 'approved': True, 'glb_sha256': actual,
+                       'generation': generation, 'legacy': bool(status.get('legacy'))}
         else:
             if record.get('approved') is not True:
                 raise ValueError(f'{monster}/{variant} is not approved')
             record['approved'] = False
         record['updated'] = datetime.now(timezone.utc).isoformat()
         guard.write_atomic(mdir / CHOICE, json.dumps(record, indent=1).encode('utf-8'))
-    return {'ok': True, 'lod': record.get('lod'), 'approved': record['approved'], 'previous': previous}
+    level = record.get('lod')
+    digest = record.get('glb_sha256') if approved else (file_sha256(mdir / 'reduced' / f'lod_error_{level}.glb') if level in LOD_LEVELS
+                                                      else None)
+    return {'ok': True, 'lod': level, 'approved': record['approved'], 'previous': previous, 'glb_sha256': digest}
 
 
 def view_retry(root: Path, item_id: str, view: object) -> dict:
-    """Verb `view_retry` (args.view): a FAILED view task goes back to pending with attempts 0 (its jobs kept); a missing task file (never
-    written) is written. Refused while the view image exists."""
+    """Verb `view_retry` (args.view): a FAILED / cancelled view task, or a finished one whose output is invalid (not a decodable RGBA PNG
+    with transparency, or no provenance record, F17), goes back to pending with attempts 0 (its jobs kept); an invalid output and its
+    record are first renamed `<file>.invalid-<time>` (the job never overwrites a file). A missing task file (never written) is written.
+    Refused while the task is still running or the image is valid."""
     mroot, monster, variant, vdir, _mdir = _variant_paths(root, item_id)
     if view not in EXTRA_VIEWS:
         raise ValueError(f'view must be one of {list(EXTRA_VIEWS)}')
     if not (vdir / 'front.png').is_file():
         raise not_found(f'{monster}/{variant} has no front view')
-    if (vdir / view_file(view)).is_file():
-        raise ValueError(f'{view}.png exists already')
-    name = view_task_name(monster, variant, view)
-    st = view_task_state(root, name)
-    if not st['exists']:
-        written = queue_view_tasks(root, mroot, monster, variant, (view,))
-        return {'ok': True, 'name': name, 'state': 'pending', 'written': bool(written), 'undo': None}
-    if st['state'] != 'failed':
-        raise ValueError(f'{name} is {st["state"]}; only a failed view task can be retried')
-    path = batch_dir(root) / 'status' / f'{name}.json'
-    status = read_obj(path)
-    before = status.get('attempts')
-    status.update(state='pending', attempts=0)
-    guard.write_atomic(path, dump(status))
-    return {'ok': True, 'name': name, 'state': 'pending', 'attempts_before': before, 'undo': None}
+    with monster_lock(root, monster):
+        if read_views_json(vdir) is None:
+            raise ValueError(f'{monster}/{variant} has no {VIEWS_JSON} (a legacy variant has no view tasks)')
+        name = view_task_name(monster, variant, view)
+        st = view_task_state(root, name, (monster, variant))
+        if st['foreign']:
+            raise guard.Conflict(f'{name}.json belongs to another monster / variant')
+        problem = view_problem(vdir, view)
+        if problem is None:
+            raise ValueError(f'{view}.png exists already and is valid')
+        if st['exists'] and st['state'] not in TERMINAL_VIEW_STATES:
+            raise ValueError(f'{name} is {st["state"]}; only a failed, cancelled or finished task can be retried')
+        aside = []
+        for fname in (view_file(view), monster_prompts.record_name(view)):
+            path = vdir / fname
+            if path.exists():
+                dst = vdir / f'{fname}.invalid-{stamp()}'
+                os.rename(path, dst)
+                aside.append(dst.name)
+        if not st['exists']:
+            written = queue_view_tasks(root, mroot, monster, variant, (view,))
+            return {'ok': True, 'name': name, 'state': 'pending', 'written': bool(written), 'moved_aside': aside, 'problem': problem,
+                    'undo': None}
+        _ensure_pick_gen(vdir)
+        path = batch_dir(root) / 'status' / f'{name}.json'
+        status = read_obj(path)
+        before = status.get('attempts')
+        status.update(state='pending', attempts=0)
+        status.pop('error', None)
+        guard.write_atomic(path, dump(status))
+    return {'ok': True, 'name': name, 'state': 'pending', 'attempts_before': before, 'moved_aside': aside, 'problem': problem, 'undo': None}
+
+
+def disposition_of(vj: dict | None, generation: str | None) -> dict | None:
+    """The persisted outcome of a frozen generation's conversion (views.json `conversion[<frozen digest>]`: {state: cancelled | failed,
+    reason, key, time}) or None. It lives OUTSIDE the rebuildable queue (phase 5 review F4): a rebuilt queue never revives it."""
+    entry = ((vj or {}).get('conversion') or {}).get(generation) if generation else None
+    return entry if isinstance(entry, dict) and entry.get('state') in ('cancelled', 'failed') else None
+
+
+def set_disposition(root: Path, monster: str, variant: str, generation: str, value: dict | None) -> dict | None:
+    """Write (value) or clear (None) the disposition of a frozen generation under the monster lock; returns the previous one. A variant
+    whose views.json is gone has nothing to record (None)."""
+    mroot = mroot_of(root)
+    monster, variant = safe_part(monster, 'monster'), check_variant(variant)
+    vdir = views_dir(mroot, monster, variant)
+    contained(mroot, vdir)
+    with monster_lock(root, monster):
+        vj = read_views_json(vdir)
+        if vj is None:
+            return None
+        conv = dict(vj.get('conversion') or {})
+        previous = conv.get(generation)
+        if value is None:
+            if generation not in conv:
+                return previous
+            conv.pop(generation, None)
+        else:
+            conv[generation] = dict(value) | {'time': now()}
+        vj['conversion'] = conv
+        write_views_json(vdir, vj)
+    return previous if isinstance(previous, dict) else None
 
 
 def variant_action(root: Path, verb: str, item_id: str, args: dict) -> dict:
@@ -1236,14 +2058,15 @@ def variant_action(root: Path, verb: str, item_id: str, args: dict) -> dict:
     if verb == 'view_retry':
         return view_retry(root, item_id, args.get('view'))
     if verb == 'approve':
-        result = write_choice(root, item_id, True, args.get('lod'))
+        result = write_choice(root, item_id, True, args.get('lod'), args.get('glb_sha256'))
         return result | {'stage': 'completed', 'undo': {'verb': 'unapprove', 'id': item_id}}
     # unapprove: completed -> 3d; a variant v2 picked whose views have not started -> the pick is undone
     mroot, monster, variant, _vdir, mdir = _variant_paths(root, item_id)
-    if read_obj(mdir / CHOICE).get('approved') is True:
+    if mdir.is_dir() and read_choice(mdir).get('approved') is True:
         result = write_choice(root, item_id, False)
-        return result | {'stage': '3d', 'undo': {'verb': 'approve', 'id': item_id, 'args': {'lod': result['lod']}}}
-    rec = read_variant_names(mroot, monster)['variants'].get(variant)
+        return result | {'stage': '3d', 'undo': {'verb': 'approve', 'id': item_id,
+                                                 'args': {'lod': result['lod'], 'glb_sha256': result['glb_sha256']}}}
+    rec = read_variant_names(mroot, monster, strict=True)['variants'].get(variant)
     folder = folder_for_monster(mroot, monster)
     if isinstance(rec, dict) and rec.get('by') == 'v2' and isinstance(rec.get('was'), str) and folder:
         return concept_action(root, 'unapprove', concept_id(folder, rec['was']), args)
@@ -1277,8 +2100,9 @@ def handles(item_id: object) -> bool:
 # --------------------------------------------------------------------------------------------------------- variant cards
 
 def monster_stage(raw: dict) -> str:
-    """approved -> completed; reduced LODs -> 3d; otherwise approved (in progress) (the phase 4 catalog rule)."""
-    if raw.get('approved'):
+    """approved AND a verified reduction (the lane's generation-bound record, or a legacy result by the compatibility rule, F12) ->
+    completed; reduced LODs -> 3d; otherwise approved (in progress). An approval whose reduction is not verified stays in 3d."""
+    if raw.get('approved') and raw.get('verified', True) and raw.get('lods'):
         return 'completed'
     return '3d' if raw.get('lods') else 'approved'
 
@@ -1307,15 +2131,22 @@ def record_step(mdir: Path, record: dict | None) -> str:
 
 
 def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: dict | None, frozen: dict | None = None,
-                    with_gate: bool = True) -> dict | None:
+                    with_gate: bool = True, vj: dict | None = None) -> dict | None:
     """`item.conversion` (web/monster_views.js): None before anything was chosen / converted, else
-    {task_id, state: queued | waiting | running | done | failed, step: submit | preview | collect | reduce, waiting_reason (held | paused |
-    user_present | browser_busy | a text) while waiting, paid, credits, error, attempts, run_now, record {status, stage, pending_action,
-    credits_committed, why, model_url, images_uploaded, actions}, screenshots [urls, newest first], reduced, started, task}."""
+    {task_id, state: queued | waiting | running | done | failed | cancelled, step: submit | preview | collect | reduce, waiting_reason (held |
+    paused | user_present | browser_busy | a text) while waiting, paid (a CONFIRMED paid action), paid_uncertain (a paid click whose outcome
+    is not confirmed), credits (the confirmed observed cost; never assumed), error, attempts, run_now, record {status, stage, pending_action,
+    credits_committed, why, model_url, images_uploaded, actions}, screenshots [urls, newest first], reduced (verified for this freeze),
+    reduce_problem, disposition, accounting_error, started, task}."""
     import monster_lane
     mdir = models_dir(mroot, monster, variant)
     record = record_of(mdir)
-    reduced = reduced_complete(mdir)
+    generation = frozen_digest(frozen)
+    verify = reduce_status(mdir, generation) if generation else reduce_status(mdir)
+    reduced = verify['ok']
+    disposition = disposition_of(vj, generation)
+    if task is not None and generation and not str(task.get('key') or '').endswith(f':{generation}'):
+        task = None                                             # the newest row belongs to an earlier freeze
     if task is None and frozen is None and record is None:
         return None
     shots = []
@@ -1330,15 +2161,16 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
         rec = {k: record.get(k) for k in ('status', 'stage', 'pending_action', 'credits_committed', 'why', 'model_url', 'images_uploaded')}
         rec['actions'] = sorted((record.get('actions') or {}).keys()) if isinstance(record.get('actions'), dict) else []
     view = _task_view(task)
-    paid = monster_lane.has_paid(record)
-    credits = record.get('credits_committed') if record else None
-    credits = credits if isinstance(credits, (int, float)) and not isinstance(credits, bool) and credits > 0 else \
-        (monster_lane.CREDITS_PER_MODEL if paid else None)
+    paid = monster_lane.paid_actions(record)
+    confirmed = [a for a in paid if a['status'] == 'confirmed']
+    known = [a['credits'] for a in confirmed if isinstance(a['credits'], (int, float))]
     step = 'reduce' if reduced else record_step(mdir, record)
     error, waiting = None, None
     if view is None:
         if reduced:
             state = 'done'
+        elif disposition is not None:
+            state, error = disposition['state'], f'{disposition["state"]}: {disposition.get("reason") or "-"}'
         elif frozen is not None:
             state, waiting = 'waiting', 'the conversion lane queues it at its next pass'
         else:
@@ -1348,7 +2180,7 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
     elif view['state'] == 'done':
         state = 'done'
     elif view['state'] in ('failed', 'cancelled'):
-        state = 'failed'
+        state = 'failed' if view['state'] == 'failed' else 'cancelled'
         verdict = view.get('verdict') or {}
         error = verdict.get('error') or view.get('error') or view['state']
         if view['state'] == 'cancelled':
@@ -1365,9 +2197,13 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
                 state, waiting = 'waiting', g['code'] or g['reason']
             elif monster_lane.lane_tasks(root, state=monster_lane.taskqueue.ACTIVE, limit=5):
                 state, waiting = 'waiting', 'another monster conversion is running'
-    return {'task_id': view['id'] if view else None, 'state': state, 'step': step, 'waiting_reason': waiting, 'paid': paid, 'credits': credits,
-            'error': error, 'attempts': view['attempts'] if view else 0, 'run_now': bool(view and view['run_now']), 'record': rec,
-            'screenshots': shots, 'reduced': reduced, 'started': conversion_started(mdir), 'task': view}
+    accounting = monster_lane.accounting_error(root, mdir / 'hyper3d' / 'studio_submission.json')
+    return {'task_id': view['id'] if view else None, 'state': state, 'step': step, 'waiting_reason': waiting,
+            'paid': bool(confirmed), 'paid_uncertain': [a['action'] for a in paid if a['status'] == 'uncertain'],
+            'credits': round(sum(known), 3) if known else None, 'error': error, 'attempts': view['attempts'] if view else 0,
+            'run_now': bool(view and view['run_now']), 'record': rec, 'screenshots': shots, 'reduced': reduced,
+            'reduce_problem': None if reduced else verify['problem'], 'disposition': disposition, 'accounting_error': accounting,
+            'generation': generation, 'started': conversion_started(mdir), 'task': view}
 
 
 def _tasks_by_variant(root: Path) -> dict[str, dict]:
@@ -1379,8 +2215,19 @@ def _tasks_by_variant(root: Path) -> dict[str, dict]:
         return {}
 
 
+def _damaged_card(raw: dict, error: str) -> dict:
+    """A read-only card of a variant whose state cannot be read (F16): shown in its tab with the error, no actions."""
+    stage = raw.get('stage_hint') or ('3d' if raw.get('lods') else 'approved')
+    return {'id': raw['id'], 'type': 'monster', 'kind': 'monster', 'name': raw.get('name') or raw['id'], 'title': raw.get('name') or raw['id'],
+            'stage': stage, 'thumbnail': raw.get('image'), 'thumbnail_kind': None, 'model': None, 'races': [],
+            'badges': [{'text': f'damaged: {error[:160]}', 'tone': 'error'}], 'actions': [], 'progress': None,
+            'monster': raw.get('monster'), 'variant': raw.get('variant'), 'library_hint': None, 'damaged': {'error': error}}
+
+
 def variant_card(root: Path, mroot: Path, raw: dict, tasks: dict) -> dict:
     """The card of a variant (monsters.cards raw) with the phase 5 badges: views a/b, Choose views, conversion state, library hint."""
+    if raw.get('damaged'):
+        return _damaged_card(raw, raw['damaged'])
     stage = monster_stage(raw)
     lods = raw.get('lods') or {}
     lod = raw.get('lod') if raw.get('lod') in lods else ('0p4' if '0p4' in lods else next(iter(lods), None))
@@ -1388,38 +2235,53 @@ def variant_card(root: Path, mroot: Path, raw: dict, tasks: dict) -> dict:
     vdir = views_dir(mroot, monster, variant)
     badges = [{'text': str(raw.get('status') or 'image only'), 'tone': 'info'}]
     actions: list[str] = []
-    if stage == 'approved':
+    if raw.get('manual'):
+        badges.append({'text': f'picked before v2, manual only ({raw["manual"]["reason"]}; source {raw["manual"]["source"]})',
+                       'tone': 'warn'})
+    elif stage == 'approved':
         vj = read_views_json(vdir)
         states = view_states(root, mroot, monster, variant) if vj is not None else {}
         phase = views_phase(root, mroot, monster, variant, vj, states)
         task = tasks.get(f'{monster}/{variant}')
         if phase == 'generating':
             planned = planned_views(vj)
-            done = sum(1 for v in ('front', *planned) if (vdir / view_file(v)).is_file())
+            done = sum(1 for v in ('front', *planned) if view_problem(vdir, v) is None)
             badges.append({'text': f'views {done}/{1 + len(planned)}', 'tone': 'info'})
-        failed = [v for v in planned_views(vj) if (st := states.get(v)) and st['exists'] and st['state'] == 'failed'
-                  and not (vdir / view_file(v)).is_file()]
+        failed = [v for v in planned_views(vj) if task_terminal(states.get(v)) and view_problem(vdir, v) is not None]
         if failed:
             badges.append({'text': f'view failed {len(failed)}', 'tone': 'error'})
         if phase == 'choose':
             badges.append({'text': 'Choose views', 'tone': 'warn'})
         if vj and vj.get('unattended') and phase != 'frozen':
             badges.append({'text': 'convert straight away', 'tone': 'info'})
+        generation = frozen_digest((vj or {}).get('frozen'))
+        if task and generation and not str(task.get('key') or '').endswith(f':{generation}'):
+            task = None
+        disposition = disposition_of(vj, generation)
         if task:
             text = {'queued': 'conversion queued', 'starting': 'converting', 'running': 'converting', 'orphan': 'converting',
                     'failed': 'conversion failed', 'done': 'converted', 'cancelled': 'conversion cancelled'}.get(task['state'], task['state'])
             tone = 'error' if task['state'] == 'failed' else 'warn' if task['state'] == 'cancelled' else 'info'
             badges.append({'text': text, 'tone': tone})
+        elif disposition:
+            badges.append({'text': f'conversion {disposition["state"]}', 'tone': 'error' if disposition['state'] == 'failed' else 'warn'})
         elif phase == 'frozen':
             badges.append({'text': 'conversion not queued', 'tone': 'warn'})
         if raw.get('importable'):
             badges.append({'text': 'picked, not imported', 'tone': 'warn'})
             actions = ['import']
     elif stage == '3d':
-        if raw.get('lod') in lods:
+        if raw.get('approved'):
+            badges.append({'text': f'approved, but the reduction is not verified ({raw.get("verify_problem")})', 'tone': 'error'})
+            actions = ['unapprove']
+        elif not raw.get('verified', True):
+            badges.append({'text': f'reduction not verified: {raw.get("verify_problem")}', 'tone': 'warn'})
+        elif raw.get('lod') in lods:
             actions = ['approve']
     else:
         badges.append({'text': 'approved', 'tone': 'ok'})
+        if raw.get('legacy_reduce'):
+            badges.append({'text': 'legacy reduction', 'tone': 'info'})
         actions = ['unapprove']
     if sections_stale(models_dir(mroot, monster, variant)):
         badges.append({'text': 'sections out of date', 'tone': 'warn'})
@@ -1453,66 +2315,127 @@ def sections_stale(mdir: Path) -> bool:
 
 
 def importable_raws(mroot: Path) -> list[dict]:
-    """Raw cards of the variants picked before v2 that were never imported (flat files only): stage approved, action import."""
+    """Raw cards of the variants picked before v2 that were never imported (flat files only): stage approved, action import; and the
+    manual-only cards of approved concepts that have nothing to import from (F15)."""
     out = []
     for monster in pipeline_monsters(mroot):
-        for variant in importable(mroot, monster):
-            files = flat_pick_files(mroot, monster, variant)
+        try:
+            sources = import_sources(mroot, monster)
+            manual = manual_picks(mroot, monster)
+        except Exception as exc:  # noqa: BLE001  (F16: one monster never breaks the others)
+            out.append({'id': f'monster:{monster}/?', 'kind': 'monster', 'name': f'{monster}', 'monster': monster, 'variant': None,
+                        'lods': {}, 'damaged': f'{type(exc).__name__}: {exc}'})
+            continue
+        for variant, source in sources.items():
             out.append({'id': f'monster:{monster}/{variant}', 'kind': 'monster', 'name': f'{monster} {variant}', 'monster': monster,
-                        'variant': variant, 'status': 'picked', 'image': murl(mroot, files['front.png']), 'lods': {}, 'lod': None,
-                        'approved': False, 'importable': True, 'roles': [], 'record': {}})
+                        'variant': variant, 'status': 'picked', 'image': murl(mroot, source['files']['front.png']), 'lods': {}, 'lod': None,
+                        'approved': False, 'importable': True, 'import_how': source['how'], 'roles': [], 'record': {}})
+        for variant, info in manual.items():
+            out.append({'id': f'monster:{monster}/{variant}', 'kind': 'monster', 'name': f'{monster} {variant}', 'monster': monster,
+                        'variant': variant, 'status': 'picked', 'image': murl(mroot, mroot / info['source']), 'lods': {}, 'lod': None,
+                        'approved': False, 'manual': info, 'roles': [], 'record': {}})
     return out
 
 
+def _verify_raw(mroot: Path, raw: dict) -> dict:
+    """Add `verified` / `verify_problem` / `legacy_reduce` (reduce_status for the variant's current freeze) to a raw card with LODs."""
+    if not raw.get('lods'):
+        return raw
+    vj = read_views_json(views_dir(mroot, raw['monster'], raw['variant']))
+    generation = frozen_digest(vj.get('frozen')) if vj and vj.get('frozen') else None
+    status = reduce_status(models_dir(mroot, raw['monster'], raw['variant']), generation)
+    return raw | {'verified': status['ok'], 'verify_problem': status['problem'], 'legacy_reduce': bool(status.get('legacy'))}
+
+
 def variant_raws(root: Path) -> list[dict]:
+    """One raw card per variant (monsters._card for each views / models folder; one that cannot be read becomes a damaged raw, F16), plus
+    the flat picks to import and the manual-only picks."""
     mroot = mroot_of(root)
-    return list(monsters.cards(Path(root))) + importable_raws(mroot)
+    out = []
+    for monster in pipeline_monsters(mroot):
+        folder = mroot / 'pipeline' / monster
+        for variant in sorted(set(_dirs(folder / 'views')) | set(_dirs(folder / 'models'))):
+            item_id = f'monster:{monster}/{variant}'
+            try:
+                raw = monsters._card(mroot, monster, variant)
+                if raw:
+                    out.append(_verify_raw(mroot, raw))
+            except Exception as exc:  # noqa: BLE001
+                out.append({'id': item_id, 'kind': 'monster', 'name': f'{monster} {variant}', 'monster': monster, 'variant': variant,
+                            'lods': {}, 'image': murl(mroot, views_dir(mroot, monster, variant) / 'front.png'),
+                            'damaged': f'{type(exc).__name__}: {exc}'})
+    return out + importable_raws(mroot)
 
 
 def variant_cards(root: Path) -> dict[str, list[dict]]:
-    """{stage: [card]} of every monster variant (approved / 3d / completed), including flat picks to import."""
+    """{stage: [card]} of every monster variant (approved / 3d / completed), including flat picks to import; a variant whose state cannot
+    be read is a read-only damaged card (F16)."""
     mroot = mroot_of(root)
     tasks = _tasks_by_variant(root)
     tabs: dict[str, list[dict]] = {'approved': [], '3d': [], 'completed': []}
     for raw in variant_raws(root):
-        card = variant_card(root, mroot, raw, tasks)
+        try:
+            card = variant_card(root, mroot, raw, tasks)
+        except Exception as exc:  # noqa: BLE001
+            card = _damaged_card(raw, f'{type(exc).__name__}: {exc}')
         tabs[card['stage']].append(card)
     return tabs
 
 
 def state_cards(root: Path) -> dict[str, list[dict]]:
     """HOOK (catalog._build_state): every monster card per tab: concept cards (concepts / provisional / archive / trash) and variant cards
-    (approved / 3d / completed). Replaces the `monsters.cards` loop."""
-    tabs = concept_cards(root)
-    for tab, cards in variant_cards(root).items():
+    (approved / 3d / completed). Never raises: a monster root that cannot be read gives no cards (F16)."""
+    try:
+        tabs = concept_cards(root)
+    except Exception:  # noqa: BLE001
+        tabs = {s: [] for s in SHOWN_STAGES}
+    try:
+        variants = variant_cards(root)
+    except Exception:  # noqa: BLE001
+        variants = {}
+    for tab, cards in variants.items():
         tabs.setdefault(tab, []).extend(cards)
     return tabs
 
 
 def view_task_info(root: Path, st: dict | None) -> dict | None:
-    """`views[].task` of the item: the runner's status in the UI's words (queued | running | done | failed), the attempt limit of the task
-    file and, for a failed task, the reason (the runner records no text: the last job and its exit)."""
-    if not st or not st['exists']:
+    """`views[].task` of the item: the runner's status in the UI's words (queued | running | done | failed | cancelled), the attempt limit
+    of the task file and, for a failed task, the reason (the runner's error, else the last job and its exit)."""
+    if not st or not st['exists'] or st.get('foreign'):
         return None
     task_file = read_obj(batch_dir(root) / 'tasks' / f'{st["name"]}.json')
     state = RUNNER_STATE.get(st['state'], st['state'])
-    error = f'no image written (last job {st["job"]}, exit {st["exit"]})' if state == 'failed' else None
+    error = (st.get('error') or f'no image written (last job {st["job"]}, exit {st["exit"]})') if state == 'failed' else None
     return {'name': st['name'], 'state': state, 'attempts': st['attempts'], 'max_attempts': task_file.get('max_attempts'), 'error': error,
             'job': st['job'], 'started': st['started']}
 
 
 def variant_item(root: Path, item_id: str) -> dict:
     """The item of a monster variant, whatever its stage (web/monster_views.js, web/monster3d.js): the raw card plus views [{name, file,
-    exists, url, enabled, planned, task, retry}] (always front, left, back, right), phase (legacy | generating | choose | frozen | import),
-    legacy, importable, unattended, frozen, draft_differs, conversion (conversion_info), library_hint / library and the pick record."""
+    exists, valid, problem, url, enabled, planned, task, retry}] (always front, left, back, right), views_rev, phase (legacy | generating |
+    choose | frozen | import | manual), legacy, importable, unattended, frozen, draft_differs, conversion (conversion_info), lods[].sha256,
+    reduce (reduce_status), library_hint / library and the pick record. A damaged variant is a read-only item with `damaged` (F16)."""
     mroot = mroot_of(root)
     monster, variant = parse_monster_id(item_id)
     raw = next((r for r in variant_raws(root) if r['id'] == item_id), None)
     if raw is None:
         raise not_found(f'Unknown monster {item_id}')
     tasks = _tasks_by_variant(root)
+    try:
+        return _variant_item(root, mroot, monster, variant, raw, tasks)
+    except (guard.Unreadable, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        error = f'{type(exc).__name__}: {exc}'
+        card = _damaged_card(raw, error)
+        return raw | {'stage': card['stage'], 'card': card, 'damaged': {'error': error}, 'state': 'damaged', 'views': [], 'phase': 'damaged',
+                      'legacy': False,
+                      'importable': False, 'frozen': None, 'conversion': None, 'actions': []}
+
+
+def _variant_item(root: Path, mroot: Path, monster: str, variant: str, raw: dict, tasks: dict) -> dict:
+    if raw.get('damaged'):
+        raise guard.Unreadable(raw['damaged'])
     card = variant_card(root, mroot, raw, tasks)
-    vdir = views_dir(mroot, monster, variant)
+    vdir, mdir = views_dir(mroot, monster, variant), models_dir(mroot, monster, variant)
     vj = read_views_json(vdir)
     available = available_views(vdir)
     ticks = ticks_of(vj, available)
@@ -1523,23 +2446,34 @@ def variant_item(root: Path, item_id: str) -> dict:
     for name in VIEW_ORDER:
         path = vdir / view_file(name)
         st = states.get(name)
-        failed = bool(st and st['exists'] and st['state'] == 'failed')
-        unwritten = name in planned and not (st and st['exists'])
+        problem = view_problem(vdir, name) if path.is_file() else None
+        unwritten = name in planned and not (st and st['exists'] and not st.get('foreign'))
+        settled = not (st and st['exists'] and not st.get('foreign')) or st['state'] in TERMINAL_VIEW_STATES
         url = murl(mroot, path) or (raw.get('image') if importing and name == 'front' else None)
-        views.append({'name': name, 'file': view_file(name), 'exists': path.is_file(), 'url': url,
-                      'enabled': ticks.get(name, False), 'planned': name in planned, 'task': view_task_info(root, st),
-                      'retry': name != 'front' and not importing and not path.is_file() and (failed or unwritten)})
+        views.append({'name': name, 'file': view_file(name), 'exists': path.is_file(), 'valid': path.is_file() and problem is None,
+                      'problem': problem, 'url': url, 'enabled': ticks.get(name, False), 'planned': name in planned,
+                      'task': view_task_info(root, st),
+                      'retry': name != 'front' and not importing and vj is not None and settled and
+                               (problem is not None or not path.is_file()) and (name in planned or bool(st and st['exists'])) and
+                               (unwritten or task_terminal(st) or problem is not None)})
     frozen = (vj or {}).get('frozen')
     frozen = frozen | {'names': [str(f)[:-4] for f in frozen.get('files') or []]} if isinstance(frozen, dict) else None
     chosen = [n for n in VIEW_ORDER if ticks.get(n)]
     rec = read_variant_names(mroot, monster)['variants'].get(variant)
-    phase = 'import' if importing else views_phase(root, mroot, monster, variant, vj, states)
+    phase = 'manual' if raw.get('manual') else 'import' if importing else views_phase(root, mroot, monster, variant, vj, states)
     lib = library_info(mroot, monster)
-    return raw | {'stage': card['stage'], 'card': card,
-                  'views': views, 'views_json': vj, 'phase': phase, 'legacy': phase == 'legacy', 'importable': importing,
-                  'unattended': bool((vj or {}).get('unattended')), 'frozen': frozen,
+    lods = {lv: dict(info) | {'sha256': file_sha256(mdir / 'reduced' / f'lod_error_{lv}.glb')}
+            for lv, info in (raw.get('lods') or {}).items()}
+    generation = frozen_digest((vj or {}).get('frozen'))
+    reduce = reduce_status(mdir, generation) if raw.get('lods') else None
+    return raw | {'stage': card['stage'], 'card': card, 'lods': lods, 'damaged': None,
+                  'views': views, 'views_json': vj, 'views_rev': views_rev(vdir, vj), 'phase': phase,
+                  'legacy': phase == 'legacy' or bool(reduce and reduce.get('legacy')),
+                  'importable': importing, 'unattended': bool((vj or {}).get('unattended')), 'frozen': frozen,
                   'draft_differs': frozen is not None and chosen != frozen['names'],
-                  'conversion': conversion_info(root, mroot, monster, variant, tasks.get(f'{monster}/{variant}'), frozen),
+                  'conversion': conversion_info(root, mroot, monster, variant, tasks.get(f'{monster}/{variant}'),
+                                                (vj or {}).get('frozen'), vj=vj),
+                  'reduce': reduce,
                   'library': lib, 'library_hint': library_hint(lib), 'pick': rec if isinstance(rec, dict) else None}
 
 
@@ -1554,48 +2488,70 @@ def item(root: Path, item_id: str) -> dict:
 
 # ----------------------------------------------------------------------------------------------------------- auto freeze
 
-def auto_freeze(root: Path) -> list[str]:
-    """HOOK (orchestrator tick, through monster_lane.tick): every variant with views.json `unattended: true`, nothing frozen, and no view
-    task pending / running is frozen with every available view (D, "unattended"). Returns the `<monster>/<variant>` frozen now."""
+def _freeze_ready(root: Path, mroot: Path, monster: str, variant: str, vj: dict) -> list[str] | None:
+    """The files an unattended freeze would take now, or None while it must wait (F9): EVERY planned view task is terminal (done / failed /
+    cancelled; a task that was never written is not), and the views to freeze are the valid ones (at most four, view order)."""
+    vdir = views_dir(mroot, monster, variant)
+    states = view_states(root, mroot, monster, variant)
+    for view in planned_views(vj):
+        if not task_terminal(states.get(view)):
+            return None
+    files = [view_file(n) for n in available_views(vdir)][:4]
+    return files or None
+
+
+def auto_freeze(root: Path, errors: list | None = None) -> list[str]:
+    """HOOK (orchestrator tick, through monster_lane.tick): every variant with views.json `unattended: true`, nothing frozen, no conversion
+    started and every planned view task terminal is frozen with its valid views (D, "unattended"); the task states and the outputs are
+    checked again under the monster lock (F9). One variant's error never stops the others (F16; appended to `errors`). Returns the
+    `<monster>/<variant>` frozen now."""
     root, mroot = Path(root), mroot_of(root)
     done = []
     for monster in pipeline_monsters(mroot):
         for variant in _dirs(mroot / 'pipeline' / monster / 'views'):
-            vdir = views_dir(mroot, monster, variant)
-            vj = read_views_json(vdir)
-            if not vj or not vj.get('unattended') or vj.get('frozen'):
-                continue
-            if views_phase(root, mroot, monster, variant, vj) != 'choose':
-                continue
-            mdir = models_dir(mroot, monster, variant)
-            if conversion_started(mdir):
-                continue
             try:
+                vdir = views_dir(mroot, monster, variant)
+                vj = read_views_json(vdir)
+                if not vj or not vj.get('unattended') or vj.get('frozen'):
+                    continue
+                if _freeze_ready(root, mroot, monster, variant, vj) is None:
+                    continue
+                if conversion_started(models_dir(mroot, monster, variant)):
+                    continue
                 with monster_lock(root, monster):
+                    contained(mroot, vdir)
                     vj = read_views_json(vdir)
                     if not vj or vj.get('frozen') or not vj.get('unattended'):
                         continue
-                    files = [view_file(n) for n in available_views(vdir)][:4]
-                    if not files:
+                    files = _freeze_ready(root, mroot, monster, variant, vj)
+                    if files is None:
                         continue
-                    vj['views'] = [{'name': n[:-4], 'enabled': True} for n in files]
+                    vj['views'] = [{'name': n, 'enabled': view_file(n) in files} for n in available_views(vdir)]
                     vj['frozen'] = freeze(vdir, files) | {'auto': True}
                     write_views_json(vdir, vj)
                 done.append(f'{monster}/{variant}')
-            except (guard.Conflict, OSError):
-                continue
+            except Exception as exc:  # noqa: BLE001
+                if errors is not None:
+                    errors.append(f'auto-freeze {monster}/{variant}: {type(exc).__name__}: {exc}')
     return done
 
 
-def frozen_variants(root: Path) -> list[dict]:
-    """Every variant whose views.json has a frozen list: {monster, variant, frozen, digest}."""
+def frozen_variants(root: Path, errors: list | None = None) -> list[dict]:
+    """Every variant whose views.json has a frozen list: {monster, variant, frozen, digest, views_json}. A damaged views.json is skipped and
+    reported in `errors` (F16)."""
     mroot = mroot_of(root)
     out = []
     for monster in pipeline_monsters(mroot):
         for variant in _dirs(mroot / 'pipeline' / monster / 'views'):
-            vj = read_views_json(views_dir(mroot, monster, variant))
+            try:
+                vj = read_views_json(views_dir(mroot, monster, variant))
+            except Exception as exc:  # noqa: BLE001
+                if errors is not None:
+                    errors.append(f'{monster}/{variant}: {type(exc).__name__}: {exc}')
+                continue
             if vj and vj.get('frozen'):
-                out.append({'monster': monster, 'variant': variant, 'frozen': vj['frozen'], 'digest': frozen_digest(vj['frozen'])})
+                out.append({'monster': monster, 'variant': variant, 'frozen': vj['frozen'], 'digest': frozen_digest(vj['frozen']),
+                            'views_json': vj})
     return out
 
 
@@ -1644,6 +2600,8 @@ def migration_plan(root: Path) -> dict:
         monster = monster_for_folder(mroot, folder)
         state = read_state(fdir, strict=False)
         names = read_variant_names(mroot, monster) if (mroot / 'pipeline' / monster).is_dir() else {'variants': {}}
+        if names.get('error') and not state.get('error'):
+            state = state | {'error': f'pipeline/{monster}/variant_names.json: {names["error"]}'}     # a damaged ledger: nothing is migrated (F11)
         by_concept: dict[str, list[str]] = {}
         for variant, rec in names['variants'].items():
             if isinstance(rec, dict) and isinstance(rec.get('concept'), str):
@@ -1687,6 +2645,18 @@ def migration_plan(root: Path) -> dict:
         totals['kept'] += len(entry['kept'])
         folders.append(entry)
     imports = [{'monster': m, 'variant': v} for m in pipeline_monsters(mroot) for v in importable(mroot, m)]
+    # a pick the migration maps (sha256 / override) but variant_names.json does not list is importable too once applied (F15)
+    known = {(i['monster'], i['variant']) for i in imports}
+    for entry in folders:
+        for rec in entry['approved']:
+            pair = (rec['monster'], rec['variant'])
+            if pair in known or ARMOUR_VARIANT.fullmatch(rec['variant']) or not (mroot / 'pipeline' / rec['monster']).is_dir():
+                continue
+            if views_dir(mroot, *pair).exists() or models_dir(mroot, *pair).exists():
+                continue
+            if 'front.png' in flat_pick_files(mroot, *pair):
+                imports.append({'monster': pair[0], 'variant': pair[1], 'how': rec['how']})
+                known.add(pair)
     return {'time': now(), 'monster_root': str(mroot), 'totals': totals, 'folders': folders, 'importable': imports}
 
 

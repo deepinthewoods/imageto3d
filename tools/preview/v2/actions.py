@@ -65,6 +65,20 @@ MANUAL_CHECK = ('manual check needed: this entry was recorded before promotions 
                 'folder it promoted; check approved/{set} by hand (move it back or claim it), then remove the entry')
 
 
+class NamespaceTaken(guard.Conflict):
+    """The set id would share another set's convert-list family (phase 5 review row 3): `<set>_<race>` of an existing set, or the base of an
+    existing `<id>_<race>` set. HTTP 409 code `namespace`."""
+    code = 'namespace'
+
+
+def check_namespace(root: Path, set_name: str) -> None:
+    """Reserve the family namespace at approval (convert_list.namespace_conflict): refuse a set id that would inherit another set's
+    pre-authorized family entry or pre-authorize another set."""
+    problem = convert_list.namespace_conflict(root, set_name)
+    if problem:
+        raise NamespaceTaken(problem)
+
+
 def _undo(verb: str | None, item_id: str | None, args: dict | None = None, rev: int | None = None) -> dict | None:
     if not verb or not item_id:
         return None
@@ -411,6 +425,7 @@ def legacy_approve(root: Path, kind: str, parts: list[str]) -> dict:
     approved_set = f'{batch.name}_{key}'               # workflow.promote's default set id
     if (root / 'approved' / approved_set).exists():
         raise FileExistsError(f'approved/{approved_set} already exists')
+    check_namespace(root, approved_set)
     dst = serve.unique(root / 'trash' / 'concepts' / batch.name)
     result: dict = {}
     promotion_id = uuid.uuid4().hex
@@ -595,7 +610,10 @@ def concept_action(root: Path, verb: str, item_id: str, args: dict) -> dict:
         result = hop_to_provisional(root, kind, name)
         return result | {'undo': _undo('unapprove', f'provisional:{name}', {'to': kind})}
     if verb == 'approve':
-        # approval = the processing request (DESIGN_PHASE4.md B / H): once the set is in approved/, it goes on the convert list
+        # approval = the processing request (DESIGN_PHASE4.md B / H): once the set is in approved/, it goes on the convert list; the set id's
+        # family namespace is reserved first (phase 5 review row 3)
+        if kind in ('concepts', 'archive', 'provisional'):
+            check_namespace(root, name)
         if kind in ('concepts', 'archive'):
             result = add_to_convert_list(root, name, direct_approve(root, kind, name))
             return result | {'undo': _undo('unapprove', f'approved:{name}', {'to': kind})}
@@ -646,6 +664,8 @@ def add_to_convert_list(root: Path, set_name: str | None, result: dict) -> dict:
         result['convert_list'] = added
         if added['excluded']:
             notes.append(f'{set_name} is on the convert list but excluded by {", ".join(added["excluded"][set_name])} in convert_sets.txt')
+        for item in (added.get('skipped') or {}).get(set_name, []):
+            notes.append(f'{item["id"]} was not added to the convert list: {item["reason"]}')
     except Exception as exc:  # noqa: BLE001  (the approval itself already happened)
         notes.append(f'convert list not updated ({type(exc).__name__}: {exc}); use Release in the Queue tab')
         result['convert_list'] = None
@@ -1266,7 +1286,7 @@ def release_set(root: Path, set_id: object) -> dict:
     if not isinstance(set_id, str) or not NAME.fullmatch(set_id):
         raise ValueError('set must be a set id')
     races = serve._base_races(root)
-    prefixes = sorted({job['set'] for job in convert_list.staged_jobs(root) if catalog.job_set(job['job'], races) == set_id})
+    prefixes = sorted({job['set'] for job in convert_list.staged_jobs(root) if catalog.job_set(job['job'], races, root) == set_id})
     if not prefixes and set_id not in catalog.derive_all(root)['sets']:
         raise catalog.NotFound(f'Unknown set {set_id}')
     added = convert_list.add_sets(root, [set_id], extra=prefixes)
@@ -1463,10 +1483,18 @@ def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
         if task['state'] in ('failed', 'cancelled') and (not task_approved(root, task) or
                                                         (task['lane'] == 'layers' and task.get('approval_gen') not in (None, gen))):
             raise ValueError(f'task {task_id} belongs to an approval that was withdrawn or changed; approve the set again instead')
-        done = queue.retry(task_id, approval_gen=gen if task['lane'] == 'layers' else None)
+        if task['lane'] == monster_lane.LANE:
+            # monster (phase 5 review F4): the generation's persisted disposition is cleared first, Run now and its override are dropped
+            done = monster_lane.retry_task(root, task_id)
+        else:
+            done = queue.retry(task_id, approval_gen=gen if task['lane'] == 'layers' else None)
     elif op == 'cancel':
         # a MANUAL cancel holds for the current approval generation: reconcile never queues it again (re-check R8)
-        done = queue.cancel(task_id, 'manual', manual_gen=(gen or 'manual') if task['lane'] == 'layers' else 'manual')
+        if task['lane'] == monster_lane.LANE:
+            # monster (phase 5 review F4): `cancelled` is persisted in the variant's views.json first, so a rebuilt queue never revives it
+            done = monster_lane.cancel_task(root, task_id, 'manual')
+        else:
+            done = queue.cancel(task_id, 'manual', manual_gen=(gen or 'manual') if task['lane'] == 'layers' else 'manual')
     else:
         import time
         token = data.get('token')

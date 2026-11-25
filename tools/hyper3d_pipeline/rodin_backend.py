@@ -24,6 +24,21 @@ cross-process browser lock `.codex_jobs/_batch/browser_hyper3d.lock` before the 
 process; waits up to $HYPER3D_LOCK_WAIT seconds, default 600, then Stop 'Hyper3D profile busy'); the monster wrappers inherit it.
 Every command (submit / collect / preview / inspect / bind) holds `<out_dir>/.record.lock` for its whole run and reads the record
 only after taking it; a second command on the same output stops at once with 'another process is handling this output'.
+
+Click-time paid gate (DESIGN_PHASE4 I.8, tools/paid_gate.py): every credit-capable step (geometry confirm, material generate,
+material confirm) calls paid_gate.check() when it starts, before it writes its intent and again right before the click. A closed
+gate raises GateClosed: no intent is left behind (one written a moment earlier is withdrawn: nothing was clicked), the CLI prints
+`PAID GATE CLOSED: <reason>` and exits EXIT_GATE_CLOSED (4); the caller waits for its gate and runs collect again. The free
+preview submit is not gated. Without $IMAGETO3D_PAID_GATE (a manual run) the explicit --allow-paid is the authority.
+
+Free preview resolution (phase 5 review finding 1): the `free_preview` intent is resolved (pending_action cleared,
+actions.free_preview gets done_at / model_id / resolved_by) as soon as its model is positively identified: the URL captured at
+submit, a `bind`, and on load by collect / preview / inspect of an existing record that is bound to a model. An unidentified
+click (no model URL) stays pending.
+
+Inputs (phase 5 review finding 7): submit copies the views it uploads into <out_dir>/upload_inputs/, uploads those copies and
+stores `inputs: [{name, sha256, size}]` (upload order, the exact bytes uploaded) and `upload_dir` in the record;
+`record_inputs(record)` reads it (None for a record written before the field existed = unknown).
 """
 import argparse
 import contextlib
@@ -57,6 +72,23 @@ def _load_tripo_module(name):
 
 views_omitted = _load_tripo_module('views_omitted')   # three-view module marker
 claim_lock = _load_tripo_module('claim_lock')         # try_lock / release_lock: the OS byte lock of workflow.py claim
+
+
+def _load_paid_gate():
+    """tools/paid_gate.py, shared through sys.modules['paid_gate'] so every importer sees one GateClosed class."""
+    if 'paid_gate' in sys.modules:
+        return sys.modules['paid_gate']
+    spec = importlib.util.spec_from_file_location('paid_gate', HERE.parent / 'paid_gate.py')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules['paid_gate'] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+paid_gate = _load_paid_gate()
+GateClosed = paid_gate.GateClosed               # a paid click was not made because the gate closed (resumable)
+EXIT_GATE_CLOSED = paid_gate.EXIT_GATE_CLOSED   # the CLI's exit code for it
+UPLOAD_DIR = 'upload_inputs'                    # <out_dir>/upload_inputs/: the exact files submit uploaded
 RECORD = 'studio_submission.json'
 COST_KINDS = ('geometry', 'material_generate', 'material_confirm')
 STAGES_TO_ACT = {'geometry_preview', 'material_ready', 'material_preview', 'export_ready'}
@@ -183,9 +215,10 @@ class Record:
         with self.path.with_name('events.jsonl').open('a') as stream:
             stream.write(json.dumps({'at': now(), 'event': event, **changes}, default=str) + '\n')
 
-    def bind(self, url):
+    def bind(self, url, resolve=True):
         """Bind the model URL under the output lock (taken here when the caller does not hold it yet; the record is then
-        re-read first, so a bind run on its own never writes back a stale copy)."""
+        re-read first, so a bind run on its own never writes back a stale copy). A bound model identifies the free preview:
+        with `resolve` its pending intent is resolved too (resolve_free_preview)."""
         ident = model_id(url)
         if not ident:
             raise ValueError('Expected a Hyper3D model URL ending in a UUID')
@@ -195,6 +228,38 @@ class Record:
             if self.data.get('model_id') not in (None, ident):
                 raise ValueError('This record is already bound to a different model')
             self.save('model_linked', model_id=ident, model_url=f'{BASE}/{ident}', project_id=ident)
+            if resolve:
+                self.resolve_free_preview('bind')
+
+    def identified_model(self):
+        """The model id this record is positively bound to (its model_url parses to a Hyper3D model UUID and model_id does not
+        contradict it), else None."""
+        ident = model_id(self.data.get('model_url') or '')
+        if ident and self.data.get('model_id') not in (None, ident):
+            return None
+        return ident
+
+    def resolve_free_preview(self, how, **changes):
+        """Phase 5 review finding 1: a pending `free_preview` intent whose model is positively identified (a bound model URL) is
+        done: pending_action is cleared and actions.free_preview gets done_at / model_id / resolved_by, in ONE save together with
+        `changes`. Returns True when it resolved. An unidentified click (no model URL) and any other pending action stay as they
+        are (`changes`, when given, are saved anyway)."""
+        ident = self.identified_model()
+        if self.data.get('pending_action') != 'free_preview' or not ident:
+            if changes:
+                self.save('updated', **changes)
+            return False
+        actions = dict(self.data.get('actions') or {})
+        entry = dict(actions.get('free_preview') or {})
+        entry.update(done_at=now(), model_id=ident, resolved_by=how)
+        actions['free_preview'] = entry
+        self.save('free_preview_resolved', pending_action=None, actions=actions, **changes)
+        return True
+
+    def restore(self, data, event):
+        """Put back a copy of the record taken before an intent that was never clicked (the paid gate closed in between)."""
+        self.data = data
+        self.save(event)
 
     def intent(self, action):
         if self.data.get('pending_action'):
@@ -207,6 +272,57 @@ class Record:
 
     def observed(self, stage):
         self.save('server_stage_observed', stage=stage, pending_action=None)
+
+
+def load_record(out_dir, how):
+    """The output's record (the caller holds the output lock), with a pending free preview of a bound model resolved (finding 1)."""
+    record = Record(Path(out_dir) / RECORD)
+    record.resolve_free_preview(how)
+    return record
+
+
+def record_inputs(record):
+    """The ordered inputs a submission uploaded, [{name, sha256, size}] (the exact bytes, in upload order), or None when the
+    record predates the field (unknown). `record`: a Record, a record dict, an output dir or a studio_submission.json path.
+    ValueError for a malformed field."""
+    if isinstance(record, Record):
+        data = record.data
+    elif isinstance(record, dict):
+        data = record
+    else:
+        path = Path(record)
+        data = json.loads((path / RECORD if path.is_dir() else path).read_text(encoding='utf-8-sig'))
+    inputs = data.get('inputs')
+    if inputs is None:
+        return None
+    if not isinstance(inputs, list):
+        raise ValueError('record inputs is not a list')
+    result = []
+    for item in inputs:
+        if not (isinstance(item, dict) and isinstance(item.get('name'), str) and isinstance(item.get('sha256'), str)
+                and re.fullmatch(r'[0-9a-f]{64}', item['sha256']) and isinstance(item.get('size'), int)
+                and not isinstance(item.get('size'), bool) and item['size'] >= 0):
+            raise ValueError(f'malformed record input {item!r}')
+        result.append({'name': item['name'], 'sha256': item['sha256'], 'size': item['size']})
+    return result
+
+
+def snapshot_inputs(plan, out_dir):
+    """Copy the views of `plan` into <out_dir>/upload_inputs/ and hash the copies: (dir, [{name, sha256, size}] of the uploaded
+    views in upload order). The browser uploads these copies, so the recorded hashes are the bytes uploaded. A views_omitted.json
+    marker is copied too (validate_views reads it)."""
+    target = Path(out_dir) / UPLOAD_DIR
+    target.mkdir(parents=True, exist_ok=True)
+    source = Path(plan['views_dir'])
+    if (source / 'views_omitted.json').is_file():
+        shutil.copyfile(source / 'views_omitted.json', target / 'views_omitted.json')
+    else:
+        (target / 'views_omitted.json').unlink(missing_ok=True)
+    for name in plan['images']:
+        shutil.copyfile(source / name, target / name)
+    inputs = [{'name': name, 'sha256': sha256_file(target / name), 'size': (target / name).stat().st_size}
+              for name in plan['uploaded']]
+    return target, inputs
 
 
 # --------------------------------------------------------------------------- cost guard
@@ -348,7 +464,14 @@ def submit(views_dir, out_dir, *, config=None, session_factory=None, dry_run=Fal
 
 
 def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
-    record = Record.create(out_dir / RECORD, _record_data(plan, config, views_dir, out_dir))
+    if (out_dir / RECORD).exists():   # checked before the snapshot: an existing record's upload_inputs/ are never overwritten
+        raise Stop(f'Submission record already exists; collect or inspect instead: {out_dir / RECORD}')
+    upload_dir, inputs = snapshot_inputs(plan, out_dir)
+    upload_plan = validate_views(upload_dir, config)   # the copies are what goes up: checked like the originals
+    if upload_plan['uploaded'] != plan['uploaded']:
+        raise Stop(f'upload snapshot differs from the views: {upload_plan["uploaded"]} != {plan["uploaded"]}')
+    record = Record.create(out_dir / RECORD, {**_record_data(plan, config, views_dir, out_dir),
+                                              'upload_dir': str(upload_dir.resolve()), 'inputs': inputs})
     session_factory = session_factory or (lambda: SeleniumRodin(config, out_dir))
     with contextlib.ExitStack() as stack:
         try:
@@ -359,7 +482,7 @@ def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
             not_submitted(record, f'{type(exc).__name__} starting the browser: {str(exc).splitlines()[0][:200]}')
         try:
             session.open_workspace()
-            paths = [(name, Path(plan['views_dir']) / name) for name in plan['uploaded']]
+            paths = [(name, Path(upload_plan['views_dir']) / name) for name in upload_plan['uploaded']]
             prepared = session.prepare_multiview(paths, config) or {}
             record.save('uploaded', upload_info=prepared)
             session.screenshot('before_submit')
@@ -382,8 +505,9 @@ def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
         url = session.wait_model_url(600)       # Rodin can sit on GENERATING for minutes when busy
         session.screenshot('after_submit')
         if url and model_id(url):
-            record.bind(url)
-            record.save('submitted', status='submitted', after_submit_at=now())
+            record.bind(url, resolve=False)
+            # the model is identified: the free intent is done (finding 1), in the same write as the status
+            record.resolve_free_preview('submit', status='submitted', after_submit_at=now())
         elif session.insufficient_balance():
             not_submitted(record, f'Hyper3D answered "{INSUFFICIENT}" to Free Preview')
         else:
@@ -392,12 +516,14 @@ def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
 
 
 def _step(record, session, config, kind, expected, allow_paid, accept_preview=False, prepare=None):
-    """Guard one credit-capable click: permissions, option selection, displayed cost, screenshot, intent."""
+    """Guard one credit-capable click: permissions, paid gate, option selection, displayed cost, screenshot, paid gate again,
+    intent. Returns a copy of the record from before the intent (_click puts it back when the gate closes before the click)."""
     if not allow_paid:
         raise Stop(f'{kind} may spend credits; pass --allow-paid')
     if kind == 'geometry' and not accept_preview:
         session.screenshot('review_required')
         raise Stop('Preview ready: inspect review_required.png / the model URL, then pass --accept-preview')
+    paid_gate.check()          # the stage wait may have lasted minutes: a closed gate stops before anything is selected
     if prepare:
         prepare()
     cost, text = session.read_cost(kind)
@@ -410,8 +536,22 @@ def _step(record, session, config, kind, expected, allow_paid, accept_preview=Fa
     budget = config.get('budget_credits')
     if budget is not None and committed > budget:
         raise Stop(f'{kind}: committed credits {committed} would exceed budget_credits {budget}')
+    paid_gate.check()          # immediately before the intent (DESIGN_PHASE4 I.8): closed = no intent written
+    before = json.loads(json.dumps(record.data))
     record.intent(kind)
     record.save('credits_committed', credits_committed=committed)
+    return before
+
+
+def _click(record, session, kind, before):
+    """The credit-capable click, with the paid gate checked right before it. A gate that closed after the intent was written
+    puts the record back as it was before the intent (nothing was clicked, so nothing may stay pending) and raises GateClosed."""
+    try:
+        paid_gate.check()
+    except paid_gate.GateClosed:
+        record.restore(before, f'{kind}_intent_withdrawn')
+        raise
+    session.click(kind)
 
 
 def collect(out_dir, *, allow_paid=False, accept_preview=False, expected_costs=None,
@@ -426,7 +566,7 @@ def collect(out_dir, *, allow_paid=False, accept_preview=False, expected_costs=N
 
 
 def _collect_locked(out_dir, allow_paid, accept_preview, expected_costs, config, session_factory):
-    record = Record(out_dir / RECORD)
+    record = load_record(out_dir, 'collect')
     data = record.data
     if data.get('backend') != 'hyper3d':
         raise Stop(f'{record.path} is not a hyper3d record')
@@ -453,11 +593,12 @@ def _collect_locked(out_dir, allow_paid, accept_preview, expected_costs, config,
             exclude = {stage}
             if stage == 'geometry_preview':
                 # the raw option is selected before the cost is read: the price belongs to that choice
-                _step(record, session, config, 'geometry', expected, allow_paid, accept_preview,
-                      prepare=lambda: record.save('mesh_mode_selected',
-                                                  geometry_options_seen=session.select_mesh_mode(config)))
+                before = _step(record, session, config, 'geometry', expected, allow_paid, accept_preview,
+                               prepare=lambda: record.save('mesh_mode_selected',
+                                                           geometry_options_seen=session.select_mesh_mode(config)))
                 record.save('symmetric_selector', symmetric_selector=session.symmetric_value())
-                session.click('geometry')
+                before['symmetric_selector'] = record.data['symmetric_selector']   # an observation, kept on a withdrawal
+                _click(record, session, 'geometry', before)
             elif stage == 'material_ready':
                 effort = session.material_effort()
                 record.save('material_options_seen', material_options=effort)
@@ -468,11 +609,11 @@ def _collect_locked(out_dir, allow_paid, accept_preview, expected_costs, config,
                     raise Stop('8K is switched on; refusing (not in the configured material options)')
                 if config.get('de_light', True):
                     session.set_delight()
-                _step(record, session, config, 'material_generate', expected, allow_paid)
-                session.click('material_generate')
+                before = _step(record, session, config, 'material_generate', expected, allow_paid)
+                _click(record, session, 'material_generate', before)
             elif stage == 'material_preview':
-                _step(record, session, config, 'material_confirm', expected, allow_paid)
-                session.click('material_confirm')
+                before = _step(record, session, config, 'material_confirm', expected, allow_paid)
+                _click(record, session, 'material_confirm', before)
             elif stage == 'export_ready':
                 path, panel = session.export_glb(out_dir, config)
                 record.save('balance_end', balance_end=session.read_balance())
@@ -510,7 +651,7 @@ def preview(out_dir, *, config=None, session_factory=None):
 
 
 def _preview_locked(out_dir, config, session_factory):
-    record = Record(out_dir / RECORD)
+    record = load_record(out_dir, 'preview')
     if record.data.get('backend') != 'hyper3d' or not record.data.get('model_url'):
         raise Stop('record is not a submitted hyper3d model')
     session_factory = session_factory or (lambda: SeleniumRodin(config, out_dir))
@@ -544,7 +685,7 @@ def inspect_only(out_dir, *, config=None, session_factory=None):
 
 
 def _inspect_locked(out_dir, config, session_factory):
-    record = Record(out_dir / RECORD)
+    record = load_record(out_dir, 'inspect')   # a bound model identifies the free preview: its marker is cleared here
     if not record.data.get('model_url'):
         return record.data
     session_factory = session_factory or (lambda: SeleniumRodin(config, out_dir))
@@ -1107,6 +1248,9 @@ def main(argv=None):
             result = inspect_only(args.out_dir)
         else:
             result = bind(args.out_dir, args.url)
+    except GateClosed as exc:
+        print(f'PAID GATE CLOSED: {exc}', file=sys.stderr)
+        raise SystemExit(EXIT_GATE_CLOSED)
     except Stop as exc:
         print(f'STOPPED: {exc}', file=sys.stderr)
         raise SystemExit(3)

@@ -3,10 +3,14 @@
 // chosen_lod.json through monsters.write_choice).
 // PHASE 5 (marked below): Approve (button + key A, confirmation) in 3D, Unapprove in Completed, Reconvert (paid, confirmation with the view
 // ticks; sends args.confirm), and the PIPELINE_LIBRARY hint badge. Item fields: tools/preview/v2/DESIGN_PHASE5.md section H.
+// Phase 5 review fixes: Approve sends the LOD AND the sha256 of the model as displayed ({lod, glb_sha256}; 409 `changed` = the model
+// changed since the modal loaded it: it is loaded again); Reconvert sends the exact ticked files and the views revision the user saw
+// ({files, views_rev, confirm}); a `damaged` reduction is read-only (the error, no buttons); a `legacy` one carries a badge.
 import { api } from './api.js';
 import { createViewer } from './viewer.js';
 import { refresh } from './state.js';
 import { toast } from './toast.js';
+import { conflictMessage, damageText, isDamaged, viewFile } from './monster_common.js';
 import { badge, button, faceText, field, fillSelect, h, lodLabel, picture, pretty, storage, toggle } from './util.js';
 import { mutationKey, showImage } from './modal.js';
 import { confirmDialog } from './confirm.js';   // PHASE 5
@@ -40,8 +44,9 @@ export async function showMonster3d(modal, host) {
   try { item = { ...card, ...(await api.item(card.id)) }; } catch { /* the card from the state is enough */ }
   if (!host.isCurrent()) return;
 
-  const lods = item.lods || {};
-  const levels = LODS.filter(level => lods[level]);
+  let lods = item.lods || {};
+  let levels = LODS.filter(level => lods[level]);
+  const damaged = isDamaged(item);
   let wire = !!storage.get('wire', false);
   let shown = 0;
 
@@ -54,11 +59,13 @@ export async function showMonster3d(modal, host) {
   const libraryHint = item.library_hint || card.library_hint;   // PHASE 5: "no library folder mapping (add to PIPELINE_LIBRARY)"
   const outdated = (item.card?.badges || card.badges || []).filter(b => b.text === 'sections out of date');   // PHASE 5: Reconvert kept sections/
   modal.setBadges([badge('Monster', 'info'), badge(item.stage || card.stage || ''), ...(item.approved ? [badge('approved', 'ok')] : []),
-    ...(libraryHint ? [badge(libraryHint, 'warn')] : []), ...outdated.map(b => badge(b.text, b.tone))]);
+    ...(libraryHint ? [badge(libraryHint, 'warn')] : []), ...(item.legacy === true ? [badge('legacy reduction', 'warn')] : []),
+    ...(damaged ? [badge('damaged', 'error')] : []), ...outdated.map(b => badge(b.text, b.tone))]);
 
-  if (!levels.length) {
+  if (damaged || !levels.length) {
     message.hidden = false;
-    message.textContent = 'No reduced model yet';
+    message.dataset.state = damaged ? 'damaged' : 'empty';
+    message.textContent = damaged ? damageText(item) : 'No reduced model yet';     // a damaged variant: the error only, no action buttons
     modal.actions.classList.add('model-actions');
     return;
   }
@@ -83,6 +90,7 @@ export async function showMonster3d(modal, host) {
   fillSelect(lodSelect, levels.map(level => [level, `${lodLabel(level)} · ${faceText(lods[level].faces).replace(' faces', '')}`]),
     item.lod && lods[item.lod] ? item.lod : (lods['0p4'] ? '0p4' : levels[0]));
   let saved = item.lod && lods[item.lod] ? item.lod : null;
+  const shownSha = {};              // level -> the sha256 of the model this modal asked the viewer to show (what Approve vouches for)
 
   function sync() {
     const faces = lods[lodSelect.value]?.faces;
@@ -95,6 +103,7 @@ export async function showMonster3d(modal, host) {
 
   async function show() {
     const mine = ++shown;
+    shownSha[lodSelect.value] = lods[lodSelect.value]?.sha256 || null;
     sync();
     message.hidden = false;
     message.textContent = 'Loading...';
@@ -120,6 +129,26 @@ export async function showMonster3d(modal, host) {
     if (host.isCurrent()) sync();
   }
 
+  /** The model changed under this modal (409 `changed`): the item is read again and the shown level is loaded again. */
+  async function reloadModel() {
+    try {
+      item = { ...card, ...(await api.item(card.id)) };
+    } catch (error) {
+      toast(`Not reloaded: ${error.message}`);
+      return;
+    }
+    if (!host.isCurrent()) return;
+    lods = item.lods || {};
+    levels = LODS.filter(level => lods[level]);
+    if (!levels.length) { refresh().catch(() => {}); return; }
+    const keep = lods[lodSelect.value] ? lodSelect.value : (item.lod && lods[item.lod] ? item.lod : levels[0]);
+    fillSelect(lodSelect, levels.map(level => [level, `${lodLabel(level)} · ${faceText(lods[level].faces).replace(' faces', '')}`]), keep);
+    saved = item.lod && lods[item.lod] ? item.lod : null;
+    for (const key of Object.keys(shownSha)) delete shownSha[key];
+    show();
+    refresh().catch(() => {});
+  }
+
   // ---- PHASE 5: Approve / Unapprove / Reconvert ------------------------------------------------------------------------
   const stage = item.stage || card.stage;
   const name = card.title || pretty(card.name);
@@ -130,7 +159,9 @@ export async function showMonster3d(modal, host) {
     if (!canApprove || asking || !host.isCurrent()) return;
     asking = true;
     try {
+      // the level AND the digest of the model on screen, captured now: what the user confirms is what the server is asked to approve
       const level = lodSelect.value;
+      const sha = shownSha[level] || lods[level]?.sha256 || null;
       const ok = await confirmDialog({
         title: `Approve ${name}?`,
         lines: [`LOD ${lodLabel(level)} (${faceText(lods[level].faces)}) becomes the approved level and ${name} moves to Completed.`,
@@ -138,7 +169,15 @@ export async function showMonster3d(modal, host) {
           'The level stays locked until you Unapprove it in Completed.'],
         confirm: 'Approve',
       });
-      if (ok && host.isCurrent()) await host.actThenAdvance(card, 'approve', { args: { lod: level }, subject: `${name} (LOD ${lodLabel(level)})` });
+      if (!ok || !host.isCurrent()) return;
+      await host.actThenAdvance(card, 'approve', {
+        args: { lod: level, ...(sha ? { glb_sha256: sha } : {}) }, subject: `${name} (LOD ${lodLabel(level)})`, quiet: true,
+        onError: error => {
+          if (!error.conflict) return;
+          toast(conflictMessage(error, 'model'), { ms: 6000 });
+          if (error.code === 'changed') reloadModel(); else refresh().catch(() => {});
+        },
+      });
     } finally {
       asking = false;
     }
@@ -149,22 +188,35 @@ export async function showMonster3d(modal, host) {
     asking = true;
     try {
       const made = (item.views || []).filter(view => view.url);
-      const ticks = made.map(view => h('input', { type: 'checkbox', checked: view.enabled !== false, dataset: { view: view.name } }));
+      const viewsRev = item.views_rev;                    // the views revision the user is looking at
+      const ticks = made.map(view => h('input', { type: 'checkbox', checked: view.enabled !== false, dataset: { view: view.name },
+        onchange: () => listFiles() }));
+      const filesLine = h('p', { class: 'mv-reconvert-files', dataset: { files: '' } });
+      const ticked = () => made.filter((view, i) => ticks[i].checked).map(viewFile);
+      function listFiles() { filesLine.textContent = `Files used: ${ticked().join(', ') || 'none'}`; }
+      listFiles();
       const content = h('div', { class: 'mv-reconvert' }, made.map((view, i) => h('label', { class: 'mv-reconvert-view' },
-        h('img', { src: view.url, alt: view.name }), h('span', null, ticks[i], pretty(view.name)))));
+        h('img', { src: view.url, alt: view.name }), h('span', null, ticks[i], pretty(view.name)))), filesLine);
       const ok = await confirmDialog({
         title: `Reconvert ${name}?`,
         lines: ['This is PAID: it starts a new Hyper3D conversion that costs 0.5 Hyper3D credits.',
           'The current Hyper3D result and reduced models are moved aside (kept as *_prev_<time>), not deleted. The variant goes back to Approved while it converts.',
-          'The views ticked below are used:'],
+          'Exactly the views ticked below are used:'],
         content,
         confirm: 'Reconvert (0.5 credits)',
         danger: true,
       });
       if (!ok || !host.isCurrent()) return;
-      const enabled = Object.fromEntries(made.map((view, i) => [view.name, ticks[i].checked]));
-      if (!Object.values(enabled).some(Boolean)) { toast('Not reconverted: tick at least one view'); return; }
-      await host.actThenAdvance(card, 'reconvert', { args: { enabled, confirm: true }, subject: `${name} (reconvert)` });   // confirm: the server refuses a paid reconvert without it
+      const files = ticked();                             // read the moment the user confirmed
+      if (!files.length) { toast('Not reconverted: tick at least one view'); return; }
+      await host.actThenAdvance(card, 'reconvert', {
+        args: { files, views_rev: viewsRev, confirm: true }, subject: `${name} (reconvert)`, quiet: true,   // confirm: the server refuses a paid reconvert without it
+        onError: error => {
+          if (!error.conflict) return;
+          toast(conflictMessage(error, 'views'), { ms: 6000 });
+          refresh().catch(() => {});
+        },
+      });
     } finally {
       asking = false;
     }

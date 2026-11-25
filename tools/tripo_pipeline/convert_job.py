@@ -69,8 +69,13 @@ Usage (from the imageto3d folder):
   submitted earlier (its geometry/material confirmations cost credits). The free Tripo collect and the free Tripo retry do not wait;
   heavy local (Blender) steps are frozen by the supervisor as before.
 - Tripo browser lock (DESIGN_PHASE4 I.3): every studio.mjs call (submit, collect, retry) runs under
-  `.codex_jobs/_batch/browser_tripo.lock` (tripo_browser_lock.py), the lock the convert worker's and the preview app's balance checks take;
-  a busy lock is waited for. A paid step re-checks the pause/hold after it got the lock.
+  `.codex_jobs/_batch/browser_tripo.lock` and the reservation of the resolved Tripo Firefox profile (tripo_browser_lock.py; the child
+  gets $IMAGETO3D_TRIPO_PROFILE_LOCK / _TOKEN and studio.mjs verifies them), the locks the convert worker's and the preview app's balance
+  checks take; a busy lock is waited for. A paid step re-checks the pause/hold after it got the lock.
+- Click-time paid gate (DESIGN_PHASE4 I.8, tools/paid_gate.py): the paid children (a Tripo submit's studio.mjs, every rodin_backend.py
+  command) get $IMAGETO3D_PAID_GATE (`paid_gate.env_for(ROOT)`, or the one this process inherited) and check it again right before
+  their credit-capable click. A child that stopped there exits 4 (nothing clicked; its record unchanged or set aside): this process
+  waits for the gate again and repeats the step; it is never counted as a failure.
 --dry-run: opens Studio, fills the form and screenshots it without pressing Generate.
 --max-submits N: submit at most N new modules in this run (e.g. what the Tripo credit balance covers); the others are
   skipped, the job stays in processing/ with state `partially_converted` and the script exits 3. Re-run (e.g. with
@@ -124,6 +129,29 @@ SPLIT_METHODS = ('segment-first', 'per-face', 'none')
 WEARABLE_METHODS = ('cut', 'faces')
 
 
+def _load_paid_gate():
+    """tools/paid_gate.py by path (tools/ never joins sys.path), shared through sys.modules['paid_gate']."""
+    import importlib.util
+    if 'paid_gate' in sys.modules:
+        return sys.modules['paid_gate']
+    spec = importlib.util.spec_from_file_location('paid_gate', Path(__file__).resolve().parents[1] / 'paid_gate.py')
+    module = importlib.util.module_from_spec(spec)
+    sys.modules['paid_gate'] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+paid_gate = _load_paid_gate()
+GATE_CLOSED = paid_gate.EXIT_GATE_CLOSED   # a paid child stopped at a closed gate before its click: wait and repeat the step
+
+
+def gate_env():
+    """{IMAGETO3D_PAID_GATE: ...} for a paid child: the gate this process was given (a caller's own gate stays in force), else
+    CONVERT_HOLD / PAUSE of ROOT."""
+    inherited = os.environ.get(paid_gate.ENV)
+    return {paid_gate.ENV: inherited} if inherited else paid_gate.env_for(ROOT)
+
+
 def write_record(path, record):
     path.write_text(json.dumps(record, indent=2) + '\n', encoding='utf-8')
 
@@ -175,17 +203,59 @@ def wait_for_gate(key, step):
         print(f'== {key}: pause/hold lifted; {step}', flush=True)
 
 
-def run_studio(command, key, step, paid, **kwargs):
-    """subprocess.run(command, **kwargs) of a studio.mjs call under the Tripo browser lock (waited for). A paid step first waits
-    for the pause/hold gate and checks it again once it holds the lock (a pause may have started while it waited)."""
+def run_studio(command, key, step, paid, check=False, env=None, **kwargs):
+    """subprocess.run(command, **kwargs) of a studio.mjs call under the Tripo browser lock and profile reservation (waited for; the
+    child gets the reservation in its environment). A paid step first waits for the pause/hold gate, checks it again once it holds
+    the lock (a pause may have started while it waited) and passes the gate to the child, which checks it right before the Generate
+    click; a child that stopped there (exit GATE_CLOSED: nothing clicked, its record set aside) is waited for and run again.
+    `check`: raise CalledProcessError on any other non-zero exit."""
     while True:
         if paid:
             wait_for_gate(key, step)
         with tripo_browser_lock(ROOT, what=f'convert_job {key} {step}',
-                                announce=lambda text: print(f'== {key}: {text} before {step}', flush=True)):
+                                announce=lambda text: print(f'== {key}: {text} before {step}', flush=True)) as reservation:
             if paid and conversion_gate():
                 continue
-            return subprocess.run(command, **kwargs)
+            child_env = dict(os.environ if env is None else env, **(reservation or {}), **(gate_env() if paid else {}))
+            run = subprocess.run(command, env=child_env, **kwargs)
+        if paid and run.returncode == GATE_CLOSED:
+            print(f'== {key}: the paid gate closed before the click ({step}); waiting for it, then repeating', flush=True)
+            wait_for_child_gate(key, step, child_env)
+            continue
+        if check and run.returncode:
+            raise subprocess.CalledProcessError(run.returncode, command)
+        return run
+
+
+def run_paid_child(command, key, step, paid, **kwargs):
+    """subprocess.run of a non-Tripo backend command that may click a paid control (rodin_backend.py). The child always gets the
+    gate; a paid run waits for it first, and a child exit GATE_CLOSED (it stopped before a credit-capable click, record unchanged)
+    waits for the gate and runs the command again: a resumable wait, never a failure."""
+    env = kwargs.pop('env', None)
+    while True:
+        if paid:
+            wait_for_gate(key, step)
+        child_env = dict(os.environ if env is None else env, **gate_env())
+        run = subprocess.run(command, env=child_env, **kwargs)
+        if paid and run.returncode == GATE_CLOSED:
+            print(f'== {key}: the paid gate closed before a click ({step}); waiting for it, then resuming', flush=True)
+            wait_for_child_gate(key, step, child_env)
+            continue
+        return run
+
+
+def wait_for_child_gate(key, step, child_env):
+    """After a child's exit GATE_CLOSED: wait (printing once) until the gate the CHILD was given is open again (its extra `cmd`
+    included), so a gate that only the child's check sees as closed never turns into a tight respawn loop."""
+    announced = False
+    while True:
+        reason = paid_gate.closed_reason(child_env)
+        if not reason:
+            break
+        if not announced:
+            print(f'== {key}: PAUSED ({reason}); waiting before {step}', flush=True)
+            announced = True
+        time.sleep(GATE_POLL)
 
 
 # Several queue workers may convert different modules of one job at once: each module is claimed with a lock
@@ -400,10 +470,13 @@ def collect_and_reduce(key, out, backend='tripo', options=None, separable=False,
         if backend == 'tripo':
             run_studio(collect_command('tripo', out), key, 'Tripo collect', paid=False, check=True, cwd=ROOT)
         else:
-            if backend == 'hyper3d' and (options or {}).get('allow_paid'):
-                # its geometry / material confirmations cost credits: an existing submission waits like a new one
-                wait_for_gate(key, 'a paid Hyper3D collect')
-            run = subprocess.run(collect_command(backend, out, options), cwd=ROOT)
+            if backend == 'hyper3d':
+                # its geometry / material confirmations cost credits: an existing submission waits like a new one, and the child
+                # re-checks the gate right before each click (exit 4 = it stopped there: wait and resume)
+                run = run_paid_child(collect_command(backend, out, options), key, 'a paid Hyper3D collect',
+                                     paid=bool((options or {}).get('allow_paid')), cwd=ROOT)
+            else:
+                run = subprocess.run(collect_command(backend, out, options), cwd=ROOT)
             if run.returncode != 0:  # a guard stop (credits/permissions/sign-in) leaves the module resumable
                 raise SystemExit(f'{key}: {backend} collect stopped (exit {run.returncode}); '
                                  f'fix what it printed and re-run; record {submission}')
@@ -832,9 +905,11 @@ def main(argv):
                     if run.returncode != 0:  # a guard stop (--allow-paid/price/sign-in; pixal3d: bad inputs) leaves the module resumable
                         raise SystemExit(f'{key}: {module_backend} submit stopped (exit {run.returncode}); '
                                          f'fix what it printed and re-run')
-                else:
-                    subprocess.run(submit_command(module_backend, job / race / module, out, dry_run),
-                                   check=True, cwd=ROOT, env=env)
+                else:   # hyper3d: the free preview (not gated in the child); the gate is passed on all the same
+                    command = submit_command(module_backend, job / race / module, out, dry_run)
+                    run = run_paid_child(command, key, f'a new {module_backend} submission', paid=False, cwd=ROOT, env=env)
+                    if run.returncode:
+                        raise subprocess.CalledProcessError(run.returncode, command)
         if dry_run:
             summary[key] = (f'dry run: inputs staged in {out / "pixal3d_input"}, nothing generated' if module_backend == 'pixal3d'
                             else f'dry run: form filled, nothing submitted; screenshot {out / "before_submit.png"}')

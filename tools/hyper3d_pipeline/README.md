@@ -75,6 +75,26 @@ The lock is re-entrant within one thread only (two threads of one process exclud
 (two real collector processes against one output: exactly one paid click; a concurrent inspector; the re-read after the lock;
 every profile entry point with fake selenium modules) and `test_monster_wrappers.py`.
 
+### Phase 5 review fixes (2026-11-25)
+
+- **Click-time paid gate** (DESIGN_PHASE4 I.8, `tools/paid_gate.py`). A caller passes its gate in `$IMAGETO3D_PAID_GATE`
+  (`paid_gate.env_for(root, override_pause, cmd)`; convert_job.py always passes it to rodin_backend.py). Every credit-capable
+  step of `collect` (geometry confirm, material generate, material confirm) checks it when the step starts, right before it
+  writes its intent and again right before the click; an intent written a moment before a gate that then closed is withdrawn
+  (event `<kind>_intent_withdrawn`, nothing was clicked). On a closed gate the record is left as it was, the CLI (and the
+  monster wrappers) print `PAID GATE CLOSED: <reason>` and exit **4**; convert_job.py then waits for the gate and runs collect
+  again. No variable = a manual run, where `--allow-paid` alone decides. The free submit is not gated. The legacy
+  `workflow.py` checks the same gate before its paid intents.
+- **Free preview resolution** (finding 1). The `free_preview` intent is resolved (`pending_action` cleared,
+  `actions.free_preview` gets `done_at`, `model_id`, `resolved_by`) once its model is positively identified: the URL captured
+  by `submit`, a `bind`, or on load by `collect` / `preview` / `inspect` of an existing record bound to a model (records written
+  before the fix are repaired that way). A click whose model was never identified stays pending.
+- **Recorded inputs** (finding 7). `submit` copies the views into `<out_dir>/upload_inputs/`, uploads those copies and stores
+  `upload_dir` and `inputs: [{name, sha256, size}]` (upload order, the bytes uploaded) in the record.
+  `rodin_backend.record_inputs(record_or_dir)` returns that list, or None for an older record (unknown).
+- **Linux login** (phase-4 finding 15). `native_browser.py login` waits for the sign-in window while it holds the browser lock on
+  Linux too (no `exec`, which dropped the close-on-exec lock).
+
 Config `allow_mixed_sizes` (only the monster multi-view wrapper sets it) lets `validate_views` accept images of different
 pixel sizes; the plan and record then carry `input_resolutions`. Hyper3D's acceptance of mixed sizes is unverified.
 

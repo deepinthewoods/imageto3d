@@ -83,6 +83,9 @@ class V2Case(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         base = Path(self.temp.name)
         self.root = base / 'project'
+        xdg = mock.patch.dict(os.environ, {'XDG_DATA_HOME': str(base / '_xdg')})   # never the real Tripo profile reservation
+        xdg.start()
+        self.addCleanup(xdg.stop)
         self.monsters_env = os.environ.get('IMAGETO3D_MONSTERS')
         self.mroot = base / 'monsters_aaa'
         os.environ['IMAGETO3D_MONSTERS'] = str(self.mroot)
@@ -224,16 +227,20 @@ class V2Case(unittest.TestCase):
         (out / f'current_{lod}.json').write_text(json.dumps(record))
         return record
 
-    def monster(self, monster='Horse', variant='1', lods=('0p4',), approved=None, image=True):
+    def monster(self, monster='Horse', variant='1', lods=('0p4',), approved=None, image=True, complete=False):
+        """`complete`: a full legacy reduction (5 LODs, manifest.json, materials.json): only such a one can be Completed (phase 5 review F12)."""
         views = self.mroot / 'pipeline' / monster / 'views' / variant
         models = self.mroot / 'pipeline' / monster / 'models' / variant
         views.mkdir(parents=True, exist_ok=True)
         models.mkdir(parents=True, exist_ok=True)
         if image:
             (views / 'front.png').write_bytes(b'png')
-        for lv in lods:
+        for lv in (('0p8', '0p6', '0p4', '0p2', '0p1') if complete else lods):
             (models / 'reduced').mkdir(exist_ok=True)
             (models / 'reduced' / f'lod_error_{lv}.glb').write_bytes(b'glb')
+        if complete:
+            (models / 'reduced' / 'manifest.json').write_text('{"levels": {}}')
+            (models / 'reduced' / 'materials.json').write_text('{"materials": {}}')
         if approved is not None:
             (models / 'chosen_lod.json').write_text(json.dumps({'lod': lods[0], 'approved': approved}))
 
@@ -929,7 +936,7 @@ class DecisionTests(V2Case):
 class MonsterTests(V2Case):
     def test_monster_cards_stage_and_lod(self):
         self.monster('Horse', '1', lods=('0p4', '0p2'))
-        self.monster('Horse', '2', lods=('0p4',), approved=True)
+        self.monster('Horse', '2', lods=('0p4',), approved=True, complete=True)
         self.monster('Horse', '3', lods=(), image=True)
         _, state = self.get('/api/v2/state')
         cards = {c['id']: c for tab, cs in state['tabs'].items() for c in cs if c['type'] == 'monster'}

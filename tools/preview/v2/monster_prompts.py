@@ -9,8 +9,9 @@ launches with the monster pipeline's own `tools/codex_imagegen.sh` (task field `
 
 All three share: the same design and the same marker colours (one line per role of the front's colours.json), front-only ornaments
 not copied, the whole creature in frame, a transparent background and the "ONE hue" paragraph of the monster PROMPTING_GUIDE.md.
-No framing, pose or colour checks and no aesthetic retries (user, 2026-11-25): Codex regenerates once only for an opaque background
-or a creature cut off by the frame.
+No framing, pose or colour checks and no aesthetic retries (user, 2026-11-25; phase 5 review F17): Codex checks only the technical
+format of its saved file (a decodable 8-bit RGBA PNG with real transparency) and regenerates once only when that is wrong. The view runner
+validates the same format and the provenance record (task fields `validate` / `provenance`) and fails the attempt otherwise.
 
     image_prompt(view, monster, colours)   the image-generation prompt (what the `<name>.prompts.json` record calls `prompt`)
     job_prompt(view, monster, variant, front, out, colours)   the whole self-contained Codex job prompt (the view task's `prompt`)
@@ -137,13 +138,13 @@ def record_name(view: str) -> str:
 
 
 RECORD_FIELDS = ('source_image', 'prompt', 'reference_paths', 'date', 'job_name', 'attempt_count', 'generated_file', 'attempts',
-                 'image_processing', 'saved_pixel_size', 'png_mode', 'fully_transparent_pixel_share', 'source_pixel_size', 'alpha_bbox',
-                 'whole_creature_in_frame')
+                 'image_processing', 'saved_pixel_size', 'png_mode', 'fully_transparent_pixel_share', 'source_pixel_size')
 
 
 def job_prompt(view: str, monster: str, variant: str, front: Path, out: Path, colours: dict | None) -> str:
-    """The whole Codex job prompt of one extra view: task, output path, the image prompt, the checks Codex runs on its own file, the
-    record, the scope limits and the report (monsters/aaa/CLAUDE.md "Launching a Codex image job")."""
+    """The whole Codex job prompt of one extra view: task, output path, the image prompt, the technical format check of its own file (no
+    framing / pose / colour inspection, F17), the record, the scope limits and the report (monsters/aaa/CLAUDE.md "Launching a Codex image
+    job")."""
     front, out = Path(front), Path(out)
     record = out.with_name(record_name(view))
     side = {'left': 'the creature\'s own LEFT side (about 90 degrees round)', 'back': 'behind (180 degrees round)',
@@ -166,11 +167,11 @@ overwrite an existing file; if the output already exists, stop and report.
 
 {image_prompt(view, monster, colours)}
 
-## Checks on your saved file
+## Technical check of your saved file
 
-Check the saved PNG yourself: its real mode is RGBA (8-bit) and the background is genuinely transparent, and the whole creature is in
-frame. Regenerate ONCE only if the background is opaque or the creature is cut off by the frame. Do not regenerate for pixel size,
-colour accuracy or taste; one generation otherwise, and report any problem instead of fixing it. Do not ask for a pixel size.
+Check only the technical format of the saved PNG: it decodes as an 8-bit RGBA image and has real transparency (transparent pixels, not an
+opaque background). Regenerate ONCE only if that format is wrong. Do NOT inspect or judge framing, pose, camera angle, colours or taste and
+do not regenerate for them: one generation otherwise; report what you notice instead of fixing it. Do not ask for a pixel size.
 
 ## Record
 

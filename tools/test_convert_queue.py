@@ -41,7 +41,8 @@ class Base(unittest.TestCase):
                    mock.patch.object(cq, 'release', lambda name: None),
                    mock.patch.object(cq, 'convert', lambda job, args: self.converts.append(list(args)) or self.code),
                    mock.patch.object(cq.portable, 'process_running', lambda pattern: pattern.startswith('view_batch')),
-                   mock.patch.object(cq, 'WORKER', 1)]
+                   mock.patch.object(cq, 'WORKER', 1),
+                   mock.patch.dict(os.environ, {'XDG_DATA_HOME': str(self.root / 'xdg')})]   # a temp Tripo profile reservation
         self.code = 0
         for patch in patches:
             patch.start()
@@ -169,6 +170,163 @@ class BalanceLoopTests(Base):
         self.stop_on_nap(3)
         self.run_main([(None, 'busy')] * 3)
         self.assertEqual(sum('HOLD set_a--abc' in l for l in self.events()), 1)
+
+
+class PartialJobTests(BalanceLoopTests):
+    """Phase 5 review finding 3 / phase-4 #4: after a partial job (convert_job exit 3 from --max-submits) only a VERIFIED
+    shortfall switches to the fallback backend."""
+
+    def hyper3d_runs(self):
+        return [c for c in self.converts if '--backend' in c]
+
+    def test_the_reviewers_case_an_unreadable_recheck_after_a_partial_job_holds(self):
+        """Balance 30, one submission permitted, exit 3, the recheck unreadable: before the fix `--backend hyper3d --allow-paid
+        --accept-preview` ran and Tripo was disabled for the worker's lifetime."""
+        self.code = 3
+        self.stop_on_nap(1)
+        self.run_main([(30, None), (None, 'studio.mjs balance exit 2')], next_jobs=[(self.job, True)])
+        self.assertEqual(self.converts, [['--max-submits', '1']])
+        self.assertEqual(self.hyper3d_runs(), [])
+        events = self.events()
+        self.assertTrue(any('HOLD set_a--abc: Tripo balance unreadable after a partial job' in l for l in events), events)
+        self.assertFalse(any('FAILED' in l or 'continuing on hyper3d' in l for l in events), events)
+        self.assertFalse((self.batch / 'convert_locks' / 'set_a--abc.fails').exists())
+
+    def test_after_the_hold_tripo_continues_when_the_balance_is_readable_again(self):
+        self.code = 3
+        readings = [(30, None), (None, 'exit 2'), (55, None), (5, None)]
+        self.stop_on_nap(2)
+        self.run_main(readings, next_jobs=[(self.job, True), (self.job, True), (None, False)])
+        self.assertEqual(self.converts[:2], [['--max-submits', '1'], ['--max-submits', '2']])   # Tripo again, not Hyper3D
+
+    def test_a_sufficient_second_balance_keeps_the_job_on_tripo(self):
+        self.code = 3
+        self.stop_on_nap(1)
+        self.run_main([(80, None), (60, None)], next_jobs=[(self.job, True), (None, False)])
+        self.assertEqual(self.converts, [['--max-submits', '3']])
+        self.assertEqual(self.hyper3d_runs(), [])
+        self.assertTrue(any('PARTIAL set_a--abc: Tripo balance 60 still covers a module; continuing on Tripo' in l
+                            for l in self.events()))
+
+    def test_a_verified_shortfall_after_a_partial_job_falls_back(self):
+        self.code = 3
+        self.stop_on_nap(1)
+        self.run_main([(30, None), (5, None)], next_jobs=[(self.job, True), (None, False)])
+        self.assertEqual(self.converts, [['--max-submits', '1'], ['--backend', 'hyper3d', '--allow-paid', '--accept-preview']])
+
+    def test_a_verified_shortfall_with_tripo_only_stops(self):
+        self.code = 3
+        self.run_main([(30, None), (5, None)], next_jobs=[(self.job, True)], argv=('--tripo-only',))
+        self.assertEqual(self.converts, [['--max-submits', '1']])
+        self.assertTrue(any('STOP set_a--abc' in l for l in self.events()))
+
+    def test_an_unreadable_recheck_with_tripo_only_holds_too(self):
+        self.code = 3
+        self.stop_on_nap(1)
+        self.run_main([(30, None), (None, 'busy')], next_jobs=[(self.job, True)], argv=('--tripo-only',))
+        self.assertFalse(any('STOP set_a--abc' in l for l in self.events()))
+        self.assertEqual(self.converts, [['--max-submits', '1']])
+
+    def test_no_tripo_policy_goes_straight_to_the_fallback(self):
+        self.code = 0
+        self.stop_on_nap(1)
+        self.run_main([], next_jobs=[(self.job, True), (None, False)], argv=('--no-tripo',))
+        self.assertEqual(self.converts, [['--backend', 'hyper3d', '--allow-paid', '--accept-preview']])
+
+
+class JobEligibleTests(unittest.TestCase):
+    """Phase-4 finding 20: convert_queue.job_eligible(root, job) is the worker's claim/join rule, read-only."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.locks = self.root / '.codex_jobs' / '_batch' / 'convert_locks'
+        self.locks.mkdir(parents=True)
+
+    def job(self, stage='processing', name='set_a--abc', modules=('outfit', 'body_armor'), **record):
+        folder = self.root / stage / name
+        folder.mkdir(parents=True)
+        (folder / '.tripo-job.json').write_text(json.dumps({
+            'set': 'set_a', 'job_id': 'abc', 'modules': [{'race_gender': 'human_male', 'module': m} for m in modules], **record}))
+        return folder
+
+    def live_pid(self):
+        child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])
+        self.addCleanup(lambda: (child.kill(), child.wait()))
+        return child.pid
+
+    def module_lock(self, module, pid):
+        locks = self.root / 'models' / 'set_a' / 'abc' / '.module_locks'
+        locks.mkdir(parents=True, exist_ok=True)
+        (locks / f'human_male__{module}.lock').write_text(str(pid))
+
+    def converted(self, module):
+        out = self.root / 'models' / 'set_a' / 'abc' / 'human_male' / module / 'reduced'
+        out.mkdir(parents=True)
+        (out / 'manifest.json').write_text('{}')
+
+    def test_rules(self):
+        self.assertEqual(cq.job_eligible(self.root, 'set_a--abc'), (False, 'not staged (no folder in processing/ or multiview_ready/)'))
+        job = self.job()
+        self.assertEqual(cq.job_eligible(self.root, 'set_a--abc')[0], True)
+        (self.locks / 'set_a--abc.fails').write_text('2')
+        self.assertEqual(cq.job_eligible(self.root, 'set_a--abc')[0], True)          # fewer than MAX_TRIES
+        (self.locks / 'set_a--abc.fails').write_text(str(cq.MAX_TRIES))
+        ok, why = cq.job_eligible(self.root, 'set_a--abc')
+        self.assertEqual((ok, why), (False, f'failed {cq.MAX_TRIES} times (MAX_TRIES {cq.MAX_TRIES})'))
+        (self.locks / 'set_a--abc.fails').unlink()
+        record = json.loads((job / '.tripo-job.json').read_text())
+        (job / '.tripo-job.json').write_text(json.dumps({**record, 'state': 'converted'}))
+        self.assertEqual(cq.job_eligible(self.root, 'set_a--abc'), (False, 'already converted'))
+        (job / '.tripo-job.json').write_text('{broken')
+        self.assertFalse(cq.job_eligible(self.root, 'set_a--abc')[0])
+
+    def test_the_reviewers_case_a_held_job_lock_with_every_module_free_is_not_eligible(self):
+        self.job()
+        pid = self.live_pid()
+        (self.locks / 'set_a--abc.lock').write_text(str(pid))
+        ok, why = cq.job_eligible(self.root, 'set_a--abc')
+        self.assertFalse(ok)
+        self.assertIn('not joinable', why)
+        self.module_lock('outfit', pid)                                              # now a live worker converts one module
+        ok, why = cq.job_eligible(self.root, 'set_a--abc')
+        self.assertTrue(ok)
+        self.assertIn('joinable', why)
+
+    def test_a_dead_holders_job_lock_is_claimable(self):
+        self.job()
+        dead = subprocess.run([sys.executable, '-c', 'import os; print(os.getpid())'], capture_output=True, text=True)
+        (self.locks / 'set_a--abc.lock').write_text(dead.stdout.strip())
+        self.assertTrue(cq.job_eligible(self.root, 'set_a--abc')[0])
+
+    def test_a_staged_job_held_elsewhere_is_never_joinable(self):
+        self.job(stage='multiview_ready')
+        pid = self.live_pid()
+        (self.locks / 'set_a--abc.lock').write_text(str(pid))
+        self.module_lock('outfit', pid)
+        self.assertFalse(cq.job_eligible(self.root, 'set_a--abc')[0])
+
+    def test_no_free_module(self):
+        self.job()
+        self.converted('outfit')
+        record = json.loads((self.root / 'processing' / 'set_a--abc' / '.tripo-job.json').read_text())
+        record['module_conversion'] = {'human_male/outfit': {}}
+        (self.root / 'processing' / 'set_a--abc' / '.tripo-job.json').write_text(json.dumps(record))
+        self.module_lock('body_armor', self.live_pid())
+        ok, why = cq.job_eligible(self.root, 'set_a--abc')
+        self.assertEqual((ok, why), (False, 'every unconverted module is being converted by another worker'))
+
+    def test_it_agrees_with_next_job(self):
+        self.job()
+        with mock.patch.object(cq, 'ROOT', self.root), mock.patch.object(cq, 'LOCKS', self.locks):
+            self.assertTrue(cq.job_eligible(self.root, 'set_a--abc')[0])
+            job, owner = cq.next_job({'set_a'})
+            self.assertEqual((job.name, owner), ('set_a--abc', True))
+            cq.release('set_a--abc')
+            (self.locks / 'set_a--abc.fails').write_text(str(cq.MAX_TRIES))
+            self.assertFalse(cq.job_eligible(self.root, 'set_a--abc')[0])
+            self.assertEqual(cq.next_job({'set_a'}), (None, False))
 
 
 class GateTests(Base):

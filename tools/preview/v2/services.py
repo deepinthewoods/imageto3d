@@ -28,15 +28,18 @@ CREATE_NO_WINDOW) with stdout/stderr appended to `.codex_jobs/_batch/<name>_win.
 Start order: supervisor, views, then the convert worker only once the supervisor completed a tick (`supervisor_tick.json`).
 
 Conversion hold (DESIGN_PHASE4.md I.1, `.codex_jobs/_batch/CONVERT_HOLD`, {since, since_unix, reason, owner_pid, owner_create_time}): written
-by begin_management, before the supervisor is stopped or restarted, and whenever no supervisor runs; removed by the tick only when it is ours
-and the running supervisor wrote `supervisor_tick.json` (its pid, a time after the hold's since). A hold of a dead owner older than
-STALE_HOLD_S is replaced by ours; a hold of a live other owner is never touched.
+by begin_management, before the supervisor is stopped or restarted (naming that supervisor in `retiring`), and whenever no supervisor runs;
+removed by the tick only when it is ours, the running supervisor wrote `supervisor_tick.json` (its pid, a time after the hold's since) AND
+that supervisor is the intended generation: not a retiring one, no stop of it pending, no legacy worker drain in progress (release_blocker;
+DESIGN_PHASE4.md I.9). A hold of a dead owner older than STALE_HOLD_S is replaced by ours; a hold of a live other owner is never touched.
 
 Convert worker stop (I.2): `.codex_jobs/_batch/convert_worker1.stop` = {pid, create_time, request, time} naming the worker process; the worker
 acknowledges with `convert_worker1.stopping`, finishes its job (finish + offload) and exits. The manager waits and NEVER kills on a timeout:
 the stop stays pending and every tick re-evaluates it. A LEGACY worker (it started before the current convert_queue.py was written, or that
-script has no stop support) is stopped by its verified handle only when no convert_job.py of this checkout runs and its last event in
-convert_events.log (since it started) is PAUSED / IDLE / LOW DISK, after its last CONVERT: it is sleeping.
+script has no stop support) is drained under the conversion hold (written first), and stopped only through frozen_stop: once no
+convert_job.py of this checkout runs and its last event in convert_events.log (since it started) is PAUSED / IDLE / LOW DISK after its last
+CONVERT, it is suspended, re-verified idle while frozen and only then terminated. An older view runner (no launch reservation) is stopped the
+same way, only while it launches nothing (I.9). A pending stop that ends in a tick is reported in the tick's `completed` with its request id.
 
 Crash restart: an enabled service that vanished (without a stop request) is restarted after 60 s, after a second quick failure after 5 min,
 after a third it is HELD ("restart failed 3 times") until Start is pressed. A run that stays up for STABLE_AFTER resets the count. The convert
@@ -232,6 +235,23 @@ def python_script(cmd: list[str]) -> tuple[str | None, list[str]]:
     if i >= n or cmd[i] == '-':
         return None, []
     return cmd[i], cmd[i + 1:]
+
+
+def _shared_parser():
+    """tools/proc_cmdline.py `python_script`, the parser the supervisor uses (phase 5 review row 7), loaded by path so both sides parse a
+    command line the same way; None when it is missing (the copy above is used)."""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('_imageto3d_proc_cmdline', HERE.parents[1] / 'proc_cmdline.py')
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module.python_script
+    except (OSError, ImportError, AttributeError, SyntaxError):
+        return None
+
+
+_local_python_script = python_script
+python_script = _shared_parser() or _local_python_script
 
 
 def node_script(cmd: list[str]) -> tuple[str | None, list[str]]:
@@ -493,11 +513,37 @@ def _hold_is_mine(hold: dict) -> bool:
                                                      or abs(float(created) - mine) < CREATE_TIME_TOLERANCE)
 
 
-def write_hold(root, reason: str, now: float | None = None) -> dict:
-    """Write OUR conversion hold (atomic): {since, since_unix, reason, owner_pid, owner_create_time}."""
+MAX_RETIRING = 8
+
+
+def _ident(inst: dict) -> dict:
+    return {'pid': inst.get('pid'), 'create_time': inst.get('create_time')}
+
+
+def _same_process(a: dict, b: dict) -> bool:
+    """Two {pid, create_time} name the same process (a missing create time compares by pid only)."""
+    if not isinstance(a, dict) or not isinstance(b, dict) or a.get('pid') != b.get('pid') or not a.get('pid'):
+        return False
+    ca, cb = a.get('create_time'), b.get('create_time')
+    if isinstance(ca, (int, float)) and isinstance(cb, (int, float)) and not isinstance(ca, bool) and not isinstance(cb, bool):
+        return abs(float(ca) - float(cb)) < CREATE_TIME_TOLERANCE
+    return True
+
+
+def _retiring(hold: dict | None) -> list[dict]:
+    """The supervisor generations a hold must outlive (phase 5 review row 2): [{pid, create_time}] of the supervisors a stop / restart was sent
+    to. A tick of one of them never releases the hold."""
+    raw = hold.get('retiring') if isinstance(hold, dict) else None
+    return [r for r in raw if isinstance(r, dict) and isinstance(r.get('pid'), int)] if isinstance(raw, list) else []
+
+
+def write_hold(root, reason: str, now: float | None = None, retiring: list[dict] | None = None) -> dict:
+    """Write OUR conversion hold (atomic): {since, since_unix, reason, owner_pid, owner_create_time, retiring}."""
     now = time.time() if now is None else now
     hold = {'since': datetime.fromtimestamp(now).isoformat(timespec='milliseconds'), 'since_unix': now, 'reason': reason,
             'owner_pid': os.getpid(), 'owner_create_time': _my_create_time()}
+    if retiring:
+        hold['retiring'] = retiring[-MAX_RETIRING:]
     guard.write_atomic(hold_path(root), (json.dumps(hold, indent=2) + '\n').encode('utf-8'))
     return hold
 
@@ -506,24 +552,28 @@ def _foreign_live(hold: dict | None) -> bool:
     return bool(hold) and not _hold_is_mine(hold) and _process_alive(hold.get('owner_pid'), hold.get('owner_create_time'))
 
 
-def assert_hold(root, reason: str, *, renew: bool = False, now: float | None = None) -> str | None:
+def assert_hold(root, reason: str, *, renew: bool = False, now: float | None = None, retiring: dict | None = None) -> str | None:
     """Make sure a conversion hold exists. `renew` (a supervisor stop / restart, a manager start) writes ours with a new `since` unless a LIVE
     other owner holds it. Without `renew` an existing hold stays as it is, except a stale one (dead owner, older than STALE_HOLD_S), which is
-    replaced by ours. Returns an event text or None."""
+    replaced by ours. `retiring` (a supervisor instance a stop is about to be sent to) is added to the hold's `retiring` generations; a rewrite
+    keeps the live ones of the hold it replaces (release_hold never accepts their ticks). Returns an event text or None."""
     now = time.time() if now is None else now
     hold = read_hold(root)
+    keep = [r for r in _retiring(hold) if _process_alive(r.get('pid'), r.get('create_time'))]
+    if retiring and not any(_same_process(r, retiring) for r in keep):
+        keep.append(_ident(retiring))
     if hold is None:
-        write_hold(root, reason, now)
+        write_hold(root, reason, now, keep)
         return f'conversion hold written ({reason})'
     if _foreign_live(hold):
         return None
-    if renew:
-        write_hold(root, reason, now)
+    if renew or (retiring and not any(_same_process(r, retiring) for r in _retiring(hold))):
+        write_hold(root, reason, now, keep)
         return f'conversion hold renewed ({reason})'
     if not _hold_is_mine(hold):
         since = _hold_time(hold)
         if since is None or now - since > STALE_HOLD_S:
-            write_hold(root, reason, now)
+            write_hold(root, reason, now, keep)
             return f'stale conversion hold of pid {hold.get("owner_pid")} replaced ({reason})'
     return None
 
@@ -548,8 +598,26 @@ def supervisor_ticked(root, sup: dict | None, after: float | None) -> bool:
     return stamp is not None and (after is None or stamp > after)
 
 
+def release_blocker(root, sup: dict | None, hold: dict | None = None) -> str | None:
+    """Why the hold may not be released for the running supervisor `sup` even if it ticked (phase 5 review row 2), else None: `sup` is a
+    generation a stop / restart was sent to (the hold's `retiring`), the supervisor's stop is still pending for that very process (the
+    restart transition is not complete), or a legacy convert worker is being drained under the hold (I.2)."""
+    hold = read_hold(root) if hold is None else hold
+    if sup and any(_same_process(r, sup) for r in _retiring(hold)):
+        return f'supervisor pid {sup["pid"]} is the outgoing one (a stop was sent to it); waiting for its successor'
+    rec = read_record(root, 'supervisor')
+    if sup and rec.get('stop_requested') and _same_process(rec, sup):
+        return f'the stop of supervisor pid {sup["pid"]} is still pending'
+    conv = read_record(root, 'convert')
+    if conv.get('stop_requested') and conv.get('drain_hold'):
+        return 'an older convert worker is being drained (the hold stays until it is gone)'
+    return None
+
+
 def release_hold(root, sup: dict | None) -> str | None:
-    """Remove the hold when it is ours (or stale) and the running supervisor ticked after its `since` (I.1). Returns an event text or None."""
+    """Remove the hold when it is ours (or stale), the running supervisor ticked after its `since` (I.1) AND that supervisor is the intended
+    generation: not one a stop / restart was sent to, with no stop of it pending, and no legacy worker drain needs the hold (release_blocker).
+    Returns an event text or None."""
     hold = read_hold(root)
     if hold is None or _foreign_live(hold):
         return None
@@ -557,6 +625,8 @@ def release_hold(root, sup: dict | None) -> str | None:
         since = _hold_time(hold)
         if since is None or time.time() - since <= STALE_HOLD_S:
             return None                        # a recent hold of a process that just exited: it may still be part of a by-hand restart
+    if release_blocker(root, sup, hold):
+        return None
     if supervisor_ticked(root, sup, _hold_time(hold)):
         hold_path(root).unlink(missing_ok=True)
         return f'conversion hold released (supervisor pid {sup["pid"]} completed a tick)'
@@ -577,8 +647,13 @@ def hold_state(root) -> dict | None:
     if hold is None:
         return None
     owner = 'this server' if _hold_is_mine(hold) else ('another live process' if _foreign_live(hold) else 'a process that exited')
-    return {**{k: hold.get(k) for k in ('since', 'reason', 'owner_pid')}, 'owner': owner,
-            'message': 'conversions wait until the running supervisor completes a tick (needs the supervisor service)'}
+    retiring = [r for r in _retiring(hold) if _process_alive(r.get('pid'), r.get('create_time'))]
+    message = 'conversions wait until the running supervisor completes a tick (needs the supervisor service)'
+    if retiring:
+        message = (f'conversions wait until a supervisor started after pid {", ".join(str(r["pid"]) for r in retiring)} (a stop was sent to it) '
+                   'completes a tick')
+    return {**{k: hold.get(k) for k in ('since', 'reason', 'owner_pid')}, 'owner': owner, 'retiring': [r['pid'] for r in retiring],
+            'message': message}
 
 
 # ------------------------------------------------------------------------------------------------------------------------ start / stop
@@ -704,7 +779,8 @@ def _restore_pause(root, rec: dict) -> None:
 
 def _finish_stop(root, name: str, rec: dict, now: float) -> None:
     """The process is gone after a stop request: record a deliberate stop (or the pending restart)."""
-    rec.update(running=False, exited_at=now, stop_requested=None, user_stopped=not rec.get('then_start'), idle_exit=False, stop_note=None)
+    rec.update(running=False, exited_at=now, stop_requested=None, user_stopped=not rec.get('then_start'), idle_exit=False, stop_note=None,
+               drain_hold=False)
     rec['duplicates'] = []
     write_record(root, name, rec)
 
@@ -774,25 +850,168 @@ def worker_sleeping(root, inst: dict, now: float | None = None, worker: int = MA
     return False
 
 
+def frozen_stop(root, svc: Service, inst: dict, check) -> tuple[bool, str | None]:
+    """Stop an older daemon that has no drain acknowledgement only when it is PROVEN idle (phase 5 review rows 6 and 17): its verified handle is
+    SUSPENDED first, so it cannot wake between the check and the signal; `check(proc)` then inspects the frozen process (its children, the
+    files that would show work in flight) and returns a problem text or None. With a problem the process is resumed untouched and (False,
+    problem) comes back; without one it is terminated while still frozen (resumed afterwards, so a POSIX SIGTERM is delivered) and waited for.
+    Returns (gone, problem)."""
+    proc = verified_handle(root, svc, inst)
+    if proc is None:
+        if _process_alive(inst['pid'], None):      # the pid runs, but not as the recorded process / service: never signalled
+            raise ServiceError(f'process {inst["pid"]} is no longer the {svc.name} service; nothing stopped')
+        return True, None
+    try:
+        proc.suspend()
+    except psutil.NoSuchProcess:
+        return True, None
+    except psutil.Error as error:
+        return False, f'it could not be suspended to verify that it is idle ({type(error).__name__}); waiting'
+    terminated = False
+    try:
+        try:
+            problem = check(proc)
+        except psutil.NoSuchProcess:
+            return True, None
+        except Exception as error:  # noqa: BLE001  (an unverifiable state is never "idle")
+            problem = f'its state could not be verified ({type(error).__name__}: {error}); waiting'
+        if problem:
+            return False, problem
+        try:
+            proc.terminate()
+            terminated = True
+        except psutil.NoSuchProcess:
+            return True, None
+    finally:
+        try:
+            proc.resume()
+        except psutil.Error:
+            pass
+    try:
+        proc.wait(10.0)
+        return True, None
+    except psutil.NoSuchProcess:
+        return True, None
+    except psutil.TimeoutExpired:
+        return False, 'it was signalled while idle but has not exited yet'
+    except psutil.Error:
+        return (not proc.is_running()) if terminated else False, None
+
+
+def _locks_naming(root, pid: int) -> list[str]:
+    """Job locks (`convert_locks/<job>.lock`, holder pid as text) that name `pid`: a worker holding one is between claim and conversion."""
+    out = []
+    for lock in (batch(root) / 'convert_locks').glob('*.lock'):
+        try:
+            if int(lock.read_text(encoding='utf-8').strip()) == pid:
+                out.append(lock.stem)
+        except (OSError, ValueError):
+            continue
+    return out
+
+
+def _worker_idle_problem(root, proc, inst: dict) -> str | None:
+    """The frozen legacy worker is provably asleep: no child process (a convert_job.py, a balance check), no convert_job.py of this checkout,
+    no job lock naming it, and its last event since it started is PAUSED / IDLE / LOW DISK after its last CONVERT."""
+    kids = proc.children()
+    if kids:
+        return f'an older worker: it has a child process (pid {kids[0].pid}): it woke up; waiting'
+    jobs = convert_job_running(root)
+    if jobs:
+        return f'an older worker: convert_job.py (pid {jobs[0]["pid"]}) runs; waiting'
+    locks = _locks_naming(root, inst['pid'])
+    if locks:
+        return f'an older worker: it holds the job lock of {locks[0]}; waiting'
+    if not worker_sleeping(root, inst, time.time()):
+        return 'an older worker: its event log no longer says it sleeps (it woke up); waiting'
+    return None
+
+
 def _convert_stop_step(root, svc: Service, inst: dict, rec: dict, now: float) -> tuple[bool, str]:
-    """One step of a pending convert stop: (gone, message). Writes / renews the stop file naming the process, stops a sleeping legacy worker
-    through its verified handle, never kills anything else."""
+    """One step of a pending convert stop: (gone, message). Writes / renews the stop file naming the process. A legacy worker (I.2, phase 5
+    review row 6) is drained in this order: the conversion hold FIRST (dispatch is quiesced: a hold-aware worker starts nothing, and every
+    convert_job.py started from the current code waits before its paid steps; the hold stays while the drain is pending, `drain_hold`), then
+    wait until it sleeps, then frozen_stop: suspended, re-verified idle, only then terminated. Never kills anything else."""
     if not _names(worker_stop_path(root), inst):
         write_worker_stop(root, inst, rec.get('stop_request_id') or iso(rec.get('stop_requested')), now)
     if _names(worker_stopping_path(root), inst):
         return False, 'the worker acknowledged the stop; it exits after its current job (finish and offload included)'
     if legacy_worker(root, inst):
+        if not rec.get('drain_hold') or read_hold(root) is None:
+            assert_hold(root, 'legacy convert worker drain')
+            current = read_record(root, 'convert')
+            current['drain_hold'] = rec['drain_hold'] = True
+            write_record(root, 'convert', current)
+        if read_hold(root) is None:
+            return False, 'an older worker: the conversion hold could not be written; it is not stopped'
         jobs = convert_job_running(root)
         if jobs:
             return False, (f'an older worker without the stop file: it is stopped only while it sleeps; convert_job.py (pid {jobs[0]["pid"]}) '
-                           'runs now')
+                           'runs now (conversions are held meanwhile)')
         if not worker_sleeping(root, inst, now):
-            return False, 'an older worker without the stop file: waiting until its event log says it sleeps (PAUSED / IDLE / LOW DISK)'
-        if convert_job_running(root) or not worker_sleeping(root, inst, time.time()):      # (re-checked right before the signal)
-            return False, 'an older worker: it woke up; waiting'
-        gone = _terminate(root, svc, inst, timeout=10.0, allow_kill=False)
-        return gone, 'the older worker was asleep: stopped by its verified PID' if gone else 'the older worker did not exit yet'
+            return False, ('an older worker without the stop file: waiting until its event log says it sleeps (PAUSED / IDLE / LOW DISK); '
+                           'conversions are held meanwhile')
+        gone, problem = frozen_stop(root, svc, inst, lambda proc: _worker_idle_problem(root, proc, inst))
+        if gone:
+            return True, 'the older worker was asleep (verified while suspended): stopped by its verified PID'
+        return False, problem or 'the older worker did not exit yet'
     return False, 'stop requested; waiting for the worker to acknowledge it (convert_worker1.stopping)'
+
+
+# ------------------------------------------------------------------------------------------------------------- view runner stop (I.5)
+
+def legacy_runner(root, inst: dict) -> bool:
+    """A view runner without the launch reservation of I.5 (an older runner: it started before the current view_batch.py was written, that
+    file has no `launching` state, or it does not hold view_runner.lock). Stopping it between a spawn and its status write would lose the job."""
+    script = Path(root) / SERVICES['views'].script
+    try:
+        mtime = script.stat().st_mtime
+        text = script.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return True
+    return "'launching'" not in text or inst['create_time'] < mtime or not _lock_held(root, SERVICES['views'])
+
+
+def _recorded_jobs(root) -> set[str]:
+    """Codex jobs the view runner's task status files record as running / launching (the ones a new runner adopts)."""
+    out = set()
+    for path in (batch(root) / 'status').glob('*.json'):
+        raw = read_json(path)
+        jobs = raw.get('jobs') if isinstance(raw, dict) else None
+        if isinstance(raw, dict) and raw.get('state') in ('running', 'launching') and isinstance(jobs, list) and jobs \
+                and isinstance(jobs[-1], dict) and isinstance(jobs[-1].get('job'), str):
+            out.add(jobs[-1]['job'])
+    return out
+
+
+def _runner_idle_problem(root, proc) -> str | None:
+    """The frozen older runner launches nothing right now: every child is a `codex_imagegen.sh <job>` whose job its status files already
+    record as running (a new runner adopts it through `.done`), and it has no other child (a framing check of a finishing task)."""
+    recorded = None
+    for child in proc.children():
+        try:
+            cmd = child.cmdline()
+        except psutil.NoSuchProcess:
+            continue
+        at = next((i for i, a in enumerate(cmd) if a.replace('\\', '/').endswith('codex_imagegen.sh')), None)
+        if at is None or at + 1 >= len(cmd):
+            return f'the older view runner is busy (child pid {child.pid} is not a recorded Codex job); waiting'
+        recorded = _recorded_jobs(root) if recorded is None else recorded
+        if cmd[at + 1] not in recorded:
+            return f'the older view runner is launching Codex job {cmd[at + 1]} (not recorded yet); waiting'
+    return None
+
+
+def _views_stop_step(root, svc: Service, inst: dict, now: float) -> tuple[bool, str]:
+    """One step of a view runner stop: a current runner (launch reservation, I.5) by its verified handle at once (running Codex jobs continue);
+    an older one only through frozen_stop while it launches nothing (phase 5 review row 17)."""
+    if not legacy_runner(root, inst):
+        gone = _terminate(root, svc, inst)
+        return gone, 'view runner stopped (running Codex jobs continue)' if gone else 'view runner is still exiting'
+    gone, problem = frozen_stop(root, svc, inst, lambda proc: _runner_idle_problem(root, proc))
+    if gone:
+        return True, 'older view runner stopped while it launched nothing (its running Codex jobs continue; the next runner adopts them)'
+    return False, problem or 'the older view runner did not exit yet'
 
 
 def _clean_worker_files(root) -> None:
@@ -843,7 +1062,7 @@ def stop(root, name: str, *, wait: float = 5.0, force: bool = False, then_start:
         write_record(root, name, rec)
         pending, message = False, f'{name} stopped'
         if name == 'supervisor':
-            assert_hold(root, 'supervisor ' + ('restart' if then_start else 'stop'), renew=True, now=now)
+            assert_hold(root, 'supervisor ' + ('restart' if then_start else 'stop'), renew=True, now=now, retiring=inst)
             run = subprocess.run([sys.executable, '-X', 'utf8', '-u', svc.script, 'stop'], cwd=str(root), capture_output=True, text=True,
                                  encoding='utf-8', errors='replace', timeout=60, creationflags=NO_WINDOW)
             if run.returncode != 0:
@@ -853,9 +1072,14 @@ def stop(root, name: str, *, wait: float = 5.0, force: bool = False, then_start:
             gone = _wait_gone(root, name, wait, inst)
             pending, message = not gone, ('supervisor stopped' if gone else 'stop requested; the supervisor exits within a few seconds')
         elif name == 'views':
-            gone = _terminate(root, svc, inst)
-            gone = gone or _wait_gone(root, name, wait, inst)
-            pending, message = not gone, ('view runner stopped (running Codex jobs continue)' if gone else 'view runner is still exiting')
+            gone, message = _views_stop_step(root, svc, inst, now)
+            if not gone and _wait_gone(root, name, wait, inst):
+                gone, message = True, 'view runner stopped (running Codex jobs continue)'
+            pending = not gone
+            if pending:
+                rec = read_record(root, name)
+                rec['stop_note'] = message
+                write_record(root, name, rec)
         else:
             gone, message = _convert_stop_step(root, svc, inst, rec, now)
             if not gone:
@@ -923,6 +1147,13 @@ def has_work(root) -> bool:
     return bool(convert_list.eligible_jobs(root))
 
 
+def _completed(ctx: dict, name: str, request, then_start: bool, text: str) -> None:
+    """Record the end of a pending stop / restart for the tick's `completed` list (phase 5 review row 18): the service request id the stop
+    carried (`stop_request_id`), so the manager can give the request its terminal outcome."""
+    ctx.setdefault('completed', []).append({'name': name, 'request': request, 'action': 'restart' if then_start else 'stop', 'ok': True,
+                                            'pending': False, 'text': text})
+
+
 def _tick_one(root, svc: Service, found: list[dict], settings: dict, now: float, ctx: dict) -> list[str]:
     events: list[str] = []
     name = svc.name
@@ -947,21 +1178,32 @@ def _tick_one(root, svc: Service, found: list[dict], settings: dict, now: float,
             rec.update(fails=0, error=None)
         if name == 'convert':
             rec['convert_jobs'] = [j['pid'] for j in convert_job_running(root)]
-            if rec.get('stop_requested'):
-                write_record(root, name, rec)
-                try:
+        if name in ('convert', 'views') and rec.get('stop_requested'):
+            write_record(root, name, rec)
+            try:
+                if name == 'convert':
                     gone, note = _convert_stop_step(root, svc, inst, rec, now)
-                except ServiceError as error:
-                    gone, note = False, str(error)
-                rec = read_record(root, name)
-                rec['stop_note'] = note
-                if gone:
-                    events.append(f'{name}: {note}')
-                    rec.update(running=False, exited_at=now, stop_requested=None, user_stopped=not rec.get('then_start'), idle_exit=False)
+                else:
+                    gone, note = _views_stop_step(root, svc, inst, now)
+            except ServiceError as error:
+                gone, note = False, str(error)
+            rec = read_record(root, name)
+            rec['stop_note'] = note
+            if gone:
+                text = f'{name}: {note}'
+                events.append(text)
+                request, then_start = rec.get('stop_request_id'), bool(rec.get('then_start'))
+                rec.update(running=False, exited_at=now, stop_requested=None, user_stopped=not then_start, idle_exit=False, drain_hold=False,
+                           stop_note=None)
+                if name == 'convert':
                     _clean_worker_files(root)
-                    if rec.get('then_start'):
-                        events += _start(root, svc, rec, settings, now, 'restart')
-                        rec = read_record(root, name)
+                started = []
+                if then_start:
+                    write_record(root, name, rec)
+                    started = _start(root, svc, rec, settings, now, 'restart')
+                    events += started
+                    rec = read_record(root, name)
+                _completed(ctx, name, request, then_start, '; '.join([text] + started))
         write_record(root, name, rec)
         return events
     # nothing runs
@@ -969,8 +1211,10 @@ def _tick_one(root, svc: Service, found: list[dict], settings: dict, now: float,
     if rec.get('running'):
         rec.update(running=False, exited_at=now)
         if rec.get('stop_requested'):
-            rec.update(user_stopped=not rec.get('then_start'), stop_requested=None, idle_exit=False, stop_note=None)
+            rec.update(user_stopped=not rec.get('then_start'), stop_requested=None, idle_exit=False, stop_note=None, drain_hold=False)
             events.append(f'{name}: stopped')
+            _completed(ctx, name, rec.get('stop_request_id'), bool(rec.get('then_start')),
+                       f'{name}: stopped' + ('; restarting' if rec.get('then_start') else ''))
         elif _idle_exit(root, svc, rec):
             rec.update(idle_exit=True)
             events.append(f'{name}: exited (idle, nothing staged)')
@@ -1031,8 +1275,10 @@ def _start(root, svc: Service, rec: dict, settings: dict, now: float, reason: st
 
 def tick(root, settings: dict | None = None, now: float | None = None) -> dict:
     """One manager pass (the orchestrator calls it every 30 s on the writer server): adopt, restart crashed services, start missing ones in the
-    order supervisor, views, convert (after the supervisor's first tick), drive pending convert stops, keep / release the conversion hold.
-    Never raises for one service's problem. Returns {"services": {name: status}, "events": [text]}."""
+    order supervisor, views, convert (after the supervisor's first tick), drive pending convert / view runner stops, keep / release the
+    conversion hold. Never raises for one service's problem. Returns {"services": {name: status}, "events": [text], "completed": [{name,
+    request, action, ok, pending: false, text}]} (`completed`: pending stops / restarts that ended in this pass, with the request id they
+    carried)."""
     settings = settings or app_settings.load(root)
     health = app_settings.health(root, reload=False)
     now = time.time() if now is None else now
@@ -1064,7 +1310,8 @@ def tick(root, settings: dict | None = None, now: float | None = None) -> dict:
                 events.append(text)
         except Exception as error:  # noqa: BLE001
             events.append(f'hold / stop files: manager error {type(error).__name__}: {error}')
-    return {'services': {n: status_one(root, s, settings, now) for n, s in SERVICES.items()}, 'events': events}
+    return {'services': {n: status_one(root, s, settings, now) for n, s in SERVICES.items()}, 'events': events,
+            'completed': ctx.get('completed', [])}
 
 
 # ------------------------------------------------------------------------------------------------------------------------ status

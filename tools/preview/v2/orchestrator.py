@@ -330,6 +330,25 @@ def classify(result: dict) -> tuple[bool, str | None, bool]:
 
 # ------------------------------------------------------------------------------------------------------------ orchestrator
 
+def receipt_builder(result: dict, claim: dict, row: dict | None, now: float) -> tuple[int, float | None] | None:
+    """(pid, create time) of the builder a result receipt belongs to when that builder may STILL run (review F12, phase 5 review row 12), else
+    None: the wrapper confirms the exit with `builder_exited`, or an older wrapper's receipt with a normal exit code counts as exited; otherwise
+    the builder named by the result, the claim or the row must be verifiably gone. The same rule for the live queue and for a rebuilt one."""
+    if result.get('builder_exited') is True:
+        return None
+    if 'builder_exited' not in result and not result.get('start_error') and isinstance(result.get('exit'), int) and result['exit'] >= 0:
+        return None
+    row = row or {}
+    if result.get('builder_pid'):
+        pid, created = result['builder_pid'], result.get('builder_create')
+    elif claim.get('builder_pid'):
+        pid, created = claim['builder_pid'], claim.get('builder_create')
+    else:
+        pid, created = row.get('builder_pid'), row.get('builder_create')
+    started = row.get('started') if row.get('started') is not None else claim.get('claimed')
+    return (pid, created) if pid and identity_ok(pid, created, started, now) else None
+
+
 class SimulatedCrash(BaseException):
     """Tests: raised by a fault hook to stop the orchestrator at an exact point (as a crash would)."""
 
@@ -339,7 +358,8 @@ class Orchestrator:
     `require_approval` / `reconcile_queue` (default on) can be switched off by tests of the raw queue mechanics."""
 
     def __init__(self, root: Path, *, argv_for=None, idle=None, interval: float = INTERVAL, stale_interval: float = STALE_INTERVAL,
-                 scan_stale: bool = True, require_approval: bool = True, reconcile_queue: bool = True) -> None:
+                 scan_stale: bool = True, require_approval: bool = True, reconcile_queue: bool = True,
+                 monster_ready: threading.Event | None = None) -> None:
         self.root = Path(root)
         self.queue = taskqueue.for_root(self.root)
         self.argv_for = argv_for or self.default_argv
@@ -359,6 +379,9 @@ class Orchestrator:
         self.notes: list[str] = []
         self.active = False
         self.faults: dict = {}                         # tests: {'claimed' | 'spawned': fn(task)} called at those points of a start
+        # monster lane (phase 5 review F2): with --manage-services the ServiceManager's `hold_asserted`; no monster conversion starts before
+        # it is set (the startup conversion hold exists). None (no managed services): the CONVERT_HOLD / PAUSE files alone decide.
+        self.monster_ready = monster_ready
         self._claims_scanned: object = 'never'          # the database identity whose emptiness was last answered by a claim scan (R5)
         self._procs: list[subprocess.Popen] = []       # the wrappers this instance started (polled, so none is left un-reaped)
 
@@ -437,8 +460,12 @@ class Orchestrator:
             except Exception as exc:  # noqa: BLE001  (one bad set must not stop the builds)
                 self.errors = (self.errors + [f'reconcile: {type(exc).__name__}: {exc}'])[-20:]
             try:
-                if monster_lane.tick(self.root)['queued']:       # the unattended auto-freeze + a task for every frozen list without one
+                lane = monster_lane.tick(self.root)                # recovery, the unattended auto-freeze, a task per frozen generation
+                if lane['queued'] or lane.get('restored') or lane.get('recovered'):
                     catalog.invalidate()
+                for text in lane.get('errors') or []:             # per-variant problems (F16): shown, never fatal
+                    if f'monster tick: {text}' not in self.errors:
+                        self.errors = (self.errors + [f'monster tick: {text}'])[-20:]
             except Exception as exc:  # noqa: BLE001
                 self.errors = (self.errors + [f'monster tick: {type(exc).__name__}: {exc}'])[-20:]
         idle = self.idle()
@@ -474,18 +501,7 @@ class Orchestrator:
         """A result exists, but the builder of the attempt may still run (review F12): the wrapper confirms the exit with `builder_exited`;
         otherwise the builder named by the result, the claim or the row must be verifiably gone (an older wrapper's receipt with a normal exit code
         counts as exited)."""
-        if result.get('builder_exited') is True:
-            return False
-        if 'builder_exited' not in result and not result.get('start_error') and isinstance(result.get('exit'), int) and result['exit'] >= 0:
-            return False
-        claim = self._claim(task) or {}
-        if result.get('builder_pid'):
-            pid, created = result['builder_pid'], result.get('builder_create')
-        elif claim.get('builder_pid'):
-            pid, created = claim['builder_pid'], claim.get('builder_create')
-        else:
-            pid, created = task.get('builder_pid'), task.get('builder_create')
-        return bool(pid) and identity_ok(pid, created, task.get('started'), now)
+        return receipt_builder(result, self._claim(task) or {}, task, now) is not None
 
     def _builder_alive(self, task: dict, claim: dict | None, now: float) -> bool:
         """The attempt's builder (from the claim, else the row) is still the live recorded process."""
@@ -498,8 +514,14 @@ class Orchestrator:
         """Settle one starting / running / orphan attempt: 'finished', 'lost', 'killed', 'kill_failed', 'adopted' (starting -> running),
         'orphaned' (running -> orphan: the wrapper died, its builder lives; the slot stays taken) or 'alive'. A result whose builder is still
         running (a receipt written before the builder exited, review F12) does not free the slot: the attempt is kept as orphan until it is gone."""
+        if task['lane'] == monster_lane.LANE:                  # phase 5 review F14: a live child of the driver keeps the slot
+            held = self._monster_tree_hold(task, now)
+            if held:
+                return held
         result = self._read_result(task)
         if result is not None and self._receipt_builder_alive(task, result, now):
+            if task.get('kill_requested'):                     # a verified orphan's Kill & retry is honoured (phase 5 review row 12)
+                return self._kill(task, result)
             if task['state'] != 'orphan' and self.queue.mark_orphan(task['id'], task.get('token')):
                 self.notes.append(f'task {task["id"]}: a result was written while its builder still runs (orphan; the worker slot stays taken)')
                 return 'orphaned'
@@ -571,6 +593,7 @@ class Orchestrator:
             elif outcome['outcome'] == 'requeue':          # "Hyper3D profile busy" (5 min) or the gate closed during the run (1 min)
                 self.queue.requeue(task['id'], task.get('token'), outcome['error'], outcome['delay'])
             else:                                          # never retried automatically: Retry resumes from the record
+                self._monster_disposition(task, outcome['error'])
                 self.queue.finish(task['id'], task.get('token'), False, result, outcome['error'])
             catalog.invalidate()
             return
@@ -592,7 +615,89 @@ class Orchestrator:
         if task['attempts'] < task['max_attempts'] and self._approved(task):
             self.queue.requeue(task['id'], task.get('token'), error, BACKOFF)
         else:
+            if task['lane'] == monster_lane.LANE:
+                self._monster_disposition(task, error)
             self.queue.finish(task['id'], task.get('token'), False, None, error)
+
+    # ------------------------------------------------------------------------------------------- monster lane (phase 5 review)
+    def _monster_disposition(self, task: dict, error: str | None) -> None:
+        """F4: the failure of a monster generation is persisted in its views.json BEFORE the row fails (a rebuilt queue never revives it)."""
+        try:
+            monster_lane.record_failure(self.root, task, error)
+        except Exception as exc:  # noqa: BLE001  (the row still fails; the error is shown)
+            self.errors = (self.errors + [f'monster disposition of task {task["id"]}: {type(exc).__name__}: {exc}'])[-20:]
+
+    def _monster_tree_hold(self, task: dict, now: float) -> str | None:
+        """F14: while a recorded child of the variant's driver (collector, reducer, Blender, browser) still runs, the attempt keeps its slot,
+        whatever its wrapper, builder or receipt say: 'orphaned' / 'alive' (a Kill & retry drains the tree first). None: no live child, the
+        normal settlement applies."""
+        args = task.get('args') if isinstance(task.get('args'), dict) else {}
+        try:
+            kids = monster_lane.live_children(self.root, str(args.get('monster')), str(args.get('variant')))
+        except Exception:  # noqa: BLE001
+            return None
+        if not kids:
+            return None
+        if task.get('kill_requested'):
+            return self._kill(task)
+        if task['state'] == 'running' and not same_process(task, now):
+            if self.queue.mark_orphan(task['id'], task.get('token')):
+                self.notes.append(f'task {task["id"]}: its driver is gone but a child process still runs (orphan; the slot stays taken)')
+                return 'orphaned'
+        return 'alive' if task['state'] in ('running', 'orphan') else None
+
+    def _monster_tree(self, task: dict, builder: tuple) -> list:
+        """F14: the process tree of a monster attempt, collected BEFORE anything is killed: every descendant (psutil, recursive) of the
+        builder and the wrapper (each only when it is still the recorded process), and every recorded live child of the variant's drivers with
+        its own descendants. The builder and wrapper themselves are not in the list (_kill terminates them after their checks)."""
+        if psutil is None:
+            return []
+        args = task.get('args') if isinstance(task.get('args'), dict) else {}
+        monster, variant = str(args.get('monster')), str(args.get('variant'))
+        procs: dict[int, object] = {}
+
+        def collect(pid, created) -> None:
+            if not pid or not pid_alive(pid):
+                return
+            actual = create_time(pid)
+            if created is not None and actual is not None and abs(actual - created) > CREATE_TIME_TOLERANCE:
+                return
+            try:
+                root_proc = psutil.Process(pid)
+                for proc in [root_proc] + root_proc.children(recursive=True):
+                    procs.setdefault(proc.pid, proc)
+            except psutil.Error:
+                pass
+        collect(*builder)
+        collect(task.get('pid'), task.get('pid_create'))
+        for child in monster_lane.recorded_children(self.root, monster, variant)['children']:
+            if monster_lane._alive(child.get('pid'), child.get('create')):
+                collect(child.get('pid'), child.get('create'))
+        own = {p for p in (builder[0], task.get('pid')) if p}
+        return [p for pid, p in procs.items() if pid not in own]
+
+    def _drain_monster_tree(self, task: dict, tree: list, problems: list[str], killed: list[str]) -> None:
+        """Kill every process of `tree` (after the builder and wrapper were stopped, so nothing spawns a new step) and wait for each to be gone.
+        A survivor is a problem (kill_failed: the slot stays taken). When all are gone, the variant's children record is cleared."""
+        args = task.get('args') if isinstance(task.get('args'), dict) else {}
+        monster, variant = str(args.get('monster')), str(args.get('variant'))
+        for proc in reversed(tree):                             # deepest first (children lists are breadth-first)
+            try:
+                proc.kill()
+            except psutil.NoSuchProcess:
+                pass
+            except psutil.Error as exc:
+                problems.append(f'child {proc.pid} could not be killed ({exc})')
+        _gone, alive = psutil.wait_procs(tree, timeout=KILL_WAIT) if tree else ([], [])
+        for proc in alive:
+            problems.append(f'child {proc.pid} is still running after the kill')
+        if tree and not alive:
+            killed.append(f'{len(tree)} child process(es)')
+        if not alive:
+            try:
+                monster_lane.clear_children(self.root, monster, variant)
+            except OSError:
+                pass
 
     def _verified(self, pid: int | None, recorded_create: float | None, must_contain: list[str]) -> bool:
         """`pid` is alive, has the recorded create time and its command line contains every string of `must_contain`."""
@@ -634,21 +739,31 @@ class Orchestrator:
         later = create_time(pid)
         return 'killed' if later is not None and created is not None and abs(later - created) > CREATE_TIME_TOLERANCE else 'survived'
 
-    def _kill(self, task: dict) -> str:
+    def _kill(self, task: dict, result: dict | None = None) -> str:
         """Kill & retry: the builder first, then the wrapper, each by PID after its command line and create time were checked. Only when BOTH are
         confirmed gone is a fresh attempt queued (attempts reset: a manual retry; failed instead when the approval was withdrawn): 'killed'. A
-        process that could not be verified or did not die leaves the row as it is, slot included, with the reason as its error ('kill_failed')."""
+        process that could not be verified or did not die leaves the row as it is, slot included, with the reason as its error ('kill_failed').
+        `result`: an early receipt whose builder still runs (an orphan, row 12): the builder it names is the one killed."""
         claim = self._claim(task) or {}
         killed, problems = [], []
         argv = [a for a in (claim.get('argv') or [])[1:]]
-        for role, pid, created, marks in (('builder', claim.get('builder_pid') or task.get('builder_pid'),
-                                           claim.get('builder_create') if claim.get('builder_pid') else task.get('builder_create'), argv),
+        if result and result.get('builder_pid'):
+            builder_pid, builder_create = result['builder_pid'], result.get('builder_create')
+        elif claim.get('builder_pid'):
+            builder_pid, builder_create = claim['builder_pid'], claim.get('builder_create')
+        else:
+            builder_pid, builder_create = task.get('builder_pid'), task.get('builder_create')
+        # a monster attempt: its whole process tree is collected first and drained after the builder / wrapper (phase 5 review F14)
+        tree = self._monster_tree(task, (builder_pid, builder_create)) if task['lane'] == monster_lane.LANE else None
+        for role, pid, created, marks in (('builder', builder_pid, builder_create, argv),
                                           ('wrapper', task.get('pid'), task.get('pid_create'), [task.get('token')] if task.get('token') else [str(RUN_TASK)])):
             outcome = self._terminate(pid, created, marks)
             if outcome == 'killed':
                 killed.append(f'{role} {pid}')
             elif outcome != 'gone':
                 problems.append(f'{role} {pid} {"could not be verified (not touched)" if outcome == "unverified" else "is still running after the kill"}')
+        if tree is not None:
+            self._drain_monster_tree(task, tree, problems, killed)
         if problems:
             detail = 'Kill & retry could not stop the attempt: ' + '; '.join(problems) + ' (the worker slot stays taken)'
             self.queue.kill_failed(task['id'], task.get('token'), detail)
@@ -807,19 +922,31 @@ class Orchestrator:
         without a result; alive = its claim's wrapper is the recorded live process, or its builder is, or (no usable claim yet) a live process
         carries its token on the command line. Merged by attempt identity (taskqueue.adopt_attempt): a row of the same key that is queued /
         failed / cancelled / done becomes this running attempt (so it is never started a second time); the same token is already known. A
-        claim whose wrapper died while its builder still runs is adopted as `orphan` (its slot stays taken, R6). Returns how many were merged."""
+        claim whose wrapper died while its builder still runs is adopted as `orphan` (its slot stays taken, R6), and so is an attempt with a
+        result receipt whose builder still runs (receipt_builder, the intact queue's rule; phase 5 review row 12). Returns how many were merged."""
         if not self.logs.is_dir():
             return 0
         now, adopted, tokens = time.time(), 0, None
         for spec_file in sorted(self.logs.glob('*.task.json')):
             base = str(spec_file)[:-len('.task.json')]
-            if Path(base + '.result.json').exists():
-                continue
             claim = _json_file(Path(base + '.claim.json'))
             spec = _json_file(spec_file) or {}
             source = claim if claim and claim.get('token') and isinstance(claim.get('task'), dict) else None
-            orphan = False
-            if source is not None and identity_ok(source.get('wrapper_pid'), source.get('wrapper_create'), source.get('claimed'), now):
+            orphan, builder = False, None
+            if Path(base + '.result.json').exists():
+                # a receipt: settled, UNLESS its builder still runs (the same liveness rule as the intact queue, phase 5 review row 12):
+                # then the attempt is adopted as an orphan, so its slot stays taken and a Kill & retry can reach the builder
+                result = _json_file(Path(base + '.result.json'))
+                if source is None and spec.get('token') and isinstance(spec.get('task'), dict):
+                    source = spec
+                if result is None or source is None or result.get('token') != source.get('token'):
+                    continue
+                builder = receipt_builder(result, claim or {}, None, now)
+                if builder is None:
+                    continue
+                pid, created, started = source.get('wrapper_pid'), source.get('wrapper_create'), source.get('claimed') or spec_file.stat().st_mtime
+                orphan = True
+            elif source is not None and identity_ok(source.get('wrapper_pid'), source.get('wrapper_create'), source.get('claimed'), now):
                 pid, created, started = source['wrapper_pid'], source.get('wrapper_create'), source.get('claimed')
             elif source is not None and source.get('builder_pid') and \
                     identity_ok(source['builder_pid'], source.get('builder_create'), source.get('claimed'), now):
@@ -850,7 +977,9 @@ class Orchestrator:
             if outcome not in ('inserted', 'merged'):
                 continue
             adopted += 1
-            if source.get('builder_pid'):
+            if builder is not None:
+                self.queue.set_builder(new_id, source['token'], builder[0], builder[1])
+            elif source.get('builder_pid'):
                 self.queue.set_builder(new_id, source['token'], source['builder_pid'], source.get('builder_create'))
             if orphan:
                 self.queue.mark_orphan(new_id, source['token'])
@@ -908,7 +1037,13 @@ class Orchestrator:
         return started
 
     def _start_monsters(self, now: float, idle: float | None) -> int:
-        """The monster lane (limit 1, its own gate; independent of the layer pool): cancel what its plan no longer wants, start what it may."""
+        """The monster lane (limit 1, its own gate; independent of the layer pool): cancel what its plan no longer wants, start what it may.
+        With managed services nothing starts before the manager asserted the startup conversion hold (phase 5 review F2)."""
+        if self.monster_ready is not None and not self.monster_ready.is_set():
+            note = 'monster conversions wait until the services manager has asserted the startup conversion hold'
+            if note not in self.notes:
+                self.notes.append(note)
+            return 0
         plan = monster_lane.plan_starts(self.root, now, idle=idle, idle_known=True)
         for task, why in plan['cancel']:
             self.queue.cancel(task['id'], why or 'no longer wanted')
@@ -1046,6 +1181,11 @@ class ServiceManager:
         self._wake = False
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
+        # set right after the startup conversion hold exists (begin): the monster dispatcher waits for it (phase 5 review finding 2)
+        self.hold_asserted = threading.Event()
+        # requests whose outcome was "pending" (a convert stop waiting for the job, a supervisor that has not exited yet): {id: request}.
+        # They stay in `pending` of the view until the tick that ends them emits the terminal `request` event with the same id (row 18).
+        self.outstanding: dict[int, dict] = {}
 
     # ------------------------------------------------------------------------------------------------------- lifecycle
     def start(self) -> None:
@@ -1097,9 +1237,20 @@ class ServiceManager:
         except Exception:  # noqa: BLE001
             pass
 
+    def _resolve(self, req_id: int, ok: bool, text: str) -> None:
+        """The terminal outcome of an outstanding (pending) request: a `request` event with its id, `pending: false`."""
+        with self.cond:
+            req = self.outstanding.pop(req_id, None)
+        if req is not None:
+            self._event('request', text, request=req_id, name=req['name'], action=req['action'], ok=ok, pending=False)
+
     def _execute(self, req: dict) -> None:
         name, action = req['name'], req['action']
         settings = self._settings(self.root)
+        with self.cond:
+            earlier = [r for r in self.outstanding.values() if r['name'] == name]
+        for old in earlier:                  # a new request takes over a pending one (the record carries the new id)
+            self._resolve(old['id'], True, f'{old["action"]} {name}: superseded by request {req["id"]} ({action})')
         try:
             if action == 'start':
                 self.services.start(self.root, name, settings)
@@ -1114,6 +1265,9 @@ class ServiceManager:
         except Exception as exc:  # noqa: BLE001
             ok, pending, message = False, False, f'{type(exc).__name__}: {exc}'
         self._refresh(settings)              # first: whoever sees the outcome event also sees the status it produced
+        if ok and pending:
+            with self.cond:
+                self.outstanding[req['id']] = dict(req) | {'pending_since': time.time()}
         self._event('request', f'{action} {name}: {message}', request=req['id'], name=name, action=action, ok=ok, pending=pending)
 
     def _refresh(self, settings: dict | None = None) -> None:
@@ -1129,21 +1283,52 @@ class ServiceManager:
         self.last_tick = time.time()
         self.ticks += 1
         self.statuses = result.get('services')
-        for text in result.get('events') or []:
-            self._event('tick', str(text))
+        events = [str(text) for text in result.get('events') or []]
+        ends = []
+        for done in result.get('completed') or []:      # pending stops / restarts that ended: their request's terminal outcome (row 18)
+            with self.cond:
+                req = self.outstanding.get(done.get('request')) if isinstance(done, dict) else None
+            if req is not None and req['name'] == done.get('name'):
+                if done.get('text') in events:
+                    events.remove(done['text'])
+                ends.append((req['id'], bool(done.get('ok', True)), f'{req["action"]} {req["name"]}: {done.get("text") or "done"}'))
+        for text in events:
+            self._event('tick', text)
+        for req_id, ok, text in ends:
+            self._resolve(req_id, ok, text)
+        self._settle_outstanding()
         return result
 
-    def begin(self) -> None:
+    def _settle_outstanding(self) -> None:
+        """An outstanding request whose service shows no pending stop any more (it ended without a matching tick record: adopted anew, stopped
+        by hand, a record from another server) gets its terminal outcome from the status."""
+        statuses = self.statuses or {}
+        with self.cond:
+            waiting = list(self.outstanding.values())
+        for req in waiting:
+            status = statuses.get(req['name'])
+            if isinstance(status, dict) and not status.get('stop_pending'):
+                detail = status.get('state') or 'unknown'
+                self._resolve(req['id'], True, f'{req["action"]} {req["name"]}: finished ({detail}'
+                              + (f': {status["message"]}' if status.get('message') else '') + ')')
+
+    def begin(self) -> bool:
         """The manager's first step, before any tick or request (DESIGN_PHASE4.md I.1): the conversion hold exists before a convert worker is
-        started or adopted. A failure is a manager error (each tick asserts the hold again while no supervisor runs)."""
+        started or adopted. `hold_asserted` is set as soon as a hold exists (ours, or a live other owner's); a failure is a manager error and
+        the loop tries again before anything else runs. Returns whether the hold is asserted."""
         try:
             for text in self.services.begin_management(self.root):
                 self._event('tick', text)
+            if self.services.read_hold(self.root) is not None:
+                self.hold_asserted.set()
         except Exception as exc:  # noqa: BLE001
             self.errors = (self.errors + [f'begin: {type(exc).__name__}: {exc}'])[-20:]
+        return self.hold_asserted.is_set()
 
     def _loop(self) -> None:
-        self.begin()
+        while not self.begin():                         # nothing is ticked, started or adopted before the startup hold exists
+            if self.stop_event.wait(5.0):
+                return
         while not self.stop_event.is_set():
             with self.cond:
                 req = self.requests.pop(0) if self.requests else None
@@ -1180,7 +1365,8 @@ class ServiceManager:
         except Exception as exc:  # noqa: BLE001
             status = {'services': self.statuses or {}, 'convert_jobs': None, 'errors': [f'status: {type(exc).__name__}: {exc}']}
         with self.cond:
-            pending = [dict(r) for r in self.requests] + ([dict(self.running) | {'running': True}] if self.running else [])
+            pending = [dict(r) for r in self.requests] + ([dict(self.running) | {'running': True}] if self.running else []) + \
+                [dict(r) | {'running': True, 'waiting': True} for r in self.outstanding.values()]
         return status | {'managed': True, 'scanned': self.last_tick is not None, 'last_tick': self.last_tick, 'interval': self.interval,
                          'pending': pending, 'events': list(self.events[-30:]), 'manager_errors': list(self.errors[-5:]),
                          'problems': self.problems()}

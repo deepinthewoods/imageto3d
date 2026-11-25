@@ -8,7 +8,8 @@
     family_ids(root, set_id)                                               the exact job set ids of a set (DESIGN_PHASE4.md I.6)
     add_sets(root, set_ids, extra=())                                      append those exact ids under a lock, idempotent
     pending_jobs(root) / held_jobs(root)                                   staged jobs the worker will / will not take
-    eligible_jobs(root)                                                    listed jobs the worker would really take now (F20)
+    eligible_jobs(root)                                                    listed jobs the worker would really take now (F20, row 20)
+    namespace_conflict(root, set_id) / owner_of(root, id)                  the reserved family namespace (phase 5 review row 3)
 
 Nothing here ever removes or reorders an existing line; `add_sets` only appends (atomic replace of the whole file). It never writes a wildcard
 (phase 4 review F3 / DESIGN_PHASE4.md I.6): a set id `S` (literal, the approval grammar `serve.NAME`) is written as `S`, `S_<race>` for every race
@@ -93,32 +94,162 @@ def base_races(root) -> list[str]:
         return []
 
 
+def family_suffixes(races: list[str]) -> list[str]:
+    """The job-name suffixes of a set's family: every race, plus the gnome race families (`gnome` of `gnome_female`)."""
+    return list(races) + sorted({r.rsplit('_', 1)[0] for r in races if r.startswith('gnome') and '_' in r})
+
+
 def family_ids(root, set_id: str, races: list[str] | None = None) -> list[str]:
     """The exact job set ids the pipeline creates for a set (DESIGN_PHASE4.md I.6): `S`, `S_<race>` for every race with a palette.json and
     `S_<gnome family>` (`S_gnome`, the historical gnome-only job name that catalog.job_set / finish_sets.set_of map back to `S`)."""
     races = base_races(root) if races is None else races
-    families = sorted({r.rsplit('_', 1)[0] for r in races if r.startswith('gnome') and '_' in r})
     out = [set_id]
-    for suffix in races + families:
+    for suffix in family_suffixes(races):
         if f'{set_id}_{suffix}' not in out:
             out.append(f'{set_id}_{suffix}')
     return out
 
 
+# ------------------------------------------------------------------------------------------------------------ set id namespace (row 3)
+# A family id `S_<race>` written for set S pre-authorizes every job of that name. An independently named set that happens to end in a race
+# suffix must therefore never share it (phase 5 review row 3): the namespace is RESERVED when a set is approved (namespace_conflict refuses the
+# approval) and RECORDED in `.codex_jobs/_app/set_namespace.json` = {"sets": {S: time}, "families": {S_<race>: S}} by add_sets, so the catalog
+# (catalog.job_set) and add_sets know whose a suffixed id is instead of guessing from the suffix.
+
+CONCEPT_STAGES = ('concepts', 'provisional', 'approved', 'archive/concepts')
+JOB_STAGES = ('processing_views', 'multiview_ready', 'processing', 'completed', 'failed', 'held_conversions')
+_NS_CACHE: dict[str, tuple] = {}
+
+
+def namespace_path(root) -> Path:
+    return Path(root) / guard.APP / 'set_namespace.json'
+
+
+def read_namespace(root) -> dict:
+    """{"sets": {set: time}, "families": {family id: set}} (empty when absent or unreadable; cached by the file's mtime)."""
+    path = namespace_path(root)
+    try:
+        stamp = path.stat().st_mtime_ns
+    except OSError:
+        return {'sets': {}, 'families': {}}
+    hit = _NS_CACHE.get(str(path))
+    if hit and hit[0] == stamp:
+        return hit[1]
+    try:
+        raw = json.loads(path.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        raw = {}
+    raw = raw if isinstance(raw, dict) else {}
+    data = {'sets': {k: v for k, v in (raw.get('sets') or {}).items() if isinstance(k, str) and NAME.fullmatch(k)}
+            if isinstance(raw.get('sets'), dict) else {},
+            'families': {k: v for k, v in (raw.get('families') or {}).items() if isinstance(k, str) and isinstance(v, str)
+                         and NAME.fullmatch(k) and NAME.fullmatch(v)} if isinstance(raw.get('families'), dict) else {}}
+    _NS_CACHE[str(path)] = (stamp, data)
+    return data
+
+
+def owner_of(root, set_id: str) -> str | None:
+    """The recorded owner of an id: itself when it was approved / released as a set, its parent when it was written as a family id, else
+    None (unrecorded: the caller falls back to the suffix rule)."""
+    data = read_namespace(root)
+    if set_id in data['sets']:
+        return set_id
+    return data['families'].get(set_id)
+
+
+def _folders(root, stages) -> set[str]:
+    out = set()
+    for stage in stages:
+        try:
+            out |= {p.name for p in (Path(root) / stage).iterdir() if p.is_dir() and NAME.fullmatch(p.name)}
+        except OSError:
+            continue
+    return out
+
+
+def independent_sets(root) -> set[str]:
+    """Sets that exist in their own right: concept-stage set folders (concepts, provisional, approved, archive) and recorded sets."""
+    return _folders(root, CONCEPT_STAGES) | set(read_namespace(root)['sets'])
+
+
+def namespace_conflict(root, set_id: str, races: list[str] | None = None) -> str | None:
+    """Why approving `set_id` would share another set's convert-list family (phase 5 review row 3), else None:
+      - `set_id` was written as a family id of another set (set_namespace.json),
+      - `set_id` = `<P>_<suffix>` for a race / gnome-family suffix and P is a set (a concept-stage folder, a recorded set, a job's set prefix
+        or a models/ folder): its jobs would match P's pre-authorized family entry,
+      - an independent set `<set_id>_<suffix>` exists: approving `set_id` would pre-authorize it as `set_id`'s race job."""
+    races = base_races(root) if races is None else races
+    suffixes = family_suffixes(races)
+    data = read_namespace(root)
+    parent = data['families'].get(set_id)
+    if parent and parent != set_id:
+        return f'{set_id} is reserved: it is the convert-list job id of the set {parent}'
+    known = independent_sets(root) | _folders(root, ('models',))
+    for stage in JOB_STAGES:
+        try:
+            known |= {p.name.split('--')[0] for p in (Path(root) / stage).iterdir() if p.is_dir() and '--' in p.name}
+        except OSError:
+            continue
+    for suffix in suffixes:
+        tail = '_' + suffix
+        if set_id.endswith(tail) and len(set_id) > len(tail):
+            base = set_id[:-len(tail)]
+            if base in known and base != set_id:
+                return (f'{set_id} ends in {tail} and {base} is a set: its jobs would share the convert-list entry of {base}\'s {suffix} jobs; '
+                        'choose another set id')
+    for other in sorted(independent_sets(root)):
+        if other != set_id and other.startswith(set_id + '_') and other[len(set_id) + 1:] in suffixes \
+                and data['families'].get(other) in (None, set_id) and other in (set(data['sets']) | _folders(root, CONCEPT_STAGES)):
+            return (f'the set {other} exists: approving {set_id} would pre-authorize it as {set_id}\'s {other[len(set_id) + 1:]} job; '
+                    'choose another set id')
+    return None
+
+
+def _register(root, set_ids: list[str], families: dict[str, str]) -> None:
+    """Record approved / released sets and the family ids written for them (under the convert-list lock; never removes an entry)."""
+    data = read_namespace(root)
+    sets, fams = dict(data['sets']), dict(data['families'])
+    changed = False
+    for set_id in set_ids:
+        if set_id not in sets:
+            sets[set_id], changed = guard.now(), True
+    for fid, parent in families.items():
+        if fid not in fams and fid not in sets:
+            fams[fid], changed = parent, True
+    if changed:
+        guard.write_atomic(namespace_path(root), (json.dumps({'sets': sets, 'families': fams}, indent=1, sort_keys=True) + '\n').encode('utf-8'))
+
+
 def add_sets(root, set_ids, extra=()) -> dict:
     """Append the exact family ids (`family_ids`) of every set, plus the exact ids in `extra` (e.g. the prefix of a staged job of the set),
     never a wildcard. Under the file lock; an exact line already present (stripped) is not added again. A set an existing `!` exclude matches
-    is still written but reported in `excluded` (the worker keeps skipping it; the user decides about the exclude).
-    Returns {"added": [lines], "present": [lines], "excluded": {set: [patterns]}}."""
+    is still written but reported in `excluded` (the worker keeps skipping it; the user decides about the exclude). A family id that is an
+    independent set of its own (another set's folder, a recorded set, or another set's recorded family id) is NOT written: it is reported in
+    `skipped` (phase 5 review row 3). The sets and the family ids written are recorded in set_namespace.json.
+    Returns {"added": [lines], "present": [lines], "excluded": {set: [patterns]}, "skipped": {set: [{id, reason}]}}."""
     ids = [set_ids] if isinstance(set_ids, str) else list(set_ids)
     extra = [extra] if isinstance(extra, str) else list(extra)
     bad = [s for s in ids + extra if not isinstance(s, str) or not NAME.fullmatch(s)]
     if bad:
         raise ValueError(f'invalid set id(s): {bad}')
     races = base_races(root)
-    wanted = {set_id: family_ids(root, set_id, races) for set_id in ids}
+    namespace = read_namespace(root)
+    independent = independent_sets(root)
+    wanted, skipped, owned = {}, {}, {}
+    for set_id in ids:
+        lines = [set_id]
+        for fid in family_ids(root, set_id, races)[1:]:
+            owner = namespace['families'].get(fid)
+            if fid in independent or (owner and owner != set_id):
+                skipped.setdefault(set_id, []).append({'id': fid, 'reason': f'{fid} is ' + (f'a family id of {owner}' if owner and owner != set_id
+                                                                                               else 'a set of its own')})
+                continue
+            lines.append(fid)
+            owned[fid] = set_id
+        wanted[set_id] = lines
     path = list_path(root)
     with guard.os_lock(lock_path(root)):
+        _register(root, ids, owned)
         try:
             raw = path.read_bytes()
         except FileNotFoundError:
@@ -142,7 +273,7 @@ def add_sets(root, set_ids, extra=()) -> dict:
         found = sorted({p for line in lines for p in excluded_by(line, current)})
         if found:
             excluded[set_id] = found
-    return {'added': added, 'present': present, 'excluded': excluded}
+    return {'added': added, 'present': present, 'excluded': excluded, 'skipped': skipped}
 
 
 # ---------------------------------------------------------------------------------------------------------------------- staged jobs
@@ -224,10 +355,48 @@ def pending_jobs(root) -> list[dict]:
     return [{**j, 'allow': allowed_by(j['set'], pats)} for j in staged_jobs(root) if matches(j['set'], pats)]
 
 
+def worker_predicate():
+    """`tools/convert_queue.py job_eligible(root, job_name) -> (bool, reason)`: the worker's own read-only claim / join predicate (phase 5 review
+    row 20), imported lazily (convert_queue imports the conversion tooling); None when it is missing (an older convert_queue.py) or cannot be
+    imported, and eligible_jobs falls back to its own copy of the rule."""
+    try:
+        tools = str(HERE.parents[1])
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        import convert_queue  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return None
+    fn = getattr(convert_queue, 'job_eligible', None)
+    return fn if callable(fn) else None
+
+
+def _fallback_eligible(root, job: dict, record: dict) -> tuple[bool, str, int]:
+    """The worker's rule (convert_queue.next_job, read-only) when its predicate is unavailable: (eligible, reason, free modules). A job is taken
+    when it has a FREE module (unconverted, no live module-lock holder) AND either its job lock (`convert_locks/<job>.lock`) has no live holder
+    (claim) or, in processing/, another worker's convert_job holds some of its modules (join). A held job lock with every module free can be
+    neither claimed nor joined."""
+    base = Path(root) / 'models' / str(record.get('set', '')) / str(record.get('job_id', ''))
+    free = busy = 0
+    for race, module in _unconverted(root, record):
+        if _holder_alive(base / '.module_locks' / f'{race}__{module}.lock'):
+            busy += 1
+        else:
+            free += 1
+    if not free:
+        return False, 'no free module', 0
+    if not _holder_alive(Path(root) / '.codex_jobs' / '_batch' / 'convert_locks' / f'{job["job"]}.lock'):
+        return True, 'claimable', free
+    if job['stage'] == 'processing' and busy:
+        return True, 'joinable', free
+    return False, 'its job lock is held and no module of it is being converted (cannot be claimed or joined)', free
+
+
 def eligible_jobs(root, max_tries: int = MAX_TRIES) -> list[dict]:
-    """Listed staged jobs the worker would really take now (convert_queue.next_job, read-only; phase 4 review F20): fewer than `max_tries`
-    failures and at least one FREE module (unconverted and no live module-lock holder). [{job, stage, set, free, fails}]"""
+    """Listed staged jobs the worker would really take now (convert_queue.next_job, read-only; phase 4 review F20, phase 5 review row 20):
+    fewer than `max_tries` failures and claimable or joinable by the worker's own predicate `convert_queue.job_eligible` (worker_predicate; the
+    copy in _fallback_eligible when it is unavailable). [{job, stage, set, free, fails, reason}]"""
     out = []
+    predicate = worker_predicate()
     for job in pending_jobs(root):
         count = fails(root, job['job'])
         if count >= max_tries:
@@ -235,10 +404,15 @@ def eligible_jobs(root, max_tries: int = MAX_TRIES) -> list[dict]:
         record = _record(Path(root) / job['stage'] / job['job'])
         if record is None:
             continue
-        base = Path(root) / 'models' / str(record.get('set', '')) / str(record.get('job_id', ''))
-        free = sum(1 for race, module in _unconverted(root, record) if not _holder_alive(base / '.module_locks' / f'{race}__{module}.lock'))
-        if free:
-            out.append({'job': job['job'], 'stage': job['stage'], 'set': job['set'], 'free': free, 'fails': count})
+        ok, reason, free = _fallback_eligible(root, job, record)
+        if predicate is not None:
+            try:
+                verdict = predicate(Path(root), job['job'])
+                ok, reason = bool(verdict[0]), str(verdict[1]) if len(verdict) > 1 else ''
+            except Exception as exc:  # noqa: BLE001  (the predicate failing never wakes the worker)
+                ok, reason = False, f'convert_queue.job_eligible failed: {type(exc).__name__}: {exc}'
+        if ok:
+            out.append({'job': job['job'], 'stage': job['stage'], 'set': job['set'], 'free': free, 'fails': count, 'reason': reason})
     return out
 
 

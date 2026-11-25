@@ -43,6 +43,35 @@ const cookieScript = fileURLToPath(new URL('./import_firefox_cookies.py',import.
 // Windows (2026-11-08): `python` (python3 there is a different interpreter); no ordinary Firefox profile to copy cookies from,
 // so a missing profile means: rely on the persistent Playwright profile's own Tripo login (log in once in that window).
 const PY = process.platform==='win32' ? 'python' : 'python3';
+// Profile reservation (phase 5 review, phase-4 finding 8; tripo_browser_lock.py): the profile above is shared by every checkout, so
+// this script never opens it unless the reservation of that RESOLVED profile is held. A python caller (convert_job, convert_queue)
+// holds it and passes IMAGETO3D_TRIPO_PROFILE_LOCK / _TOKEN, verified here; without them (a manual run, the preview app's balance
+// check, an older worker) the command is re-run under `tripo_browser_lock.py run`, which takes the reservation first (waits up to
+// $IMAGETO3D_TRIPO_PROFILE_WAIT s, default 600, then exits 75). A reservation that fails verification is refused (exit 1).
+const LOCK_TOOL = fileURLToPath(new URL('./tripo_browser_lock.py',import.meta.url));
+const LOCK_ENV = 'IMAGETO3D_TRIPO_PROFILE_LOCK', TOKEN_ENV = 'IMAGETO3D_TRIPO_PROFILE_TOKEN';
+if(!process.env[LOCK_ENV]){
+ const run=spawnSync(PY,['-X','utf8',LOCK_TOOL,'run','--profile',profile,'--',process.execPath,fileURLToPath(import.meta.url),...process.argv.slice(2)],{stdio:'inherit'});
+ if(run.error)console.error(`cannot reserve the Tripo profile (${run.error.message}); not opening it`);
+ process.exit(run.status ?? 1);
+}
+{
+ const check=spawnSync(PY,['-X','utf8',LOCK_TOOL,'verify','--profile',profile,'--lock',process.env[LOCK_ENV],'--token',process.env[TOKEN_ENV]??''],{encoding:'utf8',stdio:['ignore','pipe','pipe']});
+ if(check.status!==0){
+  console.error(`Tripo profile reservation refused: ${((check.stdout||'')+(check.stderr||'')).trim().split('\n')[0]||check.error?.message||`verify exit ${check.status}`}; not opening ${profile}`);
+  process.exit(1);
+ }
+}
+// Click-time paid gate (DESIGN_PHASE4 I.8, tools/paid_gate.py): with IMAGETO3D_PAID_GATE set (convert_job passes it to a paid submit)
+// the gate is checked right before the Generate click; null = open (or no gate: a manual run), else the reason it is closed.
+const GATE_TOOL = fileURLToPath(new URL('../paid_gate.py',import.meta.url));
+const EXIT_GATE_CLOSED = 4;
+function paidGateClosed(){
+ if(!process.env.IMAGETO3D_PAID_GATE)return null;
+ const run=spawnSync(PY,['-X','utf8',GATE_TOOL,'check'],{encoding:'utf8',stdio:['ignore','pipe','pipe']});
+ if(run.status===0)return null;
+ return (run.stdout||'').trim().split('\n')[0]||(run.stderr||'').trim().split('\n').pop()||run.error?.message||`gate check exit ${run.status}`;
+}
 function getCookies(){
  let cookies;
  try{
@@ -168,6 +197,13 @@ async function submit(){
    record.status='waiting_for_studio_queue';write(record);await page.waitForTimeout(15000);
   }
   if((await pending()).length)throw new Error(`Upload slot emptied before Generate: ${(await pending()).join(', ')}`);
+  const gate=paidGateClosed();   // immediately before the intent and the click: the queue wait above can last 30 min
+  if(gate){
+   // nothing was clicked: the record is set aside, so the resumed submit starts fresh; the caller waits for its gate (exit 4)
+   record.status='gate_closed';record.gate_closed=gate;write(record);
+   fs.renameSync(recordPath,recordPath.replace(/\.json$/,`.gate_closed_${Date.now()}.json`));
+   console.error(`PAID GATE CLOSED: ${gate}`);process.exitCode=EXIT_GATE_CLOSED;return;
+  }
   record.status='submission_attempted';record.submit_clicked_at=new Date().toISOString();write(record);
   await generate.click();await page.waitForTimeout(7000);
   record.response=responses[0]??null;record.project_id=record.response?.project_id??page.url().match(/[a-f0-9-]{36}$/)?.[0]??null;

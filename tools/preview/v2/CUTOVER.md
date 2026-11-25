@@ -6,10 +6,12 @@ the server is started with `--manage-services`: only the cut-over server gets th
 stops or signals a service). The prototype on :8790 is `experiments/shell_slots_20261122/serve.py`: it is not part of the cut-over; leave it
 running.
 
-The pipeline services (supervisor, view runner, convert worker) are never killed by the cut-over. v2 adopts them; the steps below restart the
-supervisor and the view runner on purpose and drain the old convert worker, each through the paid-safety interlock of DESIGN_PHASE4.md I:
-the conversion hold `.codex_jobs/_batch/CONVERT_HOLD` (no paid conversion step starts or continues while it exists) stays in place from the
-moment v2 starts until the new supervisor has completed a tick.
+The pipeline services (supervisor, view runner, convert worker) are never killed by the cut-over. v2 adopts them; the steps below replace
+them in a fixed order, each through the paid-safety interlock of DESIGN_PHASE4.md I: the conversion hold `.codex_jobs/_batch/CONVERT_HOLD`
+(no paid conversion step of the CURRENT code starts or continues while it exists) stays in place from the moment v2 starts until the new
+supervisor has completed a tick. The order matters (phase 5 review row 17): the live worker and any `convert_job.py` it started run code
+from BEFORE the hold existed and only honour PAUSE, which the old supervisor deletes on its way out. So the old paid work is drained FIRST
+(step 4), the old view runner is replaced only while it launches nothing (step 5), and only then is the old supervisor restarted (step 6).
 
 Run everything from the repo root in PowerShell:
 
@@ -19,51 +21,37 @@ $repo = (Get-Location).Path
 $logs = "$repo\.codex_jobs\_batch"
 ```
 
-The user must agree before step 1. Nothing below runs by itself. Never `Stop-Process -Name python`; every stop names ONE PID that was
-checked twice (command line and creation time) right before it is stopped.
+The user must agree before step 1. Nothing below runs by itself. Never `Stop-Process -Name python`; every stop below goes through the
+checker script, which names ONE process, verifies it twice (interpreter command line parsed like `services.identify`, script path resolved
+against the process's own working directory = this checkout, creation time unchanged) and refuses otherwise.
 
 ## 0. Before
 
 1. Everything is committed (`git status` clean; the generated outputs stay ignored, see the blender-repo-generated-outputs note).
 2. Tests of the pieces the cut-over relies on pass:
    ```powershell
-   python -X utf8 -m pytest -q tools/preview/v2/test_phase4.py tools/preview/v2/test_phase4b.py tools/preview/v2/test_phase3.py tools/preview/v2/test_v2.py
-   python -X utf8 -m pytest -q tools/test_pipeline_supervisor.py tools/tripo_pipeline/test_workflow.py tools/test_view_batch_launcher.py
+   python -X utf8 -m unittest tools/preview/v2/test_v2.py tools/preview/v2/test_phase3.py tools/preview/v2/test_phase4.py tools/preview/v2/test_phase4b.py tools/preview/v2/test_phase5.py
+   python -X utf8 -m pytest -q tools/test_pipeline_supervisor.py tools/tripo_pipeline/test_workflow.py tools/test_view_batch_launcher.py tools/test_convert_queue.py
    ```
-3. Record what runs now (compare after step 3):
+3. Write the checker script and the `Invoke-Check` helper: run the block of the section *Checker script* at the end of this file.
+4. Record what runs now (compare after step 3):
    ```powershell
    Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
-     Where-Object { $_.CommandLine -match 'pipeline_supervisor\.py|view_batch\.py|convert_queue\.py|preview[\\/](v2[\\/])?serve(r)?\.py' } |
+     Where-Object { $_.CommandLine -match 'pipeline_supervisor\.py|view_batch\.py|convert_queue\.py|convert_job\.py|preview[\\/](v2[\\/])?serve(r)?\.py' } |
      Select-Object ProcessId, CreationDate, CommandLine | Format-List
    ```
    No other v2 server of THIS checkout may be running (it would hold the writer lock `.codex_jobs\_app\server.lock`, and the new server would
    come up read-only): a `tools/preview/v2/server.py` line whose working directory is this repo must not be in the list.
 
-A helper used below: one process by PID, with its command line and creation time.
+## 1. Stop the old site (exactly the :8765 listener, checked by the script)
 
 ```powershell
-function Get-ProcInfo([int]$Id) { Get-CimInstance Win32_Process -Filter "ProcessId=$Id" | Select-Object ProcessId, CreationDate, CommandLine }
+Invoke-Check stop-listener 8765 tools/preview/serve.py
 ```
 
-## 1. Stop the old site (exactly the :8765 listener)
-
-```powershell
-$listen = @(Get-NetTCPConnection -State Listen -LocalPort 8765 -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique)
-$listen                                                       # exactly ONE pid
-$old = Get-ProcInfo $listen[0]
-$old | Format-List                                            # its command line must run tools/preview/serve.py (this repo), nothing else
-```
-
-Only if there is exactly one pid and its command line is `... tools/preview/serve.py ...` (not `tools/preview/v2/server.py`, not
-`experiments/...`): check it again right before stopping it, then stop that pid.
-
-```powershell
-$again = Get-ProcInfo $listen[0]
-if ($again.CreationDate -eq $old.CreationDate -and $again.CommandLine -eq $old.CommandLine -and $again.CommandLine -match 'tools[\\/]preview[\\/]serve\.py') {
-  Stop-Process -Id $listen[0]
-} else { 'the listener changed: stop here and look again' }
-Get-NetTCPConnection -State Listen -LocalPort 8765 -ErrorAction SilentlyContinue    # prints nothing: the port is free
-```
+It stops the listener only when there is exactly ONE, it runs `tools/preview/serve.py` of this checkout (resolved against its own working
+directory), and the same process is still the listener a second later. Anything else prints `REFUSED: ...` and stops nothing: look at the
+listener by hand and stop here.
 
 ## 2. Start v2 on 8765, detached, and verify it is the WRITER with managed services
 
@@ -84,7 +72,7 @@ $queue = Invoke-RestMethod http://127.0.0.1:8765/api/v2/queue
 $state.server.read_only           # False  (True = another process holds the writer lock: stop the new one by its pid and find the other)
 $state.server.manage_services     # True
 $queue.services.managed           # True
-$queue.convert_hold               # present: the manager wrote the conversion hold at start (DESIGN_PHASE4 I.1)
+$queue.convert_hold               # present: the manager wrote the conversion hold at start (DESIGN_PHASE4 I.1), before any tick
 (Get-NetTCPConnection -State Listen -LocalPort 8765).OwningProcess   # = $state.server.pid
 ```
 
@@ -94,56 +82,78 @@ $queue.convert_hold               # present: the manager wrote the conversion ho
 ## 3. v2 adopts the services
 
 Within about 30 seconds (the first tick of the services thread; the first process scan can take several seconds) the Queue tab shows supervisor,
-views and convert as **running, adopted**, with the PIDs of step 0.3 (also in `.codex_jobs/_app/services/<name>.json`). Nothing is started or
+views and convert as **running, adopted**, with the PIDs of step 0.4 (also in `.codex_jobs/_app/services/<name>.json`). Nothing is started or
 stopped by this. If a service shows `duplicate` or `waiting (could not be verified)`, fix that by hand first (v2 never does).
 
 Settings that matter on this PC (`.codex_jobs/_app/settings.json`, edited in the Queue tab; defaults are fine): `tripo: "off"` (the convert
 worker keeps `--no-tripo`), `view_parallel: 8`, all three services enabled. The mode stays `pause-conversions` (the user's manual pause); v2
 never changes it by itself. If settings.json cannot be read, the last valid settings are kept, and with none v2 starts no service at all.
 
-The conversion hold written at the manager's start is removed by the manager as soon as the adopted supervisor has written a tick
-(`.codex_jobs/_batch/supervisor_tick.json`). The live supervisor of before the cut-over does not write that file, so the hold STAYS until
-step 4: no paid conversion step runs meanwhile.
+The conversion hold written at the manager's start is removed by the manager only after a supervisor it has not sent a stop to has written a
+tick (`.codex_jobs/_batch/supervisor_tick.json`). The live supervisor of before the cut-over does not write that file, so the hold STAYS
+until step 6: no paid step of the current code runs meanwhile.
 
-## 4. Restart the supervisor (claim-lock fix, tick file)
+## 4. Drain the old paid work FIRST (legacy convert worker, I.2)
 
-From the Queue tab press **Restart** on the supervisor. The manager:
-1. renews the conversion hold (CONVERT_HOLD) BEFORE anything is stopped,
-2. runs `python tools/pipeline_supervisor.py stop` and waits for the exit (frozen processes are resumed, PAUSE is removed by the old process),
+The live convert worker (and any `convert_job.py` it started) predates CONVERT_HOLD: it only honours PAUSE, which the old supervisor removes
+when it exits. It must be gone before step 6.
+
+Press **Stop** on convert in the Queue tab (not Restart: the new worker is started in step 7). The manager:
+1. writes / keeps the conversion hold FIRST (`drain_hold` in `.codex_jobs/_app/services/convert.json`; no supervisor tick releases the hold
+   while the drain is pending), so every `convert_job.py` started from now on (current code) waits before its paid steps;
+2. writes `convert_worker1.stop` naming the worker's pid and creation time (an old worker does not read it);
+3. on every tick: waits until no `convert_job.py` of this checkout runs AND the worker's last event in `convert_events.log` (since it started)
+   is `PAUSED`, `IDLE` or `LOW DISK` after its last `CONVERT`;
+4. then SUSPENDS the worker, checks again while it is frozen (no child process, no `convert_job.py`, no job lock naming it, still asleep in
+   its log) and only then terminates it; if anything shows it woke up it is resumed untouched and the stop stays pending. It is never killed
+   on a timeout. With the current `pause-conversions` mode the worker sleeps in PAUSED, so this normally completes within a tick or two.
+
+A `convert_job.py` that is running when you press Stop is old code in flight: let it finish by itself (never kill it). Then confirm the drain
+with the script, repeating until it succeeds:
+
+```powershell
+Invoke-Check drained          # hold: present; convert_job.py: []; convert_queue.py: []   (exit 0)
+```
+
+A worker the user started by hand with `--worker N` (N > 1) is not managed by v2: `drained` lists it too; stop it through its own stop file
+(`convert_worker<N>.stop`) or wait until it is idle and stop it by hand with the same care before going on.
+
+## 5. Replace the view runner (only while it launches nothing)
+
+The live view runner predates the single-instance lock and the launch reservation (DESIGN_PHASE4 I.5): stopping it between a Codex launch
+and its status write would lose that job. Press **Restart** on views in the Queue tab. For such an older runner the manager suspends it and
+checks, while it is frozen, that every child process is a `codex_imagegen.sh <job>` whose job its status files already record as running
+(the new runner adopts those through `.done` and the job folder) and that it has no other child; only then is it terminated and the new
+runner started. If it is launching a job right now the stop stays pending (Queue tab: views "stopping") and the next tick tries again;
+running Codex jobs always continue. Afterwards:
+
+```powershell
+Invoke-Check views            # view runners: [<new pid>]; older ones: []   (exit 0: it holds view_runner.lock)
+```
+
+## 6. Restart the supervisor (claim-lock fix, tick file)
+
+Only after steps 4 and 5. From the Queue tab press **Restart** on the supervisor. The manager:
+1. renews the conversion hold (CONVERT_HOLD) BEFORE anything is stopped and names the outgoing supervisor in it (`retiring`: pid + creation
+   time),
+2. runs `python tools/pipeline_supervisor.py stop` and waits for the exit (frozen processes are resumed, PAUSE is removed by the old process;
+   no old worker is left to act on that),
 3. puts the old PAUSE file back and starts the new supervisor,
-4. removes the hold only after the NEW supervisor completed a tick (its pid is in supervisor_tick.json and the tick is newer than the hold).
+4. removes the hold only after the NEW supervisor completed a tick: a tick of the outgoing supervisor (still running while its stop is
+   pending) never releases it, and neither does any supervisor while its stop is pending.
 
-There is no gap in which the convert worker or a running convert_job.py could start a paid step: they honour CONVERT_HOLD exactly like PAUSE.
 Check in the Queue tab: supervisor running (new pid), `convert_hold` gone after its first tick (about a minute). Never restart the supervisor
 by hand around the manager; if it must be done by hand, write CONVERT_HOLD first and let the manager remove it.
 
-## 5. Restart the view runner (to load the monster launcher)
+## 7. Start the new convert worker
 
-The live view runner predates `"launcher": "monsters"` tasks and the single-instance lock / launch reservation (DESIGN_PHASE4 I.5). Press
-**Restart** on views in the Queue tab: the runner is stopped through its verified PID; running Codex jobs continue and the new runner adopts
-them through their `.done` markers (and launching reservations). Do it when no monster task is waiting to launch, or accept that it waits for the
-new runner. Afterwards `.codex_jobs/_batch/view_runner.lock` is held by the new runner.
+Press **Start** on convert. The new worker honours CONVERT_HOLD, PAUSE and its own stop file (it acknowledges with
+`convert_worker1.stopping`, finishes its job, then exits), so it may be started before or after the hold is released.
 
-## 6. Drain the old convert worker (legacy rule, I.2)
-
-The live convert worker predates the per-worker stop file. Press **Stop** (or **Restart**) on convert in the Queue tab. The manager writes
-`convert_worker1.stop` naming the worker's pid and creation time, but an old worker does not read it, so the manager applies the legacy rule
-on every tick: it stops the worker by its verified PID ONLY when no `convert_job.py` of this checkout runs AND the worker's last event in
-`convert_events.log` (since it started) is `PAUSED`, `IDLE` or `LOW DISK` after its last `CONVERT` (it is asleep). Until then the stop just
-stays pending ("stopping" in the Queue tab); it is never killed on a timeout. With the current `pause-conversions` mode the worker sleeps in
-PAUSED, so this normally completes at the next tick. On Restart the manager starts the new worker after the old one is gone; the new worker
-honours CONVERT_HOLD, PAUSE and its own stop file (it acknowledges with `convert_worker1.stopping`, finishes its job, then exits).
-
-## 7. Rollback (any time; the services keep running)
+## 8. Rollback (any time; the services keep running)
 
 ```powershell
-$listen = @(Get-NetTCPConnection -State Listen -LocalPort 8765 | Select-Object -ExpandProperty OwningProcess -Unique)
-$v2 = Get-ProcInfo $listen[0]
-$v2 | Format-List                                             # exactly one pid; command line tools/preview/v2/server.py --port 8765
-$again = Get-ProcInfo $listen[0]
-if ($listen.Count -eq 1 -and $again.CreationDate -eq $v2.CreationDate -and $again.CommandLine -match 'tools[\\/]preview[\\/]v2[\\/]server\.py') {
-  Stop-Process -Id $listen[0]
-}
+Invoke-Check stop-listener 8765 tools/preview/v2/server.py
 Start-Process -FilePath python -WorkingDirectory $repo -WindowStyle Hidden `
   -ArgumentList '-u','tools/preview/serve.py' `
   -RedirectStandardOutput "$logs\preview_win.out.log" -RedirectStandardError "$logs\preview_win.err.log"
@@ -155,15 +165,91 @@ files (`pipeline_v2.json`, `.codex_jobs/_app/`) are ignored by it. Convert-list 
 exact set ids (never wildcards) and stay; remove them by hand if unwanted. If the Queue tab had **stopped** a service on purpose, start it again
 by hand with the commands in DESIGN_PHASE4.md section A.
 
-## 8. Optional: start v2 at logon
+## 9. Optional: start v2 at logon
 
 `tools/preview/v2/install_logon_task.ps1` registers the scheduled task "Imageto3D Preview" (per user, at logon, hidden, repo as working
-directory, same command as step 2). Each run first checks the :8765 listener: when a v2 server of this repo already listens it does nothing (no
-log rotation, no second launch); when anything else listens it reports that and does nothing. It is not run by this procedure; the user
-decides:
+directory, same command as step 2). Each run first checks the :8765 listener: when anything already listens (normally the v2 server of an
+earlier trigger) it only notes that and does nothing (no log rotation, no second launch). It is not run by this procedure; the user decides:
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\preview\v2\install_logon_task.ps1 -WhatIf     # show only
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\preview\v2\install_logon_task.ps1             # register
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\preview\v2\install_logon_task.ps1 -Uninstall  # remove
+```
+
+## Checker script
+
+Run from the repo root (step 0.3). It reuses `tools/preview/v2/services.py`, the manager's own process parser; the here-string's
+closing `'@` must stay at column 0.
+
+```powershell
+$check = Join-Path $env:TEMP 'imageto3d_cutover_check.py'
+[IO.File]::WriteAllText($check, @'
+import os, sys, time
+repo = os.path.realpath(sys.argv[1])
+sys.path.insert(0, os.path.join(repo, 'tools', 'preview', 'v2'))
+import psutil
+import services
+
+def norm(path):
+    return os.path.normcase(os.path.realpath(path))
+
+def script_of(proc):
+    """(the python script this process runs, resolved against its own cwd) or None."""
+    cmd = proc.cmdline()
+    if not cmd or not os.path.basename(cmd[0]).lower().startswith('python'):
+        return None
+    found, _args = services.python_script(cmd)
+    if not found:
+        return None
+    return norm(found if os.path.isabs(found) else os.path.join(proc.cwd(), found))
+
+def running(rel):
+    """Processes of THIS checkout running tools/<rel> (any arguments, any worker number)."""
+    want, out = norm(os.path.join(repo, rel)), []
+    for proc in psutil.process_iter():
+        try:
+            if script_of(proc) == want:
+                out.append(proc)
+        except (psutil.Error, OSError):
+            continue
+    return out
+
+def listeners(port):
+    return sorted({c.pid for c in psutil.net_connections('tcp') if c.status == psutil.CONN_LISTEN and c.laddr and c.laddr.port == port and c.pid})
+
+what = sys.argv[2]
+if what == 'stop-listener':                # stop-listener <port> <script>: exactly one listener, running <script> of this checkout
+    port, rel = int(sys.argv[3]), sys.argv[4]
+    pids = listeners(port)
+    if len(pids) != 1:
+        sys.exit(f'REFUSED: {len(pids)} listener(s) on port {port} {pids}; exactly one expected')
+    proc = psutil.Process(pids[0])
+    first, created = script_of(proc), proc.create_time()
+    if first != norm(os.path.join(repo, rel)):
+        sys.exit(f'REFUSED: pid {pids[0]} runs {proc.cmdline()} (script {first}), not {rel} of {repo}')
+    time.sleep(1.0)
+    again = psutil.Process(pids[0])
+    if listeners(port) != pids or abs(again.create_time() - created) > 1 or script_of(again) != first:
+        sys.exit('REFUSED: the listener changed between the two checks; look again')
+    again.terminate()
+    again.wait(30)
+    if listeners(port):
+        sys.exit(f'port {port} still has a listener')
+    print(f'stopped pid {pids[0]} ({rel}); port {port} is free')
+elif what == 'drained':                    # the old paid work is gone: hold present, no convert_job.py, no convert worker of this checkout
+    hold = services.read_hold(repo)
+    jobs = running('tools/tripo_pipeline/convert_job.py')
+    workers = running('tools/convert_queue.py')
+    print(f'hold: {"present" if hold is not None else "MISSING"}; convert_job.py: {[p.pid for p in jobs]}; convert_queue.py: {[p.pid for p in workers]}')
+    sys.exit(0 if hold is not None and not jobs and not workers else 1)
+elif what == 'views':                      # exactly one view runner, a current one (launch reservation, holds view_runner.lock)
+    runners = services.scan(repo, ['views'])['views']
+    old = [r['pid'] for r in runners if services.legacy_runner(repo, r)]
+    print(f'view runners: {[r["pid"] for r in runners]}; older ones: {old}')
+    sys.exit(0 if len(runners) == 1 and not old else 1)
+else:
+    sys.exit(f'unknown check {what}')
+'@)
+function Invoke-Check { python -X utf8 $check $repo @args; $LASTEXITCODE -eq 0 }
 ```

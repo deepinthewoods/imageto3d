@@ -2,9 +2,11 @@
 
     snapshot(root)            {"tripo": tripo_state(root), "hyper3d": hyper3d_state(root)}   cheap; safe to call on every poll
     tripo_state(root)         the setting (`off` = "off (no credits this month)") plus the cached balance of the last check
-    check_tripo(root, run=)   the "Check balance" button: `node tools/tripo_pipeline/studio.mjs balance` while holding the Tripo browser lock
-                              `.codex_jobs/_batch/browser_tripo.lock` (DESIGN_PHASE4.md I.3; taken without waiting: held by anyone = "busy"),
-                              and only when no convert_job.py / studio.mjs of this checkout runs (legacy callers without the lock)
+    check_tripo(root, run=)   the "Check balance" button: `node tools/tripo_pipeline/studio.mjs balance` inside
+                              `tripo_browser_lock.tripo_browser_lock(root, wait=0)` (DESIGN_PHASE4.md I.3: the checkout lock
+                              `.codex_jobs/_batch/browser_tripo.lock` AND the reservation of the resolved Firefox profile, phase 5 review;
+                              held by anyone = "busy"); the reservation's env is passed to node (studio.mjs refuses to open the profile
+                              without it), and only when no convert_job.py / studio.mjs of this checkout runs (legacy callers)
     hyper3d_state(root)       newest `balances` entry of any `studio_submission.json` (models/**, monsters pipeline/**/hyper3d/)
 
 The Hyper3D scan is cheap: it lists the candidate files (a depth-limited directory walk, ~0.1 s for 1000 modules) and reads only files whose
@@ -35,6 +37,7 @@ for _p in (HERE.parent, HERE):
 import guard  # noqa: E402
 import services  # noqa: E402
 import settings as app_settings  # noqa: E402
+from tripo_browser_lock import TripoBrowserBusy, tripo_browser_lock  # noqa: E402  (tools/tripo_pipeline, on sys.path through guard)
 
 OFF_TEXT = 'off (no credits this month)'
 SUBMISSION = 'studio_submission.json'
@@ -102,11 +105,11 @@ def tripo_browser(root):
 
 
 def tripo_browser_busy(root) -> bool:
-    """A quick probe of the Tripo browser lock (taken and released at once)."""
+    """A quick probe of the Tripo browser lock and the profile reservation (taken and released at once)."""
     try:
-        with tripo_browser(root):
+        with tripo_browser_lock(root, what='v2 balance probe', wait=0):
             return False
-    except BrowserBusy:
+    except TripoBrowserBusy:
         return True
     except OSError:
         return False
@@ -125,9 +128,11 @@ def tripo_state(root) -> dict:
             'credits': cached.get('credits'), 'checked_at': cached.get('checked_at'), 'ok': cached.get('ok'), 'error': cached.get('error')}
 
 
-def _run_balance(root) -> tuple[int, str, str]:
+def _run_balance(root, env: dict | None = None) -> tuple[int, str, str]:
+    """`node studio.mjs balance` with the profile reservation's environment (`env`, from tripo_browser_lock)."""
     run = subprocess.run(['node', str(Path(root) / 'tools' / 'tripo_pipeline' / 'studio.mjs'), 'balance'], capture_output=True, text=True,
-                         encoding='utf-8', errors='replace', cwd=str(root), timeout=300, creationflags=services.NO_WINDOW)
+                         encoding='utf-8', errors='replace', cwd=str(root), timeout=300, creationflags=services.NO_WINDOW,
+                         env={**os.environ, **(env or {})})
     return run.returncode, run.stdout or '', run.stderr or ''
 
 
@@ -147,25 +152,27 @@ def parse_balance(code: int, out: str):
 
 
 def check_tripo(root, run=None, now: float | None = None) -> dict:
-    """Run the Tripo balance check once. `run(root) -> (returncode, stdout, stderr)` is injectable (tests never start node).
+    """Run the Tripo balance check once, holding the checkout lock and the profile reservation (tripo_browser_lock, wait 0: busy at once);
+    the reservation's environment goes to node. `run(root) -> (returncode, stdout, stderr)` is injectable (tests never start node).
     {"status": "ok", "credits"} | {"status": "busy", "message"} (the browser lock is held, or a conversion / another check uses the profile)
     | {"status": "error", "message"} (the last good balance stays in the cache)."""
     if not _CHECK.acquire(blocking=False):
         return {'status': 'busy', 'message': 'a balance check is already running'}
     try:
         try:
-            with tripo_browser(root):
+            with tripo_browser_lock(root, what='v2 balance check', wait=0) as env:
                 jobs = services.convert_job_running(root)
                 users = jobs or services.studio_running(root)
                 if users:
                     what = 'convert_job.py' if jobs else 'studio.mjs'
                     return {'status': 'busy', 'message': f'{what} is running (pid {users[0]["pid"]}) and uses the Tripo browser profile; check again after it'}
                 try:
-                    code, out, err = (run or _run_balance)(root)
+                    code, out, err = run(root) if run is not None else _run_balance(root, env)
                 except (OSError, subprocess.SubprocessError) as error:
                     return _tripo_failed(root, now, f'{type(error).__name__}: {error}')
-        except BrowserBusy as exc:
-            return {'status': 'busy', 'message': f'{exc}; check again after the conversion'}
+        except (BrowserBusy, TripoBrowserBusy) as exc:
+            return {'status': 'busy', 'message': f'the Tripo browser profile is in use ({exc}: browser_tripo.lock or the profile reservation is '
+                    'held); check again after the conversion'}
         credits = parse_balance(code, out)
         if credits is None:
             tail = ' | '.join((err or out).strip().splitlines()[-2:])

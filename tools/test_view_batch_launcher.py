@@ -297,5 +297,202 @@ class SingleInstanceAndReservationTests(Base):
         self.assertNotIn('job', status)
 
 
+class GuardTests(Base):
+    """Phase 5 review finding 10 (runner side): the descriptor and its guard are read again right before the spawn."""
+
+    run_once = LaunchTests.run_once
+
+    def guard_file(self, **data):
+        path = self.monsters / 'pipeline' / 'Hobgoblin' / 'concept_state.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data))
+        return path
+
+    def guarded(self, path, value='g7'):
+        return self.task(launcher='monsters', guard={'file': str(path), 'key': 'pick_generation', 'value': value})
+
+    def launches(self):
+        calls = []
+        self.run_once(popen=lambda cmd, **kw: calls.append(cmd) or mock.Mock())
+        return calls
+
+    def test_a_matching_guard_launches(self):
+        self.guarded(self.guard_file(pick_generation='g7'))
+        self.assertEqual(len(self.launches()), 1)
+        self.assertEqual(self.status()['state'], 'running')
+
+    def test_a_missing_or_different_guard_cancels_without_a_spawn(self):
+        for name, setup in (('missing', lambda: self.guarded(self.monsters / 'nope.json')),
+                            ('different', lambda: self.guarded(self.guard_file(pick_generation='g8'))),
+                            ('no key', lambda: self.guarded(self.guard_file(other=1))),
+                            ('malformed', lambda: self.task(launcher='monsters', guard={'file': 3}))):
+            for path in (self.batch / 'status').glob('*.json'):
+                path.unlink()
+            setup()
+            self.assertEqual(self.launches(), [], name)
+            status = self.status()
+            self.assertEqual(status['state'], 'cancelled', name)
+            self.assertTrue(status['reason'].startswith('guard: '), name)
+            self.assertEqual(status['jobs'], [], name)                       # the reservation was dropped
+            self.assertNotIn('job', status)
+            self.assertFalse((self.batch / 'prompts' / 'm-left-a01.md').exists())
+        self.assertEqual(self.launches(), [])                                # cancelled stays cancelled
+
+    def test_a_withdrawal_between_the_scan_and_the_spawn_is_seen(self):
+        """The reviewer's race: the pick is withdrawn after the runner cached the pending descriptor; the guard is re-read after
+        the `launching` reservation, so nothing is spawned."""
+        guard = self.guard_file(pick_generation='g7')
+        self.guarded(guard)
+        real_save = view_batch.save
+
+        def save(path, data):
+            real_save(path, data)
+            if data.get('state') == 'launching':
+                guard.write_text(json.dumps({'pick_generation': 'g8'}))      # Undo withdrew the pick right now
+        with mock.patch.object(view_batch, 'save', save):
+            self.assertEqual(self.launches(), [])
+        self.assertEqual((self.status()['state'], self.status()['reason']), ('cancelled', 'guard: withdrawn'))
+
+    def test_a_deleted_descriptor_is_not_launched(self):
+        self.task(launcher='monsters')
+        real_save = view_batch.save
+
+        def save(path, data):
+            real_save(path, data)
+            if data.get('state') == 'launching':
+                (self.batch / 'tasks' / 'm-left.json').unlink()
+        with mock.patch.object(view_batch, 'save', save):
+            self.assertEqual(self.launches(), [])
+        self.assertEqual((self.status()['state'], self.status()['reason']), ('cancelled', 'task withdrawn'))
+
+    def test_a_changed_descriptor_is_launched_only_as_changed(self):
+        task, _ = self.task(launcher='monsters')
+        real_save = view_batch.save
+        changed = []
+
+        def save(path, data):
+            real_save(path, data)
+            if data.get('state') == 'launching' and not changed:
+                changed.append(1)
+                real_save(self.batch / 'tasks' / 'm-left.json', {**task, 'refs': []})
+        with mock.patch.object(view_batch, 'save', save):
+            self.assertEqual(self.launches(), [])
+        self.assertEqual((self.status()['state'], self.status()['jobs']), ('pending', []))
+        calls = self.launches()                                              # the next scan launches the NEW descriptor
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][len(view_batch.SHELL) + 3:], [])           # no refs: the changed task
+
+
+class ValidationTests(Base):
+    """Phase 5 review finding 17 (runner side): `validate: rgba_png` and `provenance` decide whether a finished task is done."""
+
+    run_once = LaunchTests.run_once
+
+    def image(self, path, mode='RGBA', clear=0.5, opaque=0.5):
+        from PIL import Image
+        path.parent.mkdir(parents=True, exist_ok=True)
+        image = Image.new(mode, (10, 10), (200, 10, 10, 128) if mode == 'RGBA' else (200, 10, 10))
+        if mode == 'RGBA':
+            pixels = image.load()
+            n_clear, n_opaque = int(clear * 100), int(opaque * 100)
+            for i in range(100):
+                pixels[i % 10, i // 10] = (200, 10, 10, 0 if i < n_clear else 255 if i < n_clear + n_opaque else 128)
+        image.save(path)
+
+    def finished(self, **extra):
+        task, out = self.task(launcher='monsters', validate='rgba_png', provenance=['left.prompts.json'], **extra)
+        job = self.monsters / '.codex_jobs' / 'm-left-a01'
+        job.mkdir(parents=True)
+        (job / '.done').touch()
+        (job / 'exit_code').write_text('0\n')
+        (job / 'log.txt').write_text('')
+        view_batch.save(self.batch / 'status' / 'm-left.json', {
+            'state': 'running', 'attempts': 0, 'jobs': [{'job': 'm-left-a01', 'started': '2026-11-25T10:00:00'}]})
+        return task, out
+
+    def provenance(self, out, text='{"prompt": "x"}'):
+        (out.parent / 'left.prompts.json').write_text(text)
+
+    def test_a_valid_output_with_provenance_is_done(self):
+        _, out = self.finished()
+        self.image(out)
+        self.provenance(out)
+        self.run_once()
+        self.assertEqual(self.status()['state'], 'done')
+        self.assertTrue(out.exists())
+
+    def test_invalid_images_fail_the_attempt_and_are_set_aside(self):
+        cases = (('fully opaque', dict(clear=0.0, opaque=1.0), 'fully transparent'),
+                 ('fully transparent', dict(clear=1.0, opaque=0.0), 'fully opaque'),
+                 ('RGB', dict(mode='RGB'), 'mode RGB, not RGBA'))
+        for label, kw, reason in cases:
+            for path in list((self.batch / 'status').glob('*.json')):
+                path.unlink()
+            shutil.rmtree(self.monsters / '.codex_jobs', ignore_errors=True)
+            shutil.rmtree(self.monsters / 'pipeline', ignore_errors=True)
+            _, out = self.finished()
+            self.image(out, **kw)
+            self.provenance(out)
+            self.run_once(popen=lambda cmd, **k: mock.Mock())
+            status = self.status()
+            self.assertEqual(status['attempts'], 1, label)
+            self.assertIn('left.png: ', status['error'], label)
+            self.assertIn(reason, status['error'], label)
+            self.assertFalse(out.exists(), label)                            # never counted as done, generated again
+            self.assertTrue(list(out.parent.glob('left.png.invalid-*')), label)
+
+    def test_a_non_png_and_a_missing_provenance(self):
+        _, out = self.finished()
+        out.parent.mkdir(parents=True)
+        out.write_bytes(b'\x89PNG\r\n\x1a\n' + b'garbage' * 10)               # a PNG header only: the old header check passed it
+        self.run_once(popen=lambda cmd, **k: mock.Mock())
+        error = self.status()['error']
+        self.assertIn('left.png: does not decode', error)
+        self.assertIn('left.prompts.json: provenance missing', error)
+
+    def test_missing_provenance_alone_regenerates_the_image(self):
+        _, out = self.finished()
+        self.image(out)
+        self.run_once(popen=lambda cmd, **k: mock.Mock())
+        status = self.status()
+        self.assertEqual((status['attempts'], status['error']), (1, 'left.prompts.json: provenance missing'))
+        self.assertFalse(out.exists())                                       # an image without its record is generated again
+        self.provenance(out, '{broken')
+        self.assertEqual([r for _, r in view_batch.validation_problems(json.loads((self.batch / 'tasks' / 'm-left.json').read_text()))
+                          if 'provenance' in r], ['provenance is not readable JSON (JSONDecodeError)'])
+
+    def test_the_attempt_budget_ends_in_failed(self):
+        _, out = self.finished(max_attempts=1)
+        self.image(out, clear=0.0, opaque=1.0)
+        self.provenance(out)
+        self.run_once()
+        self.assertEqual(self.status()['state'], 'failed')
+
+    def test_an_existing_invalid_output_is_set_aside_before_the_launch(self):
+        task, out = self.task(launcher='monsters', validate='rgba_png')
+        self.image(out, clear=0.0, opaque=1.0)
+        prompts = []
+
+        def popen(cmd, **kw):
+            prompts.append(Path(cmd[len(view_batch.SHELL) + 2]).read_text())
+            return mock.Mock()
+        self.run_once(popen=popen)
+        self.assertFalse(out.exists())
+        self.assertNotIn('RESUME NOTE', prompts[0])                          # the invalid file is not kept as "already saved"
+
+    def test_a_task_without_the_fields_is_unchanged(self):
+        task, out = self.task(launcher='monsters')
+        job = self.monsters / '.codex_jobs' / 'm-left-a01'
+        job.mkdir(parents=True)
+        (job / '.done').touch()
+        (job / 'exit_code').write_text('0\n')
+        view_batch.save(self.batch / 'status' / 'm-left.json', {
+            'state': 'running', 'attempts': 0, 'jobs': [{'job': 'm-left-a01', 'started': '2026-11-25T10:00:00'}]})
+        out.parent.mkdir(parents=True)
+        out.write_text('not even an image')
+        self.run_once()
+        self.assertEqual(self.status()['state'], 'done')
+
+
 if __name__ == '__main__':
     unittest.main()
