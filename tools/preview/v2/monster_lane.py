@@ -105,7 +105,7 @@ HOLD_FILE = 'CONVERT_HOLD'         # = services.HOLD_FILE (DESIGN_PHASE4.md I.1)
 DRAIN_FILE = 'CONVERT_DRAIN'       # = services.DRAIN_FILE (DESIGN_PHASE4.md I.10)
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 CHILDREN_DIR = 'monster_lane'
-CREATE_TOLERANCE = 1.0
+CREATE_TOLERANCE = 0.001   # every recorded create time comes from psutil for the same process: an exact match (confirm review, blocker 2: a 1 s tolerance let a pid reused 0.5 s later pass)
 
 
 class ConfirmPaused(guard.Conflict):
@@ -358,7 +358,9 @@ def record_failure(root: Path, task: dict, error: str | None) -> None:
     written (finding 3): the orchestrator then leaves the row unfinished and tries again at its next pass; the intent stays on disk."""
     gen = _generation_of(task)
     if gen:
-        persist_disposition(root, gen[0], gen[1], gen[2], {'state': 'failed', 'reason': str(error or 'failed')[:300], 'key': task.get('key')})
+        value = {'state': 'failed', 'reason': str(error or 'failed')[:300], 'key': task.get('key')}
+        attempt = mv.attempt_ref(task.get('token'))            # the attempt this failure belongs to (mv.outcome_error matches the row by it)
+        persist_disposition(root, gen[0], gen[1], gen[2], value | ({'attempt': attempt} if attempt else {}))
 
 
 CANCEL_PASSES = 5                  # cancel_task: how often it looks again while the row keeps changing under it
@@ -447,7 +449,8 @@ def shown_outcome(root: Path, task: dict) -> dict:
     """What a failed / cancelled lane row is PUBLISHED with (final-live review, blocker 4): {conversion_seq, disposition, error} from
     ONE read of the variant's views.json. `conversion_seq` = the variant's monotonic counter (mv.disposition_seq), `disposition` =
     the recorded outcome of the row's generation in that same snapshot, `error` = the text to show: the row's own when the row
-    carries that very outcome, else the disposition's reason (mv.outcome_error). The row was read at another moment than
+    IS that very outcome (the disposition names the row's attempt, or the text is identical), else the reason STORED WITH the
+    disposition (mv.outcome_error). The row was read at another moment than
     views.json, so a row read before a Retry and a second failure is shown with the SECOND failure and its revision: the Retry the
     user presses clears the failure they were shown, never one they were not. `conversion_seq` None when the variant cannot be
     read (display only: the server refuses a Retry without it)."""
@@ -463,7 +466,7 @@ def shown_outcome(root: Path, task: dict) -> dict:
         except guard.Unreadable:
             return out | {'conversion_seq': seq}
         return {'conversion_seq': seq, 'disposition': disposition,
-                'error': mv.outcome_error(disposition, task.get('state'), task.get('error'))}
+                'error': mv.outcome_error(disposition, task.get('state'), task.get('error'), task.get('token'))}
     except Exception:  # noqa: BLE001
         return out
 
@@ -650,6 +653,9 @@ def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_k
            'pause_id': key, 'pauses': [dict(p) for p in manual['pauses']] if manual else [], 'paused': manual is not None,
            'pause_reason': manual['reason'] if manual else None, 'hold': hold, 'drain': drain, 'idle': idle, 'away': away,
            'needs_confirm': False}
+    unreadable = modes.mode_unreadable(mode_rec)           # the mode file exists but does not say which mode is in force
+    if unreadable:                                         # flagged on EVERY answer, also behind a hold / drain (confirm review): Run now
+        out['mode_unreadable'] = True                      # refuses it, so no unconfirmed override is saved for later
     if hold is not None:                                   # never overridden: the supervisor is (re)starting or has not ticked yet
         return out | {'open': False, 'code': 'held', 'reason': f'conversions are held (CONVERT_HOLD: {hold.get("reason") or "no reason"}); '
                       'they wait until the running supervisor completes a tick'}
@@ -657,7 +663,6 @@ def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_k
         return out | {'open': False, 'code': 'held', 'draining': True,
                       'reason': f'conversions are being drained (CONVERT_DRAIN: {drain.get("reason") or "no reason"}); they wait until '
                                 'the drain is over'}
-    unreadable = modes.mode_unreadable(mode_rec)           # the mode file exists but does not say which mode is in force
     if unreadable:                                         # never overridden: no consent can name a pause nobody can read
         return out | {'open': False, 'code': 'held', 'mode_unreadable': True,
                       'reason': f'the pause mode cannot be read ({unreadable}); conversions wait until supervisor_mode.json is '
@@ -1925,7 +1930,8 @@ def reduced_source_problem(mdir: Path, glb: Path, digest: str) -> str | None:
 def set_aside_unsubmitted(out_dir: Path) -> tuple[Path | None, str | None]:
     """Archive a record of a PROVEN pre-click failure (mv.proven_unsubmitted) the way the backend does, BY the backend
     (`rodin_backend.set_aside_pre_click`: under the output lock, as `studio_submission.not_submitted_<time>.json`, and only when the
-    record read under that lock still proves that nothing was clicked). (archived path, None); (None, None) when the backend left
+    record read under that lock still proves that nothing was clicked; a `not_submitted` record whose archive was interrupted before
+    its rename is resumed the same way). (archived path, None); (None, None) when the backend left
     the record where it is (not provably pre-click any more); (None, problem) when it could not be asked."""
     try:
         aside = mv.hyper3d_backend().set_aside_pre_click(Path(out_dir), 'the v2 monster lane found a proven pre-click failure')

@@ -367,3 +367,20 @@ def test_blocker2_a_helper_that_lost_its_lock_says_lost_and_leaves(tmp_path, mon
     assert g.hold_main(['--root', str(tmp_path)]) == 1
     assert capsys.readouterr().out.split('\n') == ['held', 'lost 9', '']   # one answer, then it is gone (nothing for ping 10)
     assert not g.lock_busy(tmp_path)
+
+
+def test_a_malformed_or_unknown_mode_closes_the_gate(tmp_path):
+    """Confirm review blocker 1: [] or an unknown mode in supervisor_mode.json fails closed (not just an unreadable file)."""
+    import json as _json
+    import paid_gate as g
+    batch = tmp_path / '.codex_jobs' / '_batch'
+    batch.mkdir(parents=True)
+    env = g.env_for(tmp_path)
+    for text in ('[]', '{"mode": "paus"}', '{}', '{"mode": 3}'):
+        (batch / 'supervisor_mode.json').write_text(text)
+        assert g.closed_reason(env), text
+    for mode in ('auto', 'views-run', 'run'):
+        (batch / 'supervisor_mode.json').write_text(_json.dumps({'mode': mode}))
+        assert g.closed_reason(env) is None, mode
+    import pipeline_supervisor as ps
+    assert tuple(g.MODES) == tuple(ps.MODES)

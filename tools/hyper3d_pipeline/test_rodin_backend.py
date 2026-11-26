@@ -1694,6 +1694,64 @@ class FinalLiveTests(unittest.TestCase):
         self.assertEqual(self.record()['status'], 'submitted')
         self.assertEqual(len(self.asides()), 2)
 
+    # -- confirm review (.codex_jobs/review_v2_confirm_20261126/result.md, "Pilot, rejected upload")
+    def interrupted_archive(self):
+        """The reviewer's case: a thumbnail rejection, and the archive is interrupted between its status write and its rename."""
+        class Rejected(FakeSession):
+            def prepare_multiview(self, paths, config):
+                self.calls.append(('prepare_multiview', [n for n, _ in paths]))
+                raise rb.Stop(f'Expected {len(paths)} uploaded thumbnails, found {len(paths) - 1}')
+        session = Rejected(self.out)
+        with mock.patch.object(rb, '_archive_fault', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertNotIn(('click_free_preview',), session.calls)
+        stranded = self.record()
+        self.assertEqual((stranded['status'], stranded['actions'], stranded['pending_action'], self.asides()),
+                         ('not_submitted', {}, None, []))
+        self.assertIn('thumbnails', stranded['why'])
+        return stranded
+
+    def test_an_archive_interrupted_before_its_rename_is_resumed_by_the_next_submit(self):
+        stranded = self.interrupted_archive()
+        self.assertTrue(rb.proven_pre_click(stranded))                           # still proves that nothing was clicked
+        session = FakeSession(self.out)
+        rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)   # the retry
+        self.assertIn(('click_free_preview',), session.calls)
+        self.assertEqual(self.record()['status'], 'submitted')
+        aside = [json.loads(p.read_text()) for p in self.asides()]
+        self.assertEqual(len(aside), 1)
+        self.assertEqual((aside[0]['status'], aside[0]['why'], aside[0]['actions']), ('not_submitted', stranded['why'], {}))
+        self.assertIn('stopped before the Free Preview click', aside[0]['archive_resumed']['why'])
+
+    def test_set_aside_pre_click_resumes_a_pending_archive_and_is_interruptible_again(self):
+        stranded = self.interrupted_archive()
+        with mock.patch.object(rb, '_archive_fault', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):                           # interrupted a second time: still resumable
+                rb.set_aside_pre_click(self.out, 'again')
+        self.assertTrue(rb.proven_pre_click(self.record()))
+        aside = rb.set_aside_pre_click(self.out, 'resumed by the caller')
+        self.assertEqual(self.asides(), [aside])
+        self.assertFalse((self.out / rb.RECORD).exists())
+        data = json.loads(aside.read_text())
+        self.assertEqual((data['status'], data['why'], data['archive_resumed']['why']),
+                         ('not_submitted', stranded['why'], 'resumed by the caller'))
+
+    def test_a_not_submitted_record_with_any_click_trace_is_not_resumed(self):
+        """not_submitted after a REFUSED click (Insufficient Balance) keeps its free intent: never taken for a pending archive."""
+        base = self.interrupted_archive()
+        self.assertTrue(rb.proven_pre_click(base))
+        for change in ({'actions': {'free_preview': {'intent_at': 'x'}}}, {'pending_action': 'free_preview'}, {'model_url': URL},
+                       {'model_id': MODEL}, {'project_id': MODEL}, {'submit_clicked_at': 'x'}, {'after_submit_at': 'x'},
+                       {'exports': {'GLB': {}}}, {'credits_committed': 0.5}, {'backend': None}):
+            data = {**base, **change}
+            self.assertFalse(rb.proven_pre_click(data), change)
+            (self.out / rb.RECORD).write_text(json.dumps(data))
+            self.assertIsNone(rb.set_aside_pre_click(self.out, 'x'), change)
+            with self.assertRaisesRegex(rb.Stop, 'Submission record already exists'):
+                rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: self.fail('opened'))
+            self.assertEqual((self.record(), self.asides()), (data, []), change)
+
     def test_a_submit_killed_before_its_click_leaves_a_record_the_next_submit_archives(self):
         for where in ('prepare_multiview', 'wait_balance'):                      # status preparing / ready_to_submit
             class Killed(FakeSession):

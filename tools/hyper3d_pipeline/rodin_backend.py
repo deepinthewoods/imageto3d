@@ -83,7 +83,8 @@ Windows needs the read-only attribute cleared first (renaming / moving it does n
 Pre-click failures (final-live review, "a rejected upload strands the unpaid variant"): a submit that stops BEFORE the free
 click (the upload was rejected: thumbnail count mismatch, signed out, a missing control, ...) sets its record aside as
 `studio_submission.not_submitted_<stamp>.json` under the output lock, so a retry submits fresh. That is done only for a record
-that proves nothing was clicked (proven_pre_click: status preparing / ready_to_submit, no action or intent of any kind, no
+that proves nothing was clicked (proven_pre_click: status preparing / ready_to_submit, or not_submitted still in place = an
+archive interrupted between its status write and its rename, which is then resumed; no action or intent of any kind, no
 pending action, no model URL / id, no click time, no export); a record with ANY click intent is never archived this way. A
 submit that finds such a stranded record (its process was killed before the click) archives it the same way before it starts;
 `set_aside_pre_click(out_dir, why)` does the same for a caller (the v2 monster lane).
@@ -175,8 +176,16 @@ def stat_or_none(path):
 
 def _set_aside(record, why):
     """Mark `record` not_submitted and move it to studio_submission.not_submitted_<stamp>[_N].json (a name that is free: an
-    earlier one of the same second is never overwritten). The caller holds the output lock. Returns the new path."""
-    record.save('not_submitted', status='not_submitted', pending_action=None, why=why)
+    earlier one of the same second is never overwritten). The caller holds the output lock. Returns the new path.
+
+    Crash-safe (confirm review, "Pilot, rejected upload"): the status write and the rename are two steps. A record that already
+    says `not_submitted` is one whose rename was interrupted: only the rename is done again (its `why` is kept, the resume is
+    noted as `archive_resumed`). Callers resume it only for a record that still proves no click (proven_pre_click)."""
+    if record.data.get('status') == ARCHIVE_PENDING_STATUS:
+        record.save('not_submitted_archive_resumed', archive_resumed={'at': now(), 'why': why})
+    else:
+        record.save('not_submitted', status=ARCHIVE_PENDING_STATUS, pending_action=None, why=why)
+    _archive_fault()
     stem = f'{record.path.stem}.not_submitted_{time.strftime("%Y%m%dT%H%M%S")}'
     aside, serial = record.path.with_name(f'{stem}.json'), 1
     while os.path.lexists(aside):
@@ -193,14 +202,25 @@ def not_submitted(record, why):
 
 
 PRE_CLICK_STATUSES = ('preparing', 'ready_to_submit')   # the statuses of a submit that has not reached its click
+# _set_aside wrote its status but its rename did not happen (the process was interrupted in between): a pending archive. With
+# no click intent it proves "nothing was clicked" like a pre-click status does (not_submitted after a REFUSED click keeps its
+# free intent and click time, so it is never taken for one).
+ARCHIVE_PENDING_STATUS = 'not_submitted'
+UNCLICKED_STATUSES = PRE_CLICK_STATUSES + (ARCHIVE_PENDING_STATUS,)
+
+
+def _archive_fault():
+    """Tests: the point between _set_aside's status write and its rename (patched to raise there)."""
 
 
 def proven_pre_click(data):
     """True when the record dict `data` PROVES that nothing was clicked for it (final-live review: a rejected upload strands the
     unpaid variant): a hyper3d record still in a pre-click status with no action or intent of any kind (the free intent is
     written before the click, so a click always leaves one), no pending action, no model URL / id, no click time and no export.
-    Anything else (any click intent, resolved or not) is never treated as unsubmitted."""
-    return (isinstance(data, dict) and data.get('backend') == 'hyper3d' and data.get('status') in PRE_CLICK_STATUSES
+    Anything else (any click intent, resolved or not) is never treated as unsubmitted. A `not_submitted` record still IN PLACE
+    (confirm review: its archive was interrupted between the status write and the rename) counts under the very same
+    conditions: the next submit / set_aside_pre_click resumes the pending rename."""
+    return (isinstance(data, dict) and data.get('backend') == 'hyper3d' and data.get('status') in UNCLICKED_STATUSES
             and not data.get('actions') and not data.get('pending_action')
             and not any(data.get(key) for key in ('model_url', 'model_id', 'project_id', 'submit_clicked_at',
                                                   'after_submit_at', 'exports', 'credits_committed')))
@@ -210,7 +230,8 @@ def set_aside_pre_click(out_dir, why):
     """Archive the record of `out_dir` aside (studio_submission.not_submitted_<stamp>.json) when it is a proven pre-click
     failure (proven_pre_click), under the output lock, so a retry submits fresh. Returns the archived path, or None when there
     is no record or it is not provably pre-click (a record with any click intent is left exactly as it is). A lock held by
-    another process: Stop(OUTPUT_BUSY)."""
+    another process: Stop(OUTPUT_BUSY). A `not_submitted` record left in place by an interrupted archive (no click intent) is
+    resumed here: only its pending rename is done."""
     out_dir = Path(out_dir)
     if not (out_dir / RECORD).exists():
         return None

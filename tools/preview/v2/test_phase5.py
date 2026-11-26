@@ -4121,6 +4121,18 @@ class FinalLivePauseTest(FinalLiveCase):
         # the same file identity under another source is another id: a consent never moves from one source to another
         self.assertNotEqual(modes.source_id('pause', 'file:x'), modes.source_id('mode', 'file:x'))
 
+    def test_unreadable_mode_refuses_run_now_also_behind_a_hold(self):
+        """Confirm review: with CONVERT_HOLD present AND an unreadable mode, Run now must not save an unconfirmed override."""
+        mid, v, task_id, gen = self.frozen()
+        ident = {'id': task_id} | self.ident(task_id)
+        (self.batch() / 'CONVERT_HOLD').write_text(json.dumps({'reason': 'test hold'}))
+        (self.batch() / 'supervisor_mode.json').write_bytes(b'{"mode": "pause-conv')
+        gate = monster_lane.gate(self.root, {'run_now': True}, 1000, True)
+        self.assertEqual((gate['open'], gate['code'], gate.get('mode_unreadable')), (False, 'held', True))
+        with self.assertRaises(guard.Unreadable):
+            actions.queue_op(self.root, {'op': 'run_now'} | ident)
+        self.assertFalse(taskqueue.for_root(self.root).get(task_id)['args'].get('run_now'))
+
     def test_unreadable_mode_holds_dispatch_and_run_now_is_refused(self):
         # The reviewer's case: supervisor_mode.json cannot be read and the supervisor has mirrored nothing yet (no PAUSE, no record).
         mid, v, task_id, gen = self.frozen()
@@ -4243,6 +4255,48 @@ class FinalLiveOutcomeTest(FinalLiveCase):
         self.assertEqual(mv.outcome_error({'state': 'cancelled', 'reason': 'cancelled by the user'}, 'failed', 'first'),
                          'cancelled: cancelled by the user')
         self.assertEqual(mv.outcome_error(None, 'failed', 'first'), 'first')
+
+
+class ConfirmOutcomeTest(FinalLiveCase):
+    """Confirm review (.codex_jobs/review_v2_confirm_20261126/result.md, "Earlier 4, Retry"): the text a failed row is shown with
+    always belongs to the `conversion_seq` sent with it, also when the newer reason is a PREFIX of the older row's text."""
+
+    OLD, NEW = 'collect failed: old material step', 'collect failed'
+
+    def test_the_reviewers_case_an_older_longer_text_is_never_shown_with_the_newer_revision(self):
+        mid, v, task_id, gen = self.frozen()
+        self.fail_attempt(task_id, self.OLD)
+        stale_row = dict(taskqueue.for_root(self.root).get(task_id))                             # the queue row is read HERE ...
+        first = mv.disposition_of(self.vj(v), gen)
+        self.qop('retry', task_id)
+        self.fail_attempt(task_id, self.NEW)                                                     # ... views.json after this
+        newer = mv.disposition_of(self.vj(v), gen)
+        self.assertEqual((newer['reason'], newer['seq']), (self.NEW, mv.disposition_seq(self.vj(v))))
+        self.assertNotEqual(first['attempt'], newer['attempt'])                                  # each failure names its attempt
+        self.assertEqual(newer['attempt'], mv.attempt_ref(f'tok-{self.NEW}'))
+        self.assertNotIn('tok-', json.dumps(self.vj(v)['conversion']))                           # never the token itself
+        view = orchestrator.publish_outcome(self.root, stale_row, orchestrator.task_view(stale_row, time.time()))
+        self.assertEqual((view['error'], view['conversion_seq'], view['outcome_seq']), (self.NEW, newer['seq'], newer['seq']))
+        conv = mv.conversion_info(self.root, self.mroot, 'Giant Rat', v, stale_row, self.vj(v)['frozen'], vj=self.vj(v))
+        self.assertEqual((conv['state'], conv['error'], conv['conversion_seq']), ('failed', self.NEW, newer['seq']))
+        # the live row (the attempt the disposition names) is shown with its own text and the same revision
+        row = [t for t in orchestrator.queue_state(self.root, True)['tasks'] if t['id'] == task_id][0]
+        self.assertEqual((row['error'], row['conversion_seq'], row['outcome_seq']), (self.NEW, newer['seq'], newer['seq']))
+        # Retry of what is on screen clears the failure that was SHOWN (the newer one)
+        out = actions.queue_op(self.root, {'op': 'retry', 'id': task_id, 'conversion_seq': view['conversion_seq']} | self.ident(task_id))
+        self.assertEqual(out['state'], 'queued')
+        self.assertIsNone(mv.disposition_of(self.vj(v), gen))
+
+    def test_the_rows_own_text_needs_the_attempt_or_the_identical_text(self):
+        named = {'state': 'failed', 'reason': self.NEW, 'attempt': mv.attempt_ref('tok-new')}
+        self.assertEqual(mv.outcome_error(named, 'failed', self.OLD, 'tok-old'), self.NEW)       # another attempt: the stored reason
+        self.assertEqual(mv.outcome_error(named, 'failed', self.OLD), self.NEW)                  # a row without a token
+        self.assertEqual(mv.outcome_error(named, 'failed', self.NEW + ' (the full text)', 'tok-new'), self.NEW + ' (the full text)')
+        legacy = {'state': 'failed', 'reason': self.NEW}                                         # written before `attempt` existed
+        self.assertEqual(mv.outcome_error(legacy, 'failed', self.OLD, 'tok-old'), self.NEW)      # a prefix match proves nothing
+        self.assertEqual(mv.outcome_error(legacy, 'failed', self.NEW, 'tok-old'), self.NEW)
+        self.assertIsNone(mv.attempt_ref(None))
+        self.assertIsNone(mv.attempt_ref(''))
 
 
 class FinalLiveApprovalTest(FinalLiveCase):
@@ -4552,6 +4606,70 @@ class FinalLiveUnsubmittedTest(FinalLiveCase):
                 self.assertEqual(self.calls(), [])                                               # nothing was submitted or collected
                 self.assertEqual(json.loads((mdir / 'hyper3d' / 'studio_submission.json').read_text()), record)   # untouched
                 self.assertEqual(list((mdir / 'hyper3d').glob('studio_submission.not_submitted_*')), [])
+        self.assertEqual(self.paid_clicks(), 0)
+
+
+class ConfirmInterruptedArchiveTest(FinalLiveUnsubmittedTest):
+    """Confirm review ("Pilot, rejected upload"): the backend's archive was interrupted between its status write and its rename, so a
+    `not_submitted` record with zero click intents is still in place. The variant is unsubmitted: Retry and Use enabled views work."""
+
+    WHY = 'Expected 4 uploaded thumbnails, found 3'
+
+    def interrupted(self, v):
+        return self.pre_click(v, status='not_submitted', why=self.WHY)
+
+    def archived(self, v):
+        return [json.loads(p.read_text()) for p in self.hyper(v).glob('studio_submission.not_submitted_*.json')]
+
+    def test_retry_resumes_the_pending_archive_and_submits_again(self):
+        mid, v, task_id, gen = self.frozen()
+        record = self.interrupted(v)
+        mdir = mv.models_dir(self.mroot, 'Giant Rat', v)
+        self.assertTrue(mv.proven_unsubmitted(record))
+        self.assertFalse(mv.conversion_started(mdir))
+        self.fail_attempt(task_id, f'STOPPED: {self.WHY}')
+        self.assertEqual(self.qop('retry', task_id)['state'], 'queued')                          # Retry ...
+        verdict = self.drive(v)
+        self.assertEqual(verdict['status'], 'ok', verdict)                                       # ... submits again
+        self.assertTrue(any(s.startswith('unsubmitted record set aside') for s in verdict['steps']), verdict['steps'])
+        archived = self.archived(v)
+        self.assertEqual([(a['status'], a['why'], a['actions']) for a in archived], [('not_submitted', self.WHY, {})])   # its own reason
+        self.assertIn('archive_resumed', archived[0])
+        self.assertEqual([(c['script'], c['argv'][0]) for c in self.calls()][:2],
+                         [('hyper3d_single.py', 'submit'), ('hyper3d_single.py', 'collect')])
+        self.assertEqual(self.paid_clicks(), 1)
+
+    def test_use_enabled_views_accepts_the_variant(self):
+        mid, v, task_id, gen = self.frozen()
+        self.interrupted(v)
+        self.fail_attempt(task_id, f'STOPPED: {self.WHY}')
+        out = self.convert(mid, ['front.png', 'left.png'])                                       # not 409 `frozen`
+        self.assertNotEqual(self.ident(out['task'])['generation'], gen)
+        verdict = self.drive(v)
+        self.assertEqual(verdict['status'], 'ok', verdict)
+        self.assertEqual([a['why'] for a in self.archived(v)], [self.WHY])
+        self.assertEqual([(c['script'], c['argv'][0]) for c in self.calls()][:2],
+                         [('hyper3d_multiview.py', 'submit'), ('hyper3d_multiview.py', 'collect')])
+        self.assertEqual(self.paid_clicks(), 1)
+
+    def test_a_not_submitted_record_with_a_click_trace_stays_for_review(self):
+        cases = ({'actions': {'free_preview': {'intent_at': 't'}}}, {'submit_clicked_at': 't'}, {'model_url': 'https://hyper3d.test/m1'},
+                 {'model_id': 'm1'}, {'exports': {'GLB': {}}}, {'credits_committed': 0.5}, {'pending_action': 'free_preview'})
+        mid, v, task_id, gen = self.frozen()
+        mdir = mv.models_dir(self.mroot, 'Giant Rat', v)
+        self.fail_attempt(task_id, 'STOPPED: Hyper3D answered "Insufficient Balance" to Free Preview')
+        for fields in cases:
+            with self.subTest(fields=fields):
+                record = self.pre_click(v, status='not_submitted', why='refused', **fields)
+                self.assertFalse(mv.proven_unsubmitted(record))
+                self.assertTrue(mv.conversion_started(mdir))
+                with self.assertRaises(mv.Frozen):
+                    self.convert(mid, ['front.png', 'left.png'])
+                verdict = self.drive(v)
+                self.assertEqual(verdict['status'], 'failed', verdict)
+                self.assertEqual(self.calls(), [])
+                self.assertEqual(json.loads((mdir / 'hyper3d' / 'studio_submission.json').read_text()), record)   # untouched
+                self.assertEqual(self.archived(v), [])
         self.assertEqual(self.paid_clicks(), 0)
 
 

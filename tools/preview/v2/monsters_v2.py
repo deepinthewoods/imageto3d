@@ -1078,7 +1078,9 @@ def hyper3d_backend():
 def proven_unsubmitted(record: dict | None) -> bool:
     """A record of a PROVEN pre-click failure that is still at studio_submission.json (final-live review, "a rejected upload strands
     the unpaid variant"): `rodin_backend.proven_pre_click` (a pre-click status with no action or intent of any kind, no pending
-    action, no model URL / id, no click time, no export). The backend's wrappers archive such a record themselves as
+    action, no model URL / id, no click time, no export; a `not_submitted` record still in place under those conditions counts
+    too: an archive interrupted between its status write and its rename, confirm review "Pilot, rejected upload"). The backend's
+    wrappers archive such a record themselves as
     `studio_submission.not_submitted_<time>.json` (on the pre-click stop and at the start of a new submit); one that is still in
     place leaves the variant UNSUBMITTED all the same: Retry / Use enabled views submit again. A record with any click intent is
     never one (it stays, for review). False when the backend cannot be asked (fail closed: the record counts)."""
@@ -2499,21 +2501,34 @@ def disposition_seq(vj: dict | None) -> int:
     return max([e['seq'] for e in entries if isinstance(e, dict) and isinstance(e.get('seq'), int)] or [0])
 
 
-def outcome_error(disposition: dict | None, row_state: object, row_error: object) -> object:
+def attempt_ref(token: object) -> str | None:
+    """The id a disposition names its queue ATTEMPT by (`attempt`): a digest of the attempt's token (the token itself is never
+    stored in views.json or published). None without a token."""
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()[:16] if isinstance(token, str) and token else None
+
+
+def outcome_error(disposition: dict | None, row_state: object, row_error: object, attempt: object = None) -> object:
     """The error text a failed / cancelled lane row is PUBLISHED with, next to `conversion_seq` (final-live review, blocker 4): the
     row and views.json are two reads, so a row read before a Retry + second failure would otherwise be shown with the revision of the
     second failure (and its Retry would clear a failure the user never saw). Row and revision are therefore shown as ONE outcome:
-    when the disposition of the views.json snapshot the revision comes from is not the outcome the row carries (another reason, or
-    another state), the DISPOSITION's reason is shown; the row's own (possibly longer) text is kept only when it is that outcome."""
+    the text shown always belongs to the revision sent. The reason STORED WITH the disposition is published; the row's own (possibly
+    longer) text is kept only when the row is PROVABLY that outcome: the same state and either the text is identical, or the
+    disposition names the row's attempt (`attempt` = the row's token; the disposition's `attempt` = attempt_ref of it, written by
+    monster_lane.record_failure) and the recorded reason is the beginning of that text. Confirm review ("Earlier 4, Retry"): a text that merely STARTS with the recorded reason is not that
+    outcome (the older "collect failed: old material step" was shown with the revision of the newer "collect failed")."""
     if not isinstance(disposition, dict):
         return row_error
     state, reason = disposition.get('state'), str(disposition.get('reason') or disposition.get('state') or '')
     if state == 'cancelled':
         return row_error if row_state == 'cancelled' else f'cancelled: {reason}'
-    text = str(row_error or '')
-    if row_state == state and (text[:300] == reason or (reason and text.startswith(reason))):
+    if row_state != state:
+        return f'{state}: {reason}'
+    text, recorded = str(row_error or ''), disposition.get('attempt')
+    if text == reason:
         return row_error
-    return reason if row_state == state else f'{state}: {reason}'
+    # a longer text: only that of the very attempt the disposition names, and only when the recorded reason is its beginning
+    same_attempt = recorded is not None and recorded == attempt_ref(attempt)
+    return row_error if same_attempt and (text[:300] == reason or (reason and text.startswith(reason))) else reason
 
 
 def set_disposition(root: Path, monster: str, variant: str, generation: str, value: dict | None, expect_seq: int | None = None,
@@ -2718,7 +2733,7 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
         if view['state'] == 'cancelled':
             error = f'cancelled: {error}'
         # the failure `conversion_seq` (same `vj` snapshot) belongs to, when the row carries another outcome (blocker 4)
-        shown = outcome_error(disposition, view['state'], error)
+        shown = outcome_error(disposition, view['state'], error, (task or {}).get('token'))
         if shown is not error:
             error, verdict = shown, {}
         step = VERDICT_STEP.get(verdict.get('step'), step)

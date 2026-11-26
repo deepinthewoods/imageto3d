@@ -50,6 +50,7 @@ import sys
 ENV = 'IMAGETO3D_PAID_GATE'
 EXIT_GATE_CLOSED = 4          # exit code of a paid-capable child that stopped at a closed gate (resumable, nothing clicked)
 EXIT_LOCK_BUSY = 3            # `hold`: the gate transition lock stayed busy
+MODES = ('auto', 'pause', 'pause-conversions', 'views-run', 'run')   # = pipeline_supervisor.MODES = v2 modes.MODES
 PAUSE_MODES = ('pause', 'pause-conversions')   # supervisor_mode.json modes that pause conversions by hand (= v2 modes.PAUSE_MODES)
 SUPERVISOR_PAUSE = 'supervisor_pause.json'     # the supervisor's own pause (pipeline_supervisor.py writes and removes it)
 MODE_FILE = 'supervisor_mode.json'
@@ -96,6 +97,8 @@ def mode_reason(batch) -> str | None:
     if data is None:
         return f'conversions are paused ({MODE_FILE} cannot be read)'
     mode = data.get('mode') if isinstance(data, dict) else None
+    if mode not in MODES:   # not an object, no mode, or an unknown one (e.g. [] or "paus"): fail closed (confirm review, blocker 1)
+        return f'conversions are paused ({MODE_FILE} holds no valid mode: {str(mode)[:40]!r})'
     if mode in PAUSE_MODES:
         return f'conversions are paused (mode {mode})'
     return None
