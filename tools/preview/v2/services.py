@@ -23,7 +23,7 @@ to that handle (psutil refuses a reused pid).
 
 A match is ADOPTED (recorded in `.codex_jobs/_app/services/<name>.json` as `{pid, create_time, cmdline, adopted, since, ...}`); a service is
 started only when enabled in the settings, nothing matches and the settings file is usable (settings.health). Two matches = state
-`duplicate`, an error in the UI, never fixed automatically. Services start detached (DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP |
+`duplicate`, an error in the UI, never fixed automatically. Services start in their own hidden console (CREATE_NEW_PROCESS_GROUP |
 CREATE_NO_WINDOW) with stdout/stderr appended to `.codex_jobs/_batch/<name>_win.out.log/.err.log`, so the web server never stops a service.
 Start order: supervisor, views, then the convert worker only once the supervisor completed a tick (`supervisor_tick.json`).
 
@@ -100,8 +100,10 @@ import settings as app_settings  # noqa: E402
 
 import psutil  # noqa: E402   (required: the manager cannot see processes without it)
 
-DETACHED = (getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0)
-            | getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+# CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, NOT DETACHED_PROCESS (user 2026-11-26): the child gets its OWN hidden console,
+# which every console program it starts inherits. A detached (console-less) parent made Windows open a new console per child,
+# and with Windows Terminal as the default terminal each one became an empty tab in the user's terminal window.
+DETACHED = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 BACKOFF = (60.0, 300.0)       # wait before the 1st / 2nd restart; the 3rd failure holds the service
 MAX_FAILS = 3

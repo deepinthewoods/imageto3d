@@ -31,6 +31,7 @@ import convert_list  # noqa: E402
 import credits  # noqa: E402
 import guard  # noqa: E402
 import modes  # noqa: E402
+import orchestrator  # noqa: E402
 import services  # noqa: E402
 import settings  # noqa: E402
 
@@ -634,7 +635,7 @@ class ServicesTest(TempRoot):
         self.assertEqual(seen['cwd'], str(self.root))
         self.assertEqual(seen['env']['PYTHONUTF8'], '1')
         if os.name == 'nt':
-            self.assertEqual(seen['creationflags'], 0x00000008 | 0x00000200 | 0x08000000)
+            self.assertEqual(seen['creationflags'], 0x00000200 | 0x08000000)   # own hidden console, not DETACHED_PROCESS (no empty terminal tabs)
         self.assertEqual(seen['stdout'].name, str(self.root / '.codex_jobs/_batch/views_win.out.log'))
         self.assertEqual(seen['stderr'].name, str(self.root / '.codex_jobs/_batch/views_win.err.log'))
         self.assertEqual(inst['cmdline'][-2:], ['--parallel', '8'])
@@ -1366,6 +1367,32 @@ class GateTransitionTest(TempRoot):
                 raise self.gate.GateBusy('busy')
         return Busy()
 
+
+
+@unittest.skipUnless(os.name == 'nt', 'Windows consoles')
+class HiddenConsoleTest(unittest.TestCase):
+    """User 2026-11-26: a service or task the app starts must OWN a (hidden) console, so the console programs it starts inherit it
+    instead of each getting a new console (which Windows Terminal, as the default terminal, shows as an empty tab)."""
+
+    def test_services_and_tasks_get_a_console_their_children_inherit(self):
+        import subprocess as sp
+        probe = PROBE
+        for flags in (services.DETACHED, orchestrator.DETACHED):
+            self.assertFalse(flags & 0x00000008)                       # never DETACHED_PROCESS
+            out = sp.run([sys.executable, '-c', probe], capture_output=True, text=True, creationflags=flags, timeout=60).stdout.split()
+            self.assertGreaterEqual(int(out[0]), 1, out)               # the started process has a console
+            self.assertGreaterEqual(int(out[1]), 2, out)               # and its child shares it (no new console of its own)
+
+
+PROBE = """
+import ctypes, subprocess, sys
+buf = (ctypes.c_uint * 8)()
+mine = ctypes.windll.kernel32.GetConsoleProcessList(buf, 8)
+kid = subprocess.run([sys.executable, '-c',
+                      'import ctypes; b = (ctypes.c_uint * 8)(); print(ctypes.windll.kernel32.GetConsoleProcessList(b, 8))'],
+                     capture_output=True, text=True).stdout.strip()
+print(mine, kid)
+"""
 
 if __name__ == '__main__':
     unittest.main()

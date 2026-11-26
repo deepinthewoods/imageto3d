@@ -87,7 +87,10 @@ ADOPT_CAP_S = 6 * 3600.0              # without psutil a pid cannot be proven to
 DEFAULTS = {'layer_workers_present': 1, 'layer_workers_away': 4, 'build_stall_minutes': 30}
 TASK_ENV = {'BODY_FIT_GPU': '1', 'PYTHONUTF8': '1', 'OMP_NUM_THREADS': '1'}
 LAYER_LANES = ('bare', 'layers')       # the layer pool; monster_lane.LANE has its own limit and gate
-DETACHED = (getattr(subprocess, 'DETACHED_PROCESS', 0) | getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'CREATE_NO_WINDOW', 0))
+# CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW, NOT DETACHED_PROCESS (user 2026-11-26): the child gets its OWN hidden console,
+# which every console program it starts inherits. A detached (console-less) parent made Windows open a new console per child,
+# and with Windows Terminal as the default terminal each one became an empty tab in the user's terminal window.
+DETACHED = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) | getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 NO_VERDICT = 'the builder exited 0 without a verdict on stdout'
 # failure classification (see the module docstring): invalid input never retries, anything else without a clear verdict is transient
 INVALID = re.compile(r'missing input|no garment found|required slot|invalid race|unknown module|argument error|must be one of|module dir not found|'
