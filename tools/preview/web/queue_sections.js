@@ -10,6 +10,7 @@ import { confirmDialog } from './confirm.js';
 import { toast } from './toast.js';
 import { ago, badge, bytesText, button, duration, h, pretty, storage } from './util.js';
 import { noteServices } from './status.js';
+import { estimateConfirmLines, estimateLine, estimateTitle } from './queue_estimate.js';
 
 const SERVICE_ORDER = ['supervisor', 'views', 'convert'];
 const SERVICE_TONE = { running: 'ok', idle: 'info', stopping: 'warn', stopped: '', crashed: 'error', held: 'error', duplicate: 'error' };
@@ -132,7 +133,8 @@ export function createSections({ reload }) {
       const ok = await confirmDialog({
         title: 'Run everything now?', confirm: 'Run now', danger: true,
         lines: ['Conversions (Tripo browser, Blender, GPU) start even while you are at the PC, and the idle pause is switched off.',
-          'A full pipeline load crashed the GPU before: use this only when you are not working on the machine. Auto goes back to the normal behaviour.'],
+          'A full pipeline load crashed the GPU before: use this only when you are not working on the machine. Auto goes back to the normal behaviour.',
+          ...estimateConfirmLines(data?.run_all_estimate)],
       });
       if (!ok) return;
     }
@@ -168,6 +170,7 @@ export function createSections({ reload }) {
             ? badge(`PAUSE: ${pause.reason || 'no reason given'}${pause.since ? ` · since ${pause.since}` : ''}${asList(pause.scope).length ? ` · ${asList(pause.scope).join(' + ')}` : ''}`, 'warn')
             : badge('not paused', 'ok')),
         h('div', { class: 'q-line' }, h('span', { class: 'q-idle' })),
+        h('div', { class: 'q-line q-estimate', dataset: { row: 'run-estimate' } }),
         snap.supervisor_running === false ? note(snap.warning || 'supervisor not running: the mode has no effect on conversions', 'bad') : null,
         hold ? convertHoldNote(hold) : null,
       ];
@@ -182,6 +185,11 @@ export function createSections({ reload }) {
           idle.textContent = s.idle_seconds == null ? 'User idle time unknown'
             : `You have been idle for ${mins < 1 ? `${Math.round(s.idle_seconds)} s` : `${Math.round(mins)} min`} (${s.idle_source || 'unknown source'}): `
               + (s.away ? 'away (conversions may run)' : 'at the PC (conversions wait under Auto)');
+          const est = nodes[3];                    // the Run everything now estimate (queue.run_all_estimate): updated in place, never rebuilds the buttons
+          const line = estimateLine(next.run_all_estimate);
+          if (est.textContent !== line) est.textContent = line;
+          est.title = estimateTitle(next.run_all_estimate);
+          est.hidden = !line;
         },
       };
     },
@@ -330,6 +338,8 @@ export function createSections({ reload }) {
       svc.stop_pending && !reqs.some(r => !r.final && r.action !== 'start') ? h('div', { class: 'svc-req tone-warn', dataset: { pending: 'stop' },
         text: name === 'convert' ? 'stop requested; waiting for the current job' : 'stop requested; waiting' }) : null,
       ...reqs.map(requestLine),
+      running && svc.command_differs === true && !waiting ? h('div', { class: 'svc-req tone-warn', dataset: { pending: 'apply' },
+        text: 'runs with another backend setting than the saved one; Restart to apply it' }) : null,
       svc.duplicates?.length ? h('div', { class: 'svc-message bad', text: `Two instances: pids ${svc.duplicates.map(d => d.pid).join(', ')}. Stop the extra one by hand; the app never does it.` }) : null,
       log);
     return {
@@ -369,7 +379,7 @@ export function createSections({ reload }) {
         errors: [d.services.errors, d.services.manager_errors],
         requests: names(map).flatMap(n => requestsFor(d, n)).map(r => [r.id, r.name, r.action, r.status, r.text, !!r.final]),
         services: Object.fromEntries(Object.entries(map).map(([name, s]) => [name, [s.state, s.enabled, s.pid, s.adopted, s.stop_pending, s.message, s.error, s.duplicates, s.convert_jobs,
-          s.restart_in != null, !!(s.logs?.out || s.logs?.err || s.logs?.events), s.logs?.out_file, s.logs?.err_file]])),
+          s.restart_in != null, !!(s.logs?.out || s.logs?.err || s.logs?.events), s.logs?.out_file, s.logs?.err_file, s.command_differs]])),
       };
     },
     build(d) {
@@ -690,7 +700,12 @@ export function createSections({ reload }) {
     }
     const rows = [
       ...NUMBERS.map(([key, label, hint, min, max]) => add(key, label, h('input', { type: 'number', min, max, step: 1, inputMode: 'numeric' }), hint, 'num')),
-      add('tripo', 'Tripo', h('select', null, h('option', { value: 'off', text: 'off (no credits this month)' }), h('option', { value: 'auto', text: 'auto (Tripo first, Hyper3D when it runs out)' })), 'off passes --no-tripo to the convert worker', 'select'),
+      add('tripo', 'Backend', h('select', null,
+        h('option', { value: 'off', text: 'off (Hyper3D only, no Tripo credits)' }),
+        h('option', { value: 'auto', text: 'auto (Tripo first, Hyper3D when it runs out)' }),
+        h('option', { value: 'pixal3d', text: 'pixal3d (Pixal3D only: free, local GPU, ~4.5 min/module)' }),
+        h('option', { value: 'auto_pixal3d', text: 'auto_pixal3d (Tripo first, Pixal3D when it runs out)' })),
+        'off = --no-tripo, pixal3d = --backend pixal3d, auto_pixal3d = --fallback pixal3d. A change restarts the convert worker after its running job', 'select'),
     ];
     // allowed_hosts: a list editor (one text input per host, Add / remove); the control element carries its value through `.listValue` / `.setList`
     const hostList = h('div', { class: 'q-list-edit', role: 'group', 'aria-label': 'Allowed hosts' });
@@ -777,7 +792,7 @@ export function createSections({ reload }) {
         touched.clear();
         for (const key of Object.keys(fields)) show(key);
         saved.textContent = 'Saved';
-        toast('Settings saved', { ms: 2500 });
+        toast(result?.convert_restart ? `Settings saved; ${result.convert_restart.message}` : 'Settings saved', { ms: result?.convert_restart ? 6000 : 2500 });
       } catch (error) {
         const problems = asList(error.body?.problems).length ? asList(error.body.problems).map(text) : String(error.message).split(/;\s*/);
         const loose = [];

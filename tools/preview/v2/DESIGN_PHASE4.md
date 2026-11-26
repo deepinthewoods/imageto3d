@@ -8,7 +8,7 @@ Extends DESIGN_ORCHESTRATOR.md §1. The principle: **adopt and manage** the thre
     `run`.
   - `views`: `python -u tools/view_batch.py run --parallel <settings.view_parallel, default 8>`. Matched by `view_batch.py` and `run`.
   - `convert`: `python -X utf8 -u tools/convert_queue.py --sets-file .codex_jobs/_batch/convert_sets.txt --worker 1` plus `--no-tripo`
-    when `settings.tripo == "off"`. Tripo is off in November 2026: there are no credits. Matched by `convert_queue.py`.
+    when `settings.tripo == "off"` (2026-11-26: `pixal3d` adds `--backend pixal3d`, `auto_pixal3d` adds `--fallback pixal3d`, `auto` adds nothing). Tripo is off in November 2026: there are no credits. Matched by `convert_queue.py`.
 - **Adopt before start.** Every 30 s, scan processes with psutil for python processes whose cmdline matches. A match is recorded in
   `.codex_jobs/_app/services/<name>.json` as `{pid, create_time, cmdline, adopted: true|false, since}`.
   - A service is started only when `settings.services.<name>` is true and no instance runs.
@@ -140,7 +140,7 @@ Every op uses the existing token/host rules and is logged as an event.
   5. Conversions: current, events tail, fails with Reset, held jobs with Release.
   6. Holds.
   7. Settings: an editable form for `view_parallel`, `layer_workers_present`, `layer_workers_away`, `build_stall_minutes`,
-     `tripo` (off/auto) and the services toggles.
+     `tripo` (off/auto/pixal3d/auto_pixal3d, 2026-11-26) and the services toggles.
 - **Header.** A compact status chip (`mode · paused? · services ok/n problems`) that links to Queue.
 - **Approved modal.** Shows `progress` per unit, plus Release when a set is held as not in the convert list.
 

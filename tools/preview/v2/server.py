@@ -48,6 +48,7 @@ import guard  # noqa: E402
 import modes  # noqa: E402
 import orchestrator  # noqa: E402
 import progress  # noqa: E402
+import run_estimate  # noqa: E402
 import settings as app_settings  # noqa: E402
 import taskqueue  # noqa: E402
 
@@ -149,8 +150,20 @@ def credits_view(root: Path, ctx: dict) -> dict:
     return dict(value) | {'check': tripo.view() if tripo else None}
 
 
+def run_all_estimate(root: Path, credits_now: dict) -> dict:
+    """`run_all_estimate` of GET /api/v2/queue: what "Run everything now" would cost (run_estimate.py; the scan runs in the background and is cached,
+    this never blocks and never raises: a failure is the `error` field)."""
+    try:
+        # the credits snapshot is reused for CREDITS_TTL: take the Tripo setting fresh, so a change shows at once
+        fresh = dict(credits_now or {}, tripo=dict((credits_now or {}).get('tripo') or {}, mode=app_settings.load(root)['tripo']))
+        return run_estimate.get(root, fresh)
+    except Exception as exc:  # noqa: BLE001  (display only)
+        return {'pending': False, 'error': f'{type(exc).__name__}: {exc}'}
+
+
 def queue_extras(root: Path, ctx: dict) -> dict:
-    """The phase 4 keys of GET /api/v2/queue (DESIGN_PHASE4.md H): services, mode, credits, disk, views, conversions, holds, settings."""
+    """The phase 4 keys of GET /api/v2/queue (DESIGN_PHASE4.md H): services, mode, credits, run_all_estimate, disk, views, conversions, holds,
+    settings."""
     races = serve._base_races(root)
     try:
         usage = shutil.disk_usage(root)
@@ -162,7 +175,9 @@ def queue_extras(root: Path, ctx: dict) -> dict:
         hold = services.hold_state(root)
     except Exception as exc:  # noqa: BLE001  (display only)
         hold = {'reason': f'unknown ({type(exc).__name__}: {exc})'}
-    return {'services': services_view(ctx), 'mode': modes.snapshot(root), 'credits': credits_view(root, ctx), 'disk': disk,
+    credits_now = credits_view(root, ctx)
+    return {'services': services_view(ctx), 'mode': modes.snapshot(root), 'credits': credits_now, 'run_all_estimate': run_all_estimate(root, credits_now),
+            'disk': disk,
             'views': progress.views_section(root), 'conversions': progress.conversions_section(root),
             'holds': progress.holds_section(root, lambda prefix: catalog.job_set(prefix, races, root)), 'settings': app_settings.load(root),
             'settings_health': app_settings.health(root, reload=False), 'convert_hold': hold}

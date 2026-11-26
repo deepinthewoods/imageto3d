@@ -359,6 +359,8 @@ def module_step(root, model_set: str, job_id: str, race: str, module: str) -> st
         return 'submitting'
     backend = str(submission.get('backend') or 'tripo')
     stage = submission.get('stage') or submission.get('status')
+    if backend == 'pixal3d' and stage == 'submitted':
+        stage = 'generating'                 # the submit only staged the inputs; the local GPU generation runs at collect
     return f'{backend}: {stage}' if stage else backend
 
 

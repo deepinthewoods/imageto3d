@@ -158,6 +158,39 @@ class Flow(unittest.TestCase):
         self.assertEqual(submit[-2:], ['--seed-offset', '2'])
         self.assertEqual(convert_job.collect_command('pixal3d', Path('o'))[-2:], ['collect', 'o'])
 
+    def test_the_pause_gate_is_checked_before_the_local_generation(self):
+        """The GPU generation runs at collect: it waits at the supervisor's pause gate first (a full GPU load crashed the PC while the user
+        was at it); a Tripo / formy3d collect is not touched by this."""
+        events = []
+
+        def fake_run(command, **kwargs):
+            events.append(('run', Path(command[1]).name if len(command) > 1 else command[0], command[2] if len(command) > 2 else None))
+            if 'pixal3d_backend.py' in str(command[1]) and command[2] == 'collect':
+                glb = out / 'pixal3d.glb'
+                glb.write_bytes(b'glb')
+                (out / 'studio_submission.json').write_text(json.dumps(
+                    {'backend': 'pixal3d', 'status': 'exported', 'exports': {'GLB': {'path': str(glb)}}}))
+            else:                                                     # the reduction: a manifest
+                (out / 'reduced').mkdir(exist_ok=True)
+                (out / 'reduced' / 'manifest.json').write_text('{}')
+            return mock.Mock(returncode=0)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp) / 'out'
+            out.mkdir()
+            (out / 'studio_submission.json').write_text(json.dumps({'backend': 'pixal3d', 'status': 'submitted'}))
+            with mock.patch.object(convert_job, 'wait_for_gate', lambda key, step: events.append(('gate', key, step))),                     mock.patch.object(convert_job.subprocess, 'run', fake_run):
+                convert_job.collect_and_reduce('human_male/body_armor', out, 'pixal3d')
+            self.assertEqual(events[0][0], 'gate')
+            self.assertIn('Pixal3D', events[0][2])
+            self.assertEqual(events[1], ('run', 'pixal3d_backend.py', 'collect'))          # the gate came BEFORE the generation
+            self.assertEqual(sum(e[0] == 'gate' for e in events), 1)
+            # an already exported module generates nothing, so nothing waits
+            events.clear()
+            with mock.patch.object(convert_job, 'wait_for_gate', lambda key, step: events.append(('gate', key, step))),                     mock.patch.object(convert_job.subprocess, 'run', fake_run):
+                convert_job.collect_and_reduce('human_male/body_armor', out, 'pixal3d')
+            self.assertEqual(events, [])
+
     def test_stripped_double_skin_is_not_regenerated(self):
         stripped = {'interior': {'interior_area_share': 0.53, 'threshold': 0.15, 'stripped': True,
                                  'after_strip': {'interior_area_share': 0.026}}}

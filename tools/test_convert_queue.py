@@ -236,6 +236,44 @@ class PartialJobTests(BalanceLoopTests):
         self.assertEqual(self.converts, [['--backend', 'hyper3d', '--allow-paid', '--accept-preview']])
 
 
+class Pixal3dPolicyTests(Base):
+    """The app's `tripo` setting values `pixal3d` (--backend pixal3d) and `auto_pixal3d` (--fallback pixal3d)."""
+    run_main = BalanceLoopTests.run_main
+
+    def test_backend_pixal3d_never_reads_the_tripo_balance(self):
+        self.stop_on_nap(1)
+        with mock.patch.object(cq, 'read_tripo_balance', side_effect=AssertionError('the Tripo balance was read')),                 mock.patch.object(cq, 'next_job', side_effect=[(self.job, True), (None, False)]):
+            cq.main(['--sets', 'set_a', '--poll', '1', '--backend', 'pixal3d'])
+        self.assertEqual(self.converts, [['--backend', 'pixal3d']])
+        self.assertTrue(any('CONVERTED set_a--abc' in l for l in self.events()), self.events())
+
+    def test_backend_pixal3d_is_free_so_no_paid_flags_and_no_fallback(self):
+        self.code = 3                                                # a failing local run is a failure, never a Hyper3D run
+        self.stop_on_nap(1)
+        with mock.patch.object(cq, 'read_tripo_balance', side_effect=AssertionError('the Tripo balance was read')),                 mock.patch.object(cq, 'next_job', side_effect=[(self.job, True), (None, False)]):
+            cq.main(['--sets', 'set_a', '--poll', '1', '--backend', 'pixal3d'])
+        self.assertEqual(self.converts, [['--backend', 'pixal3d']])
+        self.assertFalse(any('--allow-paid' in c for c in self.converts))
+
+    def test_fallback_pixal3d_after_a_verified_shortfall_dispatches_pixal3d(self):
+        self.code = 3
+        self.stop_on_nap(1)
+        self.run_main([(30, None), (5, None)], next_jobs=[(self.job, True), (None, False)], argv=('--fallback', 'pixal3d'))
+        self.assertEqual(self.converts, [['--max-submits', '1'], ['--backend', 'pixal3d']])
+        self.assertFalse(any('--allow-paid' in c or 'hyper3d' in c for c in self.converts))
+
+    def test_fallback_pixal3d_with_a_readable_zero_balance(self):
+        self.code = 3
+        self.stop_on_nap(1)
+        self.run_main([(10, None), (10, None)], next_jobs=[(self.job, True), (None, False)], argv=('--fallback', 'pixal3d'))
+        self.assertEqual(self.converts, [['--backend', 'pixal3d']])
+
+    def test_fallback_pixal3d_still_holds_on_an_unreadable_balance(self):
+        self.stop_on_nap(1)
+        self.run_main([(None, 'busy')], argv=('--fallback', 'pixal3d'))
+        self.assertEqual(self.converts, [])                          # unknown is not zero: no fallback of any kind
+
+
 class JobEligibleTests(unittest.TestCase):
     """Phase-4 finding 20: convert_queue.job_eligible(root, job) is the worker's claim/join rule, read-only."""
 

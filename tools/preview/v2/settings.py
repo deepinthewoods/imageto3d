@@ -44,7 +44,9 @@ DEFAULTS = {
 }
 INT_RANGES = {'view_parallel': (1, 16), 'layer_workers_present': (0, 16), 'layer_workers_away': (0, 16),
               'build_stall_minutes': (1, 1440), 'paid_budget_hyper3d': (0, 1000)}
-TRIPO_MODES = ('off', 'auto')
+# off = Hyper3D only (`--no-tripo`); auto = Tripo first, Hyper3D when it runs out; pixal3d = Pixal3D only (free, local GPU: `--backend pixal3d`);
+# auto_pixal3d = Tripo first, Pixal3D when it runs out (`--fallback pixal3d`). The key keeps its name `tripo` (user, 2026-11-26).
+TRIPO_MODES = ('off', 'auto', 'pixal3d', 'auto_pixal3d')
 HOST_RE = re.compile(r'^[A-Za-z0-9._:\[\]-]{1,253}$')
 MAX_HOSTS = 32
 _LOCK = threading.RLock()

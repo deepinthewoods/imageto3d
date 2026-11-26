@@ -871,9 +871,12 @@ def paid_actions(record: dict | None) -> list[dict]:
     """The credit-capable actions a submission record names (F5, finding 8): [{action, status, credits, id, provider_id, evidence,
     model_id}]. `status` confirmed ONLY when the backend recorded `actions[<kind>].confirmed_at` (advance_evidence); otherwise uncertain
     (the click may or may not have happened; a cleared intent alone proves nothing). `credits` = the cost the backend observed for that
-    click (`actions[<kind>].observed_cost`, else `observed_cost_<kind>.credits`), None when it was not observed (never assumed). An action
-    observed at cost 0 is free and not listed. `id` = `hyper3d:<model id>:<action>` (the ledger identity); `provider_id` = the provider's
-    own action id when the backend recorded one."""
+    click (`actions[<kind>].observed_cost`, else `observed_cost_<kind>.credits`), None when it was not observed (never assumed).
+    FREE (`free` true, `credits` 0, the reason appended to `evidence`): a CONFIRMED action observed at cost 0, or one with no observed
+    cost whose `balance_before` and `balance_after` are both numbers, equal, and recorded for this record's model id (the button shows
+    no price; the unchanged balance shows nothing was charged). A balance that changed, or is missing, keeps the amount unknown (None).
+    An UNCONFIRMED action observed at cost 0 is not listed (nothing was charged). `id` = `hyper3d:<model id>:<action>` (the ledger
+    identity); `provider_id` = the provider's own action id when the backend recorded one."""
     if not isinstance(record, dict):
         return []
     actions = record.get('actions') if isinstance(record.get('actions'), dict) else {}
@@ -888,10 +891,21 @@ def paid_actions(record: dict | None) -> list[dict]:
         if credits is None:
             observed = record.get(f'observed_cost_{kind}')
             credits = _number(observed.get('credits')) if isinstance(observed, dict) else None
-        if credits == 0:
-            continue
         evidence = advance_evidence(record, kind)
-        out.append({'action': kind, 'status': 'confirmed' if evidence else 'uncertain', 'credits': credits,
+        free_why = None
+        if evidence:
+            if credits == 0:
+                free_why = 'observed cost 0'
+            elif credits is None:
+                before, after = _number(entry.get('balance_before')), _number(entry.get('balance_after'))
+                if before is not None and before == after and model and entry.get('model_id') == model:
+                    free_why = f'balance unchanged {before} -> {after}'
+        elif credits == 0:
+            continue                                            # an unconfirmed click observed at 0: nothing was charged, not listed
+        status = 'confirmed' if evidence else 'uncertain'
+        if free_why:
+            credits, evidence = 0, f'{evidence}; free: {free_why}'
+        out.append({'action': kind, 'status': status, 'credits': credits, 'free': bool(free_why),
                     'id': f'hyper3d:{model}:{kind}' if model else None,
                     'provider_id': next((str(entry[f]) for f in PROVIDER_IDS if isinstance(entry.get(f), (str, int)) and entry[f]), None),
                     'evidence': evidence, 'model_id': entry.get('model_id') if isinstance(entry.get('model_id'), str) else model})
@@ -972,7 +986,8 @@ def _update_error(root: Path, rec_text: str, change) -> None:
 def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], record_path: Path, record: dict | None,
                    stored: list[dict] | None = None) -> str | None:
     """Bring paid_log.jsonl in line with a record (F5), on every run: one entry per provider action id, appended when it is new or its
-    status / amount changed (a confirmed entry is final). An older lane's entry (no `id`) for the same record and model covers its
+    status / amount changed (a confirmed entry with a known amount is final; a confirmed entry whose amount is null is superseded ONCE
+    by an entry whose amount is now known, free 0 or a number, with its evidence). An older lane's entry (no `id`) for the same record and model covers its
     geometry click. A write error is kept in paid_log_errors.json (shown in the Queue and the item) until a later reconcile succeeds; the
     error text is returned (None = in line).
     Finding 8: the error entry STORES the actions it could not log ({id, provider_id, action, status, credits, model_id, evidence}), so a
@@ -1018,11 +1033,18 @@ def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], rec
                 legacy = any(e.get('record') == rec_text and 'id' not in e and e.get('model_id') == action.get('model_id') for e in entries)
                 if prev is None and legacy and action['action'] in ('geometry', 'committed'):
                     continue
-                if prev is not None and (prev.get('status') == 'confirmed' or
-                                         (prev.get('status') == action['status'] and prev.get('credits') == action['credits'])):
-                    continue
+                supersedes = False
+                if prev is not None:
+                    if prev.get('status') == 'confirmed':
+                        supersedes = (prev.get('credits') is None and action['status'] == 'confirmed'
+                                      and action['credits'] is not None and bool(action.get('evidence')))
+                        if not supersedes:
+                            continue
+                    elif prev.get('status') == action['status'] and prev.get('credits') == action['credits']:
+                        continue
                 new.append({'time': guard.now(), 'kind': 'hyper3d', 'id': ident, 'action': action['action'], 'status': action['status'],
-                            'credits': action['credits'], 'monster': monster, 'variant': variant, 'views': list(files),
+                            'credits': action['credits'], **({'free': True} if action.get('free') else {}),
+                            **({'supersedes': prev.get('time')} if supersedes else {}), 'monster': monster, 'variant': variant, 'views': list(files),
                             'record': rec_text, 'model_id': action.get('model_id'), 'provider_id': action.get('provider_id'),
                             'evidence': action.get('evidence')})
             if new:
@@ -1082,7 +1104,8 @@ def repair_accounting(root: Path) -> list[str]:
 
 
 def paid_summary(root: Path) -> dict:
-    """{count, credits (confirmed, observed amounts), unknown_amounts (confirmed without an observed amount), uncertain {count, credits},
+    """{count (confirmed, not free), free (confirmed free steps: credits 0), credits (confirmed, observed amounts), unknown_amounts
+    (confirmed, not free, without an observed amount), uncertain {count, credits},
     recent, errors}: the last entry of every provider action id counts; entries of an older lane (no id) count as confirmed. An action is
     `confirmed` only with evidence that its paid stage advanced (paid_actions, finding 8)."""
     entries = [e for e in paid_entries(root) if e.get('kind') == 'hyper3d']
@@ -1094,8 +1117,10 @@ def paid_summary(root: Path) -> dict:
             legacy.append(entry)
     confirmed = [e for e in by_id.values() if e.get('status') == 'confirmed'] + legacy
     uncertain = [e for e in by_id.values() if e.get('status') != 'confirmed']
-    known = [_number(e.get('credits')) for e in confirmed]
-    return {'count': len(confirmed), 'credits': round(sum(k for k in known if k is not None), 3),
+    free = [e for e in confirmed if e.get('free') is True or _number(e.get('credits')) == 0]
+    charged = [e for e in confirmed if e not in free]
+    known = [_number(e.get('credits')) for e in charged]
+    return {'count': len(charged), 'free': len(free), 'credits': round(sum(k for k in known if k is not None), 3),
             'unknown_amounts': sum(1 for k in known if k is None),
             'uncertain': {'count': len(uncertain), 'credits': round(sum(_number(e.get('credits')) or 0 for e in uncertain), 3)},
             'recent': entries[-10:], 'errors': [dict(v, record=k) for k, v in _read_errors(root).items() if isinstance(v, dict)]}
@@ -1989,7 +2014,7 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
         rec = mv.record_of(mdir)
         paid = paid_actions(rec)
         out = base | {'status': status, 'step': step, 'steps': steps, 'error': error,
-                      'record_status': (rec or {}).get('status'), 'paid': any(a['status'] == 'confirmed' for a in paid),
+                      'record_status': (rec or {}).get('status'), 'paid': any(a['status'] == 'confirmed' and not a.get('free') for a in paid),
                       'paid_uncertain': [a['action'] for a in paid if a['status'] == 'uncertain'],
                       'accounting_error': accounting['error']} | extra
         if status == 'failed':

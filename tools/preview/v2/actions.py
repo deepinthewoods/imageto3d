@@ -1375,6 +1375,29 @@ def accept_drift(root: Path, key: object, images: object, note: object = None) -
     return {'ok': True, 'key': key, 'accepted': accepted, 'already': already, 'advance': '.codex_jobs/_batch/advance.json'}
 
 
+def _restart_convert_for_tripo(root: Path, manager, before: str, after: str) -> dict | None:
+    """A saved change of the `tripo` setting only reaches a convert worker at its next start (its backend flags are part of its command line), so
+    a RUNNING worker gets the Queue tab's own graceful Restart: `manager.request('convert', 'restart')` (queued and executed on the services
+    thread; `services.stop` waits for the in-flight job and never kills it, the replacement starts with the new flags). Nothing happens when the
+    setting did not change, the convert service is disabled or not running (a stopped worker, stopped by the user or idle, starts with the new
+    flags anyway), or its command line already has the flags (`command_differs` false). Returns {request, message} or None."""
+    if before == after:
+        return None
+    settings = app_settings.load(root)
+    if not settings['services'].get('convert', True):
+        return None
+    svc = manager.services
+    status = svc.status_one(root, svc.SERVICES['convert'], settings)
+    if status['state'] != 'running' or status.get('command_differs') is False:
+        return None
+    try:
+        requested = manager.request('convert', 'restart')
+    except guard.Busy as exc:             # a restart / stop is already queued: its start reads the settings saved now
+        return {'request': None, 'message': f'convert worker: {exc}; it starts with the new backend setting'}
+    return {'request': requested.get('request'),
+            'message': f'tripo {before} -> {after}: the convert worker restarts to apply it (after its running job)'}
+
+
 def pipeline_op(root: Path, data: dict, ctx: dict | None) -> dict:
     """The phase 4 operations of POST /api/v2/queue (DESIGN_PHASE4.md H). `ctx` = the server context: `services` (the ServiceManager, only with
     --manage-services) and `tripo` (the balance-check runner). Each is logged as a queue event."""
@@ -1393,10 +1416,15 @@ def pipeline_op(root: Path, data: dict, ctx: dict | None) -> dict:
         result = {'ok': True, 'mode': modes.write_mode(root, MODE_VALUES[mode])}
         detail = f'{mode} -> {result["mode"]["mode"]}'
     elif op == 'settings':
+        before = app_settings.load(root)['tripo']
         result = {'ok': True, 'settings': app_settings.save(root, data.get('patch'))}     # SettingsError (400 with its problems) on a bad patch
         detail = json.dumps(data.get('patch'))[:300]
         manager = ctx.get('services')
         if manager is not None:
+            restart = _restart_convert_for_tripo(root, manager, before, result['settings']['tripo'])
+            if restart:
+                result['convert_restart'] = restart
+                detail += f'; {restart["message"]}'
             manager.wake()                    # an enabled / disabled service is acted on now, not at the next 30 s tick
     elif op == 'check_tripo':
         checker = ctx.get('tripo')

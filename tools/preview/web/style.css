@@ -323,6 +323,7 @@ details.q-sec>summary h3{margin:0;font-size:.95rem;text-transform:uppercase;lett
 .q-sec details{max-height:none;overflow:visible;border:0}
 .q-sec summary{padding:0}
 .q-line{display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}
+.q-estimate{font-size:.88rem}
 .q-dim{color:#8794a8;font-size:.82rem}
 .q-bad,.q-note.bad{color:#ffc0c6}
 .q-note{margin:0;font-size:.88rem;color:#e0b86a}

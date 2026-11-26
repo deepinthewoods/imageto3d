@@ -238,6 +238,19 @@ class SettingsTest(TempRoot):
         self.assertEqual(raw['future_key'], {'a': 1})
         self.assertEqual(list(settings.path(self.root).parent.glob('settings.json.*')), [])   # no temp files left
 
+    def test_the_tripo_setting_takes_the_four_backend_modes(self):
+        self.assertEqual(settings.TRIPO_MODES, ('off', 'auto', 'pixal3d', 'auto_pixal3d'))
+        self.assertEqual(settings.DEFAULTS['tripo'], 'off')
+        for mode in settings.TRIPO_MODES:
+            self.assertEqual(settings.save(self.root, {'tripo': mode})['tripo'], mode)
+            self.assertEqual(settings.load(self.root)['tripo'], mode)
+        with self.assertRaises(settings.SettingsError) as raised:
+            settings.save(self.root, {'tripo': 'pixal'})
+        self.assertIn('pixal3d', raised.exception.problems[0])
+        self.assertEqual(settings.load(self.root)['tripo'], 'auto_pixal3d')            # the bad patch wrote nothing
+        settings.path(self.root).write_text(json.dumps({'tripo': 'sometimes'}), encoding='utf-8')
+        self.assertEqual(settings.load(self.root)['tripo'], 'off')                     # an unknown value in the file still means off
+
     def test_save_rejects_bad_values_and_writes_nothing(self):
         bad = [{'view_parallel': 0}, {'view_parallel': 17}, {'view_parallel': True}, {'view_parallel': '8'}, {'tripo': 'on'},
                {'services': {'convert': 'no'}}, {'services': {'nope': True}}, {'services': []}, {'allowed_hosts': 'a'},
@@ -465,6 +478,234 @@ class ConvertListTest(TempRoot):
         self.assertEqual(sorted(j['set'] for j in convert_list.pending_jobs(self.root)), ['held_half', 'held_set', 'listed_set'])
 
 
+# ------------------------------------------------------------------------------------------------------------- Run everything now estimate
+
+class RunEstimateTest(TempRoot):
+    """run_estimate.py: the modules / credits "Run everything now" would take, from the convert worker's own rules (read-only, temp roots)."""
+    stage = ConvertListTest.stage
+    sets_file = ConvertListTest.sets_file
+
+    def setUp(self):
+        super().setUp()
+        import run_estimate
+        self.est = run_estimate
+        run_estimate.forget()
+        self.addCleanup(run_estimate.forget)
+
+    def credits_of(self, mode='off', tripo=None, hyper=871.5):
+        return {'tripo': {'mode': mode, 'credits': tripo, 'checked_at': '2026-11-26T10:00:00+00:00' if tripo is not None else None},
+                'hyper3d': {'credits': hyper, 'at': '2026-11-26T09:00:00+00:00'}}
+
+    def fill(self):
+        """Ready: 2 modules in s--aaa111 (multiview_ready) + 1 of 2 in t--bbb222 (processing) = 2 jobs, 3 modules."""
+        self.sets_file('s\nt\n')
+        self.stage('multiview_ready', 's', modules=(('human_male', 'outfit'), ('elf_male', 'outfit')))
+        self.stage('processing', 't', 'bbb222', modules=(('human_male', 'outfit'), ('elf_male', 'outfit')), converted=(('human_male', 'outfit'),))
+
+    def estimate(self, credits, **kw):
+        self.est.forget(self.root)
+        return self.est.get(self.root, credits, wait=True, **kw)
+
+    def test_the_prices_are_read_not_invented(self):
+        import convert_queue
+        import monster_lane
+        self.assertEqual(self.est.tripo_cost(), convert_queue.TRIPO_COST)
+        self.assertEqual(self.est.hyper3d_cost(), 0.5)                                  # tools/hyper3d_pipeline/config.json expected_costs
+        self.assertEqual(self.est.monster_cost(), monster_lane.CREDITS_PER_MODEL)
+        self.assertEqual(self.est.TRIPO_RESERVE, 0)
+        command = services.SERVICES['convert'].command(settings.defaults())
+        self.assertNotIn('--reserve', command)                                          # the app starts the worker with convert_queue's default reserve
+
+    def test_tripo_off_puts_every_module_on_hyper3d(self):
+        self.fill()
+        out = self.estimate(self.credits_of('off'))
+        self.assertFalse(out['pending'])
+        self.assertIsNone(out['error'])
+        self.assertEqual((out['ready']['jobs'], out['ready']['modules']), (2, 3))
+        self.assertEqual((out['ready']['tripo_modules'], out['ready']['hyper3d_modules']), (0, 3))
+        self.assertEqual((out['ready']['tripo_credits'], out['ready']['hyper3d_credits'], out['ready']['credits']), (0, 1.5, 1.5))
+        self.assertEqual((out['coming']['modules'], out['coming']['credits']), (0, 0))
+        self.assertEqual(out['monsters'], {'queued': 0, 'failed_retryable': 0, 'credits': 0})
+        self.assertEqual((out['total']['credits'], out['total']['hyper3d_credits'], out['total']['tripo_credits']), (1.5, 1.5, 0))
+        self.assertEqual(out['balances']['hyper3d']['credits'], 871.5)
+        self.assertEqual(out['balances']['hyper3d']['at'], '2026-11-26T09:00:00+00:00')
+        self.assertTrue(out['computed_at'])
+        self.assertEqual(out['costs']['hyper3d_per_module'], 0.5)
+
+    def test_tripo_auto_with_a_partial_balance_splits_like_the_worker(self):
+        self.fill()
+        self.stage('processing_views', 's', 'ccc333', modules=(('human_male', 'outfit'), ('elf_male', 'outfit')))
+        out = self.estimate(self.credits_of('auto', tripo=60))          # (60 - 0) // 25 = 2 Tripo modules
+        self.assertEqual((out['ready']['tripo_modules'], out['ready']['hyper3d_modules']), (2, 1))
+        self.assertEqual((out['ready']['tripo_credits'], out['ready']['hyper3d_credits'], out['ready']['credits']), (50, 0.5, 50.5))
+        self.assertEqual((out['coming']['modules'], out['coming']['tripo_modules'], out['coming']['hyper3d_modules']), (2, 0, 2))
+        self.assertEqual(out['coming']['credits'], 1.0)                 # the ready modules took the Tripo credits first
+        self.assertEqual((out['total']['tripo_credits'], out['total']['hyper3d_credits'], out['total']['credits']), (50, 1.5, 51.5))
+        self.assertTrue(out['tripo_balance_known'])
+        self.assertEqual(out['balances']['tripo']['credits'], 60)
+        short = self.estimate(self.credits_of('auto', tripo=24))        # a verified shortfall: below one module -> Hyper3D for all of it
+        self.assertEqual((short['ready']['tripo_modules'], short['total']['credits']), (0, 2.5))
+        rich = self.estimate(self.credits_of('auto', tripo=1000))
+        self.assertEqual((rich['ready']['tripo_modules'], rich['coming']['tripo_modules'], rich['total']['credits']), (3, 2, 125))
+
+    def test_tripo_auto_with_an_unread_balance_says_so_and_gives_a_range(self):
+        self.fill()
+        out = self.estimate(self.credits_of('auto', tripo=None))
+        self.assertFalse(out['tripo_balance_known'])
+        self.assertIsNone(out['ready']['tripo_modules'])
+        self.assertIsNone(out['total']['credits'])
+        self.assertEqual((out['total']['min'], out['total']['max']), (1.5, 75))        # all Hyper3D .. all Tripo for 3 modules
+
+    def test_tripo_pixal3d_puts_every_module_on_the_free_local_backend(self):
+        self.fill()
+        self.stage('processing_views', 's', 'ccc333', modules=(('human_male', 'outfit'), ('elf_male', 'outfit')))
+        out = self.estimate(self.credits_of('pixal3d', tripo=None, hyper=5))
+        self.assertIsNone(out['error'])
+        self.assertEqual(out['tripo_mode'], 'pixal3d')
+        self.assertTrue(out['tripo_balance_known'])                                     # the Tripo balance is never needed
+        seconds = self.est.pixal3d_seconds()
+        self.assertEqual(seconds, 270)                                                  # no time_estimate_s in the config: the named constant
+        self.assertEqual((out['ready']['tripo_modules'], out['ready']['hyper3d_modules'], out['ready']['pixal3d_modules']), (0, None, 3))
+        self.assertEqual((out['coming']['modules'], out['coming']['pixal3d_modules']), (2, 2))
+        self.assertEqual((out['ready']['credits'], out['coming']['credits'], out['total']['credits']), (0, 0, 0))
+        self.assertEqual((out['total']['pixal3d_modules'], out['total']['pixal3d_seconds']), (5, 5 * seconds))
+        self.assertEqual((out['costs']['pixal3d_per_module'], out['costs']['pixal3d_seconds_per_module']), (0, seconds))
+
+    def test_pixal3d_time_comes_from_the_config_when_it_has_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = Path(tmp) / 'config.json'
+            with mock.patch.object(self.est, 'PIXAL3D_CONFIG', config):
+                self.assertEqual(self.est.pixal3d_seconds(), 270)                       # missing file
+                config.write_text(json.dumps({'time_estimate_s': 300}))
+                self.assertEqual(self.est.pixal3d_seconds(), 300)
+                config.write_text(json.dumps({'time_estimate_s': 'soon'}))
+                self.assertEqual(self.est.pixal3d_seconds(), 270)
+
+    def test_tripo_auto_pixal3d_sends_the_rest_to_pixal3d_not_hyper3d(self):
+        self.fill()
+        self.stage('processing_views', 's', 'ccc333', modules=(('human_male', 'outfit'), ('elf_male', 'outfit')))
+        out = self.estimate(self.credits_of('auto_pixal3d', tripo=60))                  # 2 Tripo modules, then Pixal3D
+        self.assertEqual((out['ready']['tripo_modules'], out['ready']['pixal3d_modules'], out['ready']['hyper3d_modules']), (2, 1, None))
+        self.assertEqual((out['ready']['tripo_credits'], out['ready']['hyper3d_credits'], out['ready']['credits']), (50, 0, 50))
+        self.assertEqual((out['coming']['tripo_modules'], out['coming']['pixal3d_modules'], out['coming']['credits']), (0, 2, 0))
+        self.assertEqual((out['total']['tripo_credits'], out['total']['credits'], out['total']['pixal3d_modules']), (50, 50, 3))
+        self.assertTrue(out['tripo_balance_known'])
+        self.assertEqual(out['balances']['tripo']['credits'], 60)
+        short = self.estimate(self.credits_of('auto_pixal3d', tripo=24))
+        self.assertEqual((short['ready']['tripo_modules'], short['total']['credits'], short['total']['pixal3d_modules']), (0, 0, 5))
+        unread = self.estimate(self.credits_of('auto_pixal3d', tripo=None))
+        self.assertFalse(unread['tripo_balance_known'])
+        self.assertIsNone(unread['ready']['pixal3d_modules'])
+        self.assertIsNone(unread['total']['pixal3d_modules'])
+        self.assertEqual((unread['total']['min'], unread['total']['max']), (0, 125))     # all Pixal3D (free) .. all Tripo for 5 modules
+
+    def test_an_excluded_or_unlisted_set_is_not_counted(self):
+        self.sets_file('s\nx*\n!x_blocked\n')
+        self.stage('multiview_ready', 's')
+        self.stage('multiview_ready', 'x_blocked', 'ddd444')
+        self.stage('multiview_ready', 'unlisted', 'eee555')
+        self.stage('processing_views', 'x_blocked', 'fff666')
+        self.stage('processing_views', 'unlisted', 'ggg777')
+        out = self.estimate(self.credits_of('off'))
+        self.assertEqual((out['ready']['jobs'], out['ready']['modules']), (1, 1))
+        self.assertEqual((out['coming']['jobs'], out['coming']['modules']), (0, 0))
+
+    def test_a_job_at_max_tries_is_not_ready(self):
+        self.fill()
+        locks = self.root / '.codex_jobs/_batch/convert_locks'
+        locks.mkdir(parents=True)
+        (locks / 's--aaa111.fails').write_text(str(convert_list.MAX_TRIES))
+        (locks / 't--bbb222.fails').write_text(str(convert_list.MAX_TRIES - 1))
+        out = self.estimate(self.credits_of('off'))
+        self.assertEqual((out['ready']['jobs'], out['ready']['modules']), (1, 1))      # t: its one unconverted module; s is stuck
+
+    def test_coming_modules_are_the_listed_jobs_still_getting_views(self):
+        self.sets_file('s\n')
+        self.stage('processing_views', 's', 'aaa111', modules=(('human_male', 'outfit'), ('elf_male', 'outfit'), ('orc_male', 'outfit')))
+        self.stage('processing_views', 's', 'bbb222', modules=(('human_male', 'outfit'),), converted=(('human_male', 'outfit'),))
+        out = self.estimate(self.credits_of('off'))
+        self.assertEqual((out['ready']['jobs'], out['ready']['modules']), (0, 0))
+        self.assertEqual((out['coming']['jobs'], out['coming']['modules'], out['coming']['hyper3d_credits']), (1, 3, 1.5))
+        self.assertEqual(out['total']['credits'], 1.5)
+        self.assertEqual([j['job'] for j in convert_list.coming_jobs(self.root)], ['s--aaa111'])
+
+    def test_monster_tasks_are_priced_per_queued_wanted_task(self):
+        import monster_lane
+        q = monster_lane.queue(self.root)
+        ids = {}
+        for name in ('Ogre/1', 'Ogre/2', 'Troll/1', 'Troll/2', 'Imp/1'):
+            monster, variant = name.split('/')
+            ids[name], _created = q.enqueue_once(monster_lane.LANE, f'k:{name}', f'monster:{name}', 'convert',
+                                                 {'monster': monster, 'variant': variant, 'frozen_sha': name}, priority=4, max_attempts=1)
+        q.fail_queued(ids['Troll/1'], 'boom')
+        q.fail_queued(ids['Troll/2'], 'boom')
+
+        def check(_root, task):
+            name = task['set_name'].removeprefix('monster:')
+            return {'wanted': name not in ('Ogre/2', 'Troll/2'), 'why': None, 'damaged': name == 'Imp/1'}
+        self.sets_file('')
+        with mock.patch.object(monster_lane, 'task_check', check):
+            out = self.estimate(self.credits_of('off'))
+        # queued and wanted: Ogre/1 (Ogre/2 is not wanted any more, Imp/1 is damaged); failed and retryable: Troll/1 (needs Retry, not priced)
+        self.assertEqual(out['monsters'], {'queued': 1, 'failed_retryable': 1, 'credits': monster_lane.CREDITS_PER_MODEL})
+        self.assertEqual(out['total']['credits'], monster_lane.CREDITS_PER_MODEL)
+        self.assertEqual(out['total']['hyper3d_credits'], monster_lane.CREDITS_PER_MODEL)
+
+    def test_get_never_blocks_and_serves_the_cache_with_a_background_refresh(self):
+        self.fill()
+        gate, started = threading.Event(), threading.Event()
+        real = self.est.scan
+
+        def slow(root):
+            started.set()
+            gate.wait(10)
+            return real(root)
+        with mock.patch.object(self.est, 'scan', slow):
+            first = self.est.get(self.root, self.credits_of('off'))
+            self.assertTrue(first['pending'])                                               # answered at once, the scan runs in the background
+            self.assertTrue(started.wait(5))
+            self.assertTrue(self.est.get(self.root, self.credits_of('off'))['pending'])      # still running: no second scan, no waiting
+            gate.set()
+            self.wait_for(lambda: not self.est.get(self.root, self.credits_of('off'))['pending'], what='the scan')
+            served = self.est.get(self.root, self.credits_of('off'))
+            self.assertEqual(served['ready']['modules'], 3)
+            self.assertFalse(served['stale'])
+            gate.clear()
+            started.clear()
+            stale = self.est.get(self.root, self.credits_of('off'), ttl=0.0)               # older than the TTL: the old answer, marked, + a new scan
+            self.assertTrue(stale['stale'])
+            self.assertEqual(stale['ready']['modules'], 3)
+            self.assertTrue(started.wait(5))
+            gate.set()
+            self.wait_for(lambda: not self.est.get(self.root, self.credits_of('off'), ttl=3600.0)['stale'], what='the refresh')
+
+    def test_the_balance_in_the_answer_is_always_the_current_one(self):
+        self.fill()
+        self.estimate(self.credits_of('off'))
+        out = self.est.get(self.root, self.credits_of('auto', tripo=50, hyper=10))         # same cached scan, other setting and balances
+        self.assertEqual((out['tripo_mode'], out['ready']['tripo_modules'], out['balances']['hyper3d']['credits']), ('auto', 2, 10))
+
+    def test_an_error_is_a_field_not_an_exception(self):
+        self.fill()
+        with mock.patch.object(convert_list, 'eligible_jobs', side_effect=RuntimeError('disk gone')):
+            out = self.estimate(self.credits_of('off'))
+        self.assertIn('disk gone', out['error'])
+        self.assertIsNone(out['ready'])
+        self.assertEqual(out['coming']['modules'], 0)                                       # the other parts survive
+        with mock.patch.object(self.est, 'scan', side_effect=ValueError('whole scan')):
+            out = self.estimate(self.credits_of('off'))
+        self.assertIn('whole scan', out['error'])
+        self.assertFalse(out['pending'])
+
+    def test_the_scan_writes_nothing(self):
+        self.fill()
+        before = sorted(str(p.relative_to(self.root)) for p in self.root.rglob('*'))
+        stamps = {p: p.stat().st_mtime_ns for p in self.root.rglob('*') if p.is_file()}
+        self.estimate(self.credits_of('auto', tripo=100))
+        self.assertEqual(sorted(str(p.relative_to(self.root)) for p in self.root.rglob('*')), before)
+        self.assertEqual({p: p.stat().st_mtime_ns for p in self.root.rglob('*') if p.is_file()}, stamps)
+
+
 # ----------------------------------------------------------------------------------------------------------------------- credits
 
 class CreditsTest(TempRoot):
@@ -481,6 +722,16 @@ class CreditsTest(TempRoot):
         self.assertEqual(state['mode'], 'off')
         self.assertEqual(state['text'], 'off (no credits this month)')
         self.assertIsNone(state['credits'])
+
+    def test_tripo_state_words_every_mode(self):
+        texts = {}
+        for mode in settings.TRIPO_MODES:
+            settings.save(self.root, {'tripo': mode})
+            state = credits.tripo_state(self.root)
+            self.assertEqual(state['mode'], mode)
+            texts[mode] = state['text']
+        self.assertEqual(texts, {'off': 'off (no credits this month)', 'auto': 'on (Tripo first, then Hyper3D)',
+                                 'pixal3d': 'Pixal3D only (local, free; Tripo is not used)', 'auto_pixal3d': 'on (Tripo first, then Pixal3D)'})
 
     def test_check_tripo_runs_node_only_when_nothing_uses_the_profile(self):
         calls = []
@@ -619,7 +870,23 @@ class ServicesTest(TempRoot):
         convert = services.SERVICES['convert'].command(cfg)
         self.assertEqual(convert[1:], ['-X', 'utf8', '-u', 'tools/convert_queue.py', '--sets-file', '.codex_jobs/_batch/convert_sets.txt',
                                        '--worker', '1', '--no-tripo'])
+        base = ['-X', 'utf8', '-u', 'tools/convert_queue.py', '--sets-file', '.codex_jobs/_batch/convert_sets.txt', '--worker', '1']
+        for mode, flags in (('off', ['--no-tripo']), ('auto', []), ('pixal3d', ['--backend', 'pixal3d']),
+                            ('auto_pixal3d', ['--fallback', 'pixal3d'])):
+            self.assertEqual(services.SERVICES['convert'].command({**cfg, 'tripo': mode})[1:], base + flags, mode)
         self.assertNotIn('--no-tripo', services.SERVICES['convert'].command({**cfg, 'tripo': 'auto'}))
+
+    def test_command_differs_compares_the_backend_flags_of_every_mode(self):
+        convert = services.SERVICES['convert']
+        cfg = settings.load(self.root)
+        cmdlines = {mode: convert.command({**cfg, 'tripo': mode}) for mode in settings.TRIPO_MODES}
+        for running in settings.TRIPO_MODES:
+            for saved in settings.TRIPO_MODES:
+                self.assertEqual(services._tripo_differs(convert, {**cfg, 'tripo': saved}, cmdlines[running]), running != saved, (running, saved))
+        self.assertIsNone(services._tripo_differs(convert, cfg, None))                  # no command line known (not running)
+        self.assertIsNone(services._tripo_differs(services.SERVICES['views'], cfg, cmdlines['off']))
+        self.assertEqual(services.backend_flags(['x', '--backend=pixal3d', '--worker', '1']), ['--backend', 'pixal3d'])   # argparse's `=` form
+        self.assertFalse(services._tripo_differs(convert, {**cfg, 'tripo': 'pixal3d'}, cmdlines['pixal3d'] + ['--poll', '60']))   # other flags are not backend policy
 
     def test_spawn_is_detached_with_utf8_and_appended_logs(self):
         seen = {}

@@ -9,6 +9,7 @@
     add_sets(root, set_ids, extra=())                                      append those exact ids under a lock, idempotent
     pending_jobs(root) / held_jobs(root)                                   staged jobs the worker will / will not take
     eligible_jobs(root)                                                    listed jobs the worker would really take now (F20, row 20)
+    coming_jobs(root)                                                      listed jobs still in processing_views/ (taken once their views are done)
     namespace_conflict(root, set_id) / owner_of(root, id)                  the reserved family namespace (phase 5 review row 3)
     id_claims(root, ids) / claim_problem(set, id, families, claims)        existing jobs / model folders that already use an id (I.10)
     owner_refusal(root, job, record, patterns)                             the worker's dispatch check of a job's recorded owner (I.10)
@@ -561,6 +562,24 @@ def pending_jobs(root) -> list[dict]:
     patterns."""
     pats = patterns(root)
     jobs = staged_jobs(root)
+    refused = _owner_refusals(root, jobs, pats)
+    return [{**j, 'allow': allowed_by(j['set'], pats)} for j in jobs if matches(j['set'], pats) and j['job'] not in refused]
+
+
+def coming_jobs(root) -> list[dict]:
+    """Listed jobs still in `processing_views/` (their views are not finished, so the worker cannot take them yet) that the worker would take
+    once they reach `multiview_ready/`: their set matches the list (allow, no `!`) and their recorded owner agrees (the same two checks as
+    pending_jobs / the worker). [{job, stage, set, state, modules_left}], `modules_left` = the modules nobody has converted."""
+    pats = patterns(root)
+    jobs = []
+    for job in sorted((Path(root) / 'processing_views').glob('*--*')):
+        record = _record(job) if job.is_dir() else None
+        if record is None:
+            continue
+        left = _unconverted_modules(root, record)
+        if left:
+            jobs.append({'job': job.name, 'stage': 'processing_views', 'set': job.name.split('--')[0], 'state': str(record.get('state', '')),
+                         'modules_left': left})
     refused = _owner_refusals(root, jobs, pats)
     return [{**j, 'allow': allowed_by(j['set'], pats)} for j in jobs if matches(j['set'], pats) and j['job'] not in refused]
 

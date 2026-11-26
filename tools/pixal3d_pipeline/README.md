@@ -25,6 +25,14 @@ Cost: none (local). Time: ~4.5 min per module (generation) plus the usual reduct
 - `convert_queue.py --backend pixal3d` runs a worker that converts with Pixal3D only; `--fallback pixal3d` uses it instead
   of Hyper3D once the Tripo credits run out.
 
+## From the app
+
+The preview app's Queue tab has a **Backend** setting (`tripo` in `.codex_jobs/_app/settings.json`): `pixal3d` starts the convert worker with
+`--backend pixal3d` (every module is generated here, free, about 4.5 min each, the Tripo balance is never read) and `auto_pixal3d` with
+`--fallback pixal3d` (Tripo first, Pixal3D for the modules left once the credits run out). Saving a changed value restarts a running convert
+worker gracefully (after its running job). The GPU generation runs in `pixal3d_backend.py collect`, so `convert_job.py` waits at the supervisor's
+pause gate before it (conversions idle while the user is at the PC); the Run everything now estimate counts Pixal3D modules at 0 credits.
+
 ## config.json
 
 | key | meaning |

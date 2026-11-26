@@ -2674,7 +2674,7 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
     """`item.conversion` (web/monster_views.js): None before anything was chosen / converted, else
     {task_id, state: queued | waiting | running | done | failed | cancelled, step: submit | preview | collect | reduce, waiting_reason (held |
     paused | user_present | browser_busy | a text) while waiting, paid (a CONFIRMED paid action), paid_uncertain (a paid click whose outcome
-    is not confirmed), credits (the confirmed observed cost; never assumed), error, attempts, run_now, record {status, stage, pending_action,
+    is not confirmed), credits (the confirmed observed cost of the charged steps; never assumed), free_steps (confirmed steps proven free), error, attempts, run_now, record {status, stage, pending_action,
     credits_committed, why, model_url, images_uploaded, actions}, screenshots [urls, newest first], reduced (verified for this freeze),
     reduce_problem, disposition, accounting_error, started, task}.
     Recheck (findings 3-5): `key` + `generation` = the identity of the displayed task (Run now / Retry / Cancel must echo both; a row id
@@ -2708,7 +2708,7 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
         rec['actions'] = sorted((record.get('actions') or {}).keys()) if isinstance(record.get('actions'), dict) else []
     view = _task_view(task)
     paid = monster_lane.paid_actions(record)
-    confirmed = [a for a in paid if a['status'] == 'confirmed']
+    confirmed = [a for a in paid if a['status'] == 'confirmed' and not a.get('free')]     # (a free step is not a paid one)
     known = [a['credits'] for a in confirmed if isinstance(a['credits'], (int, float))]
     step = 'reduce' if reduced else record_step(mdir, record)
     error, waiting = None, None
@@ -2763,7 +2763,8 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
             'pause_id': g['pause_id'] if g else None, 'pauses': list(g['pauses']) if g else [], 'disposition_pending': pending,
             'state': state, 'step': step, 'waiting_reason': waiting,
             'paid': bool(confirmed), 'paid_uncertain': [a['action'] for a in paid if a['status'] == 'uncertain'],
-            'credits': round(sum(known), 3) if known else None, 'error': error, 'attempts': view['attempts'] if view else 0,
+            'credits': round(sum(known), 3) if known else None,
+            'free_steps': sum(1 for a in paid if a['status'] == 'confirmed' and a.get('free')), 'error': error, 'attempts': view['attempts'] if view else 0,
             'run_now': bool(view and view['run_now']), 'record': rec, 'screenshots': shots, 'reduced': reduced,
             'reduce_problem': None if reduced else verify['problem'], 'disposition': disposition, 'accounting_error': accounting,
             'generation': generation, 'conversion_seq': disposition_seq(vj), 'started': conversion_started(mdir), 'task': view}

@@ -2,7 +2,7 @@
 
     supervisor  python -X utf8 -u tools/pipeline_supervisor.py run
     views       python -u tools/view_batch.py run --parallel <settings.view_parallel>
-    convert     python -X utf8 -u tools/convert_queue.py --sets-file .codex_jobs/_batch/convert_sets.txt --worker 1 [--no-tripo]
+    convert     python -X utf8 -u tools/convert_queue.py --sets-file .codex_jobs/_batch/convert_sets.txt --worker 1 [--no-tripo | --backend pixal3d | --fallback pixal3d]
 
 API (every function takes `root`, so tests use a temp root with fake service scripts under `<root>/tools/`):
     begin_management(root)                 the services thread's first step: writes the conversion hold (I.1) before anything is started / adopted
@@ -151,8 +151,31 @@ class Service:
         if self.name == 'convert':
             cmd = [sys.executable, '-X', 'utf8', '-u', self.script, '--sets-file', '.codex_jobs/_batch/convert_sets.txt',
                    '--worker', str(MANAGED_WORKER)]
-            return cmd + (['--no-tripo'] if settings['tripo'] == 'off' else [])
+            return cmd + CONVERT_TRIPO_FLAGS.get(settings['tripo'], CONVERT_TRIPO_FLAGS['off'])
         raise ServiceError(f'{self.name} cannot be started')
+
+
+# the Queue setting `tripo` -> the backend flags of the convert worker (tools/convert_queue.py); `auto` is its default behaviour
+CONVERT_TRIPO_FLAGS = {
+    'off': ['--no-tripo'],                          # Hyper3D only
+    'auto': [],                                     # Tripo first, Hyper3D when the credits run out
+    'pixal3d': ['--backend', 'pixal3d'],            # Pixal3D only: free, local GPU, the Tripo balance is never read
+    'auto_pixal3d': ['--fallback', 'pixal3d'],      # Tripo first, Pixal3D when the credits run out
+}
+BACKEND_FLAGS = ('--no-tripo', '--backend', '--fallback')
+
+
+def backend_flags(cmdline) -> list[str]:
+    """The backend-relevant part of a convert worker command line: `--no-tripo`, `--backend X` and `--fallback X`, in a canonical order."""
+    words = [str(w) for w in cmdline or ()]
+    found: list[str] = []
+    for flag in BACKEND_FLAGS:
+        for i, word in enumerate(words):
+            if word == flag:
+                found += [flag] if flag == '--no-tripo' else [flag, words[i + 1] if i + 1 < len(words) else '']
+            elif word.startswith(flag + '=') and flag != '--no-tripo':
+                found += [flag, word.split('=', 1)[1]]            # argparse also takes `--backend=pixal3d`
+    return found
 
 
 SERVICES = {
@@ -1899,10 +1922,11 @@ def tick(root, settings: dict | None = None, now: float | None = None) -> dict:
 # ------------------------------------------------------------------------------------------------------------------------ status
 
 def _tripo_differs(svc: Service, settings: dict, cmdline: list | None) -> bool | None:
-    """The running convert worker was started with another Tripo policy than the saved setting (the setting changes the NEXT start only)."""
+    """The running convert worker was started with another backend policy than the saved `tripo` setting (the setting changes the NEXT start
+    only): its backend flags (`--no-tripo`, `--backend`, `--fallback`) are compared with the ones the setting would give."""
     if svc.name != 'convert' or not cmdline:
         return None
-    return ('--no-tripo' in cmdline) != (settings['tripo'] == 'off')
+    return backend_flags(cmdline) != backend_flags(svc.command(settings))
 
 
 def status_one(root, svc: Service, settings: dict | None = None, now: float | None = None, lines: int = LOG_LINES) -> dict:

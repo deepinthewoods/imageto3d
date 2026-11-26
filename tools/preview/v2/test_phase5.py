@@ -1255,7 +1255,8 @@ class RealRecordTest(MonsterCase):
         self.assertEqual((record['status'], record['pending_action']), ('exported', None))
         self.assertEqual(self.paid_clicks(), 1)
         entries = monster_lane.paid_entries(self.root)
-        self.assertEqual([(e['action'], e['status'], e['credits']) for e in entries], [('geometry', 'confirmed', 0.5)])
+        self.assertEqual([(e['action'], e['status'], e['credits']) for e in entries], [('geometry', 'confirmed', 0.5), ('material_generate', 'confirmed', 0),
+                                                                                       ('material_confirm', 'confirmed', 0)])      # free: balance unchanged
         self.assertEqual(entries[0]['id'], 'hyper3d:e1690fdd-98aa-4581-a015-2a2a58a787e4:geometry')
         # ambiguous clicks: an unbound free preview and a pending paid click are never resumed by the lane
         self.assertFalse(monster_lane.free_preview_resolved({'pending_action': 'free_preview', 'status': 'submission_attempted',
@@ -1310,7 +1311,7 @@ class AccountingTest(MonsterCase):
 
     def test_uncertain_intent_is_not_counted_and_never_assumed(self):
         record = {'model_id': 'm2', 'actions': {'geometry': {}}, 'pending_action': 'geometry', 'credits_committed': 0.5}
-        self.assertEqual(monster_lane.paid_actions(record), [{'action': 'geometry', 'status': 'uncertain', 'credits': None,
+        self.assertEqual(monster_lane.paid_actions(record), [{'action': 'geometry', 'status': 'uncertain', 'credits': None, 'free': False,
                                                               'id': 'hyper3d:m2:geometry', 'provider_id': None, 'evidence': None,
                                                               'model_id': 'm2'}])
         self.assertIsNone(monster_lane.reconcile_paid(self.root, 'Giant Rat', 'main', ['front.png'], self.root / 'r.json', record))
@@ -1329,6 +1330,87 @@ class AccountingTest(MonsterCase):
         summary = monster_lane.paid_summary(self.root)
         self.assertEqual((summary['count'], summary['credits'], summary['uncertain']['count']), (1, 0.5, 0))
         self.assertEqual(monster_lane.paid_entries(self.root)[-1]['provider_id'], 'pa-7')
+
+    def free_record(self, **material):
+        """A record whose geometry click was charged (0.5) and whose material_generate click has the given fields on top of a confirmation."""
+        done = {'confirmed_at': '2026-11-26T10:34:20', 'confirmed_by': 'stage_advanced', 'model_id': 'mf', 'observed_cost': None}
+        return {'model_id': 'mf', 'pending_action': None, 'actions': {
+            'geometry': {'confirmed_at': '2026-11-26T10:32:04', 'confirmed_by': 'stage_advanced', 'model_id': 'mf', 'observed_cost': 0.5,
+                         'balance_before': 871.5, 'balance_after': 871.0},
+            'material_generate': done | material}}
+
+    def material(self, record):
+        return next(a for a in monster_lane.paid_actions(record) if a['action'] == 'material_generate')
+
+    def test_balance_unchanged_is_free(self):
+        a = self.material(self.free_record(balance_before=871.0, balance_after=871.0, balance_delta=0.0))
+        self.assertEqual((a['status'], a['credits'], a['free']), ('confirmed', 0, True))
+        self.assertIn('balance unchanged 871.0 -> 871.0', a['evidence'])
+        self.assertIn('confirmed 2026-11-26T10:34:20 by stage_advanced', a['evidence'])
+
+    def test_balance_changed_or_missing_stays_unknown(self):
+        for fields in ({'balance_before': 871.0, 'balance_after': 870.0}, {'balance_before': 871.0}, {'balance_after': 871.0}, {},
+                       {'balance_before': '871', 'balance_after': '871'}, {'balance_before': True, 'balance_after': True},
+                       {'balance_before': 871.0, 'balance_after': 871.0, 'model_id': 'other'}):
+            a = self.material(self.free_record(**fields))
+            self.assertEqual((a['status'], a['credits'], a['free']), ('confirmed', None, False), fields)
+        unconfirmed = self.free_record(balance_before=871.0, balance_after=871.0)
+        del unconfirmed['actions']['material_generate']['confirmed_at']                          # no proof the click happened
+        a = self.material(unconfirmed)
+        self.assertEqual((a['status'], a['credits'], a['free']), ('uncertain', None, False))
+
+    def test_observed_zero_is_listed_as_free(self):
+        a = self.material(self.free_record(observed_cost=0))
+        self.assertEqual((a['status'], a['credits'], a['free']), ('confirmed', 0, True))
+        self.assertIn('observed cost 0', a['evidence'])
+        unconfirmed = self.free_record(observed_cost=0)
+        del unconfirmed['actions']['material_generate']['confirmed_at']                          # nothing charged, not listed
+        self.assertEqual([a['action'] for a in monster_lane.paid_actions(unconfirmed)], ['geometry'])
+
+    def test_unknown_entry_is_superseded_once_and_a_known_one_never_rewritten(self):
+        rec_path = self.root / 'rf.json'
+        args = (self.root, 'Giant Rat', 'main', ['front.png'], rec_path)
+        unknown = self.free_record()                                                              # no balance evidence yet
+        self.assertIsNone(monster_lane.reconcile_paid(*args, unknown))
+        before = monster_lane.paid_summary(self.root)
+        self.assertEqual((before['count'], before['free'], before['credits'], before['unknown_amounts']), (2, 0, 0.5, 1))
+        self.assertIsNone(monster_lane.reconcile_paid(*args, unknown))
+        self.assertEqual(len(monster_lane.paid_entries(self.root)), 2)                            # nothing new without new evidence
+        known = self.free_record(balance_before=871.0, balance_after=871.0)
+        self.assertIsNone(monster_lane.reconcile_paid(*args, known))
+        entries = monster_lane.paid_entries(self.root)
+        self.assertEqual(len(entries), 3)                                                         # appended; the old line stays
+        self.assertEqual((entries[-1]['action'], entries[-1]['credits'], entries[-1]['free']), ('material_generate', 0, True))
+        self.assertIn('balance unchanged', entries[-1]['evidence'])
+        self.assertEqual(entries[-1]['supersedes'], entries[1]['time'])
+        after = monster_lane.paid_summary(self.root)
+        self.assertEqual((after['count'], after['free'], after['credits'], after['unknown_amounts']), (1, 1, 0.5, 0))
+        self.assertIsNone(monster_lane.reconcile_paid(*args, known))                              # once: not again
+        self.assertEqual(len(monster_lane.paid_entries(self.root)), 3)
+        # a confirmed entry with a known amount is never rewritten (neither by a different number nor by free evidence)
+        changed = self.free_record(balance_before=871.0, balance_after=870.0, observed_cost=0.5)
+        changed['actions']['geometry']['observed_cost'] = 0.7
+        self.assertIsNone(monster_lane.reconcile_paid(*args, changed))
+        self.assertEqual(len(monster_lane.paid_entries(self.root)), 3)
+        freed = self.free_record(observed_cost=0)
+        freed['actions']['geometry']['observed_cost'] = 0
+        self.assertIsNone(monster_lane.reconcile_paid(*args, freed))
+        self.assertEqual(len(monster_lane.paid_entries(self.root)), 3)
+        self.assertEqual(monster_lane.paid_summary(self.root)['credits'], 0.5)
+
+    def test_summary_counts_free_apart_from_charged_and_unknown(self):
+        ledger = monster_lane.paid_log_path(self.root)
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        rows = [{'kind': 'hyper3d', 'id': 'a', 'status': 'confirmed', 'credits': 0.5},
+                {'kind': 'hyper3d', 'id': 'b', 'status': 'confirmed', 'credits': 0, 'free': True},
+                {'kind': 'hyper3d', 'id': 'c', 'status': 'confirmed', 'credits': 0},
+                {'kind': 'hyper3d', 'id': 'd', 'status': 'confirmed', 'credits': None},
+                {'kind': 'hyper3d', 'id': 'd', 'status': 'confirmed', 'credits': None},
+                {'kind': 'hyper3d', 'id': 'e', 'status': 'uncertain', 'credits': None},
+                {'kind': 'hyper3d', 'status': 'confirmed', 'credits': 0.5}]
+        ledger.write_text(''.join(json.dumps(r) + '\n' for r in rows), encoding='utf-8')
+        s = monster_lane.paid_summary(self.root)
+        self.assertEqual((s['count'], s['free'], s['credits'], s['unknown_amounts'], s['uncertain']['count']), (3, 2, 1.0, 1, 1))
 
     def test_log_write_error_stays_visible_until_repaired(self):
         record = {'model_id': 'm3', 'actions': {'geometry': {'confirmed_at': 't', 'provider_action_id': 'pa-3'}}, 'pending_action': None,

@@ -40,6 +40,12 @@ import settings as app_settings  # noqa: E402
 from tripo_browser_lock import TripoBrowserBusy, tripo_browser_lock  # noqa: E402  (tools/tripo_pipeline, on sys.path through guard)
 
 OFF_TEXT = 'off (no credits this month)'
+TRIPO_TEXTS = {   # the Queue setting `tripo` (settings.TRIPO_MODES) as the Credits section words it
+    'off': OFF_TEXT,
+    'auto': 'on (Tripo first, then Hyper3D)',
+    'pixal3d': 'Pixal3D only (local, free; Tripo is not used)',
+    'auto_pixal3d': 'on (Tripo first, then Pixal3D)',
+}
 SUBMISSION = 'studio_submission.json'
 SCAN_DEPTH = 4                 # models/<set>/<job>/<race>/<module>/ and pipeline/<Monster>/models/<n>/hyper3d/ are both 4 directories deep
 MTIME_SLACK = 120.0            # seconds: the file's mtime may trail a balance's timestamp by this much without being skipped
@@ -124,7 +130,7 @@ def now_iso(now: float | None = None) -> str:
 def tripo_state(root) -> dict:
     mode = app_settings.load(root)['tripo']
     cached = read_cache(root).get('tripo') or {}
-    return {'mode': mode, 'text': OFF_TEXT if mode == 'off' else 'on (Tripo first)',
+    return {'mode': mode, 'text': TRIPO_TEXTS.get(mode, OFF_TEXT),
             'credits': cached.get('credits'), 'checked_at': cached.get('checked_at'), 'ok': cached.get('ok'), 'error': cached.get('error')}
 
 

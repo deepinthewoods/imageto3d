@@ -86,7 +86,7 @@ views and convert as **running, adopted**, with the PIDs of step 0.4 (also in `.
 stopped by this. If a service shows `duplicate` or `waiting (could not be verified)`, fix that by hand first (v2 never does).
 
 Settings that matter on this PC (`.codex_jobs/_app/settings.json`, edited in the Queue tab; defaults are fine): `tripo: "off"` (the convert
-worker keeps `--no-tripo`), `view_parallel: 8`, all three services enabled. The mode stays `pause-conversions` (the user's manual pause); v2
+worker keeps `--no-tripo`; since 2026-11-26 the Queue tab also offers `auto`, `pixal3d` = `--backend pixal3d` and `auto_pixal3d` = `--fallback pixal3d`, and saving a changed value restarts a running convert worker after its job), `view_parallel: 8`, all three services enabled. The mode stays `pause-conversions` (the user's manual pause); v2
 never changes it by itself. If settings.json cannot be read, the last valid settings are kept, and with none v2 starts no service at all.
 
 The conversion hold written at the manager's start is removed by the manager only after a supervisor it has not sent a stop to has written a

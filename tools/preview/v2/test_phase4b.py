@@ -262,6 +262,77 @@ class ServerServicesTest(TempRoot):
 
 # ---------------------------------------------------------------------------------------------------------- convert list / ops
 
+class TripoRestartTest(TempRoot):
+    """A saved change of the `tripo` setting restarts a RUNNING convert worker (the Queue tab's own graceful Restart) so it picks up the new
+    backend flags; everything else leaves the worker alone."""
+
+    def manager(self, state='running', differs=True):
+        calls = []
+        fake = mock.Mock()
+        fake.services = services
+        fake.request = lambda name, action: calls.append((name, action)) or {'ok': True, 'pending': True, 'request': 7, 'name': name, 'action': action}
+        patch = mock.patch.object(services, 'status_one', lambda root, svc, settings=None, now=None, lines=20: {'state': state, 'command_differs': differs})
+        patch.start()
+        self.addCleanup(patch.stop)
+        return fake, calls
+
+    def save(self, fake, tripo):
+        return actions.pipeline_op(self.root, {'op': 'settings', 'patch': {'tripo': tripo}}, {'services': fake})
+
+    def test_a_changed_tripo_setting_restarts_a_running_convert_worker(self):
+        fake, calls = self.manager()
+        result = self.save(fake, 'pixal3d')
+        self.assertEqual(calls, [('convert', 'restart')])
+        self.assertEqual(result['convert_restart']['request'], 7)
+        self.assertIn('off -> pixal3d', result['convert_restart']['message'])
+        self.assertEqual(result['settings']['tripo'], 'pixal3d')
+        fake.wake.assert_called_once()
+
+    def test_no_restart_without_a_change_a_running_worker_or_an_enabled_service(self):
+        fake, calls = self.manager()
+        self.save(fake, 'off')                                           # unchanged (the default)
+        self.assertEqual(calls, [])
+        settings.save(self.root, {'services': {'convert': False}})       # the convert service is switched off
+        self.save(fake, 'auto')
+        self.assertEqual(calls, [])
+        settings.save(self.root, {'services': {'convert': True}})
+        stopped, calls2 = self.manager(state='stopped')                  # a stopped / idle worker starts with the new flags anyway
+        self.save(stopped, 'auto_pixal3d')
+        self.assertEqual(calls2, [])
+        same_flags, calls3 = self.manager(differs=False)                 # the running command line already has the new flags
+        self.save(same_flags, 'pixal3d')
+        self.assertEqual(calls3, [])
+        self.assertIsNone(self.save(same_flags, 'off').get('convert_restart'))
+
+    def test_a_request_already_in_progress_is_not_an_error(self):
+        fake, _calls = self.manager()
+        fake.request = mock.Mock(side_effect=actions.guard.Busy('convert: a restart request is already in progress'))
+        result = self.save(fake, 'auto')
+        self.assertIsNone(result['convert_restart']['request'])
+        self.assertEqual(result['settings']['tripo'], 'auto')
+
+    def test_without_a_service_manager_only_the_setting_is_saved(self):
+        result = actions.pipeline_op(self.root, {'op': 'settings', 'patch': {'tripo': 'pixal3d'}}, {})
+        self.assertNotIn('convert_restart', result)
+        self.assertEqual(settings.load(self.root)['tripo'], 'pixal3d')
+
+
+class ModuleStepTest(TempRoot):
+    def test_a_staged_pixal3d_module_is_generating_not_submitted(self):
+        module = self.root / 'models/s/a1b2c3d4e5f6/human_male/outfit'
+        module.mkdir(parents=True)
+        record = module / 'studio_submission.json'
+        step = lambda: progress.module_step(self.root, 's', 'a1b2c3d4e5f6', 'human_male', 'outfit')
+        record.write_text(json.dumps({'backend': 'pixal3d', 'status': 'submitted'}))
+        self.assertEqual(step(), 'pixal3d: generating')
+        record.write_text(json.dumps({'backend': 'pixal3d', 'status': 'exported'}))
+        self.assertEqual(step(), 'pixal3d: exported')
+        record.write_text(json.dumps({'backend': 'hyper3d', 'status': 'submitted', 'stage': 'geometry_preview'}))
+        self.assertEqual(step(), 'hyper3d: geometry_preview')
+        record.write_text(json.dumps({'status': 'submitted'}))
+        self.assertEqual(step(), 'tripo: submitted')                                  # other backends keep their words
+
+
 class ConvertListOnApproveTest(V2Case):
     def lines(self):
         path = self.root / '.codex_jobs/_batch/convert_sets.txt'
@@ -362,6 +433,30 @@ class QueueOpsTest(V2Case):
         self.assertIsNone(self.unit('r')[0]['progress']['held_kind'])
         self.assertEqual(self.op(op='release', set='unknown_set')[0], 404)
         self.assertEqual(self.op(op='release', set='Bad Name')[0], 400)
+
+    def test_the_queue_carries_the_run_everything_now_estimate(self):
+        import run_estimate
+        run_estimate.forget()
+        self.addCleanup(run_estimate.forget)
+        self.job('r', 'a1b2c3d4e5f6', 'multiview_ready', units=(('human_male', 'outfit'), ('dwarf_male', 'outfit')), state='ready_for_tripo')
+        self.job('p', 'b1b2c3d4e5f6', 'processing_views', units=(('human_male', 'outfit'),))
+        self.assertEqual(self.op(op='release', set='r')[0], 200)
+        self.assertEqual(self.op(op='release', set='p')[0], 200)
+        _s, first = self.get('/api/v2/queue')
+        self.assertIn('run_all_estimate', first)                                          # the first answer may still be `pending` (background scan)
+        estimate = wait_for(lambda: (lambda e: e if not e['pending'] else None)(self.get('/api/v2/queue')[1]['run_all_estimate']), what='the estimate')
+        self.assertIsNone(estimate['error'])
+        self.assertEqual((estimate['ready']['jobs'], estimate['ready']['modules'], estimate['coming']['modules']), (1, 2, 1))
+        self.assertEqual(estimate['tripo_mode'], 'off')
+        self.assertEqual((estimate['total']['modules'], estimate['total']['credits']), (3, 1.5))   # 3 modules x 0.5 Hyper3D, no monsters
+        self.assertEqual(self.op(op='settings', patch={'tripo': 'auto'})[0], 200)
+        auto = self.get('/api/v2/queue')[1]['run_all_estimate']                           # the same scan, the new setting (no Tripo balance read yet)
+        self.assertEqual((auto['tripo_mode'], auto['tripo_balance_known'], auto['total']['credits']), ('auto', False, None))
+        self.assertEqual((auto['total']['min'], auto['total']['max']), (1.5, 75))
+        with mock.patch.object(run_estimate, 'get', side_effect=RuntimeError('broken')):
+            status, queue = self.get('/api/v2/queue')
+        self.assertEqual(status, 200)                                                     # an estimate failure is a field, never a 500
+        self.assertIn('broken', queue['run_all_estimate']['error'])
 
     def test_view_retry(self):
         batch = self.batch()

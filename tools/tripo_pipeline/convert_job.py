@@ -615,6 +615,11 @@ def collect_and_reduce(key, out, backend='tripo', options=None, separable=False,
                 run = run_paid_child(collect_command(backend, out, options), key, 'a paid Hyper3D collect',
                                      paid=bool((options or {}).get('allow_paid')), cwd=ROOT)
             else:
+                if backend == 'pixal3d':
+                    # the local GPU generation runs HERE (submit only staged the inputs): it idles with the user at the PC like every
+                    # conversion (user rule 2026-10-29, a full GPU load crashed the PC). Also covers a module resumed with an existing
+                    # submission and each seed regeneration, which always ends in this collect.
+                    wait_for_gate(key, 'the local Pixal3D generation')
                 run = subprocess.run(collect_command(backend, out, options), cwd=ROOT)
             if run.returncode != 0:  # a guard stop (credits/permissions/sign-in) leaves the module resumable
                 raise SystemExit(f'{key}: {backend} collect stopped (exit {run.returncode}); '

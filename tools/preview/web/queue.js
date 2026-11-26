@@ -119,6 +119,15 @@ export function mountQueue(container) {
     await load();
   }
 
+  /** "limit 1 · paid 2 (1 Hyper3D credits) · 4 free steps", plus "· N amount unknown" only when some paid step has no observed amount. */
+  function paidLine(lane) {
+    const paid = lane.paid || {};
+    const free = paid.free ?? 0;
+    const unknown = paid.unknown_amounts ?? 0;
+    return `limit ${lane.limit ?? 1} · paid ${paid.count ?? 0} (${paid.credits ?? 0} Hyper3D credits)`
+      + (free ? ` · ${free} free step${free === 1 ? '' : 's'}` : '') + (unknown > 0 ? ` · ${unknown} amount unknown` : '');
+  }
+
   /** The monster lane: gate, counts and the Hyper3D credits spent (paid_log.jsonl). */
   function drawMonsters(lane) {
     monsterLine.hidden = !lane;
@@ -129,7 +138,7 @@ export function mountQueue(container) {
     monsterLine.replaceChildren(h('strong', { text: 'Monster conversions' }),
       badge(gate.open ? 'gate open' : `waiting: ${gate.reason || gate.code || 'closed'}`, gate.open ? 'ok' : 'warn'),
       ...totals.map(([state, n]) => badge(`${state} ${n}`, TONE[state] || '')),
-      h('span', { text: `limit ${lane.limit ?? 1} · paid ${lane.paid?.count ?? 0} (${lane.paid?.credits ?? 0} Hyper3D credits)` }));
+      h('span', { text: paidLine(lane) }));
   }
 
   function row(task) {

@@ -370,6 +370,7 @@ export async function showMonsterViews(modal, host) {
       badge(done ? 'converted' : failed ? 'failed' : c.state === 'waiting' ? 'waiting' : c.state === 'queued' ? 'queued' : `running: ${c.step || '...'}`,
         done ? 'ok' : failed ? 'error' : c.state === 'waiting' ? 'warn' : 'info'),
       c.paid ? badge(`paid${c.credits != null ? ` ${c.credits} credits` : ''}`, 'warn') : badge('nothing paid yet', ''),
+      c.free_steps > 0 ? badge(`${c.free_steps} free step${c.free_steps === 1 ? '' : 's'}`, 'ok') : null,
       c.run_now ? badge('run now', 'info') : null);
     const nodes = [head, steps];
     if (c.state === 'waiting' && !damaged()) {
