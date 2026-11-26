@@ -66,15 +66,34 @@ inputs (None for a record written before the field existed = unknown). The pin (
 folder are plain folders, not links / junctions / reparse points, the folder still has the recorded file id and resolves inside
 the output) is re-verified immediately before every temp-file create and every os.replace of the snapshot, before the upload,
 before the free click and before every paid step; a mismatch stops there. A record from before the pin keeps the flat
-<out_dir>/upload_inputs/ layout. Residual: python has no handle-relative rename on Windows, so a local attacker who can write
-to the output folder could still swap the folder in the instants between a check and the os.replace / the browser's own open
-of the files; what was uploaded is then caught by the re-hash and pin check before the click and before every paid step (the
-free preview costs nothing), but a file of the attacker's own folder may have been replaced by a view copy. Moving an output
+<out_dir>/upload_inputs/ layout. Final-live review, prior item 14: on Windows submit also HOLDS the pinned folder open
+(hold_directory: CreateFileW with FILE_FLAG_BACKUP_SEMANTICS and a share mode WITHOUT FILE_SHARE_DELETE) from right after its
+exclusive mkdir, through every snapshot write, the upload and the free click, until submit returns: while that handle is open
+the folder (and `upload_inputs/` above it) cannot be renamed, moved or deleted, so it cannot be swapped between a pin check and
+the os.replace / the browser's own open of the files. The handle is verified to be the entry at that path (same file id), and
+a folder that cannot be held stops the submit before anything is written. Residual: the instant between the mkdir and the
+open of the handle (a swap there is caught by the pin, which is taken and checked after the handle is open), and other systems
+(POSIX has no such share mode: there the pin checks alone apply, as before). Moving an output
 folder to another volume changes the file id: its record then needs review before a paid step.
 `verify_upload_inputs(record)` checks the pin and re-hashes the folder against the record ([] = identical, None =
 unknown): submit runs it immediately before the upload and again before the click (a mismatch sets the record aside: nothing was
 generated), collect before every credit-capable intent (a mismatch stops before the paid click). Deleting an output folder on
 Windows needs the read-only attribute cleared first (renaming / moving it does not).
+
+Pre-click failures (final-live review, "a rejected upload strands the unpaid variant"): a submit that stops BEFORE the free
+click (the upload was rejected: thumbnail count mismatch, signed out, a missing control, ...) sets its record aside as
+`studio_submission.not_submitted_<stamp>.json` under the output lock, so a retry submits fresh. That is done only for a record
+that proves nothing was clicked (proven_pre_click: status preparing / ready_to_submit, no action or intent of any kind, no
+pending action, no model URL / id, no click time, no export); a record with ANY click intent is never archived this way. A
+submit that finds such a stranded record (its process was killed before the click) archives it the same way before it starts;
+`set_aside_pre_click(out_dir, why)` does the same for a caller (the v2 monster lane).
+
+Export (final-live review, "interrupted paid export cannot resume"): the downloaded ZIP is extracted into a staging folder
+`<out_dir>/.export_staging_<pid>_<random>/` under the output lock and only the complete, CRC-checked GLB is put at
+<out_dir>/glb_<name>.glb (hard link / rename: never a half-written file under the final name). When a collect was interrupted
+after the GLB was placed and before the export receipt (exports.GLB) was written, the resumed collect downloads again and finds
+the destination taken: an existing file with the same size and SHA-256 as the freshly extracted one is ADOPTED into the receipt
+(exports.GLB.adopted_existing true); a different file stops with 'needs review' and nothing is overwritten.
 """
 import argparse
 import contextlib
@@ -154,12 +173,55 @@ def stat_or_none(path):
         return None
 
 
+def _set_aside(record, why):
+    """Mark `record` not_submitted and move it to studio_submission.not_submitted_<stamp>[_N].json (a name that is free: an
+    earlier one of the same second is never overwritten). The caller holds the output lock. Returns the new path."""
+    record.save('not_submitted', status='not_submitted', pending_action=None, why=why)
+    stem = f'{record.path.stem}.not_submitted_{time.strftime("%Y%m%dT%H%M%S")}'
+    aside, serial = record.path.with_name(f'{stem}.json'), 1
+    while os.path.lexists(aside):
+        serial += 1
+        aside = record.path.with_name(f'{stem}_{serial}.json')
+    record.path.rename(aside)
+    return aside
+
+
 def not_submitted(record, why):
     """Nothing was generated (no click, or Hyper3D refused it): set the record aside so a re-run submits again."""
-    record.save('not_submitted', status='not_submitted', pending_action=None, why=why)
-    aside = record.path.with_name(f'{record.path.stem}.not_submitted_{time.strftime("%Y%m%dT%H%M%S")}.json')
-    record.path.rename(aside)
+    aside = _set_aside(record, why)
     raise Stop(f'{why}; nothing was generated, record moved to {aside.name}, a re-run submits again')
+
+
+PRE_CLICK_STATUSES = ('preparing', 'ready_to_submit')   # the statuses of a submit that has not reached its click
+
+
+def proven_pre_click(data):
+    """True when the record dict `data` PROVES that nothing was clicked for it (final-live review: a rejected upload strands the
+    unpaid variant): a hyper3d record still in a pre-click status with no action or intent of any kind (the free intent is
+    written before the click, so a click always leaves one), no pending action, no model URL / id, no click time and no export.
+    Anything else (any click intent, resolved or not) is never treated as unsubmitted."""
+    return (isinstance(data, dict) and data.get('backend') == 'hyper3d' and data.get('status') in PRE_CLICK_STATUSES
+            and not data.get('actions') and not data.get('pending_action')
+            and not any(data.get(key) for key in ('model_url', 'model_id', 'project_id', 'submit_clicked_at',
+                                                  'after_submit_at', 'exports', 'credits_committed')))
+
+
+def set_aside_pre_click(out_dir, why):
+    """Archive the record of `out_dir` aside (studio_submission.not_submitted_<stamp>.json) when it is a proven pre-click
+    failure (proven_pre_click), under the output lock, so a retry submits fresh. Returns the archived path, or None when there
+    is no record or it is not provably pre-click (a record with any click intent is left exactly as it is). A lock held by
+    another process: Stop(OUTPUT_BUSY)."""
+    out_dir = Path(out_dir)
+    if not (out_dir / RECORD).exists():
+        return None
+    with output_lock(out_dir):
+        try:
+            record = Record(out_dir / RECORD)
+        except (OSError, ValueError):
+            return None
+        if not proven_pre_click(record.data):
+            return None
+        return _set_aside(record, why)
 
 
 # --------------------------------------------------------------------------- config / inputs
@@ -480,9 +542,56 @@ def _require_pin(out_dir, pin):
         raise Stop(f'{problem}; nothing more is written, uploaded or clicked')
 
 
-def _new_upload_dir(out_dir):
+@contextlib.contextmanager
+def hold_directory(path):
+    """Hold the directory `path` open so that it CANNOT be renamed, moved or deleted while the block runs (final-live review,
+    prior item 14). Windows: CreateFileW(GENERIC_READ, share READ|WRITE and NOT FILE_SHARE_DELETE, FILE_FLAG_BACKUP_SEMANTICS |
+    FILE_FLAG_OPEN_REPARSE_POINT): a rename / delete needs DELETE access, which the share mode of this handle refuses to every
+    process (ours too), and a folder above it cannot be renamed while a handle below it is open; files inside can still be
+    created, replaced and read (the upload). The handle is opened on the entry itself (never through a junction) and checked
+    to BE the entry at `path` (same file id as os.lstat). Yields True while held. Stop when it cannot be opened or is not
+    that entry: nothing was written. Other systems have no such share mode: yields False and holds nothing (the pin checks
+    alone apply there)."""
+    if os.name != 'nt':
+        yield False
+        return
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+    create = kernel32.CreateFileW
+    create.restype = wintypes.HANDLE
+    create.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD,
+                       wintypes.HANDLE]
+    full = os.path.abspath(str(path))
+    if not full.startswith('\\\\'):
+        full = '\\\\?\\' + full                      # no MAX_PATH limit
+    # GENERIC_READ (list the directory): a handle with data access takes part in share-mode checks; share READ | WRITE only
+    handle = create(full, 0x80000000, 0x1 | 0x2, None, 3, 0x02000000 | 0x00200000, None)   # OPEN_EXISTING
+    if handle is None or handle == ctypes.c_void_p(-1).value:
+        raise Stop(f'upload snapshot folder could not be held open (WinError {ctypes.get_last_error()}); '
+                   f'nothing more is written, uploaded or clicked: {path}')
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except OSError:
+        kernel32.CloseHandle(wintypes.HANDLE(handle))
+        raise Stop(f'upload snapshot folder could not be held open; nothing more is written, uploaded or clicked: {path}') from None
+    try:
+        held, entry = os.fstat(fd), _lstat(path)
+        if (entry is None or _is_link(entry) or not stat.S_ISDIR(entry.st_mode) or not stat.S_ISDIR(held.st_mode)
+                or (held.st_dev, held.st_ino) != (entry.st_dev, entry.st_ino)):
+            raise Stop(f'upload snapshot folder changed while it was being held (not the folder that was opened); '
+                       f'nothing more is written, uploaded or clicked: {path}')
+        yield True
+    finally:
+        os.close(fd)                                  # closes the OS handle too
+
+
+def _new_upload_dir(out_dir, holds=None):
     """A fresh snapshot folder <out_dir>/upload_inputs/<stamp>-<pid>-<random>/ for ONE submission (last-check row 14): made with
-    an exclusive mkdir (an existing entry of that name is never reused: Stop) and pinned at once. Returns (path, pin)."""
+    an exclusive mkdir (an existing entry of that name is never reused: Stop) and pinned at once. With `holds` (a
+    contextlib.ExitStack; prior item 14) the folder is held open against renaming (hold_directory) from right after the mkdir
+    until the caller closes that stack; the pin is taken and checked while it is held. Returns (path, pin)."""
     container = _upload_dir(out_dir)
     name = f'{time.strftime("%Y%m%dT%H%M%S")}-{os.getpid()}-{os.urandom(6).hex()}'
     target = container / name
@@ -490,6 +599,8 @@ def _new_upload_dir(out_dir):
         os.mkdir(target)
     except FileExistsError:
         raise Stop(f'upload snapshot folder already exists and is never reused: {target}') from None
+    if holds is not None:
+        holds.enter_context(hold_directory(target))
     info = os.lstat(target)
     pin = {'name': name, 'dev': info.st_dev, 'ino': info.st_ino}
     _require_pin(out_dir, pin)
@@ -567,7 +678,7 @@ def _replace_own(source, target, name, pinned=None):
     return digest, size
 
 
-def snapshot_inputs(plan, out_dir):
+def snapshot_inputs(plan, out_dir, holds=None):
     """Copy the views of `plan` into a FRESH folder <out_dir>/upload_inputs/<unique>/, hash the copies and make them read-only
     (finding 13): (dir, [{name, sha256, size}] of the uploaded views in upload order, pin). The browser uploads these copies,
     so the recorded hashes are the bytes uploaded; verify_upload_inputs re-hashes them before the upload and before every paid
@@ -578,8 +689,17 @@ def snapshot_inputs(plan, out_dir):
     link / junction / reparse point on the way, resolved inside the output dir); the pin is re-verified immediately before
     every temp-file create and every os.replace (upload_pin_problem), every final destination is checked before anything is
     written (_own_destination) and a file is put in place by renaming a new temp file, never by writing through a name. A
-    mismatch stops the submit (Stop) before the record exists: nothing is uploaded or clicked."""
-    target, pin = _new_upload_dir(out_dir)
+    mismatch stops the submit (Stop) before the record exists: nothing is uploaded or clicked.
+
+    Prior item 14 (final-live review): the folder is held open against renaming (hold_directory; Windows) during all of these
+    writes. With `holds` (a contextlib.ExitStack of the caller: submit) the hold lasts until the caller closes that stack
+    (through the upload and the click); without it, until this function returns."""
+    with contextlib.ExitStack() as own:
+        return _snapshot_inputs(plan, out_dir, own if holds is None else holds)
+
+
+def _snapshot_inputs(plan, out_dir, holds):
+    target, pin = _new_upload_dir(out_dir, holds)
     source = Path(plan['views_dir'])
     names = ['views_omitted.json', *plan['images']]
     for name in names:                                   # all destinations first: nothing is written when one is refused
@@ -796,9 +916,17 @@ def submit(views_dir, out_dir, *, config=None, session_factory=None, dry_run=Fal
 
 
 def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
+    # prior item 14: the snapshot folder stays held open (not renameable; Windows) through the writes, the upload and the click
+    with contextlib.ExitStack() as holds:
+        return _submit_held(views_dir, out_dir, plan, config, session_factory, dry_run, holds)
+
+
+def _submit_held(views_dir, out_dir, plan, config, session_factory, dry_run, holds):
     if (out_dir / RECORD).exists():   # checked before the snapshot: an existing record's upload_inputs/ are never overwritten
-        raise Stop(f'Submission record already exists; collect or inspect instead: {out_dir / RECORD}')
-    upload_dir, inputs, pin = snapshot_inputs(plan, out_dir)   # a fresh, pinned folder per submission (last-check row 14)
+        # a record that PROVES nothing was clicked (an earlier submit died before its click) is archived; any other one stops
+        if set_aside_pre_click(out_dir, 'an earlier submit stopped before the Free Preview click (no click intent, no model)') is None:
+            raise Stop(f'Submission record already exists; collect or inspect instead: {out_dir / RECORD}')
+    upload_dir, inputs, pin = snapshot_inputs(plan, out_dir, holds)   # a fresh, pinned, held folder per submission (row 14)
     upload_plan = validate_views(upload_dir, config)   # the copies are what goes up: checked like the originals
     if upload_plan['uploaded'] != plan['uploaded']:
         raise Stop(f'upload snapshot differs from the views: {upload_plan["uploaded"]} != {plan["uploaded"]}')
@@ -829,7 +957,12 @@ def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
                 return record.data
             balance = session.wait_balance(BALANCE_WAIT_S)
             record.save('balance_before_submit', balance_before_submit=balance)
-        except Stop:
+        except Stop as exc:
+            # final-live review: a Stop here is a failure BEFORE the click (e.g. 'Expected 4 uploaded thumbnails, found 3').
+            # The record proves it (no intent of any kind, no model): archived aside, so a retry submits fresh instead of
+            # finding a 'preparing' record that collect refuses. A record that is not provably pre-click stays as it is.
+            if record.path.exists() and proven_pre_click(record.data):
+                not_submitted(record, str(exc))
             raise
         except Exception as exc:                # 2026-10-27: a DNS error left a 'preparing' record collect refuses
             not_submitted(record, f'{type(exc).__name__} before the click: {str(exc).splitlines()[0][:200]}')
@@ -980,16 +1113,19 @@ def _collect_locked(out_dir, allow_paid, accept_preview, expected_costs, config,
             elif stage == 'export_ready':
                 path, panel = session.export_glb(out_dir, config)
                 record.save('balance_end', balance_end=session.read_balance())
-                return _record_export(record, path, panel)
+                return _record_export(record, path, panel, adopted=bool(getattr(session, 'export_adopted', False)))
         raise Stop('stage machine did not reach export_ready; inspect the model and resume')
 
 
-def _record_export(record, path, panel_text):
+def _record_export(record, path, panel_text, adopted=False):
+    """Write the export receipt (exports.GLB). `adopted`: the GLB was already in place from an interrupted collect and is
+    byte-identical (size + SHA-256) to the one downloaded now (place_glb); the receipt says so."""
     path = Path(path)
     report = inspect_glb(path)
     exports = dict(record.data.get('exports', {}))
     exports['GLB'] = {'path': str(path), 'bytes': path.stat().st_size, 'sha256': sha256_file(path),
-                      'downloaded_at': now(), 'inspection': report, 'export_panel_text': panel_text}
+                      'downloaded_at': now(), 'inspection': report, 'export_panel_text': panel_text,
+                      **({'adopted_existing': True} if adopted else {})}
     record.save('exported', exports=exports, studio_result={
         'topology': 'raw', 'faces': report['triangles'], 'inspected_at': now()})
     return _finish(record, exports['GLB'])
@@ -1535,39 +1671,103 @@ class SeleniumRodin:
                 size = st.st_size if (st := stat_or_none(fresh[0])) else -1
                 time.sleep(3)
                 if (st := stat_or_none(fresh[0])) and st.st_size == size:
-                    return extract_glb(fresh[0], Path(out_dir)), panel_text
+                    target, self.export_adopted = place_glb(fresh[0], Path(out_dir))
+                    return target, panel_text
             time.sleep(3)
         raise TimeoutError('Download not found; resume to download again without regenerating')
 
 
-def extract_glb(downloaded, out_dir):
-    """Place the downloaded GLB (or the single GLB inside a ZIP) at <out>/glb_<name>.glb."""
-    downloaded = Path(downloaded)
-    if zipfile.is_zipfile(downloaded):
-        with zipfile.ZipFile(downloaded) as archive:
-            if archive.testzip() is not None:
-                raise ValueError('ZIP checksum failed')
-            members = [n for n in archive.namelist() if n.lower().endswith('.glb')]
-            if len(members) > 1:      # Shaded + PBR both ticked exports two GLBs (base_basic_shaded / _pbr)
-                members = [n for n in members if 'pbr' in Path(n).name.lower()] or members
-            if len(members) != 1:
-                raise ValueError(f'expected exactly one GLB in the ZIP, found {members}')
-            target = out_dir.resolve() / ('glb_' + Path(members[0]).name)
-            if target.exists():
-                raise FileExistsError(f'Export destination exists: {target}')
-            with archive.open(members[0]) as src, target.open('wb') as dst:
-                shutil.copyfileobj(src, dst)
-        return target
-    if downloaded.suffix.lower() != '.glb':
-        raise ValueError(f'downloaded file is neither GLB nor ZIP: {downloaded.name}')
-    target = out_dir.resolve() / ('glb_' + downloaded.name)
-    if target.exists():
-        raise FileExistsError(f'Export destination exists: {target}')
+EXPORT_STAGING = '.export_staging_'    # <out_dir>/.export_staging_<pid>_<random>/: where a ZIP is extracted before placing
+
+
+def _settle_existing(candidate, target):
+    """`target` (the export destination) already exists: True when it is a plain file with the same size and SHA-256 as the
+    complete, verified `candidate` (it is adopted; nothing is written); Stop for review when it is anything else (never
+    overwritten, never deleted)."""
+    info = _lstat(target)
+    if info is None or _is_link(info) or not stat.S_ISREG(info.st_mode):
+        raise Stop(f'Export destination exists and is not a plain file; needs review, nothing was overwritten: {target}')
+    size = os.stat(candidate).st_size
+    if info.st_size == size:
+        have, want = sha256_file(target), sha256_file(candidate)
+        if have == want:
+            return True
+        detail = f'sha256 {have[:12]} != downloaded {want[:12]}'
+    else:
+        detail = f'{info.st_size} bytes != downloaded {size} bytes'
+    raise Stop(f'Export destination exists with DIFFERENT content ({detail}); needs review, nothing was overwritten: {target}')
+
+
+def _place(candidate, target, staging):
+    """Put the complete file `candidate` at `target` without ever exposing a half-written file there and without overwriting:
+    a hard link (fails when the name is taken), else a rename of a staged copy. An existing `target`: _settle_existing.
+    Returns True when the existing file was adopted, False when the file was placed now."""
+    if os.path.lexists(target):
+        return _settle_existing(candidate, target)
     try:
-        os.link(downloaded, target)  # same bytes as the download: a hard link saves ~40 MB per module
+        os.link(candidate, target)   # same bytes: no second copy on disk (~40 MB per module), and exclusive
+        return False
+    except FileExistsError:
+        return _settle_existing(candidate, target)
     except OSError:
-        shutil.copy2(downloaded, target)
-    return target
+        pass                         # no hard links here (another volume / file system): a staged copy, then a rename
+    staged = Path(candidate)
+    if staged.parent != staging:
+        staging.mkdir(exist_ok=True)
+        staged = staging / target.name
+        shutil.copy2(candidate, staged)
+    if os.path.lexists(target):
+        return _settle_existing(staged, target)
+    os.rename(staged, target)
+    return False
+
+
+def place_glb(downloaded, out_dir):
+    """Place the downloaded GLB (or the single GLB inside a ZIP) at <out>/glb_<name>.glb: (path, adopted).
+
+    Final-live review ("interrupted paid export cannot resume"): runs under the output lock (re-entrant for the collect that
+    holds it). A ZIP member is extracted into the staging folder <out>/.export_staging_<pid>_<random>/ first (staging folders
+    left by a killed run are removed: only the lock holder makes them), so the final name only ever holds a complete file.
+    When the destination already exists (a collect interrupted after the placement and before the export receipt, then
+    resumed): a file identical to the freshly downloaded, CRC-checked one (size + SHA-256) is adopted (`adopted` True); a
+    different one raises Stop for review and is left untouched."""
+    downloaded, out_dir = Path(downloaded), Path(out_dir).resolve()
+    with output_lock(out_dir):
+        for stale in out_dir.glob(EXPORT_STAGING + '*'):
+            shutil.rmtree(stale, ignore_errors=True)
+        staging = out_dir / f'{EXPORT_STAGING}{os.getpid()}_{os.urandom(4).hex()}'
+        try:
+            if zipfile.is_zipfile(downloaded):
+                with zipfile.ZipFile(downloaded) as archive:
+                    if archive.testzip() is not None:
+                        raise ValueError('ZIP checksum failed')
+                    members = [n for n in archive.namelist() if n.lower().endswith('.glb')]
+                    if len(members) > 1:      # Shaded + PBR both ticked exports two GLBs (base_basic_shaded / _pbr)
+                        members = [n for n in members if 'pbr' in Path(n).name.lower()] or members
+                    if len(members) != 1:
+                        raise ValueError(f'expected exactly one GLB in the ZIP, found {members}')
+                    target = out_dir / ('glb_' + Path(members[0]).name)
+                    os.mkdir(staging)
+                    staged = staging / target.name
+                    with archive.open(members[0]) as src, staged.open('wb') as dst:
+                        shutil.copyfileobj(src, dst)
+                        dst.flush()
+                        os.fsync(dst.fileno())
+                    if staged.stat().st_size != archive.getinfo(members[0]).file_size:
+                        raise ValueError('extracted GLB is incomplete')
+                return target, _place(staged, target, staging)
+            if downloaded.suffix.lower() != '.glb':
+                raise ValueError(f'downloaded file is neither GLB nor ZIP: {downloaded.name}')
+            target = out_dir / ('glb_' + downloaded.name)
+            return target, _place(downloaded, target, staging)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+
+
+def extract_glb(downloaded, out_dir):
+    """Place the downloaded GLB (or the single GLB inside a ZIP) at <out>/glb_<name>.glb and return that path (place_glb: staged
+    extraction; an identical file already in place is adopted, a different one stops for review)."""
+    return place_glb(downloaded, out_dir)[0]
 
 
 # --------------------------------------------------------------------------- CLI

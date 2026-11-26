@@ -20,7 +20,9 @@ and the driver walks the steps, each resumable from `models/<v>/hyper3d/studio_s
      an earlier attempt (the children file, below); otherwise verdict `busy`;
   1. paid accounting is reconciled from the record on EVERY run (F5), also for an exported or reduced record;
   2. a record exists -> its `inputs` (the backend's ordered [{name, sha256, size}]) must equal the frozen generation, else it is refused
-     before anything is spent (F7); collect or inspect by `status` / `actions` / `pending_action` (a `free_preview` intent of a record
+     before anything is spent (F7); a record of a PROVEN pre-click failure (`rodin_backend.proven_pre_click`; the wrappers archive
+     it themselves as `studio_submission.not_submitted_<time>.json`) that is still in place is archived through
+     `rodin_backend.set_aside_pre_click` and the variant is unsubmitted again (Retry / Use enabled views submit again; a record with any click intent stays and stops for review); collect or inspect by `status` / `actions` / `pending_action` (a `free_preview` intent of a record
      whose model is bound and identified is resolved, F1; any other pending click is refused). NO record -> submit (free): the frozen
      files are first copied to `models/<v>/hyper3d/inputs_<generation>/` (read-only, sha256-verified) and THAT folder is uploaded (F7):
      one view -> `hyper3d_single.py submit <snapshot> <out> --view <file>`; 2-4 -> `hyper3d_multiview.py submit <snapshot> <out> --views
@@ -29,8 +31,13 @@ and the driver walks the steps, each resumable from `models/<v>/hyper3d/studio_s
   3. `collect --allow-paid --accept-preview` (PAID, 0.5 credits). Every wrapper child gets the click-time gate (DESIGN_PHASE4.md I.8):
      `paid_gate.env_for(root, override_pause, cmd=[python, -X, utf8, monster_lane.py, gate, --root, R, --task-args, <json>])`; a child that
      stops at a closed gate exits 4 (paid_gate.EXIT_GATE_CLOSED) = verdict `waiting` (requeue), never a failure;
-  4. `python tools/reduce_monster.py "<M>/<v>"` (Blender) -> models/<v>/reduced/; then every output is validated and the generation-bound
-     success record `reduced/v2_reduce_ok.json` is written (F12; `--redo` only for an existing reduced/).
+  4. `python tools/reduce_monster.py "<M>/<v>" --glb <receipted GLB> --sha256 <its digest>` (Blender) -> models/<v>/reduced/. The
+     model reduced is the one the record's export receipt names (`exports.GLB` {path, sha256, bytes}; receipted_glb): its bytes are
+     hashed BEFORE the reducer starts and AGAIN after it ended, the reducer itself refuses a file that is not that digest, and its
+     materials.json must name that file and digest. Another `glb_*.glb` in the folder is never reduced, and a missing receipted file
+     is never replaced by one (final-live review, "reduction can certify the wrong model"). Then every output is validated and
+     the generation-bound success record `reduced/v2_reduce_ok.json` (with `source` {file, sha256}) is written (F12; `--redo` only
+     for an existing reduced/).
 Every child is started with Popen and recorded in `.codex_jobs/_app/monster_lane/<variant key>.children.json` ({driver, children: [{pid,
 create, argv}]}) until it exited, so Kill & retry can drain the whole process tree and a slot is never released while a child of the
 attempt still runs (F14).
@@ -41,7 +48,9 @@ GATE (identical to conversions): the conversion hold `.codex_jobs/_batch/CONVERT
 `pause-conversions`, or a PAUSE file with `conversions` in its scope for a manual reason -> wait; a Run now confirmed while paused stores
 the PAUSE ID it overrode (`override_pause` = the `pause_id` of modes.manual_pause: unique per pause transition, recheck finding 5; ONE id
 for ALL independent manual pauses in force, final-verify row 5: a manual PAUSE added after the confirmation of a pause mode is a new id)
-and overrides only that (a new pause needs a new confirmation; an ordinary Retry clears Run now and the override, F4); mode `auto` /
+and overrides only that (a new pause needs a new confirmation; an ordinary Retry clears Run now and the override, F4); a supervisor_mode.json that exists but
+cannot be read -> wait (`held`, `mode_unreadable`), never overridden and Run now is refused until it is readable (nobody can tell
+whether conversions are paused: final-live review, "payment without pause confirmation"); mode `auto` /
 `views-run` -> only when the user is away (idle >= 300 s) and no "user active" PAUSE -> a per-task Run now overrides this idle gate only.
 `gate()['code']`: `held` (hold, or drain with `draining`) | `paused` | `user_present` (None when open). The paid children ask the same
 `gate()` through this file's `gate` sub-command right before every credit-capable click.
@@ -55,6 +64,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -99,8 +109,11 @@ CREATE_TOLERANCE = 1.0
 
 
 class ConfirmPaused(guard.Conflict):
-    """Run now while conversions are paused by hand (HTTP 409 `confirm`, body `pause_id`): the client asks the user, then sends
-    `confirm: true` AND the `pause_id` it showed (finding 5); an echoed id that is not the pause in force is answered the same way."""
+    """Run now while conversions are paused by hand (HTTP 409 `confirm`): the server's CHALLENGE. Its body carries `pause_id` (the
+    challenge id: one identity for the exact set of pauses in force, each bound to its source and file revision) and `pauses`
+    ([{pause_id, kind, reason}]: every pause the user must be shown). The client shows those reasons, then sends `confirm: true` AND
+    that `pause_id` (finding 5); the server accepts only while the pauses in force still equal the challenge, and answers a new
+    challenge otherwise (final-live review, "undisclosed maintenance override")."""
     code = 'confirm'
 
 
@@ -430,17 +443,34 @@ def cancel_task(root: Path, task: dict, detail: str = 'manual') -> bool:
     raise changed('the conversion task keeps changing')
 
 
-def shown_seq(root: Path, task: dict) -> int | None:
-    """The disposition revision a lane row is DISPLAYED with (queue row / item.conversion `conversion_seq`): the variant's monotonic
-    counter (views.json `conversion_seq`, mv.disposition_seq) now. None when the variant cannot be read (display only: the server
-    refuses a Retry without it)."""
+def shown_outcome(root: Path, task: dict) -> dict:
+    """What a failed / cancelled lane row is PUBLISHED with (final-live review, blocker 4): {conversion_seq, disposition, error} from
+    ONE read of the variant's views.json. `conversion_seq` = the variant's monotonic counter (mv.disposition_seq), `disposition` =
+    the recorded outcome of the row's generation in that same snapshot, `error` = the text to show: the row's own when the row
+    carries that very outcome, else the disposition's reason (mv.outcome_error). The row was read at another moment than
+    views.json, so a row read before a Retry and a second failure is shown with the SECOND failure and its revision: the Retry the
+    user presses clears the failure they were shown, never one they were not. `conversion_seq` None when the variant cannot be
+    read (display only: the server refuses a Retry without it)."""
+    out = {'conversion_seq': None, 'disposition': None, 'error': task.get('error')}
     gen = _generation_of(task)
     if not gen:
-        return None
+        return out
     try:
-        return mv.disposition_seq(mv.read_views_json(mv.views_dir(mv.mroot_of(root), gen[0], gen[1])))
+        vj = mv.read_views_json(mv.views_dir(mv.mroot_of(root), gen[0], gen[1]))
+        seq = mv.disposition_seq(vj)
+        try:
+            disposition = mv.disposition_of(vj, gen[2])
+        except guard.Unreadable:
+            return out | {'conversion_seq': seq}
+        return {'conversion_seq': seq, 'disposition': disposition,
+                'error': mv.outcome_error(disposition, task.get('state'), task.get('error'))}
     except Exception:  # noqa: BLE001
-        return None
+        return out
+
+
+def shown_seq(root: Path, task: dict) -> int | None:
+    """The disposition revision a lane row is DISPLAYED with (queue row / item.conversion `conversion_seq`): shown_outcome's."""
+    return shown_outcome(root, task)['conversion_seq']
 
 
 def retry_task(root: Path, task: dict, seq: object = None) -> bool:
@@ -584,8 +614,10 @@ def pause_id(root: Path) -> str | None:
 
 
 def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_known: bool = False) -> dict:
-    """Whether a monster conversion step may run now: {open, reason, code, mode, pause, pause_id, paused, pause_reason, hold, drain,
-    idle, away, needs_confirm}. `idle` = the user's idle seconds (None + idle_known=False: read presence.json / GetLastInputInfo).
+    """Whether a monster conversion step may run now: {open, reason, code, mode, pause, pause_id, pauses, paused, pause_reason, hold,
+    drain, idle, away, needs_confirm} (+ `mode_unreadable` when supervisor_mode.json exists but cannot be read: closed with code
+    `held`, never overridden by Run now or a consent; `pauses` = every independent manual pause in force as {pause_id, kind,
+    reason}: what a Run now confirmation must show). `idle` = the user's idle seconds (None + idle_known=False: read presence.json / GetLastInputInfo).
     `code`: held (CONVERT_HOLD, or CONVERT_DRAIN with `draining: true`; neither is ever overridden) | paused | user_present | None.
     `paused` / `pause_id` / `pause_reason` describe ALL independent manual pauses in force (modes.manual_pause: the pause mode, a
     supervisor pause that is neither the idle rule nor its reflection of the current mode, and every PAUSE file that is not PROVABLY
@@ -615,7 +647,7 @@ def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_k
     run_now = bool(args.get('run_now'))
     override = modes.consent_covers(args.get('override_pause'), manual)   # every pause in force is one the user confirmed
     out = {'open': True, 'reason': None, 'code': None, 'mode': mode, 'pause': pause, 'supervisor_pause': modes.public_pause(own),
-           'pause_id': key, 'paused': manual is not None,
+           'pause_id': key, 'pauses': [dict(p) for p in manual['pauses']] if manual else [], 'paused': manual is not None,
            'pause_reason': manual['reason'] if manual else None, 'hold': hold, 'drain': drain, 'idle': idle, 'away': away,
            'needs_confirm': False}
     if hold is not None:                                   # never overridden: the supervisor is (re)starting or has not ticked yet
@@ -625,6 +657,11 @@ def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_k
         return out | {'open': False, 'code': 'held', 'draining': True,
                       'reason': f'conversions are being drained (CONVERT_DRAIN: {drain.get("reason") or "no reason"}); they wait until '
                                 'the drain is over'}
+    unreadable = modes.mode_unreadable(mode_rec)           # the mode file exists but does not say which mode is in force
+    if unreadable:                                         # never overridden: no consent can name a pause nobody can read
+        return out | {'open': False, 'code': 'held', 'mode_unreadable': True,
+                      'reason': f'the pause mode cannot be read ({unreadable}); conversions wait until supervisor_mode.json is '
+                                'readable again (nobody can tell whether they are paused)'}
     idle_pause = modes.idle_paused(mode_rec, own)          # the supervisor's own record says so (never a PAUSE file's wording)
     if manual is not None and not override:                # the consent must name exactly the set of manual pauses in force now
         return out | {'open': False, 'code': 'paused', 'reason': f'conversions are paused ({manual["reason"]})', 'needs_confirm': True}
@@ -734,21 +771,28 @@ def run_now(root: Path, task_id: object, confirm: bool = False, key: object = No
     hint; 409 `changed` when it expired, finding 4) and every state change compares that identity in its own transaction. Run now
     overrides the idle gate. While conversions are paused by hand it needs `confirm: true` AND the `pause_id` the user was shown (409
     `confirm` with the current `pause_id` otherwise, also when the echoed id is not the pause in force any more); the override then holds
-    for THAT pause only (finding 5). The conversion hold (CONVERT_HOLD) is never overridden: the task is marked and starts when the hold
+    for THAT pause only (finding 5). The 409 `confirm` is the server's CHALLENGE: it carries `pauses` (the exact list of pauses in
+    force, ids + reasons) for the confirmation dialog and `pause_id`, the challenge id the client echoes; the request is accepted
+    only while the pauses in force still equal that challenge (each id is the pause's source + file revision, so a pause that was
+    added, or rewritten with another reason, is a new challenge). While supervisor_mode.json cannot be read Run now is REFUSED (409
+    `unreadable`): nothing is marked until the mode is readable. The conversion hold (CONVERT_HOLD) is never overridden: the task is marked and starts when the hold
     lifts (the answer carries a `warning`). Run now of a FAILED / CANCELLED row is a Retry first: it needs the `conversion_seq` the
     client displayed (retry_task: 409 `changed` when a newer outcome was recorded since; post-cut-over blocker 4)."""
     task = resolve_task(root, task_id, key, generation)
     ident, task_id = task_ident(task), task['id']
     q = queue(root)
     g = gate(root, {'run_now': True})
+    if g.get('mode_unreadable'):                               # an unconfirmed (or any) Run now is never accepted on an unknown mode
+        raise guard.Unreadable(f'Run now is refused: {g["reason"]}')
     override = None
     if g['paused']:
         if not confirm:
             raise ConfirmPaused(f'conversions are paused ({g["pause_reason"]}): run this conversion anyway? (it pays {CREDITS_PER_MODEL} '
-                                'Hyper3D credits)', pause_id=g['pause_id'])
+                                'Hyper3D credits)', pause_id=g['pause_id'], pauses=g['pauses'])
         if not isinstance(pause_id, str) or pause_id != g['pause_id']:
             raise ConfirmPaused(f'the pause changed since you were asked: conversions are paused ({g["pause_reason"]}) now. Run this '
-                                f'conversion anyway? (it pays {CREDITS_PER_MODEL} Hyper3D credits)', pause_id=g['pause_id'])
+                                f'conversion anyway? (it pays {CREDITS_PER_MODEL} Hyper3D credits)', pause_id=g['pause_id'],
+                                pauses=g['pauses'])
         override = g['pause_id']
     try:
         if task['state'] in ('failed', 'cancelled'):
@@ -1106,8 +1150,36 @@ def _alive(pid: object, create: object) -> bool:
 
 
 def _proven(pid: object, create: object) -> bool:
-    """The live process `pid` IS the recorded one: a recorded create time that matches. The only identity a signal may rely on."""
+    """The live process `pid` IS the recorded one: a recorded create time that matches. Evidence for HOLDING a slot; a signal needs
+    the verified object itself (`_open_proven`), never a second look-up of the pid."""
     return isinstance(create, (int, float)) and not isinstance(create, bool) and _alive(pid, create)
+
+
+def _open_proven(pid: object, create: object):
+    """The psutil.Process OBJECT of the recorded process (pid + recorded create time), or None (final-live review, blocker 7). The
+    pid is opened ONCE and the identity is verified ON THAT OBJECT (its own create time is the recorded one); the caller keeps and
+    signals exactly this object. Checking the pid and then opening it again would leave a gap in which the process exits and its
+    pid is given to an unrelated one, which the second look-up would return."""
+    if psutil is None or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return None
+    if isinstance(create, bool) or not isinstance(create, (int, float)):
+        return None
+    try:
+        proc = psutil.Process(pid)
+        if abs(proc.create_time() - float(create)) > CREATE_TOLERANCE:
+            return None
+    except psutil.Error:
+        return None
+    return proc
+
+
+def _still_same(proc) -> bool:
+    """The RETAINED process object still names the process it was verified as (psutil compares the create time it holds with the
+    pid's now): False once that process is gone, also when its pid belongs to another process by now."""
+    try:
+        return bool(proc.is_running())
+    except psutil.Error:
+        return False
 
 
 # ---- Windows Job Object (finding 9) ------------------------------------------------------------------------------------------------
@@ -1345,7 +1417,10 @@ def tree_plan(root: Path, monster: str, variant: str, roots: list[tuple] | tuple
       - with the attempt's Job Object: the job is the tree (nothing is enumerated by parent pid);
       - otherwise only processes whose identity is PROVEN (pid + a recorded create time that matches): the `roots` the caller verified
         and the recorded driver / children / descendants, each with its descendants at this moment. A recorded process that is alive but
-        has no recorded create time is `blocking`: nothing at all is signalled then (it may be an unrelated process on a reused pid)."""
+        has no recorded create time is `blocking`: nothing at all is signalled then (it may be an unrelated process on a reused pid).
+    `procs` are the VERIFIED psutil.Process objects themselves (`_open_proven`: opened once, identity checked on that object; their
+    descendants are the objects psutil made for them); `drain_tree` signals exactly these retained objects and never opens a pid
+    again (final-live review, blocker 7)."""
     path = children_path(root, monster, variant)
     state = _tree_state(path)
     plan = {'job': state.get('handle') if state['job'] else None, 'procs': [], 'blocking': [], 'incomplete': state['incomplete']}
@@ -1354,14 +1429,16 @@ def tree_plan(root: Path, monster: str, variant: str, roots: list[tuple] | tuple
     procs: dict[int, object] = {}
 
     def collect(pid, created) -> None:
-        if pid == os.getpid() or not _proven(pid, created):     # (never this process: a driver run inside it, as in tests)
+        if pid == os.getpid():                                  # (never this process: a driver run inside it, as in tests)
+            return
+        top = _open_proven(pid, created)                        # ONE open; the identity is verified on the object that is kept
+        if top is None:
             return
         try:
-            top = psutil.Process(pid)
             for proc in [top] + top.children(recursive=True):
                 procs.setdefault(proc.pid, proc)
         except psutil.Error:
-            pass
+            procs.setdefault(top.pid, top)
     for pid, created in roots:
         collect(pid, created)
     value = mv.read_json(path, None)
@@ -1401,6 +1478,10 @@ def drain_tree(root: Path, monster: str, variant: str, plan: dict, wait: float =
         tree = list(plan.get('procs') or [])
         for proc in reversed(tree):                             # deepest first (children lists are breadth-first)
             try:
+                # the RETAINED verified object is what gets the signal (blocker 7): it is checked once more on itself, so a
+                # process that exited meanwhile is skipped also when its pid belongs to another process by now
+                if not _still_same(proc):
+                    continue
                 proc.kill()
             except psutil.NoSuchProcess:
                 pass
@@ -1783,6 +1864,76 @@ def inputs_problem(record: dict, frozen: dict, snap: Path) -> str | None:
     return None
 
 
+GLB_SHA = re.compile(r'[0-9a-f]{64}')
+
+
+def receipted_glb(record: dict | None, out_dir: Path) -> tuple[Path | None, str | None, str | None]:
+    """(path, sha256, problem) of the high-poly GLB the record's EXPORT RECEIPT names (`exports.GLB` {path, sha256, bytes}, written by
+    rodin_backend when the export was downloaded and inspected). The path must be a `glb_*.glb` directly in this variant's hyper3d/
+    folder and the receipt must carry the file's sha256: only that file, with those bytes, is ever reduced (final-live review,
+    "reduction can certify the wrong model"). (None, None, problem) for a record without a usable receipt."""
+    exports = record.get('exports') if isinstance(record, dict) else None
+    entry = exports.get('GLB') if isinstance(exports, dict) else None
+    if not isinstance(entry, dict):
+        return None, None, 'the record has no export receipt (exports.GLB)'
+    raw, digest = entry.get('path'), entry.get('sha256')
+    if not isinstance(raw, str) or not raw:
+        return None, None, 'the export receipt names no file'
+    if not isinstance(digest, str) or not GLB_SHA.fullmatch(digest):
+        return None, None, 'the export receipt carries no sha256 of the exported GLB'
+    out_dir = Path(out_dir)
+    path = Path(raw) if Path(raw).is_absolute() else out_dir / raw
+    try:
+        inside = path.parent.resolve() == out_dir.resolve()
+    except OSError:
+        inside = False
+    if not inside or not path.name.startswith('glb_') or path.suffix.lower() != '.glb':
+        return None, None, f'the export receipt names {raw!r}, which is not a glb_*.glb of this variant\'s hyper3d folder'
+    return out_dir / path.name, digest, None
+
+
+def glb_problem(path: Path, digest: str, when: str) -> str | None:
+    """None when `path` is a regular file whose bytes have the receipted sha256 NOW (hashed, never taken from a cache)."""
+    path = Path(path)
+    try:
+        if path.is_symlink() or not path.is_file():
+            return f'the receipted GLB {path.name} is missing {when}'
+        actual = mv.sha256_file(path)
+    except OSError as exc:
+        return f'the receipted GLB {path.name} cannot be read {when} ({exc})'
+    if actual != digest:
+        return (f'{path.name} is not the model the export receipt names {when} (sha256 {actual[:12]} != receipted {digest[:12]}); '
+                'it is not reduced')
+    return None
+
+
+def reduced_source_problem(mdir: Path, glb: Path, digest: str) -> str | None:
+    """None when reduced/materials.json (the reducer's LAST write) says it reduced exactly the receipted GLB: `source` = its path
+    relative to the model folder and `source_sha256` = the receipted digest (reduce_monster.py writes both when it is given `--glb`
+    and `--sha256`)."""
+    materials = mv.read_json(Path(mdir) / 'reduced' / 'materials.json', None)
+    if not isinstance(materials, dict):
+        return 'reduced/materials.json is missing or invalid (the reducer did not finish)'
+    want = f'hyper3d/{Path(glb).name}'
+    if materials.get('source') != want:
+        return f'the reducer reduced {materials.get("source")!r}, not the receipted {want}'
+    if materials.get('source_sha256') != digest:
+        return 'the reducer did not confirm the sha256 of the receipted GLB (materials.json source_sha256)'
+    return None
+
+
+def set_aside_unsubmitted(out_dir: Path) -> tuple[Path | None, str | None]:
+    """Archive a record of a PROVEN pre-click failure (mv.proven_unsubmitted) the way the backend does, BY the backend
+    (`rodin_backend.set_aside_pre_click`: under the output lock, as `studio_submission.not_submitted_<time>.json`, and only when the
+    record read under that lock still proves that nothing was clicked). (archived path, None); (None, None) when the backend left
+    the record where it is (not provably pre-click any more); (None, problem) when it could not be asked."""
+    try:
+        aside = mv.hyper3d_backend().set_aside_pre_click(Path(out_dir), 'the v2 monster lane found a proven pre-click failure')
+    except Exception as exc:  # noqa: BLE001  (Stop: the output lock is busy; anything else: fail closed, nothing is submitted)
+        return None, f'{type(exc).__name__}: {exc}'
+    return (Path(aside) if aside else None), None
+
+
 def run_conversion(root: Path, monster: str, variant: str, *, frozen_sha: str | None = None, run_now: bool = False,
                    override_pause: str | None = None, idle: float | None = None, idle_known: bool = False, python: str | None = None,
                    say=None, own_process: bool = False) -> dict:
@@ -1886,6 +2037,19 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
     snap = snapshot_dir(out_dir, frozen)
 
     record = mv.record_of(mdir)
+    if mv.proven_unsubmitted(record):
+        # a PROVEN pre-click failure the backend left in place (it normally sets the record aside itself): nothing was clicked, so
+        # the variant is unsubmitted and this attempt submits again. A record with ANY click intent is not touched (it fails below
+        # with its status, for review).
+        blocked = unsafe('check')
+        if blocked:
+            return blocked
+        aside, problem = set_aside_unsubmitted(out_dir)
+        if problem:
+            return verdict('failed', 'check', f'the record of the failed submission could not be set aside ({problem})')
+        if aside is not None:
+            steps.append(f'unsubmitted record set aside ({aside.name})')
+        record = mv.record_of(mdir)                             # None now; a record the backend left in place is judged below
     if record is None:
         if any(out_dir.glob('glb_*.glb')):
             return verdict('failed', 'check', f'{out_dir.as_posix()} has a GLB but no studio_submission.json; inspect it by hand')
@@ -1924,7 +2088,19 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
     if problem:
         return verdict('failed', 'check', problem)
     status = record.get('status')
-    if status == 'submitted' or (status == 'exported' and not any(out_dir.glob('glb_*.glb'))):
+    glb, glb_sha, receipt_problem = (None, None, None)
+    if status == 'exported':
+        # ONLY the GLB the export receipt names is reduced. A receipt that cannot be used, or a receipted file that is gone while
+        # ANOTHER glb_*.glb lies in the folder, stops here: that other file is never taken for the model that was paid for.
+        glb, glb_sha, receipt_problem = receipted_glb(record, out_dir)
+        if receipt_problem:
+            return verdict('failed', 'check', f'{receipt_problem}; nothing is reduced: inspect {record_path.as_posix()}')
+        if not glb.exists() and any(out_dir.glob('glb_*.glb')):
+            others = sorted(p.name for p in out_dir.glob('glb_*.glb'))
+            return verdict('failed', 'check', f'the receipted GLB {glb.name} is missing, but {", ".join(others[:4])} is in '
+                                              f'{out_dir.as_posix()}; that is not the model the receipt names and is not reduced: '
+                                              'check it by hand')
+    if status == 'submitted' or (status == 'exported' and not glb.exists()):
         pending = record.get('pending_action')
         if pending and not free_preview_resolved(record):
             return verdict('failed', 'collect', f'the record has an unresolved {pending!r} click; inspect '
@@ -1952,17 +2128,23 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
                 return verdict('busy', 'collect', message)
             return verdict('failed', 'collect', message)
         status = record.get('status')
-    if status != 'exported' or not any(out_dir.glob('glb_*.glb')):
+        glb, glb_sha, receipt_problem = receipted_glb(record, out_dir) if status == 'exported' else (None, None, None)
+    if status != 'exported':
         why = record.get('why') or record.get('pending_action')
         return verdict('failed', 'collect', f'record status {status!r}' + (f' ({why})' if why else '') +
                        f'; inspect {record_path.as_posix()}')
+    if receipt_problem:
+        return verdict('failed', 'collect', f'{receipt_problem}; nothing is reduced: inspect {record_path.as_posix()}')
 
     blocked = gated('reduce') or unsafe('reduce')
     if blocked:
         return blocked
+    problem = glb_problem(glb, glb_sha, 'before the reduction')  # the receipted bytes, hashed now
+    if problem:
+        return verdict('failed', 'reduce', f'{problem}; inspect {record_path.as_posix()}')
     redo = ['--redo'] if (mdir / 'reduced').exists() else []
-    code, err = _run([sys.executable, '-X', 'utf8', str(mroot / 'tools' / 'reduce_monster.py'), f'{monster}/{variant}', *redo], mroot, say,
-                     None, tracker)
+    code, err = _run([sys.executable, '-X', 'utf8', str(mroot / 'tools' / 'reduce_monster.py'), f'{monster}/{variant}', *redo,
+                      '--glb', str(glb), '--sha256', glb_sha], mroot, say, None, tracker)
     steps.append(f'reduce exit {code}')
     blocked = unsafe('reduce')
     if blocked:
@@ -1971,8 +2153,13 @@ def _drive(root: Path, mroot: Path, monster: str, variant: str, base: dict, trac
     if code != 0 or problem:
         return verdict('failed', 'reduce', stopped_message(err) or problem or
                        f'reduce_monster.py exit code {code}; see {(mdir / "reduce.log").as_posix()}')
+    # AFTER: the file is still the receipted model, and the reducer says that file and digest is what it reduced. Only then is
+    # the reduction certified (with its source).
+    problem = glb_problem(glb, glb_sha, 'after the reduction') or reduced_source_problem(mdir, glb, glb_sha)
+    if problem:
+        return verdict('failed', 'reduce', f'the reduction is not certified: {problem}')
     try:
-        mv.write_reduce_ok(mdir, frozen)
+        mv.write_reduce_ok(mdir, frozen, source={'file': f'hyper3d/{glb.name}', 'sha256': glb_sha})
     except (OSError, ValueError) as exc:
         return verdict('failed', 'reduce', f'the reduction could not be verified: {exc}')
     return verdict('ok', 'done')

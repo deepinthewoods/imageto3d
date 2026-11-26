@@ -103,7 +103,8 @@ export function mountQueue(container) {
     await load();
   }
 
-  /** Run now of a queued monster conversion: overrides the idle gate; while paused by hand the server asks (409 confirm) first. */
+  /** Run now of a queued monster conversion: overrides the idle gate; while paused by hand the server asks first (409 `confirm`: its
+   * challenge with the pauses in force and their reasons, which the dialog shows; runNowTask). */
   async function runNow(task) {
     if (busy.has(task.id)) return;
     busy.add(task.id);

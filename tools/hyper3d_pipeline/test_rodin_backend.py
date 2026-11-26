@@ -140,6 +140,12 @@ class FakeSession:
         return target, 'panel .glb 2K'
 
 
+@contextlib.contextmanager
+def no_hold(path):
+    """rb.hold_directory switched off: what a system without the share mode does (the pin checks alone)."""
+    yield False
+
+
 class ViewTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -444,8 +450,17 @@ class GlbTests(unittest.TestCase):
         out.mkdir()
         target = rb.extract_glb(archive, out)
         self.assertEqual(target.name, 'glb_inner.glb')
-        with self.assertRaises(FileExistsError):
+        # final-live review: the same verified bytes already in place are adopted, never a FileExistsError
+        self.assertEqual(rb.place_glb(archive, out), (target, True))
+        self.assertFalse(list(out.glob(rb.EXPORT_STAGING + '*')))                 # the staging folder is gone
+        make_glb(self.root / 'inner.glb', triangles=99)                          # another model under the same name
+        with zipfile.ZipFile(archive, 'w') as z:
+            z.write(self.root / 'inner.glb', 'model/inner.glb')
+        kept = target.read_bytes()
+        with self.assertRaisesRegex(rb.Stop, 'DIFFERENT content .*needs review'):
             rb.extract_glb(archive, out)
+        self.assertEqual(target.read_bytes(), kept)                              # never overwritten
+        self.assertFalse(list(out.glob(rb.EXPORT_STAGING + '*')))
 
     def test_zip_with_shaded_and_pbr_prefers_pbr(self):
         make_glb(self.root / 'a.glb')
@@ -1270,7 +1285,9 @@ class RecheckTests(unittest.TestCase):
                 swapped.append(name)
             return result
         session = FakeSession(self.out)
-        with mock.patch.object(rb, '_own_destination', swap_then_check):
+        # prior item 14: on Windows the held folder cannot be renamed at all (FinalLiveTests); this is the pin check behind
+        # it, as it works where no hold exists
+        with mock.patch.object(rb, '_own_destination', swap_then_check), mock.patch.object(rb, 'hold_directory', no_hold):
             with self.assertRaisesRegex(rb.Stop, 'not a plain folder|was replaced'):
                 rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
         self.assertEqual(len(swapped), 3)
@@ -1309,8 +1326,9 @@ class RecheckTests(unittest.TestCase):
                 do_swap()                                                        # after the snapshot, before the upload
                 super().open_workspace()
         session = Swapping(self.out)
-        with self.assertRaisesRegex(rb.Stop, 'upload copies changed after they were hashed .*not a plain folder'):
-            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        with mock.patch.object(rb, 'hold_directory', no_hold):                   # the pin check behind the hold (see above)
+            with self.assertRaisesRegex(rb.Stop, 'upload copies changed after they were hashed .*not a plain folder'):
+                rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
         self.assertFalse([c for c in session.calls if c[0] in ('prepare_multiview', 'click_free_preview')])
         # the same swap after a good submit: collect stops before the paid intent and click
         os.rmdir(swap['target'])
@@ -1454,6 +1472,302 @@ class RecheckTests(unittest.TestCase):
         session = FakeSession(self.out, stages=['geometry_preview', 'export_ready'], costs=self.COSTS)
         self.collect(session)
         self.assertIn(('click', 'geometry'), session.calls)
+
+
+class FinalLiveTests(unittest.TestCase):
+    """review_v2_final_live_20261126: prior item 14 (the pinned upload folder is held against renaming), "interrupted paid
+    export cannot resume" and "a rejected upload strands the unpaid variant"."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.views = make_views(self.root / 'views')
+        self.out = self.root / 'out'
+        env = mock.patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop(rb.paid_gate.ENV, None)                 # a manual run: no gate
+
+    def record(self):
+        return json.loads((self.out / rb.RECORD).read_text())
+
+    def asides(self):
+        return sorted(self.out.glob('studio_submission.not_submitted_*.json'))
+
+    def upload(self):
+        return self.out / rb.UPLOAD_DIR / self.record()['upload_dir_id']['name']
+
+    # -- prior item 14
+    @unittest.skipUnless(os.name == 'nt', 'the share-mode hold exists on Windows only')
+    def test_item14_the_pinned_folder_cannot_be_renamed_during_the_writes_the_upload_or_the_click(self):
+        """The reviewer's trace: the upload directory moved between its pin check and the replacement. With the handle held
+        (no FILE_SHARE_DELETE) the move itself is refused, at every point of the submit."""
+        refused = []
+
+        def try_swap(where):
+            folders = [p for p in (self.out / rb.UPLOAD_DIR).iterdir() if p.is_dir()]
+            self.assertEqual(len(folders), 1)
+            for entry in (folders[0], self.out / rb.UPLOAD_DIR):               # the folder, and its container above it
+                with self.assertRaises(PermissionError, msg=f'{where}: {entry}'):
+                    os.rename(entry, Path(str(entry) + '.aside'))
+                self.assertTrue(entry.is_dir())
+            with self.assertRaises(OSError, msg=where):
+                os.rmdir(folders[0])
+            refused.append(where)
+        real_own = rb._own_destination
+
+        def own(target, name):
+            result = real_own(target, name)
+            if Path(target).parent.name == rb.UPLOAD_DIR:
+                try_swap(f'write {name}')                                        # between the look and the temp file / os.replace
+            return result
+
+        class Session(FakeSession):
+            def open_workspace(self):
+                try_swap('before the upload')
+                super().open_workspace()
+
+            def prepare_multiview(self, paths, config):
+                try_swap('during the upload')
+                for _, path in paths:                                            # the browser can still read the copies
+                    assert Path(path).read_bytes()
+                return super().prepare_multiview(paths, config)
+
+            def click_free_preview(self):
+                try_swap('at the click')
+                super().click_free_preview()
+        session = Session(self.out)
+        with mock.patch.object(rb, '_own_destination', own):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertEqual(self.record()['status'], 'submitted')
+        self.assertGreaterEqual(sum(w.startswith('write ') for w in refused), 3 * len(CONFIG['view_order']))
+        for where in ('before the upload', 'during the upload', 'at the click'):
+            self.assertIn(where, refused)
+        self.assertEqual(rb.verify_upload_inputs(self.out), [])
+        # the hold ends with the submit: the folder can be moved again (and the pin then catches it, as before)
+        folder = self.upload()
+        os.rename(folder, Path(str(folder) + '.aside'))
+        self.assertIn('is gone', rb.verify_upload_inputs(self.out)[0])
+        os.rename(Path(str(folder) + '.aside'), folder)
+
+    @unittest.skipUnless(os.name == 'nt', 'the share-mode hold exists on Windows only')
+    def test_item14_hold_directory_holds_the_entry_itself_and_stops_when_it_cannot(self):
+        folder = self.root / 'held'
+        folder.mkdir()
+        with rb.hold_directory(folder) as held:
+            self.assertTrue(held)
+            with self.assertRaises(PermissionError):
+                os.rename(folder, self.root / 'moved')
+            (folder / 'a.txt').write_text('x')                                   # files inside are not affected
+            os.replace(folder / 'a.txt', folder / 'b.txt')
+            (folder / 'b.txt').unlink()
+        os.rename(folder, self.root / 'moved')                                   # released
+        with self.assertRaisesRegex(rb.Stop, 'could not be held open'):
+            with rb.hold_directory(self.root / 'missing'):
+                self.fail('held a folder that does not exist')
+        snapshot, _, pin = rb.snapshot_inputs({'views_dir': self.views, 'images': list(CONFIG['view_order']),
+                                               'uploaded': list(CONFIG['view_order'])}, self.out)
+        os.rename(snapshot, Path(str(snapshot) + '.aside'))                      # without a caller's stack the hold ended
+        self.assertIn('is gone', rb.upload_pin_problem(self.out, pin))
+
+    # -- interrupted paid export
+    def export_session(self, archive, **kw):
+        test = self
+
+        class Exporting(FakeSession):
+            def export_glb(self, out_dir, config):                               # as SeleniumRodin.export_glb places a download
+                self.calls.append(('export_glb',))
+                target, self.export_adopted = rb.place_glb(archive, Path(out_dir))
+                test.assertFalse(list(Path(out_dir).glob(rb.EXPORT_STAGING + '*')))
+                return target, 'panel .glb 2K'
+        return Exporting(self.out, **kw)
+
+    def archive(self, name='dl.zip', **glb):
+        make_glb(self.root / 'inner.glb', **glb)
+        path = self.root / name
+        with zipfile.ZipFile(path, 'w') as z:
+            z.write(self.root / 'inner.glb', 'model/base_basic_pbr.glb')
+        return path
+
+    def interrupted_after_extraction(self):
+        """A paid collect (0.5-credit geometry confirm) interrupted after the ZIP was extracted and before the export receipt."""
+        rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out))
+        session = self.export_session(self.archive(), stages=['geometry_preview', 'export_ready'],
+                                      costs={'geometry': 0.5, 'material_generate': None, 'material_confirm': None})
+        with mock.patch.object(rb, '_record_export', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                rb.collect(self.out, config=CONFIG, allow_paid=True, accept_preview=True, session_factory=lambda: session)
+        self.assertIn(('click', 'geometry'), session.calls)
+        self.assertNotIn('exports', self.record())                               # no receipt
+        target = self.out / 'glb_base_basic_pbr.glb'
+        self.assertTrue(target.is_file())
+        return target
+
+    def test_the_reviewers_case_an_interrupted_paid_export_resumes_by_adopting_the_identical_glb(self):
+        target = self.interrupted_after_extraction()
+        digest = rb.sha256_file(target)
+        for attempt in range(2):                                                 # "both retries hit FileExistsError"
+            session = self.export_session(self.archive(f'again{attempt}.zip'), stages=['export_ready'])
+            data = rb.collect(self.out, config=CONFIG, session_factory=lambda: session)
+            self.assertFalse([c for c in session.calls if c[0] == 'click'])      # nothing is paid again
+            self.assertEqual(data['status'], 'exported')
+            receipt = data['exports']['GLB']
+            self.assertEqual((receipt['path'], receipt['sha256'], receipt['bytes']), (str(target.resolve()), digest, target.stat().st_size))
+            self.assertTrue(receipt['adopted_existing'])
+            self.assertEqual(receipt['inspection']['problems'], [])
+            if attempt:
+                self.assertFalse(session.calls)                                  # the receipt exists: no browser at all
+        self.assertEqual(sorted(p.name for p in self.out.glob('glb_*')), ['glb_base_basic_pbr.glb'])
+
+    def test_a_different_glb_in_place_stops_the_resumed_export_for_review(self):
+        target = self.interrupted_after_extraction()
+        kept = target.read_bytes()
+        for other in (self.archive('other.zip', triangles=77),                   # same size class, other bytes
+                      self.archive('longer.zip', triangles=123456789)):          # another size
+            session = self.export_session(other, stages=['export_ready'])
+            with self.assertRaisesRegex(rb.Stop, 'Export destination exists with DIFFERENT content .*needs review'):
+                rb.collect(self.out, config=CONFIG, session_factory=lambda: session)
+            self.assertEqual(target.read_bytes(), kept)
+            self.assertNotIn('exports', self.record())
+            self.assertFalse(list(self.out.glob(rb.EXPORT_STAGING + '*')))
+        # a folder under the name is not a file to adopt
+        blocked = self.root / 'blocked'
+        blocked.mkdir()
+        (blocked / 'glb_base_basic_pbr.glb').mkdir()
+        with self.assertRaisesRegex(rb.Stop, 'not a plain file'):
+            rb.place_glb(self.archive('third.zip'), blocked)
+
+    def test_export_staging_and_the_plain_glb_download(self):
+        out = self.root / 'plain'
+        (out / 'downloads').mkdir(parents=True)
+        (out / (rb.EXPORT_STAGING + '999_dead')).mkdir()                         # left by a killed run
+        (out / (rb.EXPORT_STAGING + '999_dead') / 'glb_half.glb').write_bytes(b'half')
+        make_glb(out / 'downloads' / 'model.glb')
+        self.assertEqual(rb.place_glb(out / 'downloads' / 'model.glb', out), (out.resolve() / 'glb_model.glb', False))
+        self.assertFalse(list(out.glob(rb.EXPORT_STAGING + '*')))
+        self.assertEqual(rb.place_glb(out / 'downloads' / 'model.glb', out), (out.resolve() / 'glb_model.glb', True))
+        make_glb(out / 'downloads' / 'model.glb', triangles=5)
+        os.unlink(out / 'glb_model.glb')                                         # (the download was a hard link of it)
+        make_glb(out / 'glb_model.glb', triangles=6)
+        with self.assertRaisesRegex(rb.Stop, 'DIFFERENT content'):
+            rb.place_glb(out / 'downloads' / 'model.glb', out)
+        # no hard links available: a staged copy is renamed into place
+        other = self.root / 'nolink'
+        other.mkdir()
+        with mock.patch.object(rb.os, 'link', side_effect=OSError('no hard links')):
+            target, adopted = rb.place_glb(self.archive('nolink.zip'), other)
+            self.assertEqual((adopted, rb.inspect_glb(target)['problems']), (False, []))
+            self.assertEqual(rb.place_glb(self.archive('nolink.zip'), other), (target, True))
+        self.assertFalse(list(other.glob(rb.EXPORT_STAGING + '*')))
+        # a truncated archive never reaches the final name
+        broken = self.root / 'broken.zip'
+        data = bytearray(self.archive('whole.zip').read_bytes())
+        data[40] ^= 0xFF
+        broken.write_bytes(bytes(data))
+        empty = self.root / 'empty'
+        empty.mkdir()
+        with self.assertRaises((ValueError, zipfile.BadZipFile)):
+            rb.place_glb(broken, empty)
+        self.assertEqual([p.name for p in empty.iterdir() if p.name != rb.RECORD_LOCK], [])
+
+    # -- a rejected upload
+    def test_the_reviewers_case_a_rejected_upload_archives_the_preparing_record_and_the_retry_submits_fresh(self):
+        class Rejected(FakeSession):
+            def prepare_multiview(self, paths, config):
+                self.calls.append(('prepare_multiview', [n for n, _ in paths]))
+                raise rb.Stop(f'Expected {len(paths)} uploaded thumbnails, found {len(paths) - 1}')
+        session = Rejected(self.out)
+        with self.assertRaisesRegex(rb.Stop, 'Expected 4 uploaded thumbnails, found 3; nothing was generated, record moved to '
+                                             'studio_submission.not_submitted_.*a re-run submits again'):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertNotIn(('click_free_preview',), session.calls)
+        self.assertFalse((self.out / rb.RECORD).exists())                        # no stranded 'preparing' record
+        aside = json.loads(self.asides()[0].read_text())
+        self.assertEqual((aside['status'], aside['actions'], aside['model_url'], aside['pending_action']),
+                         ('not_submitted', {}, None, None))
+        self.assertIn('thumbnails', aside['why'])
+        with self.assertRaises(rb.Stop):                                         # twice in one second: neither aside is overwritten
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: Rejected(self.out))
+        self.assertEqual(len(self.asides()), 2)
+        rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: FakeSession(self.out))   # the retry
+        self.assertEqual(self.record()['status'], 'submitted')
+        self.assertEqual(len(self.asides()), 2)
+
+    def test_a_submit_killed_before_its_click_leaves_a_record_the_next_submit_archives(self):
+        for where in ('prepare_multiview', 'wait_balance'):                      # status preparing / ready_to_submit
+            class Killed(FakeSession):
+                pass
+            setattr(Killed, where, lambda self, *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()))
+            with self.assertRaises(KeyboardInterrupt):
+                rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: Killed(self.out))
+            stranded = self.record()
+            self.assertIn(stranded['status'], rb.PRE_CLICK_STATUSES)
+            self.assertTrue(rb.proven_pre_click(stranded))
+            before = len(self.asides())
+            with self.assertRaisesRegex(rb.Stop, 'record status'):               # what the reviewer saw: collect refuses it
+                rb.collect(self.out, config=CONFIG, session_factory=lambda: self.fail('opened'))
+            session = FakeSession(self.out)
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+            self.assertIn(('click_free_preview',), session.calls)
+            self.assertEqual(self.record()['status'], 'submitted')
+            self.assertEqual(len(self.asides()), before + 1)
+            self.assertIn('stopped before the Free Preview click', json.loads(self.asides()[-1].read_text())['why'])
+            shutil.rmtree(self.out, onerror=lambda f, p, _: (os.chmod(p, 0o666), f(p)))
+
+    def test_a_record_with_any_click_intent_is_never_archived(self):
+        """The free intent is written before the click: once it exists the click may have happened."""
+        class ClickDies(FakeSession):
+            def click_free_preview(self):
+                raise KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: ClickDies(self.out))
+        pending = self.record()
+        self.assertEqual((pending['status'], pending['pending_action']), ('ready_to_submit', 'free_preview'))
+        self.assertFalse(rb.proven_pre_click(pending))
+        self.assertIsNone(rb.set_aside_pre_click(self.out, 'x'))
+        with self.assertRaisesRegex(rb.Stop, 'Submission record already exists'):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: self.fail('opened'))
+        self.assertEqual((self.record(), self.asides()), (pending, []))
+        base = {'backend': 'hyper3d', 'status': 'preparing', 'actions': {}, 'pending_action': None, 'model_url': None,
+                'model_id': None, 'project_id': None}
+        self.assertTrue(rb.proven_pre_click(base))
+        for change in ({'actions': {'free_preview': {'intent_at': 'x'}}}, {'actions': {'geometry': {}}},
+                       {'pending_action': 'free_preview'}, {'model_url': URL}, {'model_id': MODEL}, {'project_id': MODEL},
+                       {'submit_clicked_at': 'x'}, {'status': 'submission_attempted'}, {'status': 'submission_needs_review'},
+                       {'status': 'submitted'}, {'status': 'dry_run'}, {'status': 'exported'}, {'backend': None},
+                       {'exports': {'GLB': {}}}, {'credits_committed': 0.5}):
+            self.assertFalse(rb.proven_pre_click({**base, **change}), change)
+        self.assertFalse(rb.proven_pre_click(None))
+
+    def test_set_aside_pre_click_archives_only_under_the_output_lock(self):
+        self.assertIsNone(rb.set_aside_pre_click(self.out, 'x'))                 # no folder, no record
+        self.out.mkdir()
+        rb.Record.create(self.out / rb.RECORD, {'backend': 'hyper3d', 'status': 'preparing', 'actions': {},
+                                                'pending_action': None, 'model_url': None})
+        held, release = threading.Event(), threading.Event()
+
+        def holder():
+            with rb.output_lock(self.out):
+                held.set()
+                release.wait(10)
+        thread = threading.Thread(target=holder)
+        thread.start()
+        try:
+            self.assertTrue(held.wait(10))
+            with self.assertRaisesRegex(rb.Stop, rb.OUTPUT_BUSY):                # another command is handling this output
+                rb.set_aside_pre_click(self.out, 'x')
+            self.assertTrue((self.out / rb.RECORD).exists())
+        finally:
+            release.set()
+            thread.join()
+        aside = rb.set_aside_pre_click(self.out, 'the upload was rejected')
+        self.assertEqual((aside.parent, json.loads(aside.read_text())['why']), (self.out, 'the upload was rejected'))
+        self.assertFalse((self.out / rb.RECORD).exists())
+        (self.out / rb.RECORD).write_text(json.dumps({'status': 'preparing', 'project_id': None}))   # Tripo's studio.mjs record
+        self.assertIsNone(rb.set_aside_pre_click(self.out, 'x'))
+        (self.out / rb.RECORD).write_text('{not json')
+        self.assertIsNone(rb.set_aside_pre_click(self.out, 'x'))
 
 
 class DispatchTests(unittest.TestCase):

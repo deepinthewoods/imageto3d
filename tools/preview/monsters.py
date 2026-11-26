@@ -21,6 +21,7 @@ Card shape (one per monster variant; deliberately none of the keys the outfit ca
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -81,6 +82,27 @@ def _faces(manifest: dict, level: str) -> int | None:
     return None
 
 
+NO_CHOICE = 'none'             # choice revision of a variant without a chosen_lod.json (= v2 monsters_v2.NO_CHOICE)
+
+
+def choice_snapshot(folder: Path) -> tuple[dict, str | None]:
+    """(chosen_lod.json, its revision) from ONE read of the file: the record ({} when absent or not a JSON object) and the revision
+    of exactly those bytes (`c:` + the first 32 hex of their sha256 = v2 monsters_v2.choice_rev; `none` when absent; None when the
+    file exists but could not be read). The card's `lod`, `approved` and `choice_rev` all come from this one snapshot, so the 3D
+    modal never shows one approval with the revision of another (final-live review, blocker 5)."""
+    try:
+        raw = (folder / CHOICE).read_bytes()
+    except FileNotFoundError:
+        return {}, NO_CHOICE
+    except OSError:
+        return {}, None
+    try:
+        value = json.loads(raw.decode('utf-8-sig'))
+    except (UnicodeDecodeError, ValueError):
+        value = None
+    return (value if isinstance(value, dict) else {}), 'c:' + hashlib.sha256(raw).hexdigest()[:32]
+
+
 def _card(base: Path, monster: str, variant: str) -> dict | None:
     views = base / 'pipeline' / monster / 'views' / variant
     model = base / 'pipeline' / monster / 'models' / variant
@@ -114,7 +136,7 @@ def _card(base: Path, monster: str, variant: str) -> dict | None:
              for role, value in (colours.get('roles') or {}).items() if isinstance(value, dict)]
     prompts = _read(views / 'prompts.json')
     source = next((prompts[k] for k in ('source_image', 'source_image_path', 'source') if isinstance(prompts.get(k), str)), None)
-    choice = _read(model / CHOICE)
+    choice, choice_rev = choice_snapshot(model)      # ONE read: level, approval and revision of the same bytes
     status = 'reduced' if lods else 'converted' if highpoly else record.get('status') or 'image only'
     return {'id': f'monster:{monster}/{variant}', 'kind': 'monster', 'name': f'{monster} {variant}', 'monster': monster,
             'variant': variant, 'status': status, 'image': image,
@@ -122,6 +144,7 @@ def _card(base: Path, monster: str, variant: str) -> dict | None:
             'roles': roles, 'highpoly': highpoly, 'highpoly_faces': (record.get('studio_result') or {}).get('faces'),
             'lods': lods, 'lod': choice.get('lod') if choice.get('lod') in LOD_LEVELS else None,
             'approved': choice.get('approved') is True,
+            'choice_rev': choice_rev, 'choice': choice,      # the snapshot `lod` / `approved` were taken from, and its revision
             'record': {key: record.get(key) for key in ('status', 'stage', 'model_url', 'credits_committed') if key in record}}
 
 

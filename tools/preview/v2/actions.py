@@ -1466,7 +1466,9 @@ def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
         return rebuild_stale(root)
     if data['op'] == 'run_now':
         # a monster conversion (recheck findings 4, 5): the task is the one the client displayed (`key` + `generation`, `id` a hint);
-        # overrides the idle gate; while paused by hand 409 `confirm` (with `pause_id`) until the client sends confirm: true + that pause_id
+        # overrides the idle gate; while paused by hand 409 `confirm` = the server's challenge (`pause_id` + `pauses`: the exact pauses
+        # in force, ids and reasons) until the client sends confirm: true + that pause_id while those pauses are still the ones in
+        # force; 409 `unreadable` while supervisor_mode.json cannot be read (final-live review)
         result = monster_lane.run_now(root, data.get('id'), data.get('confirm') is True, data.get('key'), data.get('generation'),
                                       data.get('pause_id'), data.get('conversion_seq'))
         _log_op(root, 'run_now', f'task {result.get("id")} {result.get("key")}' + (' (override pause)' if result.get('override_pause') else ''))

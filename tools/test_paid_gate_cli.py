@@ -313,3 +313,57 @@ def test_checked_dispatch_never_dispatches_through_a_closed_or_busy_gate(tmp_pat
         with pytest.raises(g.GateClosed):
             g.checked_dispatch(lambda: calls.append(3), env, wait=0.05)
     assert calls == [1]
+
+
+# ---------------------------------------------------------------- final-live review, earlier blocker 2: the helper's ping
+def test_blocker2_the_hold_helper_answers_a_ping_only_after_rechecking_its_own_lock(tmp_path):
+    """node's last look before its dispatch: `ping <nonce>` on the helper's stdin is answered `held <nonce>` by the helper that
+    re-checked its lock handle; other lines are ignored; the lock stays held through it."""
+    import paid_gate as g
+    holder, said = _holder(tmp_path, '--what', 'a paid click')
+    try:
+        assert said == 'held' and g.lock_busy(tmp_path)
+        for nonce in ('1', 'abc-7'):
+            holder.stdin.write(f'noise\nping {nonce}\n')
+            holder.stdin.flush()
+            assert holder.stdout.readline().strip() == f'held {nonce}'
+            assert g.lock_busy(tmp_path) and holder.poll() is None
+        holder.stdin.write('ping\n')                             # without a nonce
+        holder.stdin.flush()
+        assert holder.stdout.readline().strip() == 'held'
+        holder.stdin.close()
+        assert holder.wait(10) == 0 and not g.lock_busy(tmp_path)
+    finally:
+        _end(holder)
+
+
+def test_blocker2_verify_rechecks_the_lock_itself(tmp_path):
+    import paid_gate as g
+    lock = g.transition_lock(tmp_path, what='verify')
+    assert lock.verify() is False                                 # never taken
+    with lock:
+        assert lock.verify() is True and lock.verify() is True    # the probe leaves the lock as it is
+        with __import__('pytest').raises(g.GateBusy):
+            with g.transition_lock(tmp_path, wait=0.05):
+                pass
+        g._unlock(lock.handle)                                    # the lock is gone under the holder that still thinks it has it
+        assert lock.owned() is True and lock.verify() is False
+        assert g._try_lock(lock.handle) and lock.verify() is True
+        handle, lock.handle = lock.handle, None
+        assert lock.verify() is False                             # no handle
+        lock.handle = handle
+    assert lock.verify() is False                                 # released
+    with g.transition_lock(tmp_path) as second:
+        second.handle.close()                                     # a closed handle holds nothing
+        assert second.verify() is False
+
+
+def test_blocker2_a_helper_that_lost_its_lock_says_lost_and_leaves(tmp_path, monkeypatch, capsys):
+    import io
+    import types
+    import paid_gate as g
+    monkeypatch.setattr(g.transition_lock, 'verify', lambda self: False)
+    monkeypatch.setattr(g.sys, 'stdin', types.SimpleNamespace(buffer=io.BytesIO(b'ping 9\nping 10\n')))
+    assert g.hold_main(['--root', str(tmp_path)]) == 1
+    assert capsys.readouterr().out.split('\n') == ['held', 'lost 9', '']   # one answer, then it is gone (nothing for ping 10)
+    assert not g.lock_busy(tmp_path)

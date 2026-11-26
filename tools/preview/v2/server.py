@@ -392,7 +392,7 @@ def make_handler(root: Path, token: str, web: Path = WEB, ctx: dict | None = Non
                 self.send_json(200, result)
             except guard.Conflict as exc:
                 catalog.invalidate()
-                extra = {k: v for k, v in (getattr(exc, 'extra', None) or {}).items() if k in ('changes', 'file', 'files', 'pause_id')}   # `changes` of 409 changed / stale; `file(s)` of a monster 409 missing; `pause_id` of a monster 409 confirm
+                extra = {k: v for k, v in (getattr(exc, 'extra', None) or {}).items() if k in ('changes', 'file', 'files', 'pause_id', 'pauses')}   # `changes` of 409 changed / stale; `file(s)` of a monster 409 missing; `pause_id` + `pauses` of a monster 409 confirm (the Run now challenge: its id and the pauses to show)
                 extra |= {'rev': exc.current} if isinstance(exc, decisions.RevConflict) else {}
                 self.send_json(409, {'ok': False, 'error': str(exc), 'code': exc.code, 'item': self.current_item(body)} | extra)
             except catalog.NotFound as exc:

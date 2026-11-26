@@ -513,6 +513,44 @@ def test_blocker6_a_record_is_dropped_only_when_the_process_is_confirmed_gone(ro
     assert sorted(r['pid'] for r, _ in sup.resume_failures) == [112, 120]
 
 
+def test_blocker6_a_paused_tick_keeps_the_record_of_a_pid_whose_start_time_is_unreadable(root, monkeypatch):
+    """Final-live review, earlier blocker 6 (the reviewer's case): while paused, a tick on which the suspended pid's start time
+    could not be read erased its record in freeze(), so the process was never resumed. freeze applies the confirmed-gone rule
+    of resume: the record stays, the process is not suspended a second time, and it is resumed once the pause ends."""
+    rows, sent = table(root), []
+    by_pid = {row['pid']: row for row in rows}
+    monkeypatch.setattr(ps, 'process_table', lambda: rows)
+    sup = make_sup(root)
+    monkeypatch.setattr(sup, 'send', lambda pid, sig, start=None: sent.append((pid, sig, start)))
+    sup.run_cmd.screen = '(false,)\n'
+    sup.tick_screen()                                                        # the pause: the four heavy processes are suspended
+    records = json.loads(sup.pids_file.read_text())
+    assert sorted(r['pid'] for r in records) == [111, 112, 118, 120]
+    readable = by_pid[111]['start']
+    by_pid[111]['start'] = 0                                                 # psutil could not read it on this tick
+    by_pid[118]['start'] += 500                                              # a later process has this pid: the old one is gone
+    rows.remove(by_pid[120])                                                 # ended: confirmed gone
+    del sent[:]
+    for _ in range(3):                                                       # paused ticks
+        sup.tick_screen()
+        assert sup.paused
+    assert sup.freeze(rows) == []
+    later = {'pid': 118, 'start': by_pid[118]['start'], 'comm': 'python3'}   # the new heavy process with pid 118 was frozen
+    assert json.loads(sup.pids_file.read_text()) == [r for r in records if r['pid'] in (111, 112)] + [later]
+    assert [s for s in sent if s[1] == ps.SIGSTOP] == [(118, ps.SIGSTOP, later['start'])]   # 111 / 112 never a second time
+    assert not [s for s in sent if s[1] == ps.SIGCONT]
+    by_pid[111]['start'] = readable
+    sup.run_cmd.screen = '(true,)\n'
+    sup.tick_screen()                                                        # the pause ends: every recorded process continues
+    assert sorted(s[0] for s in sent if s[1] == ps.SIGCONT) == [111, 112, 118]
+    assert (111, ps.SIGCONT, readable) in sent
+    assert not sup.pids_file.exists()
+    # a malformed entry is not a record of anything and never breaks a tick
+    ps.atomic_write(sup.pids_file, [{'pid': 112}, 'x', {'pid': 112, 'start': by_pid[112]['start'], 'comm': 'python3'}])
+    assert sorted(r['pid'] for r in sup.freeze(rows)) == [111, 118]          # 112 is on record
+    assert sorted(r['pid'] for r in json.loads(sup.pids_file.read_text())) == [111, 112, 118]
+
+
 # ---------------------------------------------------------------- gate 1
 def gate1_ready(root, **kwargs):
     for race in RACES:

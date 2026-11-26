@@ -26,6 +26,10 @@ Non-python children (tools/tripo_pipeline/studio.mjs before its Generate click) 
                                          it until its stdin closes (the caller is done, or died), then exits 0; exit EXIT_LOCK_BUSY
                                          (prints "busy") when it could not be taken within S seconds. node holds the lock this way
                                          (tripo_pipeline/paid_click.mjs takeGateMutex), so it never depends on a lock expiring.
+                                         While it holds, each stdin line "ping <nonce>" is answered on stdout with "held <nonce>"
+                                         after the helper RE-CHECKED its own lock handle (transition_lock.verify), or with
+                                         "lost <nonce>" (it then releases and exits 1). node asks this immediately before its
+                                         dispatch, after the intent write (final-live review, earlier blocker 2).
 
 The pauses (post-cut-over review, blockers 1 and 3; DESIGN_PHASE4.md I.11). Three INDEPENDENT things pause conversions, each closes
 the gate by itself and none is overridden by anything but `override_pause`:
@@ -275,6 +279,23 @@ class transition_lock:
         """This holder has the lock. (An OS lock cannot be taken away from a live holder; kept for the callers of the old mutex.)"""
         return self.held
 
+    def verify(self) -> bool:
+        """Re-check the lock itself, not this object's memory of it (final-live review, earlier blocker 2; the `hold` helper
+        answers node's ping with it): this holder's handle is still open AND the lock byte is still locked, i.e. a second handle
+        cannot take it (handles exclude each other inside one process too). False when anything about that cannot be shown."""
+        handle = self.handle
+        if not self.held or handle is None or handle.closed:
+            return False
+        try:
+            os.fstat(handle.fileno())
+            with open(self.path, 'a+b') as probe:
+                if _try_lock(probe):          # free: this holder does not have it (any more)
+                    _unlock(probe)
+                    return False
+        except (OSError, ValueError):
+            return False
+        return True
+
     def __enter__(self):
         import time
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -302,8 +323,8 @@ class transition_lock:
             return
         try:
             _unlock(handle)
-        except OSError:
-            pass          # closing the handle releases it as well
+        except (OSError, ValueError):
+            pass          # closing the handle releases it as well (ValueError: it was closed already)
         finally:
             handle.close()
 
@@ -331,7 +352,9 @@ def hold_main(args) -> int:
     """`hold --root R [--wait S] [--what TEXT]`: take the gate transition lock for the calling process (node), say "held", keep it
     until stdin closes (the caller finished its critical section, or died), release it and exit 0. "busy" + EXIT_LOCK_BUSY when it
     could not be taken. If THIS process dies the kernel releases the lock; the caller notices that the helper is gone (`owned()` in
-    paid_click.mjs) before it dispatches."""
+    paid_click.mjs) before it dispatches. A stdin line `ping <nonce>` is answered with `held <nonce>` when the lock handle was
+    re-checked and is still held (transition_lock.verify), else with `lost <nonce>` and exit 1: node's last look before its
+    dispatch (`verify()` in paid_click.mjs). Any other line is ignored."""
     import argparse
     parser = argparse.ArgumentParser(prog='paid_gate.py hold')
     parser.add_argument('--root')
@@ -346,11 +369,21 @@ def hold_main(args) -> int:
         print('no root', flush=True)
         return 2
     try:
-        with transition_lock(root, wait=opts.wait, what=opts.what):
+        with transition_lock(root, wait=opts.wait, what=opts.what) as lock:
             print('held', flush=True)
             try:
-                while sys.stdin.buffer.read(4096):   # until EOF: the caller closed its end, or is gone
-                    pass
+                while True:
+                    line = sys.stdin.buffer.readline()   # until EOF: the caller closed its end, or is gone
+                    if not line:
+                        break
+                    words = line.split()
+                    if words[:1] != [b'ping']:
+                        continue
+                    nonce = words[1].decode('ascii', 'replace') if len(words) > 1 else ''
+                    held = lock.verify()
+                    print(f"{'held' if held else 'lost'} {nonce}".rstrip(), flush=True)
+                    if not held:
+                        return 1
             except (OSError, ValueError):
                 pass
     except GateBusy:

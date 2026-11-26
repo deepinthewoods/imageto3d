@@ -1527,6 +1527,19 @@ def task_view(task: dict, now: float, stall_minutes: int = DEFAULTS['build_stall
             'token': task.get('token') if task['state'] in taskqueue.ACTIVE else None}
 
 
+def publish_outcome(root: Path, task: dict, view: dict) -> dict:
+    """A failed / cancelled monster row is published with its failure AND the disposition revision TOGETHER (final-live review,
+    blocker 4): `conversion_seq`, `outcome_seq` (the `seq` of the recorded outcome shown, None without one) and `error` all come from
+    ONE read of the variant's views.json (monster_lane.shown_outcome). The row itself was read earlier; when it carries another
+    outcome than the one that revision belongs to (a Retry and a second failure happened in between), the row shows the failure of
+    the revision, so the Retry that echoes `conversion_seq` clears exactly the failure on screen."""
+    shown = monster_lane.shown_outcome(root, task)
+    view['conversion_seq'] = shown['conversion_seq']
+    view['outcome_seq'] = (shown['disposition'] or {}).get('seq')
+    view['error'] = shown['error']
+    return view
+
+
 def queue_state(root: Path, active: bool, now: float | None = None) -> dict:
     """GET /api/v2/queue. The rows come in three groups (re-check R16): EVERY active attempt (starting / running / stalled / orphan) first, never
     truncated, newest first; then queued tasks (newest first, at most OPEN_PAGE); then failed / done / cancelled ones of the last 24 h (newest first,
@@ -1547,9 +1560,9 @@ def queue_state(root: Path, active: bool, now: float | None = None) -> dict:
     pool = pool_status(root)
     stall = read_settings(root)['build_stall_minutes']
     views = [task_view(t, now, stall) for t in tasks]
-    for task, view in zip(tasks, views):                        # a monster row's disposition revision: Retry echoes it (blocker 4)
+    for task, view in zip(tasks, views):                        # a monster row's failure + disposition revision, as ONE outcome
         if task['lane'] == monster_lane.LANE and task['state'] in ('failed', 'cancelled'):
-            view['conversion_seq'] = monster_lane.shown_seq(root, task)
+            publish_outcome(root, task, view)
     try:
         monsters = monster_lane.lane_status(root)
     except Exception as exc:  # noqa: BLE001  (display only: a damaged monster root never breaks the queue view)

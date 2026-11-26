@@ -993,9 +993,11 @@ def reduced_complete(mdir: Path) -> bool:
     return reduced_files_problem(mdir) is None
 
 
-def write_reduce_ok(mdir: Path, frozen: dict) -> dict:
+def write_reduce_ok(mdir: Path, frozen: dict, source: dict | None = None) -> dict:
     """The lane's generation-bound success record `reduced/v2_reduce_ok.json` (phase 5 review F12), written only after every output
-    validated: {schema, generation (the frozen digest), frozen_time, files {name: {sha256, size}}, materials: true, time}."""
+    validated: {schema, generation (the frozen digest), frozen_time, files {name: {sha256, size}}, materials: true, time}. `source`
+    ({file, sha256}: the RECEIPTED high-poly GLB the lane handed to the reducer and verified before and after the reduction;
+    final-live review, "reduction can certify the wrong model") is stored as `source`."""
     mdir = Path(mdir)
     problem = reduced_files_problem(mdir)
     if problem:
@@ -1005,6 +1007,8 @@ def write_reduce_ok(mdir: Path, frozen: dict) -> dict:
              for name in (*LEVEL_FILES, 'manifest.json', 'materials.json')}
     record = {'schema': 1, 'generation': frozen_digest(frozen), 'frozen_time': frozen.get('time'), 'files': files, 'materials': True,
               'time': now(), 'by': 'v2 monster lane'}
+    if source is not None:
+        record['source'] = dict(source)
     if len(mdir.parents) > 3:
         contained(mdir.parents[3], red / REDUCE_OK)
     guard.write_atomic(red / REDUCE_OK, dump(record))
@@ -1062,11 +1066,39 @@ def record_of(mdir: Path) -> dict | None:
     return value if isinstance(value, dict) else None
 
 
+def hyper3d_backend():
+    """tools/hyper3d_pipeline/rodin_backend (imported on first use: it is the authority on what a submission record proves)."""
+    folder = str(Path(__file__).resolve().parents[2] / 'hyper3d_pipeline')
+    if folder not in sys.path:
+        sys.path.insert(0, folder)
+    import rodin_backend
+    return rodin_backend
+
+
+def proven_unsubmitted(record: dict | None) -> bool:
+    """A record of a PROVEN pre-click failure that is still at studio_submission.json (final-live review, "a rejected upload strands
+    the unpaid variant"): `rodin_backend.proven_pre_click` (a pre-click status with no action or intent of any kind, no pending
+    action, no model URL / id, no click time, no export). The backend's wrappers archive such a record themselves as
+    `studio_submission.not_submitted_<time>.json` (on the pre-click stop and at the start of a new submit); one that is still in
+    place leaves the variant UNSUBMITTED all the same: Retry / Use enabled views submit again. A record with any click intent is
+    never one (it stays, for review). False when the backend cannot be asked (fail closed: the record counts)."""
+    if not isinstance(record, dict):
+        return False
+    try:
+        return bool(hyper3d_backend().proven_pre_click(record))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def conversion_started(mdir: Path) -> bool:
-    """A conversion record, a downloaded GLB or a reduced folder exists (a Use enabled views would pay again: Reconvert only)."""
+    """A conversion record, a downloaded GLB or a reduced folder exists (a Use enabled views would pay again: Reconvert only). A
+    record of a proven pre-click failure (proven_unsubmitted; one the backend archived as `studio_submission.not_submitted_*.json`
+    is no record at all) does not count: nothing was submitted, let alone paid."""
     mdir = Path(mdir)
     hyper = mdir / 'hyper3d'
-    return (hyper / 'studio_submission.json').is_file() or any(hyper.glob('glb_*.glb')) or (mdir / 'reduced').exists()
+    record = hyper / 'studio_submission.json'
+    started = record.is_file() and not proven_unsubmitted(record_of(mdir))
+    return started or any(hyper.glob('glb_*.glb')) or (mdir / 'reduced').exists()
 
 
 # ------------------------------------------------------------------------------------------------------------- view tasks
@@ -2467,6 +2499,23 @@ def disposition_seq(vj: dict | None) -> int:
     return max([e['seq'] for e in entries if isinstance(e, dict) and isinstance(e.get('seq'), int)] or [0])
 
 
+def outcome_error(disposition: dict | None, row_state: object, row_error: object) -> object:
+    """The error text a failed / cancelled lane row is PUBLISHED with, next to `conversion_seq` (final-live review, blocker 4): the
+    row and views.json are two reads, so a row read before a Retry + second failure would otherwise be shown with the revision of the
+    second failure (and its Retry would clear a failure the user never saw). Row and revision are therefore shown as ONE outcome:
+    when the disposition of the views.json snapshot the revision comes from is not the outcome the row carries (another reason, or
+    another state), the DISPOSITION's reason is shown; the row's own (possibly longer) text is kept only when it is that outcome."""
+    if not isinstance(disposition, dict):
+        return row_error
+    state, reason = disposition.get('state'), str(disposition.get('reason') or disposition.get('state') or '')
+    if state == 'cancelled':
+        return row_error if row_state == 'cancelled' else f'cancelled: {reason}'
+    text = str(row_error or '')
+    if row_state == state and (text[:300] == reason or (reason and text.startswith(reason))):
+        return row_error
+    return reason if row_state == state else f'{state}: {reason}'
+
+
 def set_disposition(root: Path, monster: str, variant: str, generation: str, value: dict | None, expect_seq: int | None = None,
                     only_absent: bool = False) -> dict:
     """Write (value) or clear (None) the disposition of a frozen generation under the monster lock, as ONE read-compare-write (finding 3).
@@ -2616,7 +2665,8 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
     Recheck (findings 3-5): `key` + `generation` = the identity of the displayed task (Run now / Retry / Cancel must echo both; a row id
     is only a hint), `pause_id` = the manual pause of conversions in force (a confirmed Run now echoes it), `disposition_pending` = a
     failure / cancellation that could not be written to views.json yet (shown as an error; nothing is queued again meanwhile).
-    `conversion_seq` = the variant's disposition revision as displayed (Retry / Run now of a failed or cancelled task echo it)."""
+    `conversion_seq` = the variant's disposition revision as displayed (Retry / Run now of a failed or cancelled task echo it); the
+    `error` of a failed / cancelled task is the outcome THAT revision belongs to (outcome_error; `vj` is one snapshot)."""
     import monster_lane
     mdir = models_dir(mroot, monster, variant)
     record = record_of(mdir)
@@ -2647,6 +2697,7 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
     known = [a['credits'] for a in confirmed if isinstance(a['credits'], (int, float))]
     step = 'reduce' if reduced else record_step(mdir, record)
     error, waiting = None, None
+    g = None                                                    # the ONE gate snapshot: waiting reason, pause ids and their reasons
     if view is None:
         if reduced:
             state = 'done'
@@ -2666,6 +2717,10 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
         error = verdict.get('error') or view.get('error') or view['state']
         if view['state'] == 'cancelled':
             error = f'cancelled: {error}'
+        # the failure `conversion_seq` (same `vj` snapshot) belongs to, when the row carries another outcome (blocker 4)
+        shown = outcome_error(disposition, view['state'], error)
+        if shown is not error:
+            error, verdict = shown, {}
         step = VERDICT_STEP.get(verdict.get('step'), step)
     else:                                                       # queued: waiting for its gate, its backoff or the running one
         state = 'queued'
@@ -2675,7 +2730,7 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
         elif with_gate:
             g = monster_lane.gate(root, task.get('args'))
             if not g['open']:
-                state, waiting = 'waiting', g['code'] or g['reason']
+                state, waiting = 'waiting', (g['reason'] if g.get('mode_unreadable') else g['code'] or g['reason'])
             elif monster_lane.lane_tasks(root, state=monster_lane.taskqueue.ACTIVE, limit=5):
                 state, waiting = 'waiting', 'another monster conversion is running'
     accounting = monster_lane.accounting_error(root, mdir / 'hyper3d' / 'studio_submission.json')
@@ -2685,9 +2740,12 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
         error = f'{error}; {text}' if error else text
         if state in ('waiting', 'queued', 'running'):
             state, waiting = 'failed', None
-    manual = monster_lane.modes.manual_pause(root) if with_gate else None
+    if g is None and with_gate:
+        g = monster_lane.gate(root, (task or {}).get('args'))
+    # `pause_id` + `pauses` (each {pause_id, kind, reason}) come from the SAME gate snapshot as `waiting_reason`. They are a hint
+    # only: Run now always asks the server, which answers 409 `confirm` with the exact pauses to show (the challenge).
     return {'task_id': view['id'] if view else None, 'key': view['key'] if view else None,
-            'pause_id': manual['pause_id'] if manual else None, 'disposition_pending': pending,
+            'pause_id': g['pause_id'] if g else None, 'pauses': list(g['pauses']) if g else [], 'disposition_pending': pending,
             'state': state, 'step': step, 'waiting_reason': waiting,
             'paid': bool(confirmed), 'paid_uncertain': [a['action'] for a in paid if a['status'] == 'uncertain'],
             'credits': round(sum(known), 3) if known else None, 'error': error, 'attempts': view['attempts'] if view else 0,
@@ -2785,7 +2843,7 @@ def variant_card(root: Path, mroot: Path, raw: dict, tasks: dict) -> dict:
             'thumbnail': raw.get('image'), 'thumbnail_kind': None, 'model': lods[lod]['url'] if lod else None, 'races': [],
             'badges': badges, 'actions': actions, 'progress': None, 'monster': monster, 'variant': variant, 'library_hint': hint,
             # the approval revision the card shows: its hover Unapprove echoes it (post-cut-over blocker 5)
-            'approval_rev': choice_snapshot(models_dir(mroot, monster, variant))[1] if 'unapprove' in actions else None}
+            'approval_rev': raw_choice(mroot, raw)[1] if 'unapprove' in actions else None}
 
 
 def _newest_mtime(folder: Path) -> float | None:
@@ -2865,10 +2923,20 @@ def _verify_raw(mroot: Path, raw: dict) -> dict:
     status = reduce_status(mdir, generation)
     out = raw | {'verified': status['ok'], 'verify_problem': status['problem'], 'legacy_reduce': bool(status.get('legacy'))}
     if raw.get('approved') and status['ok']:
-        problem = approval_problem(mdir, read_choice(mdir), generation, bool(status.get('legacy')))
+        problem = approval_problem(mdir, raw_choice(mroot, raw)[0], generation, bool(status.get('legacy')))
         if problem:
             out |= {'verified': False, 'verify_problem': problem}
     return out
+
+
+def raw_choice(mroot: Path, raw: dict) -> tuple[dict, str]:
+    """(chosen_lod.json, its approval revision) AS THE RAW CARD READ IT (monsters.choice_snapshot: `choice` + `choice_rev`, the one
+    read its `lod` and `approved` come from). Display, stage, approval check and the `approval_rev` a card / item shows all use this
+    one snapshot, so a concurrent approval can never give "the level of one approval with the revision of another" (final-live
+    review, blocker 5). A raw without a snapshot (a flat pick to import, a damaged card) is read now (choice_snapshot, strict)."""
+    if isinstance(raw.get('choice'), dict) and isinstance(raw.get('choice_rev'), str):
+        return raw['choice'], raw['choice_rev']
+    return choice_snapshot(models_dir(mroot, raw['monster'], raw['variant']))
 
 
 def variant_raws(root: Path) -> list[dict]:
@@ -3007,7 +3075,9 @@ def _variant_item(root: Path, mroot: Path, monster: str, variant: str, raw: dict
     generation = frozen_digest((vj or {}).get('frozen'))
     reduce = reduce_status(mdir, generation) if raw.get('lods') else None
     return raw | {'stage': card['stage'], 'card': card, 'lods': lods, 'damaged': None,
-                  'approval_rev': choice_snapshot(mdir)[1],   # the approval revision shown: Unapprove echoes it (blocker 5)
+                  # the approval revision shown (Unapprove echoes it, blocker 5): the revision of the SAME chosen_lod.json snapshot
+                  # that `lod`, `approved`, the stage and the card were built from (final-live review, blocker 5)
+                  'approval_rev': raw_choice(mroot, raw)[1],
                   'views': views, 'views_json': vj, 'views_rev': views_rev(vdir, vj), 'phase': phase,
                   'legacy': phase == 'legacy' or bool(reduce and reduce.get('legacy')),
                   'importable': importing, 'unattended': bool((vj or {}).get('unattended')), 'frozen': frozen,

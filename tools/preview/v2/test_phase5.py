@@ -184,7 +184,10 @@ elif cmd == 'collect':
         sys.exit(3)
     (out / 'glb_m1.glb').write_bytes(b'glb')
     data['status'] = 'exported'
-    data['exports'] = {'GLB': {'path': str(out / 'glb_m1.glb')}}
+    # the export receipt of rodin_backend._record_export: the file, its size and its sha256
+    data['exports'] = {'GLB': {'path': str(out / 'glb_m1.glb'), 'bytes': 3, 'sha256': sha(out / 'glb_m1.glb')}}
+    if mode == 'no_receipt_sha':                 # an older record: the receipt names the file only
+        data['exports'] = {'GLB': {'path': str(out / 'glb_m1.glb')}}
     rec.write_text(json.dumps(data))
     print(json.dumps({'status': 'exported'}, indent=2))
 else:
@@ -192,25 +195,39 @@ else:
 '''
 
 FAKE_REDUCE = r'''
-import json, os, pathlib, sys
+import hashlib, json, os, pathlib, sys
 mroot = pathlib.Path(__file__).resolve().parents[1]
 with open(mroot / 'calls.jsonl', 'a', encoding='utf-8') as log:
     log.write(json.dumps({'script': 'reduce_monster.py', 'argv': sys.argv[1:]}) + '\n')
 monster, _, variant = sys.argv[1].partition('/')
 model = mroot / 'pipeline' / monster / 'models' / variant
 out = model / 'reduced'
+mode = os.environ.get('FAKE_REDUCE')
+# like the real reduce_monster.py: --glb + --sha256 name the exact model; a mismatch is refused before anything is touched
+source = sha = None
+if '--glb' in sys.argv:
+    source, sha = pathlib.Path(sys.argv[sys.argv.index('--glb') + 1]), sys.argv[sys.argv.index('--sha256') + 1]
+    if not source.is_file() or hashlib.sha256(source.read_bytes()).hexdigest() != sha:
+        raise SystemExit(f'{source} is not the expected model before the reduction; nothing was reduced from it')
+else:
+    source = sorted((model / 'hyper3d').glob('glb_*.glb'))[0]      # the old manual behaviour: whatever GLB is there
+if mode == 'other_glb':                          # a reducer that ignores its flags and takes another GLB of the folder
+    source, sha = sorted(p for p in (model / 'hyper3d').glob('glb_*.glb') if p != source)[0], None
 if out.exists():
     if '--redo' not in sys.argv:
         raise SystemExit(f'{out} exists; pass --redo')
     out.rename(model / f'reduced_prev_test_{len(list(model.glob("reduced_prev_test*")))}')
-if os.environ.get('FAKE_REDUCE') == 'fail':
+if mode == 'fail':
     raise SystemExit('reduction failed (exit 1, missing levels)')
 out.mkdir(parents=True)
 for lv in ('0p8', '0p6', '0p4', '0p2', '0p1'):
     (out / f'lod_error_{lv}.glb').write_bytes(b'glb' + lv.encode())
 (out / 'manifest.json').write_text(json.dumps({'levels': {lv: {'triangles': 100} for lv in ('0p8', '0p6', '0p4', '0p2', '0p1')}}))
-if os.environ.get('FAKE_REDUCE') != 'no_materials':
-    (out / 'materials.json').write_text(json.dumps({'materials': {}}))
+if mode == 'swap_during':                        # the receipted file is replaced while the reducer runs
+    source.write_bytes(b'another model of the same name')
+if mode != 'no_materials':
+    (out / 'materials.json').write_text(json.dumps({'materials': {}, 'source': f'hyper3d/{source.name}',
+                                                    **({'source_sha256': sha} if sha else {})}))
 print(f'{sys.argv[1]}: 1 s')
 '''
 
@@ -1281,6 +1298,7 @@ class AccountingTest(MonsterCase):
         (hyper / 'glb_m9.glb').write_bytes(b'glb')
         (hyper / 'studio_submission.json').write_text(json.dumps({
             'backend': 'hyper3d', 'status': 'exported', 'model_id': 'm9', 'model_url': 'https://h/m9', 'pending_action': None,
+            'exports': {'GLB': {'path': str(hyper / 'glb_m9.glb'), 'bytes': 3, 'sha256': hashlib.sha256(b'glb').hexdigest()}},
             'actions': {'free_preview': {}, 'geometry': {'confirmed_at': 't', 'observed_cost': 0.5}}, 'credits_committed': 0.5,
             'inputs': [{'name': 'front.png', 'sha256': gen['sha256']['front.png'], 'size': 1}], 'images_uploaded': ['front.png']}))
         verdict = monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None)
@@ -1714,6 +1732,9 @@ class WiringTest(MonsterCase):
             ident = {'id': r['task']} | self.ident(r['task'])
             status, r3 = call('POST', '/api/v2/queue', {'op': 'run_now'} | ident)
             self.assertEqual((status, r3['code']), (409, 'confirm'))
+            # the challenge over HTTP: the exact pauses to show (final-live review), each id = its source + file revision
+            self.assertEqual([(p['kind'], p['reason']) for p in r3['pauses']], [('mode', 'mode pause-conversions')])
+            self.assertEqual(r3['pause_id'], r3['pauses'][0]['pause_id'])
             self.assertEqual(r3['pause_id'], call('GET', '/api/v2/state')[1]['status']['pause_id'])
             self.assertEqual(r3['pause_id'], call('GET', '/api/v2/queue')[1]['mode']['pause_id'])
             status, r4 = call('POST', '/api/v2/queue', {'op': 'run_now', 'confirm': True} | ident)
@@ -2060,7 +2081,7 @@ class RecheckPauseTest(RecheckCase):
         os.remove(batch / 'supervisor_mode.json')
         (batch / 'supervisor_mode.json').write_text(body)                                         # resume ... pause again, the same second
         b = modes.read_mode(self.root)['pause_id']
-        self.assertTrue(a.startswith('file:') and b.startswith('file:') and a != b)
+        self.assertTrue(a.startswith('mode:file:') and b.startswith('mode:file:') and a != b)   # (source + file revision)
         self.assertEqual(b, modes.read_mode(self.root)['pause_id'])                               # stable while the file is not rewritten
         modes.write_mode(self.root, 'views-run')
         pause = json.dumps({'since': 's', 'reason': 'manual pause-conversions', 'scope': ['conversions']})
@@ -4022,6 +4043,516 @@ class PostCutoverApprovalTest(FinalVerifyCase):
         with mock.patch.object(mv, 'choice_snapshot', snapshot):
             mv.write_choice(self.root, mid, False, approval_rev=first['approval_rev'])
         self.assertEqual(seen[-1], 1)                             # (earlier strict reads of the damage check are unlocked)
+
+
+class FinalLiveCase(FinalVerifyCase):
+    """Shared fixture of the final-live regressions (.codex_jobs/review_v2_final_live_20261126/result.md, the monster findings)."""
+
+    def fail_attempt(self, task_id, error):
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, f'tok-{error}', None)
+        orch = orchestrator.Orchestrator(self.root, idle=lambda: 10.0, scan_stale=False)
+        orch._finish(q.get(task_id), {'exit': 1, 'last_json': {'status': 'failed', 'step': 'collect', 'error': error}})
+        self.assertEqual(q.get(task_id)['state'], 'failed')
+
+    def drive(self, v, **extra):
+        return monster_lane.run_conversion(self.root, 'Giant Rat', v, run_now=True, idle=10, idle_known=True, say=lambda t: None, **extra)
+
+    def scripts(self):
+        return [c['script'] for c in self.calls()]
+
+
+class FinalLivePauseTest(FinalLiveCase):
+    """Blocker 1 (consent = pause SOURCE + file revision), "payment without pause confirmation" (an unreadable mode holds dispatch and
+    refuses Run now) and "undisclosed maintenance override" (Run now is confirmed through the server's challenge)."""
+
+    def pause_file(self, reason, **extra):
+        guard.write_atomic(self.batch() / 'PAUSE', json.dumps({'since': 's', 'reason': reason, 'scope': ['conversions']} | extra).encode())
+
+    def child_gate(self, args):
+        env = paid_gate.env_for(self.root, override_pause=True, cmd=monster_lane.gate_command(self.root, args, 10, True))
+        return paid_gate.closed_reason(env)
+
+    def test_foreign_pause_that_keeps_its_pause_id_but_changes_its_reason_needs_new_consent(self):
+        # The reviewer's case: a foreign PAUSE carries its own `pause_id`; it is rewritten with another reason and the SAME pause_id.
+        mid, v, task_id, gen = self.frozen()
+        ident = {'id': task_id} | self.ident(task_id)
+        self.pause_file('maintenance: A', pause_id='kept-by-its-writer')
+        with self.assertRaises(monster_lane.ConfirmPaused) as caught:
+            actions.queue_op(self.root, {'op': 'run_now'} | ident)
+        id_a = caught.exception.extra['pause_id']
+        self.assertTrue(id_a.startswith('pause:file:'), id_a)                                    # the source and the file revision
+        self.assertNotIn('kept-by-its-writer', id_a)                                            # never the id stored in the file
+        actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': id_a} | ident)
+        args = taskqueue.for_root(self.root).get(task_id)['args']
+        self.assertEqual(args['override_pause'], id_a)
+        self.assertTrue(monster_lane.gate(self.root, args, 10, True)['open'])
+        self.assertIsNone(self.child_gate(args))
+        self.pause_file('maintenance: B (nobody confirmed this)', pause_id='kept-by-its-writer')  # same stored id, another reason
+        gate = monster_lane.gate(self.root, args, 10, True)
+        self.assertEqual((gate['open'], gate['code'], gate['needs_confirm']), (False, 'paused', True))
+        self.assertNotEqual(gate['pause_id'], id_a)
+        self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])     # the lane
+        self.assertIn('maintenance: B', self.child_gate(args))                                              # the paid child
+        with self.assertRaises(monster_lane.ConfirmPaused) as caught:                                      # the old consent, echoed again
+            actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': id_a} | ident)
+        self.assertEqual([p['reason'] for p in caught.exception.extra['pauses']], ['maintenance: B (nobody confirmed this)'])
+        # the very same bytes written again are another revision too (a consent is for one write of the file)
+        id_b = monster_lane.pause_id(self.root)
+        self.pause_file('maintenance: B (nobody confirmed this)', pause_id='kept-by-its-writer')
+        self.assertNotEqual(monster_lane.pause_id(self.root), id_b)
+
+    def test_the_id_names_the_source_and_a_foreign_mode_rewrite_is_a_new_pause(self):
+        mode_file = self.batch() / 'supervisor_mode.json'
+        guard.write_atomic(mode_file, json.dumps({'mode': 'pause', 'since': 's', 'pause_id': 'm'}).encode())
+        first = modes.read_mode(self.root)['pause_id']
+        self.assertTrue(first.startswith('mode:file:'), first)
+        self.assertEqual(first, modes.read_mode(self.root)['pause_id'])                          # stable while the file is not rewritten
+        guard.write_atomic(mode_file, json.dumps({'mode': 'pause-conversions', 'since': 's', 'pause_id': 'm'}).encode())
+        second = modes.read_mode(self.root)['pause_id']
+        self.assertNotEqual(first, second)
+        self.assertFalse(modes.consent_covers(first, modes.manual_pause(self.root)))
+        written = modes.write_mode(self.root, 'pause')                                           # our own write: the id of THAT revision
+        self.assertEqual(written['pause_id'], modes.read_mode(self.root)['pause_id'])
+        self.assertTrue(modes.consent_covers(written['pause_id'], modes.manual_pause(self.root)))
+        self.supervisor_pause('weird', ['conversions'])                                          # an independent supervisor pause
+        kinds = {p['kind']: p['pause_id'].split(':')[0] for p in modes.manual_pause(self.root)['pauses']}
+        self.assertEqual(kinds, {'mode': 'mode', 'supervisor': 'supervisor'})
+        # the same file identity under another source is another id: a consent never moves from one source to another
+        self.assertNotEqual(modes.source_id('pause', 'file:x'), modes.source_id('mode', 'file:x'))
+
+    def test_unreadable_mode_holds_dispatch_and_run_now_is_refused(self):
+        # The reviewer's case: supervisor_mode.json cannot be read and the supervisor has mirrored nothing yet (no PAUSE, no record).
+        mid, v, task_id, gen = self.frozen()
+        ident = {'id': task_id} | self.ident(task_id)
+        mode_file = self.batch() / 'supervisor_mode.json'
+        q = taskqueue.for_root(self.root)
+        for raw in (b'{"mode": "pause-conv', b'[]', b'{"mode": "paus"}', b'{}'):
+            mode_file.write_bytes(raw)
+            self.assertFalse((self.batch() / 'PAUSE').exists() or (self.batch() / modes.OWN_PAUSE).exists())
+            for args in ({}, {'run_now': True}, {'run_now': True, 'override_pause': 'anything'}):
+                gate = monster_lane.gate(self.root, args, 1000, True)                             # also while the user is away
+                self.assertEqual((gate['open'], gate['code'], gate.get('mode_unreadable'), gate['needs_confirm']),
+                                 (False, 'held', True, False), (raw, args))
+                self.assertIn('supervisor_mode.json', gate['reason'])
+                self.assertIn('supervisor_mode.json', self.child_gate(args))                      # the paid child's final check
+                self.assertEqual(monster_lane.main(['gate', '--root', str(self.root), '--task-args', json.dumps(args), '--idle', '1000']), 1)
+            for body in ({}, {'confirm': True}, {'confirm': True, 'pause_id': 'anything'}):
+                with self.assertRaises(guard.Unreadable) as caught:                              # an unconfirmed request too
+                    actions.queue_op(self.root, {'op': 'run_now'} | ident | body)
+                self.assertEqual((caught.exception.code, caught.exception.status), ('unreadable', 409))
+            self.assertFalse(q.get(task_id)['args'].get('run_now'))                              # nothing was marked
+            self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])
+            self.assertIn('supervisor_mode.json', modes.snapshot(self.root, supervisor=(True, '1'))['warning'])
+            conv = mv.item(self.root, mid)['conversion']
+            self.assertEqual(conv['state'], 'waiting')
+            self.assertIn('supervisor_mode.json', conv['waiting_reason'])
+        q.mark_run_now(task_id, None)                                                            # even a task marked earlier waits
+        self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])
+        # readable again (a pause mode): the ordinary confirmation; then a mode that runs: Run now is accepted
+        modes.write_mode(self.root, 'pause-conversions')
+        with self.assertRaises(monster_lane.ConfirmPaused):
+            actions.queue_op(self.root, {'op': 'run_now'} | ident)
+        modes.write_mode(self.root, 'views-run')
+        self.assertTrue(actions.queue_op(self.root, {'op': 'run_now'} | ident)['run_now'])
+        self.assertEqual(len(monster_lane.plan_starts(self.root, idle=10, idle_known=True)['start']), 1)
+        mode_file.unlink()                                                                       # an ABSENT file is the default mode
+        self.assertTrue(monster_lane.gate(self.root, {'run_now': True}, 10, True)['open'])
+
+    def test_run_now_challenge_names_exactly_the_pauses_in_force(self):
+        # The reviewer's case: the page saw "paused" (the mode); a maintenance PAUSE is added before the confirmation is sent.
+        mid, v, task_id, gen = self.frozen()
+        ident = {'id': task_id} | self.ident(task_id)
+        modes.write_mode(self.root, 'pause-conversions')
+        conv = mv.item(self.root, mid)['conversion']                                             # what the Approved modal read
+        self.assertEqual((conv['waiting_reason'], [p['kind'] for p in conv['pauses']]), ('paused', ['mode']))
+        self.assertEqual(conv['pause_id'], conv['pauses'][0]['pause_id'])                        # one gate snapshot
+        self.pause_file('maintenance: disk swap')                                                # added between the reads
+        with self.assertRaises(monster_lane.ConfirmPaused) as caught:                            # the item's id, sent as consent
+            actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': conv['pause_id']} | ident)
+        challenge = caught.exception.extra
+        self.assertEqual([(p['kind'], p['reason']) for p in challenge['pauses']],
+                         [('mode', 'mode pause-conversions'), ('pause', 'maintenance: disk swap')])
+        self.assertEqual(challenge['pause_id'], modes.ID_JOIN.join(p['pause_id'] for p in challenge['pauses']))
+        self.assertIn('maintenance: disk swap', str(caught.exception))
+        self.assertFalse(taskqueue.for_root(self.root).get(task_id)['args'].get('run_now'))
+        with self.assertRaises(monster_lane.ConfirmPaused):                                      # a challenge is asked for first
+            actions.queue_op(self.root, {'op': 'run_now'} | ident)
+        self.pause_file('maintenance: firmware')                                                 # ... and it changes while the dialog is open
+        with self.assertRaises(monster_lane.ConfirmPaused) as caught:
+            actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': challenge['pause_id']} | ident)
+        newer = caught.exception.extra
+        self.assertEqual([p['reason'] for p in newer['pauses']], ['mode pause-conversions', 'maintenance: firmware'])
+        out = actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': newer['pause_id']} | ident)
+        self.assertEqual((out['override_pause'], out['pause_id']), (True, newer['pause_id']))
+        args = taskqueue.for_root(self.root).get(task_id)['args']
+        self.assertTrue(monster_lane.gate(self.root, args, 10, True)['open'])
+        self.assertEqual(monster_lane.gate(self.root, {}, 10, True)['pauses'], newer['pauses'])  # the gate lists the same pauses
+
+    def test_the_client_confirms_through_the_server_challenge_only(self):
+        web = HERE.parent / 'web'
+        views = (web / 'monster_views.js').read_text(encoding='utf-8')
+        self.assertNotIn('askFirst', views)                                                      # no consent from what the page read
+        self.assertNotIn('pauseId', views)
+        self.assertNotIn('conversion.pause_id', views)
+        self.assertIn('error.body?.pauses', views)                                               # the dialog shows the server's reasons
+        self.assertIn('error.body?.pause_id', views)                                             # and echoes the challenge id
+        self.assertIn("import { runNowTask } from './monster_views.js'", (web / 'queue.js').read_text(encoding='utf-8'))
+        self.assertIn("'pauses'", (HERE / 'server.py').read_text(encoding='utf-8'))              # the 409 body carries the list
+
+
+class FinalLiveOutcomeTest(FinalLiveCase):
+    """Blocker 4: a failed row is published with the failure its `conversion_seq` belongs to."""
+
+    def test_a_row_read_before_the_second_failure_shows_the_failure_of_its_revision(self):
+        mid, v, task_id, gen = self.frozen()
+        self.fail_attempt(task_id, 'first')
+        stale_row = dict(taskqueue.for_root(self.root).get(task_id))                             # the queue rows are read HERE ...
+        vj_then = self.vj(v)
+        self.qop('retry', task_id)
+        self.fail_attempt(task_id, 'second (newer)')                                             # ... views.json after this
+        newer = mv.disposition_of(self.vj(v), gen)
+        view = orchestrator.publish_outcome(self.root, stale_row, orchestrator.task_view(stale_row, time.time()))
+        self.assertEqual((view['error'], view['conversion_seq'], view['outcome_seq']),
+                         ('second (newer)', mv.disposition_seq(self.vj(v)), newer['seq']))
+        # the Approved modal's item: the same pair from its one views.json snapshot
+        conv = mv.conversion_info(self.root, self.mroot, 'Giant Rat', v, stale_row, self.vj(v)['frozen'], vj=self.vj(v))
+        self.assertEqual((conv['state'], conv['error'], conv['conversion_seq']), ('failed', 'second (newer)', view['conversion_seq']))
+        conv = mv.conversion_info(self.root, self.mroot, 'Giant Rat', v, stale_row, vj_then['frozen'], vj=vj_then)
+        self.assertEqual((conv['error'], conv['conversion_seq']), ('first', mv.disposition_seq(vj_then)))   # the old pair, whole
+        # the Retry of what is on screen clears exactly the failure that was shown
+        out = actions.queue_op(self.root, {'op': 'retry', 'id': task_id, 'conversion_seq': view['conversion_seq']} | self.ident(task_id))
+        self.assertEqual(out['state'], 'queued')
+        self.assertIsNone(mv.disposition_of(self.vj(v), gen))
+
+    def test_the_queue_row_and_its_revision_are_one_outcome(self):
+        mid, v, task_id, gen = self.frozen()
+        self.fail_attempt(task_id, 'first ' + 'x' * 400)                                         # longer than the recorded reason
+        row = [t for t in orchestrator.queue_state(self.root, True)['tasks'] if t['id'] == task_id][0]
+        disp = mv.disposition_of(self.vj(v), gen)
+        self.assertEqual((row['error'], row['conversion_seq'], row['outcome_seq']),
+                         ('first ' + 'x' * 400, mv.disposition_seq(self.vj(v)), disp['seq']))    # its own outcome: the full text
+        # a row whose text is NOT the recorded outcome (whatever wrote it) is shown with the recorded one: the pair stays whole
+        q = taskqueue.for_root(self.root)
+        other = dict(q.get(task_id)) | {'error': 'a failure views.json does not carry'}
+        view = orchestrator.publish_outcome(self.root, other, orchestrator.task_view(other, time.time()))
+        self.assertEqual((view['error'], view['outcome_seq']), (disp['reason'], disp['seq']))
+        cancelled = dict(q.get(task_id)) | {'state': 'cancelled', 'error': 'manual'}             # the row says cancelled, the record failed
+        view = orchestrator.publish_outcome(self.root, cancelled, orchestrator.task_view(cancelled, time.time()))
+        self.assertEqual(view['error'], f'failed: {disp["reason"]}')
+        self.assertEqual(mv.outcome_error({'state': 'cancelled', 'reason': 'cancelled by the user'}, 'failed', 'first'),
+                         'cancelled: cancelled by the user')
+        self.assertEqual(mv.outcome_error(None, 'failed', 'first'), 'first')
+
+
+class FinalLiveApprovalTest(FinalLiveCase):
+    """Blocker 5: the 3D / Completed modal's level, approval and `approval_rev` come from ONE chosen_lod.json snapshot."""
+
+    def test_item_and_card_show_one_choice_snapshot_under_a_concurrent_approval(self):
+        import monsters as monsters_v1
+        mid, v, task_id, gen = self.frozen()
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, 'tok', None)
+        q.finish(task_id, 'tok', True)
+        self.converted('Giant Rat', v)
+        mdir = mv.models_dir(self.mroot, 'Giant Rat', v)
+        choice = mdir / 'chosen_lod.json'
+
+        def approve(lod):
+            return self.act(mid, 'approve', lod=lod, glb_sha256=mv.item(self.root, mid)['lods'][lod]['sha256'])
+        approve('0p4')
+        bytes_04 = choice.read_bytes()
+        self.unapprove(mid)
+        approve('0p2')
+        bytes_02 = choice.read_bytes()
+        choice.write_bytes(bytes_04)                             # the modal opens on the 0p4 approval ...
+        real = monsters_v1.choice_snapshot
+
+        def racing(folder):
+            out = real(folder)
+            if Path(folder) == mdir:
+                choice.write_bytes(bytes_02)                     # ... and another tab's 0p2 approval lands right after that read
+            return out
+        with mock.patch.object(monsters_v1, 'choice_snapshot', racing):
+            item = mv.item(self.root, mid)
+        self.assertEqual((item['lod'], item['approved'], item['stage']), ('0p4', True, 'completed'))
+        self.assertEqual(item['approval_rev'], mv.choice_rev(bytes_04))                          # the revision OF the approval shown
+        self.assertEqual(item['card']['approval_rev'], mv.choice_rev(bytes_04))
+        self.assertEqual(choice.read_bytes(), bytes_02)
+        with self.assertRaises(guard.Changed):                                                   # its Unapprove never clears 0p2
+            self.act(mid, 'unapprove', approval_rev=item['approval_rev'])
+        self.assertEqual(choice.read_bytes(), bytes_02)
+        choice.write_bytes(bytes_04)
+        with mock.patch.object(monsters_v1, 'choice_snapshot', racing):
+            card = self.tabs()['completed'][mid]
+        self.assertEqual(card['approval_rev'], mv.choice_rev(bytes_04))
+        fresh = mv.item(self.root, mid)                                                          # a later look: the 0p2 pair, whole
+        self.assertEqual((fresh['lod'], fresh['approval_rev']), ('0p2', mv.choice_rev(bytes_02)))
+        self.assertEqual(monsters_v1.choice_snapshot(mdir)[1], mv.choice_snapshot(mdir)[1])      # one revision formula
+        self.assertEqual(monsters_v1.choice_snapshot(mdir / 'nope'), ({}, mv.NO_CHOICE))
+
+
+class FinalLiveTreeTest(FinalLiveCase):
+    """Blocker 7: without a Job Object the fallback kill signals the RETAINED verified psutil.Process object, never a reopened pid."""
+
+    def tree_file(self, v, **data):
+        path = monster_lane.children_path(self.root, 'Giant Rat', v)
+        guard.write_atomic(path, json.dumps({'set_name': f'monster:Giant Rat/{v}', 'driver': None, 'children': []} | data).encode())
+        return path
+
+    def test_the_verified_object_is_planned_and_signalled_without_reopening_the_pid(self):
+        import psutil
+        mid, v, task_id, gen = self.frozen()
+        child = self.sleeper()
+        create = monster_lane._create_time(child.pid)
+        self.tree_file(v, children=[{'pid': child.pid, 'create': create, 'argv': ['collect']}])
+        verified = monster_lane._open_proven(child.pid, create)
+        self.assertEqual((verified.pid, verified.create_time()), (child.pid, create))
+        self.assertIsNone(monster_lane._open_proven(child.pid, create + 60))                     # the pid of ANOTHER process by now
+        self.assertIsNone(monster_lane._open_proven(child.pid, None))
+        opened = []
+        with mock.patch.object(monster_lane, '_open_proven', lambda pid, created: opened.append(pid) or verified):
+            plan = monster_lane.tree_plan(self.root, 'Giant Rat', v)
+        self.assertEqual((plan['job'], opened), (None, [child.pid]))                             # ONE verified open per recorded process
+        self.assertIs(plan['procs'][0], verified)                                                # that very object is kept
+        calls = []
+        real_kill = psutil.Process.kill
+
+        def kill(proc):
+            calls.append(proc)
+            real_kill(proc)
+
+        def no_reopen(pid, created):
+            raise AssertionError(f'pid {pid} was opened again for the signal')
+        with mock.patch.object(psutil.Process, 'kill', kill), mock.patch.object(monster_lane, '_open_proven', no_reopen):
+            out = monster_lane.drain_tree(self.root, 'Giant Rat', v, plan, wait=20)
+        self.assertEqual((out['killed'], out['problems'], [p is verified for p in calls]), (1, [], [True]))
+        self.assertIsNotNone(child.wait(timeout=20))
+
+    def test_a_retained_object_whose_process_is_gone_is_never_signalled(self):
+        import psutil
+        mid, v, task_id, gen = self.frozen()
+
+        class Replaced:
+            """A verified process that exited; its pid belongs to another process now (psutil: is_running() is False)."""
+            pid = os.getpid()
+            killed = 0
+
+            def is_running(self):
+                return False
+
+            def kill(self):
+                Replaced.killed += 1
+        gone = Replaced()
+        with mock.patch.object(psutil, 'wait_procs', lambda procs, timeout=None: (list(procs), [])):
+            out = monster_lane.drain_tree(self.root, 'Giant Rat', v, {'job': None, 'procs': [gone], 'blocking': [], 'incomplete': None})
+        self.assertEqual((Replaced.killed, out['problems']), (0, []))                            # this very test process was not killed
+
+
+class FinalLiveReduceTest(FinalLiveCase):
+    """"Reduction can certify the wrong model": only the GLB the export receipt names is reduced, verified before and after."""
+
+    GLB = b'the model that was paid for'
+
+    def exported(self, receipt=True, name='glb_m9.glb', write=True):
+        mid, v, task_id, gen = self.frozen()
+        vdir, mdir = mv.views_dir(self.mroot, 'Giant Rat', v), mv.models_dir(self.mroot, 'Giant Rat', v)
+        frozen = mv.read_views_json(vdir)['frozen']
+        hyper = mdir / 'hyper3d'
+        _snap, problem = monster_lane.snapshot_inputs(hyper, vdir, frozen)
+        self.assertIsNone(problem)
+        if write:
+            (hyper / name).write_bytes(self.GLB)
+        entry = {'path': str(hyper / name), 'bytes': len(self.GLB), 'sha256': hashlib.sha256(self.GLB).hexdigest()}
+        if receipt is not True:
+            entry = receipt
+        (hyper / 'studio_submission.json').write_text(json.dumps({
+            'backend': 'hyper3d', 'status': 'exported', 'model_id': 'm9', 'model_url': 'https://h/m9', 'pending_action': None,
+            'actions': {'free_preview': {}, 'geometry': {'confirmed_at': 't', 'observed_cost': 0.5}}, 'credits_committed': 0.5,
+            'inputs': [{'name': 'front.png', 'sha256': frozen['sha256']['front.png'], 'size': 1}], 'images_uploaded': ['front.png'],
+            **({'exports': {'GLB': entry}} if entry is not None else {})}))
+        return mid, v, mdir, hyper, gen
+
+    def not_certified(self, v, mdir, gen, needle, reduced=False):
+        verdict = self.drive(v)
+        self.assertEqual(verdict['status'], 'failed', verdict)
+        self.assertIn(needle, verdict['error'])
+        self.assertEqual('reduce_monster.py' in self.scripts(), reduced)
+        self.assertFalse((mdir / 'reduced' / mv.REDUCE_OK).exists())
+        self.assertFalse(mv.reduce_status(mdir, gen)['ok'])
+        self.assertNotIn('collect', [c['argv'][0] for c in self.calls()])                        # and nothing was paid again
+        return verdict
+
+    def test_missing_receipted_glb_is_never_replaced_by_another_one(self):
+        # The reviewer's case: the receipted GLB is gone and a different glb_*.glb lies in the folder.
+        mid, v, mdir, hyper, gen = self.exported(write=False)
+        (hyper / 'glb_other.glb').write_bytes(b'some other model')
+        verdict = self.not_certified(v, mdir, gen, 'the receipted GLB glb_m9.glb is missing')
+        self.assertIn('glb_other.glb', verdict['error'])
+        self.assertEqual(self.scripts(), [])
+
+    def test_receipted_file_with_other_bytes_is_refused_before_the_reducer_starts(self):
+        mid, v, mdir, hyper, gen = self.exported()
+        (hyper / 'glb_m9.glb').write_bytes(b'another model of the same name')
+        self.not_certified(v, mdir, gen, 'is not the model the export receipt names before the reduction')
+        self.assertEqual(self.scripts(), [])
+
+    def test_a_record_without_a_usable_receipt_is_not_reduced(self):
+        for receipt, needle in ((None, 'no export receipt'), ({'path': 'glb_m9.glb'}, 'carries no sha256'),
+                                ({'path': '../glb_m9.glb', 'sha256': '0' * 64}, 'not a glb_*.glb of this variant'),
+                                ({'path': 'model.glb', 'sha256': '0' * 64}, 'not a glb_*.glb of this variant')):
+            with self.subTest(receipt=receipt):
+                self.assertEqual(monster_lane.receipted_glb({'exports': {'GLB': receipt}} if receipt else {}, self.root)[0], None)
+                self.assertIn(needle, monster_lane.receipted_glb({'exports': {'GLB': receipt}} if receipt else {}, self.root)[2])
+        mid, v, mdir, hyper, gen = self.exported(receipt={'path': str(self.mroot / 'x' / 'glb_m9.glb')})
+        self.not_certified(v, mdir, gen, 'carries no sha256')
+        self.assertEqual(self.scripts(), [])
+
+    def test_the_reducer_gets_the_receipted_path_and_digest_and_the_success_record_names_them(self):
+        mid, v, mdir, hyper, gen = self.exported()
+        (hyper / 'glb_aaa_other.glb').write_bytes(b'some other model')                           # sorts first: the old pick
+        verdict = self.drive(v)
+        self.assertEqual(verdict['status'], 'ok', verdict)
+        sha = hashlib.sha256(self.GLB).hexdigest()
+        argv = [c['argv'] for c in self.calls() if c['script'] == 'reduce_monster.py'][0]
+        self.assertEqual(argv, [f'Giant Rat/{v}', '--glb', str(hyper / 'glb_m9.glb'), '--sha256', sha])
+        ok = json.loads((mdir / 'reduced' / mv.REDUCE_OK).read_text())
+        self.assertEqual(ok['source'], {'file': 'hyper3d/glb_m9.glb', 'sha256': sha})
+        self.assertTrue(mv.reduce_status(mdir, gen)['ok'])
+
+    def test_a_reducer_that_took_another_glb_is_not_certified(self):
+        mid, v, mdir, hyper, gen = self.exported()
+        (hyper / 'glb_other.glb').write_bytes(b'some other model')
+        with mock.patch.dict(os.environ, {'FAKE_REDUCE': 'other_glb'}):
+            self.not_certified(v, mdir, gen, "the reducer reduced 'hyper3d/glb_other.glb'", reduced=True)
+
+    def test_a_glb_replaced_during_the_reduction_is_not_certified(self):
+        mid, v, mdir, hyper, gen = self.exported()
+        with mock.patch.dict(os.environ, {'FAKE_REDUCE': 'swap_during'}):
+            self.not_certified(v, mdir, gen, 'is not the model the export receipt names after the reduction', reduced=True)
+
+    def test_collect_that_leaves_no_receipt_digest_is_not_reduced(self):
+        mid, v, task_id, gen = self.frozen()
+        with mock.patch.dict(os.environ, {'FAKE_H3D': 'no_receipt_sha'}):
+            verdict = self.drive(v)
+        self.assertEqual((verdict['status'], verdict['step']), ('failed', 'collect'), verdict)
+        self.assertIn('carries no sha256', verdict['error'])
+        self.assertNotIn('reduce_monster.py', self.scripts())
+
+    @unittest.skipUnless((REAL_MROOT / 'tools' / 'reduce_monster.py').is_file(), 'the monster repo is not checked out')
+    def test_real_reduce_monster_flags_refuse_a_mismatch_before_blender(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('reduce_monster_under_test', REAL_MROOT / 'tools' / 'reduce_monster.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        mod.PIPELINE = Path(self.temp.name) / 'dry_pipeline'                                    # never the real pipeline folder
+        model = mod.PIPELINE / 'Rat' / 'models' / '1'
+        (model / 'hyper3d').mkdir(parents=True)
+        good, other = model / 'hyper3d' / 'glb_good.glb', model / 'hyper3d' / 'glb_other.glb'
+        good.write_bytes(self.GLB)
+        other.write_bytes(b'some other model')
+        sha = hashlib.sha256(self.GLB).hexdigest()
+        ran = []
+        mod.find_blender = lambda explicit=None: ran.append('blender looked up') or 'blender'
+        mod.reduce = lambda *a: ran.append(a)
+        for argv, needle in ((['Rat/1', '--glb', str(good)], 'given together'), (['Rat/1', '--sha256', sha], 'given together'),
+                             (['Rat/1', '--glb', str(other), '--sha256', sha], 'is not the expected model'),
+                             (['Rat/1', '--glb', str(model / 'hyper3d' / 'glb_gone.glb'), '--sha256', sha], 'does not exist'),
+                             (['Rat/1', '--glb', str(mod.PIPELINE / 'glb_out.glb'), '--sha256', sha], 'is not a glb_*.glb in'),
+                             (['Rat/1', '--glb', str(good), '--sha256', 'abc'], '64 hex digits'),
+                             (['Rat/1', 'Rat/2', '--glb', str(good), '--sha256', sha], 'exactly ONE')):
+            with self.assertRaises(SystemExit) as caught:
+                mod.main(argv)
+            self.assertIn(needle, str(caught.exception))
+            self.assertEqual(ran, [])                                                           # refused before Blender is looked for
+        mod.main(['Rat/1', '--glb', str(good), '--sha256', sha])
+        self.assertEqual(ran, ['blender looked up', ('Rat/1', 'blender', False, str(good), sha)])
+        self.assertEqual(mod.checked_source(model, good, sha), (good, sha))
+        good.write_bytes(b'changed while Blender ran')
+        with self.assertRaises(SystemExit) as caught:
+            mod.checked_source(model, good, sha, when='after the reduction')
+        self.assertIn('changed during the reduction', str(caught.exception))
+        ran.clear()
+        mod.main(['Rat/1', '--redo'])                                                            # manual use: the old behaviour
+        self.assertEqual(ran, ['blender looked up', ('Rat/1', 'blender', True, None, None)])
+        self.assertEqual(mod.source_glb.__name__, 'source_glb')
+
+
+class FinalLiveUnsubmittedTest(FinalLiveCase):
+    """"A rejected upload strands the unpaid variant" (the v2 side): a proven pre-click failure leaves the variant unsubmitted."""
+
+    def hyper(self, v):
+        out = mv.models_dir(self.mroot, 'Giant Rat', v) / 'hyper3d'
+        out.mkdir(parents=True, exist_ok=True)
+        return out
+
+    def pre_click(self, v, **fields):
+        record = {'backend': 'hyper3d', 'status': 'preparing', 'started_at': 't', 'model_id': None, 'model_url': None, 'actions': {},
+                  'pending_action': None, 'why': None} | fields
+        (self.hyper(v) / 'studio_submission.json').write_text(json.dumps(record))
+        return record
+
+    def test_an_archived_pre_click_record_is_no_conversion_and_retry_submits_again(self):
+        mid, v, task_id, gen = self.frozen()
+        hyper = self.hyper(v)
+        # what the backend leaves after a rejected upload: the archived record, the upload copies and a screenshot
+        (hyper / 'studio_submission.not_submitted_20261126T010203.json').write_text(json.dumps(
+            {'backend': 'hyper3d', 'status': 'not_submitted', 'why': 'the page shows 3 thumbnails for 4 files', 'actions': {}}))
+        (hyper / 'upload_inputs').mkdir()
+        (hyper / 'upload_inputs' / 'front.png').write_bytes(b'stale')
+        mdir = mv.models_dir(self.mroot, 'Giant Rat', v)
+        self.assertIsNone(mv.record_of(mdir))
+        self.assertFalse(mv.conversion_started(mdir))
+        self.fail_attempt(task_id, 'STOPPED: the page shows 3 thumbnails for 4 files; nothing was generated')
+        self.assertEqual(mv.item(self.root, mid)['conversion']['state'], 'failed')
+        self.assertEqual(self.qop('retry', task_id)['state'], 'queued')                          # Retry ...
+        verdict = self.drive(v)
+        self.assertEqual(verdict['status'], 'ok', verdict)                                       # ... submits again
+        self.assertEqual([(c['script'], c['argv'][0]) for c in self.calls()][:2],
+                         [('hyper3d_single.py', 'submit'), ('hyper3d_single.py', 'collect')])
+        self.assertEqual(self.paid_clicks(), 1)
+        self.assertTrue((hyper / 'studio_submission.not_submitted_20261126T010203.json').is_file())   # the evidence stays
+
+    def test_a_proven_pre_click_record_left_in_place_is_archived_and_use_enabled_views_resubmits(self):
+        mid, v, task_id, gen = self.frozen()
+        self.pre_click(v, why='the page shows 3 thumbnails for 4 files')
+        mdir, hyper = mv.models_dir(self.mroot, 'Giant Rat', v), self.hyper(v)
+        self.assertTrue(mv.proven_unsubmitted(mv.record_of(mdir)))
+        self.assertFalse(mv.conversion_started(mdir))
+        self.fail_attempt(task_id, 'STOPPED: thumbnails')
+        out = self.convert(mid, ['front.png', 'left.png'])                                       # Use enabled views: not 409 `frozen`
+        self.assertNotEqual(self.ident(out['task'])['generation'], gen)
+        verdict = self.drive(v)
+        self.assertEqual(verdict['status'], 'ok', verdict)
+        self.assertTrue(any(s.startswith('unsubmitted record set aside') for s in verdict['steps']), verdict['steps'])
+        archived = list(hyper.glob('studio_submission.not_submitted_*.json'))
+        self.assertEqual(len(archived), 1)
+        self.assertEqual(json.loads(archived[0].read_text())['why'], 'the v2 monster lane found a proven pre-click failure')
+        self.assertEqual([(c['script'], c['argv'][0]) for c in self.calls()][:2],
+                         [('hyper3d_multiview.py', 'submit'), ('hyper3d_multiview.py', 'collect')])
+        self.assertEqual(self.paid_clicks(), 1)
+
+    def test_a_record_with_any_click_intent_stops_for_review(self):
+        cases = ({'actions': {'free_preview': {'intent_at': 't'}}, 'pending_action': 'free_preview'},
+                 {'actions': {'free_preview': {'intent_at': 't'}}},
+                 {'model_url': 'https://hyper3d.test/m1'}, {'model_id': 'm1'}, {'submit_clicked_at': 't'},
+                 {'status': 'submission_attempted'}, {'credits_committed': 0.5})
+        mid, v, task_id, gen = self.frozen()
+        mdir = mv.models_dir(self.mroot, 'Giant Rat', v)
+        self.fail_attempt(task_id, 'STOPPED: the submission needs review')
+        for fields in cases:
+            with self.subTest(fields=fields):
+                record = self.pre_click(v, **fields)
+                self.assertFalse(mv.proven_unsubmitted(record))
+                self.assertTrue(mv.conversion_started(mdir))
+                with self.assertRaises(mv.Frozen):                                               # Use enabled views: refused
+                    self.convert(mid, ['front.png', 'left.png'])
+                verdict = self.drive(v)
+                self.assertEqual(verdict['status'], 'failed', verdict)
+                self.assertEqual(self.calls(), [])                                               # nothing was submitted or collected
+                self.assertEqual(json.loads((mdir / 'hyper3d' / 'studio_submission.json').read_text()), record)   # untouched
+                self.assertEqual(list((mdir / 'hyper3d').glob('studio_submission.not_submitted_*')), [])
+        self.assertEqual(self.paid_clicks(), 0)
 
 
 class MigrateCliTest(MonsterCase):

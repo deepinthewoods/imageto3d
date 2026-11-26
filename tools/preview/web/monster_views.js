@@ -23,38 +23,48 @@ const generating = view => ['queued', 'running'].includes(view?.task?.state);
 const hasFile = view => !!view?.url;
 const waitingText = reason => WAITING[reason] || reason || 'unknown';
 
+const PAUSE_KIND = { mode: 'pause mode', supervisor: 'supervisor pause', pause: 'PAUSE file (manual / maintenance)' };
+
+/** The lines of the Run now confirmation for ONE server challenge: its message and every pause it names, with its reason. */
+export function challengeLines(error) {
+  const pauses = Array.isArray(error.body?.pauses) ? error.body.pauses.filter(p => p && typeof p === 'object') : [];
+  return [error.message,
+    ...(pauses.length ? [`Run now overrides exactly ${pauses.length === 1 ? 'this pause' : `these ${pauses.length} pauses`}:`] : []),
+    ...pauses.map(p => `- ${PAUSE_KIND[p.kind] || p.kind || 'pause'}: ${p.reason || 'no reason given'}`),
+    'A pause added or changed after this is asked about again.'];
+}
+
 /**
  * Run now of a monster conversion task: POST /api/v2/queue {op: run_now, id, key, generation, confirm?, pause_id?}. `task` = {id, key,
  * generation} of the task AS DISPLAYED (the server finds it by key + generation; the row number is only a hint; 409 `changed` when that
- * task is gone). While conversions are paused by hand the server needs the user's yes FOR THAT PAUSE: `confirm: true` plus the
- * `pause_id` the user was shown. `askFirst` + `pauseId` (the item says it is paused, and by which pause) ask before the first request;
- * otherwise a 409 `confirm` carries the `pause_id` to ask about. A pause that changed while the dialog was open is asked about again.
+ * task is gone). While conversions are paused by hand the confirmation is a SERVER CHALLENGE, in the Approved modal and the Queue tab
+ * alike (final-live review, "undisclosed maintenance override"): the first request carries no confirmation, the server answers 409
+ * `confirm` with `pause_id` (the challenge id) and `pauses` (the exact pauses in force: ids + reasons), the dialog shows THOSE reasons,
+ * and the yes is sent as `confirm: true` + that `pause_id`. Nothing the page read earlier (the item's waiting reason, its pause id) is
+ * ever used as the consent, so a maintenance pause added meanwhile cannot ride in behind a generic question. The server accepts only
+ * while the pauses in force still equal the challenge; otherwise it answers a new challenge, which is shown and asked again.
  * Resolves the response, or null when the user said no. Errors other than the confirmation are thrown.
  */
-export async function runNowTask(task, { askFirst = false, pauseId = null } = {}) {
+export async function runNowTask(task) {
   // conversion_seq: the disposition revision the task is displayed with (Run now of a failed / cancelled task is a Retry first)
   const base = { op: 'run_now', id: task.id, key: task.key, generation: task.generation,
     ...(Number.isInteger(task.conversion_seq) ? { conversion_seq: task.conversion_seq } : {}) };
-  const ask = async message => confirmDialog({
-    title: 'Run now although conversions are paused?',
-    lines: [message || 'Conversions were paused by hand. Run now starts this conversion anyway (Hyper3D, paid: 0.5 credits).'],
-    confirm: 'Run now',
-    danger: true,
-  });
-  let confirmed = null;              // the pause_id the user said yes to
-  if (askFirst && pauseId) {
-    if (!(await ask())) return null;
-    confirmed = pauseId;
-  }
-  for (let round = 0; round < 3; round += 1) {
+  let confirmed = null;              // the challenge id (pause_id) of the pauses the user was shown and said yes to
+  for (let round = 0; round < 4; round += 1) {
     try {
       return await api.queuePost(confirmed ? { ...base, confirm: true, pause_id: confirmed } : base);
     } catch (error) {
       if (error.code !== 'confirm') throw error;
-      const shown = error.body?.pause_id;        // the pause in force now: the one the user is asked about
-      if (!shown) throw error;
-      if (!(await ask(error.message))) return null;
-      confirmed = shown;
+      const challenge = error.body?.pause_id;    // the pauses in force NOW, as the server names them: what the user is asked about
+      if (!challenge) throw error;
+      const yes = await confirmDialog({
+        title: 'Run now although conversions are paused?',
+        lines: challengeLines(error),
+        confirm: 'Run now (0.5 credits)',
+        danger: true,
+      });
+      if (!yes) return null;
+      confirmed = challenge;
     }
   }
   throw new Error('the pause kept changing; nothing was started');
@@ -311,10 +321,10 @@ export async function showMonsterViews(modal, host) {
     runningNow = true;
     draw();
     try {
-      // the task and the pause exactly as this dialog shows them: the server refuses (409) when either is something else by now
+      // the task exactly as this dialog shows it (409 when it is something else by now). A pause is confirmed through the server's
+      // challenge only (runNowTask): this modal's own waiting reason / pause id are never sent as the consent.
       const result = await runNowTask({ id: conversion.task_id, key: conversion.key, generation: conversion.generation,
-        conversion_seq: conversion.conversion_seq },
-        { askFirst: conversion.waiting_reason === 'paused', pauseId: conversion.pause_id });
+        conversion_seq: conversion.conversion_seq });
       if (result) toast(result.warning ? `Run now: ${result.warning}` : 'Conversion starts now', { ms: result.warning ? 8000 : 4000 });
     } catch (error) {
       toast(`Run now failed: ${error.message}`);

@@ -89,7 +89,9 @@ const EXIT_GATE_CLOSED = 4;
 // Last-check row 6: the final gate check, the intent and the Generate dispatch run under the paid-gate transition lock of the
 // gate's root (paid_click.mjs takeGateMutex: a `paid_gate.py hold` helper process holds tools/paid_gate.py's OS byte lock for this
 // process until the dispatch has returned; it never expires, post-cut-over blocker 2; `paid_gate.py check` itself does not take
-// it). The check is bounded; one that does not answer in time counts as closed.
+// it). The check is bounded; one that does not answer in time counts as closed. Final-live review, earlier blocker 2: after the
+// intent write and immediately before the dispatch the helper is pinged and must answer that it still holds the lock; if not,
+// nothing is clicked and the intent is withdrawn (withdrawIntent below), so the record set aside as gate_closed shows no click.
 const GATE_CHECK_TIMEOUT_MS = 20000;
 function paidGateRoot(){
  try{const spec=JSON.parse(process.env.IMAGETO3D_PAID_GATE??'');return typeof spec?.root==='string'&&spec.root?spec.root:null;}catch{return null;}
@@ -222,7 +224,7 @@ async function submit(){
   const queueDeadline=Date.now()+Number(process.env.TRIPO_QUEUE_WAIT_MIN??30)*60000;
   // Finding 6: every wait (the Studio queue, the upload slots, Playwright's actionability: visible, stable, enabled, not covered)
   // ends BEFORE the paid gate is asked; the gate, the intent and the dispatch then follow at once (gatedPaidClick).
-  let click;
+  let click,beforeIntent=null;
   for(let attempt=1;;attempt++){
    while(!(await generate.isEnabled())){
     if(Date.now()>queueDeadline)throw new Error('Generate stayed disabled; another Studio generation may be stuck');
@@ -232,7 +234,10 @@ async function submit(){
    click=await gatedPaidClick({control:generate,gateClosed:paidGateClosed,
     takeMutex:gateRoot?()=>takeGateMutex(gateRoot,{what:`tripo generate ${path.basename(output)}`,python:PY}):null,
     stillReady:async()=>{const empty=await pending();return empty.length?`Upload slot emptied before Generate: ${empty.join(', ')}`:null;},
-    writeIntent:()=>{record.status='submission_attempted';record.submit_clicked_at=new Date().toISOString();write(record);}});
+    writeIntent:()=>{beforeIntent=record.status;record.status='submission_attempted';record.submit_clicked_at=new Date().toISOString();write(record);},
+    // the lock was lost between the intent write and the dispatch: nothing was clicked, so the intent is taken back
+    withdrawIntent:reason=>{record.status=beforeIntent??'ready_to_submit';delete record.submit_clicked_at;
+     record.intent_withdrawn={at:new Date().toISOString(),reason};write(record);}});
    if(click.outcome!=='not_actionable')break;
    if(attempt>=3){
     // never clicked, no intent written: the record is set aside so a resume submits fresh
@@ -245,6 +250,13 @@ async function submit(){
   if(click.outcome==='gate_closed'){
    // nothing was clicked: the record is set aside, so the resumed submit starts fresh; the caller waits for its gate (exit 4)
    const gate=click.gate;
+   if(click.intent_withdrawn===false){
+    // the lock was lost after the intent write and the intent could not be taken back: the record keeps its intent and is NOT
+    // set aside as unsubmitted (a resume stops on it for review), although nothing was clicked
+    record.review=`Generate was NOT clicked (${gate}), but the click intent could not be withdrawn (${click.withdraw_error??'no withdrawal'}): check and remove this record by hand.`;
+    record.status='submission_needs_review';write(record);
+    throw new Error(`Generate was not clicked and its intent could not be withdrawn; ${recordPath} needs review`);
+   }
    record.status='gate_closed';record.gate_closed=gate;write(record);
    fs.renameSync(recordPath,recordPath.replace(/\.json$/,`.gate_closed_${Date.now()}.json`));
    console.error(`PAID GATE CLOSED: ${gate}`);process.exitCode=EXIT_GATE_CLOSED;return;

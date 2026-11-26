@@ -550,15 +550,20 @@ class Supervisor:
 
     def freeze(self, rows=None):
         """SIGSTOP the running heavy descendants of convert_job.py; returns the newly frozen rows. Each signal is sent only after the
-        pid is verified to be the same process (create time) as the table row (send(..., start=))."""
+        pid is verified to be the same process (create time) as the table row (send(..., start=)).
+        Final-live review, earlier blocker 6: like resume(), freeze drops a record from paused_pids.json only when its process
+        is CONFIRMED GONE (confirmed_gone: no process with that pid, or the pid has a KNOWN other start time). A recorded pid
+        whose start time cannot be read on this tick (0) keeps its record (the only note that the process is suspended), and
+        such a row is never suspended a second time on top of it."""
         rows = process_table() if rows is None else rows
-        kept = [r for r in self.recorded() if any(same_process(row, r) for row in rows)]
+        kept = [r for r in self.recorded() if isinstance(r, dict) and 'pid' in r and 'start' in r
+                and not self.confirmed_gone(r, rows)]
         new = []
         for row in heavy_processes(rows, self.root):
             # Windows suspends are counted and psutil does not always report a suspended process as stopped, so a
             # process already on record is never suspended a second time (2026-11-16: body_fit.py was frozen three
             # times, resumed twice and stayed suspended for six hours)
-            if row['stopped'] or any(same_process(row, r) for r in kept):
+            if row['stopped'] or any(same_process(row, r) or (not row['start'] and row['pid'] == r['pid']) for r in kept):
                 continue
             try:
                 self.send(row['pid'], SIGSTOP, start=row['start'])

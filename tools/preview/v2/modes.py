@@ -48,6 +48,18 @@ with the reason of B" (a consent for A accepted while B is reported).
 WRITES (last-check review, row 6): `write_mode` writes supervisor_mode.json under `paid_gate.transition_lock(root)` (retried while
 GateBusy), so a pause can never land between a paid click's final gate check and its dispatch. This module writes no PAUSE file and
 no supervisor_pause.json, and its readers never take that lock (the click-time gate command runs under it).
+
+SOURCE + FILE REVISION (final-live review, blocker 1). A consent names, per pause, WHERE the pause comes from and WHICH WRITE of that
+file the user was shown: every id is `<source>:<identity of the read>` (`mode:` supervisor_mode.json, `supervisor:`
+supervisor_pause.json, `pause:` the PAUSE file; the identity is read_file's digest of the file's inode, times, size and bytes). A
+`pause_id` field stored INSIDE a file is never the identity on its own: a foreign PAUSE that is rewritten with another reason while it
+keeps its stored `pause_id` is another revision, hence another id, and needs a new confirmation. `write_mode` returns the id of the file
+it wrote (read back under the transition lock).
+
+UNREADABLE MODE (final-live review, "payment without pause confirmation"). A supervisor_mode.json that EXISTS but cannot be read, is
+not an object or names no known mode says nothing about whether conversions are paused: `read_mode` reports `readable: False` (+
+`problem`), and the monster lane holds dispatch and refuses Run now until the file is readable again (monster_lane.gate: code `held`,
+never overridden). Only an ABSENT file is the supervisor's default mode.
 """
 from __future__ import annotations
 
@@ -146,20 +158,48 @@ def file_identity(path: Path) -> str | None:
     return read_file(path)[0]
 
 
-def read_mode(root) -> dict:
-    """{"mode", "since", "label", "pause_id"}; a missing / invalid file means the supervisor's default `auto`. `pause_id` (None unless
-    the mode pauses conversions) = the id this module wrote with the mode, else the identity of the file's write; mode and identity come
-    from the SAME read (row 5)."""
-    ident, raw = read_file(batch(root) / 'supervisor_mode.json')
+def source_id(source: str, ident: str | None) -> str:
+    """The id of one pause: its SOURCE (`mode` | `supervisor` | `pause`) and the identity of the file revision that was read
+    (read_file). An identity that could not be taken never repeats (so it never equals an id a user confirmed)."""
+    return f'{source}:{ident or "unidentified:" + uuid.uuid4().hex}'
+
+
+def mode_problem(ident: str | None, raw: object) -> str | None:
+    """Why a read of supervisor_mode.json does not say which mode is in force (None: it does, or the file is absent = the default)."""
+    if ident is None:
+        return None
+    if raw is UNREADABLE:
+        return 'supervisor_mode.json cannot be read'
+    if not isinstance(raw, dict):
+        return 'supervisor_mode.json is not an object'
+    if not isinstance(raw.get('mode'), str) or raw['mode'] not in MODES:
+        return f'supervisor_mode.json names no known mode ({raw.get("mode")!r})'
+    return None
+
+
+def _mode_record(ident: str | None, raw: object) -> dict:
+    problem = mode_problem(ident, raw)
     raw = raw if isinstance(raw, dict) else {}
     mode = raw.get('mode')
     mode = mode if isinstance(mode, str) and mode in MODES else 'auto'
     since = raw.get('since') if isinstance(raw.get('since'), str) else None
-    pause_id = None
-    if mode in PAUSE_MODES:
-        stored = raw.get('pause_id')
-        pause_id = stored if isinstance(stored, str) and stored else ident
-    return {'mode': mode, 'since': since, 'label': PRESET_LABELS[mode], 'pause_id': pause_id}
+    pause_id = source_id('mode', ident) if mode in PAUSE_MODES else None    # the source and THIS revision of the file (blocker 1)
+    out = {'mode': mode, 'since': since, 'label': PRESET_LABELS[mode], 'pause_id': pause_id}
+    return out if problem is None else out | {'readable': False, 'problem': problem}
+
+
+def read_mode(root) -> dict:
+    """{"mode", "since", "label", "pause_id"}. A MISSING file is the supervisor's default `auto`. A file that exists but cannot be
+    read / is not an object / names no known mode ADDS `readable: False` and `problem` (`mode_unreadable`; shown as `auto`, but the
+    monster lane holds dispatch and refuses Run now until it is readable: nothing says whether conversions are paused). `pause_id`
+    (None unless the mode pauses conversions) = `mode:` + the identity of this read of the file (its revision; a `pause_id` stored in
+    the file is part of the bytes, never the identity by itself); mode and identity come from the SAME read (row 5)."""
+    return _mode_record(*read_file(batch(root) / 'supervisor_mode.json'))
+
+
+def mode_unreadable(mode: dict) -> str | None:
+    """Why a read_mode record does not say which mode is in force (its `problem`), None when it does."""
+    return None if mode.get('readable', True) else str(mode.get('problem') or 'supervisor_mode.json cannot be read')
 
 
 def write_mode(root, mode: str) -> dict:
@@ -167,7 +207,8 @@ def write_mode(root, mode: str) -> dict:
     (`pause_all`, `pause_conversions`, `run_now`, `auto`). EVERY write carries a fresh uuid4 `pause_id` (finding 5): pausing again, even
     with the same mode within the same second, is a new pause. The write happens under the gate transition mutex
     (paid_gate.transition_lock; retried while GateBusy for LOCK_WAIT seconds, then ModeError: nothing was written). Returns what was
-    written, in read_mode's shape."""
+    written, in read_mode's shape: its `pause_id` is the id of the file revision this call wrote (`mode:` + its identity), the one
+    read_mode reports until the file is written again."""
     mode = PRESETS.get(mode, mode)
     if mode not in MODES:
         raise ModeError(f'unknown mode {mode!r}; one of {list(MODES)} or {list(PRESETS)}')
@@ -177,13 +218,16 @@ def write_mode(root, mode: str) -> dict:
     while True:
         try:
             with paid_gate.transition_lock(root, wait=2.0, what=f'mode {mode}'):
-                guard.write_atomic(batch(root) / 'supervisor_mode.json', (json.dumps(data, indent=2) + '\n').encode('utf-8'))
+                path = batch(root) / 'supervisor_mode.json'
+                guard.write_atomic(path, (json.dumps(data, indent=2) + '\n').encode('utf-8'))
+                with open(path, 'rb') as handle:                # the revision just written, read back under the lock (no READS hook)
+                    st, body = os.fstat(handle.fileno()), handle.read()
+                written = _mode_record(_identity(st, body), json.loads(body.decode('utf-8-sig')))
             break
         except paid_gate.GateBusy as exc:
             if time.monotonic() >= deadline:
                 raise ModeError(f'the mode was not changed: {exc}') from exc
-    return {'mode': mode, 'since': data['since'], 'label': PRESET_LABELS[mode],
-            'pause_id': data['pause_id'] if mode in PAUSE_MODES else None}
+    return written
 
 
 def _scope(raw: dict) -> list[str]:
@@ -193,34 +237,34 @@ def _scope(raw: dict) -> list[str]:
 
 def pause_snapshot(root) -> dict | None:
     """The PAUSE file from ONE read (row 5): {"since", "reason", "scope": [...], "pause_id", "extra": [...], "sha256"} or None when
-    absent (an unreadable file counts as a pause of everything). `pause_id` = the file's own `pause_id` when its writer stored one, else
-    the identity of this read; `extra` = the names of its fields other than since / reason / scope; `sha256` = the digest of the bytes
+    absent (an unreadable file counts as a pause of everything). `pause_id` = `pause:` + the identity of THIS read (the source and the
+    file revision, blocker 1: a `pause_id` its writer stored inside is only part of the bytes; a rewrite that keeps it while the
+    reason changes is a new id); `extra` = the names of its fields other than since / reason / scope; `sha256` = the digest of the bytes
     read (what `mirrored` compares with the supervisor's record). Identity, reason, scope, extra and digest describe the same bytes."""
     ident, raw, sha = read_file3(batch(root) / 'PAUSE')
     if ident is None:
         return None
     if not isinstance(raw, dict):
-        return {'since': None, 'reason': 'unreadable PAUSE file', 'scope': ['conversions', 'views'], 'pause_id': ident, 'extra': [],
-                'sha256': sha}
-    stored = raw.get('pause_id')
+        return {'since': None, 'reason': 'unreadable PAUSE file', 'scope': ['conversions', 'views'], 'pause_id': source_id('pause', ident),
+                'extra': [], 'sha256': sha}
     return {'since': raw.get('since'), 'reason': raw.get('reason'), 'scope': _scope(raw),
-            'pause_id': stored if isinstance(stored, str) and stored else ident,
+            'pause_id': source_id('pause', ident),
             'extra': sorted(str(k) for k in raw if k not in ('since', 'reason', 'scope')), 'sha256': sha}
 
 
 def own_snapshot(root) -> dict | None:
-    """The supervisor's OWN pause (supervisor_pause.json, I.11) from ONE read: {"since", "reason", "scope": [...], "pause_id" (the
-    identity of this read), "mirror" (the sha256 of the PAUSE bytes the supervisor last wrote, None when it names none), "readable"}
+    """The supervisor's OWN pause (supervisor_pause.json, I.11) from ONE read: {"since", "reason", "scope": [...], "pause_id" (`supervisor:` +
+    the identity of this read), "mirror" (the sha256 of the PAUSE bytes the supervisor last wrote, None when it names none), "readable"}
     or None when absent. A file that exists but is not a JSON object is a pause of everything of unknown reason (`readable: False`,
     never the reflection of anything)."""
     ident, raw, _sha = read_file3(batch(root) / OWN_PAUSE)
     if ident is None:
         return None
     if not isinstance(raw, dict):
-        return {'since': None, 'reason': f'unreadable {OWN_PAUSE}', 'scope': ['conversions', 'views'], 'pause_id': ident, 'mirror': None,
-                'readable': False}
+        return {'since': None, 'reason': f'unreadable {OWN_PAUSE}', 'scope': ['conversions', 'views'],
+                'pause_id': source_id('supervisor', ident), 'mirror': None, 'readable': False}
     mirror = raw.get('mirror')
-    return {'since': raw.get('since'), 'reason': raw.get('reason'), 'scope': _scope(raw), 'pause_id': ident,
+    return {'since': raw.get('since'), 'reason': raw.get('reason'), 'scope': _scope(raw), 'pause_id': source_id('supervisor', ident),
             'mirror': mirror if isinstance(mirror, str) and mirror else None, 'readable': True}
 
 
@@ -417,5 +461,6 @@ def snapshot(root, now: float | None = None, presence_file: Path | None = None, 
         'idle_seconds': idle, 'idle_source': source,
         'away': None if idle is None else idle >= AWAY_AFTER,
         'supervisor_running': running, 'supervisor_pid': pid,
-        'warning': None if running else 'supervisor not running: the mode has no effect on conversions',
+        'warning': (f'{mode_unreadable(mode)}: monster conversions wait and Run now is refused until it is readable'
+                    if mode_unreadable(mode) else None if running else 'supervisor not running: the mode has no effect on conversions'),
     }

@@ -333,3 +333,78 @@ test('the lock is released by the OS when the node owner dies, and a holder whos
   assert.deepEqual(result, {outcome: 'gate_closed', gate: 'the paid-gate transition lock was lost (its holder process is gone)'});
   assert.deepEqual([intents, control.clicks.length], [0, 0]);
 });
+
+// Final-live review, earlier blocker 2: "simulated Node helper loss during the intent write still produced a click". The last
+// look before the dispatch now asks the helper itself (verify: ping -> the helper re-checks its lock handle -> "held <nonce>").
+test("the final-live reviewer's case: the lock helper is lost during the intent write: no click, the intent is withdrawn", async t => {
+  const root = tempRoot(t);
+  const mutex = await takeGateMutex(root, {wait: 2000, what: 'click that loses its helper'});
+  t.after(() => mutex?.release());
+  assert.ok(mutex?.owned());
+  assert.equal(await mutex.verify(), true);                     // the helper answers for its own lock
+  assert.equal(lockOwner(root).pid, mutex.pid);
+  const control = stubControl();
+  const record = {status: 'ready_to_submit'};
+  let ownedBeforeIntent = null, holdWritten = null;
+  const result = await gatedPaidClick({control, gateClosed: pythonGate(root), takeMutex: () => mutex,
+    writeIntent: async () => {
+      ownedBeforeIntent = mutex.owned();
+      record.status = 'submission_attempted';
+      process.kill(mutex.pid);                                  // the helper dies while the intent is being written
+      for (let i = 0; i < 100 && lockOwner(root) !== null; i++) await sleep(50);
+      holdWritten = writeHold(root, 2).status;                  // ... and a hold writer gets the freed lock at once
+    },
+    withdrawIntent: reason => { record.status = 'ready_to_submit'; record.withdrawn = reason; }});
+  assert.equal(ownedBeforeIntent, true);                        // the look before the intent could not see it coming
+  assert.equal(holdWritten, 0);
+  assert.equal(result.outcome, 'gate_closed');
+  assert.match(result.gate, /transition lock was lost after the intent was written .*nothing was clicked/);
+  assert.equal(result.intent_withdrawn, true);
+  assert.equal(control.clicks.length, 0, 'a click was dispatched without the lock');
+  assert.ok(!control.log.some(entry => entry[0] === 'click'));
+  assert.deepEqual([record.status, record.withdrawn], ['ready_to_submit', result.gate]);
+  assert.equal(await mutex.verify(), false);
+});
+
+test('verify() is the helper\'s own answer: held while it holds, false once released, lost, silent or gone', async t => {
+  const root = tempRoot(t);
+  const mutex = await takeGateMutex(root, {wait: 2000});
+  t.after(() => mutex?.release());
+  assert.deepEqual([await mutex.verify(), await mutex.verify()], [true, true]);   // each ping has its own nonce
+  assert.equal(writeHold(root, 0.2).status, 7);                 // pinging does not let anybody in
+  assert.equal(await mutex.verify(0), false);                   // no answer in time counts as not held
+  assert.equal(await mutex.verify(), true);                     // (the late answer of the timed-out ping is not taken for this one)
+  await mutex.release();
+  assert.deepEqual([mutex.owned(), await mutex.verify()], [false, false]);
+  // with any holder object: whatever verify() says is the last word before the dispatch, after the intent
+  for (const [verify, withdraw, expected] of [
+    [async () => false, () => {}, {intent_withdrawn: true}],
+    [async () => { throw new Error('pipe closed'); }, () => {}, {intent_withdrawn: true}],
+    [async () => false, null, {intent_withdrawn: false}],
+    [async () => false, () => { throw new Error('disk full\nat ...'); }, {intent_withdrawn: false, withdraw_error: 'disk full'}],
+  ]) {
+    const control = stubControl();
+    const order = [];
+    const result = await gatedPaidClick({control, gateClosed: () => null, writeIntent: () => { order.push('intent'); },
+      withdrawIntent: withdraw && (reason => { order.push('withdraw'); return withdraw(reason); }),
+      takeMutex: () => ({owned: () => true, verify: () => { order.push('verify'); return verify(); }, release: async () => { order.push('release'); }})});
+    const {gate, ...rest} = result;
+    assert.deepEqual(rest, {outcome: 'gate_closed', ...expected});
+    assert.match(gate, /lost after the intent was written/);
+    assert.deepEqual(order, ['intent', 'verify', ...(withdraw ? ['withdraw'] : []), 'release']);
+    assert.equal(control.clicks.length, 0);
+  }
+  // a holder that confirms: the click follows the verification at once, and a holder without verify() is asked owned() again
+  for (const holder of [{owned: () => true, verify: async () => true, release: async () => {}},
+                        {owned: () => true, release: async () => {}}]) {
+    const control = stubControl();
+    assert.deepEqual(await gatedPaidClick({control, gateClosed: () => null, writeIntent: () => {}, takeMutex: () => holder}),
+                     {outcome: 'clicked'});
+    assert.equal(control.clicks.length, 1);
+  }
+  let alive = true;                                             // a legacy holder (no verify) lost during the intent write
+  const control = stubControl();
+  const result = await gatedPaidClick({control, gateClosed: () => null, writeIntent: () => { alive = false; },
+    takeMutex: () => ({owned: () => alive, release: async () => {}})});
+  assert.deepEqual([result.outcome, result.intent_withdrawn, control.clicks.length], ['gate_closed', false, 0]);
+});
