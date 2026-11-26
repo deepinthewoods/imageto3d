@@ -48,6 +48,47 @@ Flow (resumable by the server's stage, intents flushed before every click, never
    - In both cases the record is renamed to `studio_submission.not_submitted_<time>.json` (status `not_submitted`), so a re-run submits again.
    - `export_glb` also tolerates Firefox renaming a download while it is being listed; that crashed a collect on 2026-10-27.
 
+### Site change 2026-11-26: announcement dialog and percentage wallet
+
+Probe (read-only, signed in): `.codex_jobs/hyper3d_probe_20261126/` (screenshots, `02_modal_dialog.html`,
+`02_wallet_header.html`, `05_wallet_popup_visible.txt`, the free verification runs `verify_*`). Two things broke every
+submit before any click:
+
+- **Announcement dialog.** The workspace opened under a "What's New" dialog (`div[role=dialog][aria-modal=true]
+  [aria-label="What's New"]` in a `fixed inset-0 z-[1000]` overlay: a video, `View all updates`, a `Got it` button and a
+  `button[aria-label=Close]` X). The upload card could not be hovered through it: `Multi-view tab not found`.
+  `SeleniumRodin.dismiss_announcements()` closes such dialogs: after sign-in in `open_workspace` / `open_model` (it
+  watches a fresh page for `ANNOUNCEMENT_WAIT_S` = 4 s), before the Multi-view hover (which is tried a second time when
+  the tab does not show), before the Generate hover of `click_free_preview` and before `read_cost`. What counts as an
+  announcement and which button is pressed is `announcement_button()`: a visible `aria-modal` dialog that has a `Got it`
+  button, or whose aria-label says what's new / announcement / changelog / release notes / new feature; the button is the
+  one whose whole text is `Got it`, else a text-less one with aria-label `Close`. No other button is ever chosen and no
+  other dialog is touched, so nothing paid can be clicked. An announcement that stays open stops the run
+  (`announcement_not_dismissed.png`); `Multi-view tab not found` / `Upload card not found` now name any dialog still
+  covering the page. `Got it` is remembered by the site (the dialog did not come back after a reload).
+- **Wallet.** The header no longer prints a credit number: the pill (`#rechargeSelf`, aria-label `Business · 35%`) shows the
+  plan's remaining **percentage**, and the old anchor line `MCP&CLI` is now `MCP`, so `parse_balance` read `None`
+  (`the wallet still showed None credits after 60 s`). The absolute numbers are in the wallet panel the pill opens on
+  hover; it is in the DOM all the time (`#rechargeSelf section.unified-wallet`): `Plan remaining 35%`, `Available / total
+  861.50 / 2,496.00 credits`, a `role=meter` bar (`aria-valuenow="34.515..."`), `Permanent available 10.00 credits`, and
+  the note "Plan credits are used first, then permanent credits". `SeleniumRodin.read_wallet()` reads those elements
+  (`WALLET_JS`, no hover and no click: the panel also holds the top-up and plan buttons) and `parse_wallet()` returns
+  `credits` = plan available + permanent, with `plan_available`, `plan_total`, `permanent`, `plan_percent`, `header`.
+  `read_balance()` returns `credits` (the legacy `MCP&CLI` parser is only a fallback for the old header); `submit` also
+  stores the figures as `wallet_before_submit`. **Nothing is derived from the percentage.** The reading is `None`
+  (= unreadable = STOP, as before) unless both credit figures are printed as numbers with the word `credits`, the plan bar
+  agrees with available / total within 0.5 points, the printed percentage within 1 point, and the pill equals the
+  panel's percentage (or, when it shows a number, the permanent credits). While the account loads the panel reads
+  `0.00 / — credits`, permanent `0.00` and the pill `0` (about 1.4 s to 4 s after load): a certain 0, which
+  `wait_balance` waits out as before. A state that was not seen (e.g. the plan used up, pill text other than a percentage
+  or the permanent credits) reads `None` and stops. The balance values of older records (`balances`,
+  `balance_before_submit`) are the old header number; whether that included the permanent credits is not known, so do
+  not compare across 2026-11-26.
+- Unchanged: the paid contract (displayed cost = expected cost, `--allow-paid`, `--accept-preview`, budget, paid gate), the
+  Multi-view tab, the upload inputs, the `Free Preview` label and the geometry Confirm price (`0.5 Credits`), all re-read
+  live on 2026-11-26 without any paid click. Other requests the page makes (not used): `api.hyper3d.com/api/user/get_info`,
+  `/api/billing/portal/overview`, `/api/content/changelog/feed|events` (`04_network_fetch_xhr.txt`).
+
 ### Browser lock (2026-11-25; moved to the profile launch after review_v2_phase4)
 
 The Hyper3D Firefox profile admits one browser, and several processes now use it (outfit `convert_job.py`, the monster

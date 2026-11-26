@@ -1,6 +1,7 @@
 """Offline tests for rodin_backend.py and the convert_job.py backend dispatch (browser is faked)."""
 import contextlib
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 import zlib
@@ -302,6 +304,262 @@ class PageStateTests(unittest.TestCase):
         self.assertEqual(rb.parse_balance('Add On\nAPI\nMCP&CLI\n1310.5\nQuinlan'), 1310.5)
         self.assertEqual(rb.parse_balance('MCP&CLI\n0\n'), 0.0)
         self.assertIsNone(rb.parse_balance('MCP&CLI\nLogin'))
+
+    # ---- site change 2026-11-26: percentage wallet pill + "What's New" dialog (probe .codex_jobs/hyper3d_probe_20261126/)
+    WALLET = {'header': '35%', 'aria': 'Business \u00b7 35%', 'plan_percent': '35%', 'figures': ['861.50', '2,496.00'],
+              'permanent': '10.00', 'meter': '34.515224358974365',
+              'summary': 'Plan remaining35%Available / total861.50 / 2,496.00 creditsPermanent available10.00 credits'}
+
+    def test_wallet_panel_gives_the_absolute_credits(self):
+        self.assertEqual(rb.parse_wallet(self.WALLET),
+                         {'credits': 871.5, 'plan_available': 861.5, 'plan_total': 2496.0, 'permanent': 10.0,
+                          'plan_percent': 35.0, 'header': '35%'})
+        self.assertEqual(rb.parse_wallet({**self.WALLET, 'meter': None})['credits'], 871.5)   # the bar is optional evidence
+        # the header as it is now carries no credit number: the legacy parser cannot (and must not) read one from it
+        self.assertIsNone(rb.parse_balance('Business\nAdd On\nAPI\nMCP\n35%\nGen-2.5 Agent-Ready'))
+
+    def test_wallet_while_the_account_loads_is_a_certain_zero(self):
+        loading = {'header': '0', 'aria': 'Permanent credits \u00b7 0', 'plan_percent': '\u2014', 'figures': ['0.00', '\u2014'],
+                   'permanent': '0.00', 'meter': None,
+                   'summary': 'Plan used up\u2014Available / total0.00 / \u2014 creditsPermanent available0.00 credits'}
+        self.assertEqual(rb.parse_wallet(loading)['credits'], 0.0)
+        self.assertEqual(rb.parse_wallet({**loading, 'header': '12', 'permanent': '12.00'})['credits'], 12.0)
+        self.assertIsNone(rb.parse_wallet({**loading, 'figures': ['5.00', '\u2014']}))    # credits without a plan total
+        self.assertIsNone(rb.parse_wallet({**loading, 'header': '3'}))                    # pill != permanent credits
+
+    def test_wallet_is_unreadable_rather_than_guessed(self):
+        w = self.WALLET
+        for bad in (None, {}, 'x',
+                    {**w, 'figures': []}, {**w, 'figures': ['861.50']}, {**w, 'figures': ['35%', '2,496.00']},
+                    {**w, 'figures': ['861.50', 'lots']}, {**w, 'figures': ['', '2,496.00']},
+                    {**w, 'figures': ['2,600.00', '2,496.00']},                 # more available than the plan holds
+                    {**w, 'figures': ['861.50', '0.00']},
+                    {**w, 'permanent': None}, {**w, 'permanent': '10.00 USD'},
+                    {**w, 'summary': 'Plan remaining35%Available / total861.50 / 2,496.00 pointsPermanent available10.00'},
+                    {**w, 'summary': None},
+                    {**w, 'meter': '50'}, {**w, 'meter': 'full'},               # the bar disagrees with the figures
+                    {**w, 'plan_percent': '60%', 'header': '60%'},              # the printed percentage disagrees
+                    {**w, 'plan_percent': None},
+                    {**w, 'header': '36%'}, {**w, 'header': ''}, {**w, 'header': 'Business'}, {**w, 'header': None},
+                    {**w, 'header': '861.5'}):                                  # a number that is not the permanent credits
+            self.assertIsNone(rb.parse_wallet(bad), bad)
+        # a percentage alone is never turned into credits
+        self.assertIsNone(rb.parse_wallet({'header': '35%', 'plan_percent': '35%', 'meter': '35', 'figures': [],
+                                           'permanent': None, 'summary': 'Plan remaining35%'}))
+
+    def wallet_session(self, script_result, body='Business\nAdd On\nAPI\nMCP\n35%'):
+        session = rb.SeleniumRodin(CONFIG, tempfile.mkdtemp())
+
+        class Driver:
+            def execute_script(self, js, *args):
+                if isinstance(script_result, Exception):
+                    raise script_result
+                return script_result
+
+            def find_element(self, by, value):
+                return mock.Mock(text=body)
+
+        session.driver = Driver()
+        return session
+
+    def test_read_balance_uses_the_wallet_panel(self):
+        session = self.wallet_session(dict(self.WALLET))
+        self.assertEqual(session.read_balance(), 871.5)
+        self.assertEqual(session.last_wallet['plan_available'], 861.5)
+        with mock.patch('time.sleep'):
+            self.assertEqual(session.wait_balance(60), 871.5)
+
+    def test_read_balance_is_none_when_the_panel_cannot_be_read(self):
+        for result in (None, {**self.WALLET, 'figures': []}, RuntimeError('page gone')):
+            session = self.wallet_session(result)
+            self.assertIsNone(session.read_balance())
+            self.assertIsNone(session.last_wallet)
+        # ... so the submit stops after its wait: the last value read is None, never a number made from "35%"
+        with mock.patch('time.sleep'), mock.patch('time.monotonic', side_effect=itertools.count(0, 30)):
+            self.assertIsNone(self.wallet_session(None).wait_balance(60))
+
+    def test_read_balance_still_reads_the_header_from_before_the_change(self):
+        session = self.wallet_session(None, body='Add On\nAPI\nMCP&CLI\n1310.5\nQuinlan')
+        self.assertEqual(session.read_balance(), 1310.5)
+        self.assertIsNone(session.last_wallet)
+
+    def test_submit_records_the_wallet_figures_behind_the_balance(self):
+        out = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, out, True)
+        views = out / 'views'
+        make_views(views)
+        session = FakeSession(out / 'job', balance=871.5)
+        session.last_wallet = rb.parse_wallet(self.WALLET)
+        data = rb.submit(views, out / 'job', config=CONFIG, session_factory=lambda: session)
+        self.assertEqual((data['balance_before_submit'], data['wallet_before_submit']['permanent']), (871.5, 10.0))
+
+    WHATS_NEW = {'label': "What's New", 'title': 'Low-Poly, Now with Artist-Style Topology',
+                 'buttons': [{'text': '', 'aria': 'Close'}, {'text': '', 'aria': 'Play video'},
+                             {'text': '', 'aria': 'Turn sound on'}, {'text': 'Got it', 'aria': ''}]}
+
+    def test_announcement_button_is_got_it_or_the_close_x_and_nothing_else(self):
+        pick = rb.announcement_button
+        self.assertEqual(pick(self.WHATS_NEW), 3)                                    # Got it
+        self.assertEqual(pick({**self.WHATS_NEW, 'buttons': self.WHATS_NEW['buttons'][:3]}), 0)   # no Got it: the X
+        self.assertEqual(pick({'label': '', 'buttons': [{'text': 'Learn more', 'aria': ''}, {'text': ' got it ', 'aria': ''}]}), 1)
+        self.assertEqual(pick({'label': 'Announcement', 'buttons': [{'text': 'Try it now', 'aria': ''}, {'text': '', 'aria': 'close'}]}), 1)
+        # an announcement without either button is not touched (its other buttons are never pressed)
+        self.assertIsNone(pick({'label': "What's New", 'buttons': [{'text': 'Try it now', 'aria': ''}, {'text': 'Upgrade', 'aria': ''}]}))
+        self.assertIsNone(pick({'label': "What's New", 'buttons': [{'text': 'Close and buy', 'aria': 'Close'}]}))
+        # any other dialog is left alone, also when it has a Close X: only announcements are closed
+        for other in ({'label': 'Confirm purchase', 'buttons': [{'text': '', 'aria': 'Close'}, {'text': 'Pay $12', 'aria': ''}]},
+                      {'label': '', 'buttons': [{'text': 'Confirm0.5 Credits', 'aria': ''}, {'text': 'Cancel', 'aria': ''}]},
+                      {'label': 'Top up', 'buttons': [{'text': 'Got it, pay', 'aria': ''}, {'text': 'OK', 'aria': ''}]},
+                      {'label': None, 'buttons': None}, {}):
+            self.assertIsNone(pick(other), other)
+
+    def dialog_session(self, pages):
+        """A SeleniumRodin whose page shows `pages[0]`, then `pages[1]` after the first click, ... (the last one stays).
+        Each page is a list of dialogs; clicks are recorded as (dialog label, button text or aria)."""
+        session = rb.SeleniumRodin(CONFIG, tempfile.mkdtemp())
+        self.clicked, self.shots, state = [], [], {'page': 0}
+        test = self
+
+        class Button:
+            def __init__(self, dialog, button, stuck):
+                self.dialog, self.button, self.stuck = dialog, button, stuck
+
+            def click(self):
+                test.clicked.append((self.dialog['label'], self.button['text'] or self.button['aria']))
+                if not self.stuck:
+                    state['page'] = min(state['page'] + 1, len(pages) - 1)
+
+        class Driver:
+            def execute_script(self, js, *args):
+                return [{**d, 'elements': [Button(d, b, d.get('stuck')) for b in d['buttons']]} for d in pages[state['page']]]
+
+        session.driver, session.screenshot = Driver(), self.shots.append
+        return session
+
+    def test_dismiss_announcements_clicks_got_it_and_reports(self):
+        session = self.dialog_session([[self.WHATS_NEW], []])
+        out = io.StringIO()
+        with mock.patch('time.sleep'), contextlib.redirect_stdout(out):
+            closed = session.dismiss_announcements()
+        self.assertEqual(closed, ["What's New - Low-Poly, Now with Artist-Style Topology"])
+        self.assertEqual(self.clicked, [("What's New", 'Got it')])
+        self.assertIn('Hyper3D announcement closed', out.getvalue())
+
+    def test_dismiss_announcements_closes_several_and_leaves_other_dialogs(self):
+        second = {'label': 'Announcement', 'title': 'Sale', 'buttons': [{'text': 'Shop now', 'aria': ''}, {'text': '', 'aria': 'Close'}]}
+        purchase = {'label': 'Confirm purchase', 'title': '', 'buttons': [{'text': '', 'aria': 'Close'}, {'text': 'Pay $12', 'aria': ''}]}
+        session = self.dialog_session([[purchase, self.WHATS_NEW, second], [purchase, second], [purchase]])
+        with mock.patch('time.sleep'), contextlib.redirect_stdout(io.StringIO()):
+            closed = session.dismiss_announcements()
+        self.assertEqual(len(closed), 2)
+        self.assertEqual(self.clicked, [("What's New", 'Got it'), ('Announcement', 'Close')])   # never Shop now / Pay / the purchase X
+        self.assertEqual(session._covering_dialogs(), ' (a dialog covers the page: Confirm purchase)')
+
+    def test_dismiss_announcements_without_one_clicks_nothing(self):
+        purchase = {'label': 'Confirm purchase', 'title': '', 'buttons': [{'text': '', 'aria': 'Close'}, {'text': 'Pay $12', 'aria': ''}]}
+        for page in ([], [purchase]):
+            session = self.dialog_session([page])
+            with mock.patch('time.sleep'), mock.patch('time.monotonic', side_effect=itertools.count(0, 3)):
+                self.assertEqual(session.dismiss_announcements(wait=4), [])
+            self.assertEqual(self.clicked, [])
+        session = self.dialog_session([[]])
+        session.driver.execute_script = mock.Mock(side_effect=RuntimeError('navigating'))
+        self.assertEqual(session.dismiss_announcements(), [])
+
+    def test_dismiss_announcements_waits_for_a_late_dialog(self):
+        session = self.dialog_session([[self.WHATS_NEW], []])
+        reads, original = [], session.driver.execute_script
+
+        def late(js, *args):                       # the dialog only shows on the third look
+            reads.append(1)
+            return original(js, *args) if len(reads) != 1 and len(reads) != 2 else []
+
+        session.driver.execute_script = late
+        with mock.patch('time.sleep'), mock.patch('time.monotonic', side_effect=itertools.count(0, 1)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            closed = session.dismiss_announcements(wait=4)
+        self.assertEqual((len(closed), self.clicked), (1, [("What's New", 'Got it')]))
+
+    def test_an_announcement_that_stays_open_stops_the_run(self):
+        session = self.dialog_session([[{**self.WHATS_NEW, 'stuck': True}]])
+        with mock.patch('time.sleep'), contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(rb.Stop, 'announcement dialog did not close'):
+                session.dismiss_announcements()
+        self.assertEqual(len(self.clicked), rb.SeleniumRodin.ANNOUNCEMENT_ROUNDS)
+        self.assertEqual(set(self.clicked), {("What's New", 'Got it')})
+        self.assertEqual(self.shots, ['announcement_not_dismissed'])
+
+    def test_pages_are_cleared_of_announcements_before_they_are_used(self):
+        session = rb.SeleniumRodin(CONFIG, tempfile.mkdtemp())
+        order = []
+        session.wf = mock.Mock(navigate=lambda driver, url: order.append('navigate'))
+        session._require_signed_in = lambda: order.append('signed_in')
+        session.dismiss_announcements = lambda wait=0: order.append(('dismiss', wait))
+        with mock.patch('time.sleep'):
+            session.open_workspace()
+            session.open_model('https://hyper3d.ai/workspace/rodin/x')
+        self.assertEqual(order, ['navigate', 'signed_in', ('dismiss', rb.ANNOUNCEMENT_WAIT_S)] * 2)
+        # the Free Preview and price reads close one first; a dialog that will not close stops before anything is clicked
+        session.dismiss_announcements = mock.Mock(side_effect=rb.Stop('announcement dialog did not close'))
+        session._control = mock.Mock(side_effect=AssertionError('control looked up under a dialog'))
+        session.wf = mock.Mock(exact=mock.Mock(side_effect=AssertionError('Generate looked up under a dialog')))
+        chains = types.ModuleType('selenium.webdriver.common.action_chains')
+        chains.ActionChains = mock.Mock()
+        modules = {'selenium': mock.Mock(), 'selenium.webdriver': mock.Mock(), 'selenium.webdriver.common': mock.Mock(),
+                   'selenium.webdriver.common.action_chains': chains}
+        with mock.patch.dict(sys.modules, modules):
+            for call in (session.click_free_preview, lambda: session.read_cost('geometry')):
+                with self.assertRaisesRegex(rb.Stop, 'did not close'):
+                    call()
+
+    def tab_session(self, tab_shows_on):
+        """SeleniumRodin._select_multiview_tab against a fake page: the Multi-view tab is visible from hover number
+        `tab_shows_on` (None = never)."""
+        session = rb.SeleniumRodin(CONFIG, tempfile.mkdtemp())
+        self.shots, self.dismissed, hovers = [], [], []
+        visible = mock.Mock(is_displayed=lambda: True)
+
+        class Driver:
+            def find_elements(self, by, xpath):
+                if 'Multi-view' in xpath:
+                    return [visible] if tab_shows_on is not None and len(hovers) >= tab_shows_on else []
+                return [visible]
+
+            def execute_script(self, js, *args):
+                if 'elementFromPoint' in js:
+                    hovers.append(1)
+                    return visible
+                if 'generation-tabs' in js:
+                    return '--items: 2; --active: 1;'
+                return [{'label': 'Survey', 'title': '', 'buttons': [], 'elements': []}]      # open_dialogs
+
+        session.driver, session.wf, session.screenshot = Driver(), mock.Mock(), self.shots.append
+        session.dismiss_announcements = lambda wait=0: self.dismissed.append(len(hovers))
+        chains, by = types.ModuleType('selenium.webdriver.common.action_chains'), types.ModuleType('selenium.webdriver.common.by')
+        chains.ActionChains, by.By = mock.Mock(), types.SimpleNamespace(XPATH='xpath')
+        modules = {'selenium': mock.Mock(), 'selenium.webdriver': mock.Mock(), 'selenium.webdriver.common': mock.Mock(),
+                   'selenium.webdriver.common.action_chains': chains, 'selenium.webdriver.common.by': by}
+        return session, modules, visible
+
+    def test_multiview_tab_is_looked_for_after_announcements_are_closed(self):
+        session, modules, tab = self.tab_session(1)
+        with mock.patch.dict(sys.modules, modules), mock.patch('time.sleep'):
+            session._select_multiview_tab()
+        self.assertEqual((self.dismissed, self.shots), ([0], []))          # closed before the first hover
+        tab.click.assert_called_once()
+        session, modules, tab = self.tab_session(2)                        # a dialog opened late: second hover finds it
+        with mock.patch.dict(sys.modules, modules), mock.patch('time.sleep'):
+            session._select_multiview_tab()
+        self.assertEqual(self.dismissed, [0, 1])
+        tab.click.assert_called_once()
+
+    def test_a_missing_multiview_tab_names_the_dialog_in_the_way(self):
+        session, modules, tab = self.tab_session(None)
+        with mock.patch.dict(sys.modules, modules), mock.patch('time.sleep'):
+            with self.assertRaisesRegex(rb.Stop, r'Multi-view tab not found \(a dialog covers the page: Survey\)'):
+                session._select_multiview_tab()
+        self.assertEqual(self.shots, ['multiview_tab_missing'])
+        tab.click.assert_not_called()
 
     def test_poly_label(self):
         self.assertEqual(rb.parse_poly_label('Triangle Detailed sharp triangular mesh 1M'), '1M')

@@ -163,6 +163,7 @@ from browser_lock import (BrowserLock, LOCK_BUSY, LOCK_FILE, LOCK_FILE_ENV, LOCK
                           LOCK_WAIT_S, OUTPUT_BUSY, RECORD_LOCK, Stop, lock_wait_seconds, open_profile, output_lock)
 
 
+ANNOUNCEMENT_WAIT_S = 4   # how long a freshly loaded page is watched for an announcement dialog before the run goes on
 BALANCE_WAIT_S = 60   # the header balance loads late (0, then the real one); Generate with 0 shown = "Insufficient Balance"
 INSUFFICIENT = 'Insufficient Balance'
 
@@ -855,7 +856,8 @@ def derive_stage(base_stage, pack_text, has_download, has_material_action):
 
 
 def parse_balance(body_text):
-    """Credit balance shown in the header: the number on the line after `MCP&CLI`."""
+    """LEGACY header (until the site change seen 2026-11-26): the credit number on the line after `MCP&CLI`. The header now
+    shows a percentage of the plan ("35%") there; the credits are read from the wallet panel (parse_wallet)."""
     lines = [line.strip() for line in (body_text or '').splitlines()]
     for i, line in enumerate(lines):
         if line == 'MCP&CLI':
@@ -863,6 +865,95 @@ def parse_balance(body_text):
                 if re.fullmatch(r'\d+(?:\.\d+)?', nxt):
                     return float(nxt)
     return None
+
+
+def _credit_number(text):
+    """A credit figure as the wallet panel prints it ('861.50', '2,496.00'); None for anything else (e.g. the dash)."""
+    text = (text or '').strip()
+    if not re.fullmatch(r'\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?', text):
+        return None
+    return float(text.replace(',', ''))
+
+
+def _percent(text):
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)\s*%', (text or '').strip())
+    return float(match.group(1)) if match else None
+
+
+def parse_wallet(info):
+    """Credit balance from the header wallet panel (site change seen 2026-11-26; probe .codex_jobs/hyper3d_probe_20261126/).
+
+    The header pill now reads a percentage of the plan ("35%"); the absolute numbers are in the wallet panel that the pill
+    opens on hover and that is in the DOM all the time (`#rechargeSelf section.unified-wallet`): "Plan remaining 35% /
+    Available / total 861.50 / 2,496.00 credits" and "Permanent available 10.00 credits" ("Plan credits are used first,
+    then permanent credits"). `info` is what SeleniumRodin.WALLET_JS read: header (the pill's text), plan_percent,
+    figures [available, total], permanent, meter (aria-valuenow of the plan bar), summary (the panel's text).
+
+    Returns {'credits': plan available + permanent, 'plan_available', 'plan_total', 'permanent', 'plan_percent', 'header'}
+    or None when the panel cannot be read WITH CERTAINTY. Nothing is ever derived from the percentage: the two credit
+    figures must be printed as numbers, the word `credits` must be there, and every redundant reading must agree with
+    them (the plan bar within 0.5 points, the printed percentages within 1 point, the pill equal to the panel's
+    percentage, or to the permanent credits when it shows a number). While the account loads the panel reads
+    "0.00 / — credits", permanent 0.00 and the pill "0": that is a certain 0 (the caller waits for more).
+    """
+    if not isinstance(info, dict):
+        return None
+    figures = info.get('figures')
+    if not isinstance(figures, (list, tuple)) or len(figures) != 2:
+        return None
+    available, permanent = _credit_number(figures[0]), _credit_number(info.get('permanent'))
+    if available is None or permanent is None or 'credits' not in (info.get('summary') or '').lower():
+        return None
+    total_text = (figures[1] or '').strip()
+    total = _credit_number(total_text)
+    if total is None and total_text not in ('\u2014', '\u2013', '-'):
+        return None
+    header = (info.get('header') or '').strip()
+    plan_percent = _percent(info.get('plan_percent'))
+    if total is None:                       # no plan quota shown (seen while the account loads): nothing may be available
+        if available != 0 or info.get('meter') not in (None, ''):
+            return None
+    else:
+        if total <= 0 or available > total + 1e-6:
+            return None
+        share = available / total * 100
+        try:
+            meter = None if info.get('meter') in (None, '') else float(info['meter'])
+        except (TypeError, ValueError):
+            return None
+        if meter is not None and abs(meter - share) > 0.5:
+            return None
+        if plan_percent is None or abs(plan_percent - share) > 1:
+            return None
+    if _percent(header) is not None:        # the pill shows the plan's percentage ...
+        if plan_percent is None or _percent(header) != plan_percent:
+            return None
+    elif _credit_number(header) is None or abs(_credit_number(header) - permanent) > 1e-6:   # ... or the permanent credits
+        return None
+    return {'credits': round(available + permanent, 4), 'plan_available': available, 'plan_total': total,
+            'permanent': permanent, 'plan_percent': plan_percent, 'header': header}
+
+
+ANNOUNCEMENT_LABEL = re.compile(r"what'?s new|announcement|changelog|release notes|new feature", re.I)
+ANNOUNCEMENT_ACK = 'got it'      # the acknowledge button of the site's announcement dialog (seen 2026-11-26)
+
+
+def announcement_button(dialog):
+    """Index of the button that closes an announcement dialog, or None when `dialog` is not one (it is then left alone).
+
+    `dialog` = {'label': aria-label, 'buttons': [{'text', 'aria'}]} of a visible `aria-modal` dialog. An announcement
+    (seen 2026-11-26: aria-label "What's New", a video, `Got it`, a `Close` X) is a dialog whose label says so or that has a
+    `Got it` button. Only two kinds of button are ever chosen: one whose whole text is `Got it`, else one without text whose
+    aria-label is `Close`. Nothing else is clicked, so a button that buys, confirms or generates can never be hit, and a
+    dialog of any other kind (a purchase, a confirmation) is never touched."""
+    buttons = dialog.get('buttons') or []
+    texts = [((b.get('text') or '').strip().lower(), (b.get('aria') or '').strip().lower()) for b in buttons]
+    ack = next((i for i, (text, _) in enumerate(texts) if text == ANNOUNCEMENT_ACK), None)
+    if ack is not None:
+        return ack
+    if not ANNOUNCEMENT_LABEL.search(dialog.get('label') or ''):
+        return None
+    return next((i for i, (text, aria) in enumerate(texts) if not text and aria == 'close'), None)
 
 
 # --------------------------------------------------------------------------- GLB inspection
@@ -977,7 +1068,9 @@ def _submit_held(views_dir, out_dir, plan, config, session_factory, dry_run, hol
                 record.save('dry_run', status='dry_run')
                 return record.data
             balance = session.wait_balance(BALANCE_WAIT_S)
-            record.save('balance_before_submit', balance_before_submit=balance)
+            wallet = getattr(session, 'last_wallet', None)   # the panel's figures behind `balance` (None: legacy header / fake)
+            record.save('balance_before_submit', balance_before_submit=balance,
+                        **({'wallet_before_submit': wallet} if wallet else {}))
         except Stop as exc:
             # final-live review: a Stop here is a failure BEFORE the click (e.g. 'Expected 4 uploaded thumbnails, found 3').
             # The record proves it (no intent of any kind, no model): archived aside, so a retry submits fresh instead of
@@ -1332,7 +1425,87 @@ class SeleniumRodin:
         self.screenshot('auth_unknown')
         raise Stop('Could not confirm a signed-in Hyper3D session (no Logout entry found)')
 
+    DIALOGS_JS = """
+    const vis = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+    return [...document.querySelectorAll('[role=dialog][aria-modal=true]')].filter(vis).map(d => {
+        const buttons = [...d.querySelectorAll('button')].filter(vis);
+        return {label: d.getAttribute('aria-label') || '', title: ((d.querySelector('h1,h2,h3') || {}).innerText || '').trim().slice(0, 120),
+                buttons: buttons.map(b => ({text: (b.innerText || '').trim(), aria: b.getAttribute('aria-label') || ''})),
+                elements: buttons};
+    });
+    """
+    ANNOUNCEMENT_ROUNDS = 5
+
+    def open_dialogs(self):
+        """The visible modal dialogs ({label, title, buttons, elements}); [] when the page cannot be asked."""
+        try:
+            return self.driver.execute_script(self.DIALOGS_JS) or []
+        except Exception:   # noqa: BLE001  e.g. the page is navigating: the caller's own checks decide
+            return []
+
+    def dismiss_announcements(self, wait=0):
+        """Close the site's announcement / what's-new dialogs (2026-11-26: a "What's New" dialog covered the workspace, so
+        the upload card could not be hovered: 'Multi-view tab not found'). Looks for up to `wait` seconds for one to show,
+        then closes each by its `Got it` (else its `Close` X) button, which is all announcement_button() ever returns; any
+        other dialog is left alone. An announcement that does not go away stops the run. Returns the titles closed."""
+        closed = []
+        deadline = time.monotonic() + wait
+        for _ in range(self.ANNOUNCEMENT_ROUNDS):
+            while True:
+                found = [(d, announcement_button(d)) for d in self.open_dialogs()]
+                found = [(d, i) for d, i in found if i is not None]
+                if found or time.monotonic() >= deadline:
+                    break
+                time.sleep(0.5)
+            if not found:
+                return closed
+            dialog, index = found[0]
+            name = ' - '.join(t for t in (dialog.get('label'), dialog.get('title')) if t) or 'announcement'
+            dialog['elements'][index].click()
+            closed.append(name)
+            print(f'Hyper3D announcement closed: {name} [{dialog["buttons"][index].get("text") or "Close"}]', flush=True)
+            time.sleep(1.5)                 # its fade-out; the next round reads the page again
+        if any(announcement_button(d) is not None for d in self.open_dialogs()):
+            self.screenshot('announcement_not_dismissed')
+            raise Stop(f'A Hyper3D announcement dialog did not close ({closed[-1]}); close it in the browser, then run again')
+        return closed
+
+    def _covering_dialogs(self):
+        """' (a dialog covers the page: ...)' for a Stop message, '' when none is open."""
+        names = [d.get('label') or d.get('title') or 'unnamed' for d in self.open_dialogs()]
+        return f' (a dialog covers the page: {", ".join(names)})' if names else ''
+
+    WALLET_JS = """
+    const pill = document.querySelector('#rechargeSelf');
+    if (!pill) return null;
+    const text = s => { const e = pill.querySelector(s); return e ? e.textContent.trim() : null; };
+    const meter = pill.querySelector('section.unified-wallet [role=meter]');
+    return {header: text('span[class*="walletLabel"]'), aria: pill.getAttribute('aria-label'),
+            plan_percent: text('section.unified-wallet .wallet-headline strong'),
+            figures: [...pill.querySelectorAll('section.unified-wallet .wallet-summary-figures b')].map(e => e.textContent.trim()),
+            permanent: text('section.unified-wallet .permanent-head b'),
+            meter: meter ? meter.getAttribute('aria-valuenow') : null,
+            summary: text('section.unified-wallet')};
+    """
+
+    last_wallet = None
+
+    def read_wallet(self):
+        """The wallet panel's figures (parse_wallet) or None; kept in `last_wallet` for the record. Read from the DOM:
+        the panel is rendered all the time and only shown on hover, so nothing is hovered or clicked near its top-up buttons."""
+        try:
+            info = self.driver.execute_script(self.WALLET_JS)
+        except Exception:   # noqa: BLE001  unreadable = unknown, never a guess
+            info = None
+        self.last_wallet = parse_wallet(info)
+        return self.last_wallet
+
     def read_balance(self):
+        """Credits in the wallet (plan available + permanent, both printed in the wallet panel); None = unreadable.
+        A page that still has the header from before 2026-11-26 is read by parse_balance."""
+        wallet = self.read_wallet()
+        if wallet is not None:
+            return wallet['credits']
         return parse_balance(self.driver.find_element('tag name', 'body').text)
 
     def wait_balance(self, timeout):
@@ -1352,6 +1525,7 @@ class SeleniumRodin:
         self.wf.navigate(self.driver, self.config['workspace_url'])
         time.sleep(4)
         self._require_signed_in()
+        self.dismiss_announcements(wait=ANNOUNCEMENT_WAIT_S)
 
     def _pick_effort(self, wanted, levels):
         """Open the effort dropdown (current level next to the timer icon) and choose `wanted`."""
@@ -1380,19 +1554,25 @@ class SeleniumRodin:
         wf, driver = self.wf, self.driver
         from selenium.webdriver.common.action_chains import ActionChains
         from selenium.webdriver.common.by import By
-        label = next((e for e in driver.find_elements(By.XPATH, '//*[normalize-space(text())="Text to Image/3D"]')
-                      if e.is_displayed()), None)
-        if label is None:
-            raise Stop('Upload card not found')
-        plus = driver.execute_script(
-            'const r=arguments[0].getBoundingClientRect(); return document.elementFromPoint(r.left+r.width/2, r.top-60)', label)
-        ActionChains(driver).move_to_element(plus).perform()
-        time.sleep(1.5)
-        tab = next((e for e in driver.find_elements(By.XPATH, '//*[normalize-space(text())="Multi-view"]')
-                    if e.is_displayed()), None)
+        tab = None
+        for _ in range(2):                  # an announcement that opened late hides the card: close it and hover once more
+            self.dismiss_announcements()
+            label = next((e for e in driver.find_elements(By.XPATH, '//*[normalize-space(text())="Text to Image/3D"]')
+                          if e.is_displayed()), None)
+            if label is None:
+                raise Stop('Upload card not found' + self._covering_dialogs())
+            plus = driver.execute_script(
+                'const r=arguments[0].getBoundingClientRect(); return document.elementFromPoint(r.left+r.width/2, r.top-60)', label)
+            ActionChains(driver).move_to_element(plus).perform()
+            time.sleep(1.5)
+            tab = next((e for e in driver.find_elements(By.XPATH, '//*[normalize-space(text())="Multi-view"]')
+                        if e.is_displayed()), None)
+            if tab is not None:
+                break
+            time.sleep(2)
         if tab is None:
             self.screenshot('multiview_tab_missing')
-            raise Stop('Multi-view tab not found')
+            raise Stop('Multi-view tab not found' + self._covering_dialogs())
         tab.click()
         time.sleep(1.5)
         active = driver.execute_script('const t=document.querySelector(".generation-tabs"); return t && t.getAttribute("style")')
@@ -1455,6 +1635,7 @@ class SeleniumRodin:
     def click_free_preview(self):
         wf, driver = self.wf, self.driver
         from selenium.webdriver.common.action_chains import ActionChains
+        self.dismiss_announcements()        # nothing may cover the Generate control when its label is read and clicked
         generate = wf.exact(driver, 'GENERATE')
         if generate is None:
             raise Stop('Main Generate control not found')
@@ -1481,6 +1662,7 @@ class SeleniumRodin:
         self.wf.navigate(self.driver, url)
         time.sleep(4)
         self._require_signed_in()
+        self.dismiss_announcements(wait=ANNOUNCEMENT_WAIT_S)
 
     def observe_stage(self):
         wf, driver = self.wf, self.driver
@@ -1516,6 +1698,7 @@ class SeleniumRodin:
 
     def read_cost(self, kind):
         from selenium.webdriver.common.action_chains import ActionChains
+        self.dismiss_announcements()        # the price only shows while the control is hovered
         control = self._control(kind)
         ActionChains(self.driver).move_to_element(control).perform()
         time.sleep(1)
