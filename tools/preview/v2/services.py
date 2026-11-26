@@ -1187,10 +1187,28 @@ def _locks_naming(root, pid: int) -> list[str]:
     return out
 
 
+CONSOLE_HOSTS = {'conhost.exe', 'openconsole.exe'}
+
+
+def _work_children(proc, recursive: bool = False) -> list:
+    """The child processes that can do work: Windows gives every console process a console host (conhost.exe, started with it and
+    living as long as it does), which is never work and must not count as "the worker woke up" (found at the real cut-over: the
+    legacy worker's only child was its conhost.exe from the day it started)."""
+    out = []
+    for kid in proc.children(recursive=recursive):
+        try:
+            if os.name == 'nt' and kid.name().lower() in CONSOLE_HOSTS:
+                continue
+        except psutil.Error:
+            pass
+        out.append(kid)
+    return out
+
+
 def _worker_idle_problem(root, proc, inst: dict) -> str | None:
     """The frozen legacy worker is provably asleep: no child process (a convert_job.py, a balance check), no convert_job.py of this checkout,
     no job lock naming it, and its last event since it started is PAUSED / IDLE / LOW DISK after its last CONVERT."""
-    kids = proc.children()
+    kids = _work_children(proc)
     if kids:
         return f'an older worker: it has a child process (pid {kids[0].pid}): it woke up; waiting'
     jobs = convert_job_running(root)
@@ -1387,7 +1405,7 @@ def _drain_idle_problem(root, proc, inst: dict) -> str | None:
     one after which it only releases the job and picks the next (DRAIN_SAFE_EVENTS; never while it finishes / offloads a set)."""
     deadline = time.monotonic() + DRAIN_SETTLE
     while True:
-        kids = proc.children(recursive=True)
+        kids = _work_children(proc, recursive=True)
         if not kids:
             break
         waiting = {w['pid'] for w in gate_waiters(root)}
@@ -1486,7 +1504,7 @@ def _runner_idle_problem(root, proc) -> str | None:
     """The frozen older runner launches nothing right now: every child is a `codex_imagegen.sh <job>` whose job its status files already
     record as running (a new runner adopts it through `.done`), and it has no other child (a framing check of a finishing task)."""
     recorded = None
-    for child in proc.children():
+    for child in _work_children(proc):
         try:
             cmd = child.cmdline()
         except psutil.NoSuchProcess:

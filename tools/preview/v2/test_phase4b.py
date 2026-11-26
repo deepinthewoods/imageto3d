@@ -2335,5 +2335,27 @@ class CutoverCheckerTest(TempRoot):
         self.assert_safe()
 
 
+
+class ConsoleHostTest(unittest.TestCase):
+    """Real cut-over: the legacy worker's only child was its conhost.exe; that is not work."""
+
+    def test_console_hosts_are_not_work_children(self):
+        import services
+
+        class Kid:
+            def __init__(self, pid, name):
+                self.pid, self._name = pid, name
+
+            def name(self):
+                return self._name
+
+        class Proc:
+            def children(self, recursive=False):
+                return [Kid(1, 'conhost.exe'), Kid(2, 'python.exe'), Kid(3, 'OpenConsole.exe')]
+
+        kids = services._work_children(Proc())
+        expected = [2] if os.name == 'nt' else [1, 2, 3]
+        self.assertEqual([k.pid for k in kids], expected)
+
 if __name__ == '__main__':
     unittest.main()
