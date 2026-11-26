@@ -105,7 +105,7 @@ HOLD_FILE = 'CONVERT_HOLD'         # = services.HOLD_FILE (DESIGN_PHASE4.md I.1)
 DRAIN_FILE = 'CONVERT_DRAIN'       # = services.DRAIN_FILE (DESIGN_PHASE4.md I.10)
 NO_WINDOW = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
 CHILDREN_DIR = 'monster_lane'
-CREATE_TOLERANCE = 0.001   # every recorded create time comes from psutil for the same process: an exact match (confirm review, blocker 2: a 1 s tolerance let a pid reused 0.5 s later pass)
+CREATE_TOLERANCE = 0.0     # exact: every recorded create time is psutil's float for that same process and JSON round-trips it exactly (confirm reviews: a reused pid differing by 0.5 s, then by 0.5 ms, must not pass)
 
 
 class ConfirmPaused(guard.Conflict):

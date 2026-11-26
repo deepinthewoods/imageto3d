@@ -4690,5 +4690,17 @@ class MigrateCliTest(MonsterCase):
         self.assertEqual(len(list(self.mroot.rglob(mv.STATE_FILE))), 4)
 
 
+
+class ExactCreateTimeTest(unittest.TestCase):
+    """Second confirm review: a recycled pid whose start time differs by 0.5 ms must not be treated as the recorded process."""
+
+    def test_only_the_exact_recorded_create_time_opens_the_process(self):
+        import psutil
+        me = psutil.Process(os.getpid())
+        created = me.create_time()
+        self.assertIsNotNone(monster_lane._open_proven(os.getpid(), json.loads(json.dumps(created))))   # JSON round trip is exact
+        for off in (0.0005, -0.0005, 0.5):
+            self.assertIsNone(monster_lane._open_proven(os.getpid(), created + off), off)
+
 if __name__ == '__main__':
     unittest.main()
