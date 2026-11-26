@@ -1237,6 +1237,13 @@ class HostAndPathTests(V2Case):
         found = server.discover_hosts(self.root, run=lambda *a, **k: fake)
         self.assertEqual(found, ['100.64.0.7', 'pc', 'pc.tail1234.ts.net', 'review.example.test'])
         self.assertEqual(server.discover_hosts(self.root, run=mock.Mock(side_effect=FileNotFoundError())), ['review.example.test'])
+        serve = json.dumps({'Web': {'pc.tail1234.ts.net:8445': {'Handlers': {'/': {'Proxy': 'http://127.0.0.1:8765'}}},
+                                    'pc.tail1234.ts.net:8443': {'Handlers': {'/': {'Proxy': 'http://127.0.0.1:3002'}}}}})
+        def run(cmd, **kw):   # tailscale serve front-ends that proxy to this server's port keep their own port in Host
+            return subprocess.CompletedProcess(cmd, 0, serve if 'serve' in cmd else fake.stdout, '')
+        found_serve = server.discover_hosts(self.root, run=run, port=8765)
+        self.assertIn('pc.tail1234.ts.net:8445', found_serve)
+        self.assertNotIn('pc.tail1234.ts.net:8443', found_serve)
         second = server.create_server(self.root, port=0, web=self.web, extra_hosts=found, read_only=True)
         thread = threading.Thread(target=second.serve_forever, daemon=True)
         thread.start()

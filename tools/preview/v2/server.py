@@ -93,7 +93,7 @@ def inject_token(html: str, token: str) -> str:
 
 # ---------------------------------------------------------------------------------------------------------------- hosts
 
-def discover_hosts(root: Path, run=subprocess.run) -> list[str]:
+def discover_hosts(root: Path, run=subprocess.run, port: int | None = None) -> list[str]:
     """Extra Host names to accept: this machine's tailnet name(s) (`tailscale status --json`) and `allowed_hosts` of
     `.codex_jobs/_app/settings.json`. A missing tailscale or file just means none."""
     names: list[str] = []
@@ -104,6 +104,17 @@ def discover_hosts(root: Path, run=subprocess.run) -> list[str]:
         names += [str(ip) for ip in me.get('TailscaleIPs') or []]
     except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
         pass
+    if port is not None:   # `tailscale serve` front-ends that proxy to this server keep their own port in the Host header (found at cut-over)
+        try:
+            out = run(['tailscale', 'serve', 'status', '--json'], capture_output=True, text=True, timeout=5, check=False)
+            web = (json.loads(out.stdout or '{}').get('Web') or {}) if out.returncode == 0 else {}
+            for hostport, cfg in web.items():
+                for handler in ((cfg or {}).get('Handlers') or {}).values():
+                    target = urlsplit(str((handler or {}).get('Proxy') or ''))
+                    if target.hostname in ('127.0.0.1', 'localhost', '::1') and target.port == port:
+                        names.append(str(hostport))
+        except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+            pass
     names += list(app_settings.load(root)['allowed_hosts'])          # settings.load: the only settings reader (DESIGN_PHASE4.md H)
     return sorted({n.strip().lower() for n in names if n and n.strip()})
 
@@ -440,7 +451,7 @@ def create_server(root: Path = DEFAULT_ROOT, host: str = '127.0.0.1', port: int 
     server = Server((host, port), make_handler(root, token, Path(web), ctx))
     server.token = token
     server.ctx = ctx
-    ctx['hosts'] = host_set(server.server_port, discover_hosts(root) if extra_hosts is None else list(extra_hosts), host)
+    ctx['hosts'] = host_set(server.server_port, discover_hosts(root, port=server.server_port) if extra_hosts is None else list(extra_hosts), host)
     lock = guard.ServerLock(root)
     if read_only or not lock.acquire():
         ctx['read_only'] = True
