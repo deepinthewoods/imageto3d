@@ -3105,6 +3105,519 @@ class FinalVerifyJournalTest(FinalVerifyCase):
         self.assertEqual(json.loads(mv.variant_names_path(self.mroot, 'Hobgoblin').read_text())['variants']['1']['imported_by'], 'v2')
 
 
+# ------------------------------------------------------------------------------------------------- last check (review_v2_last_check)
+
+SUCCESSOR_STUB = r'''
+import os, pathlib, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+import monster_lane, psutil
+monster_lane._Tracker.WATCH_S = 60          # no watcher sample: only the cleanup's own looks at the job count
+tracker = monster_lane._Tracker(sys.argv[2], 'Giant Rat', sys.argv[3], own_process=True)
+go, note = pathlib.Path(sys.argv[4]), sys.argv[5]
+member = ('import os, pathlib, subprocess, sys, time\n'
+          'D = subprocess.DEVNULL\n'
+          'while not pathlib.Path(sys.argv[1]).exists(): time.sleep(0.02)\n'
+          'p = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"], stdin=D, stdout=D, stderr=D)\n'
+          'open(sys.argv[2] + ".tmp", "w").write(str(p.pid))\n'
+          'os.replace(sys.argv[2] + ".tmp", sys.argv[2])\n')
+D = subprocess.DEVNULL
+proc = subprocess.Popen([sys.executable, '-c', member, str(go), note], stdin=D, stdout=D, stderr=D)   # a member of the driver's job
+real = tracker._job_survivors
+
+
+def survivors():
+    out = real()                             # the cleanup looks at the job: the member lives and is on record
+    assert proc.pid in tracker.descendants, tracker.descendants
+    go.write_text('go')                      # ... and NOW, during the cleanup, it spawns a successor and exits
+    proc.wait(60)
+    while psutil.pid_exists(proc.pid):
+        time.sleep(0.02)
+    assert pathlib.Path(note).exists()
+    return out
+
+
+tracker._job_survivors = survivors
+tracker.close()
+print(tracker.job or '-', proc.pid, flush=True)
+'''
+
+
+class LastCheckCancelTest(FinalVerifyCase):
+    """New blocker + row 3: Cancel never answers success while the generation stays runnable; a repeated Cancel is never lost."""
+
+    def lost_cancel(self):
+        """A row that is cancelled in SQLite while its durable disposition is MISSING (what the reviewer's repeated Cancel resolved)."""
+        mid, v, task_id, gen = self.frozen()
+        self.assertTrue(taskqueue.for_root(self.root).cancel(task_id, 'manual', manual_gen='manual'))
+        self.assertIsNone(mv.disposition_of(self.vj(v), gen))
+        return mid, v, task_id, gen, {'id': task_id} | self.ident(task_id)
+
+    def runnable(self):
+        return [t['key'] for t in monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start']]
+
+    def lane_states(self):
+        return [t['state'] for t in taskqueue.for_root(self.root).tasks(lane=monster_lane.LANE)]
+
+    def test_queue_rebuilt_between_the_handlers_two_lookups(self):
+        mid, v, task_id, gen, ident = self.lost_cancel()
+        real = monster_lane.resolve_task
+
+        def resolve(*args, **kwargs):
+            row = real(*args, **kwargs)                         # the handler's FIRST lookup: the cancelled row
+            self.assertEqual(row['state'], 'cancelled')
+            self.assertEqual(self.rebuild(), ([f'Giant Rat/{v}'], []))    # the queue is rebuilt: no disposition, so it is QUEUED again
+            self.assertEqual(self.runnable(), [row['key']])     # (what HEAD then left selected for conversion)
+            return row
+        with mock.patch.object(monster_lane, 'resolve_task', resolve):
+            out = actions.queue_op(self.root, {'op': 'cancel'} | ident)
+        self.assertEqual((out['ok'], out['state']), (True, 'cancelled'))                         # the Cancel was RE-APPLIED, not lost
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['state'], 'cancelled')               # durably
+        self.assertEqual((self.lane_states(), self.runnable()), (['cancelled'], []))
+        self.assertEqual(self.rebuild(), ([], [f'Giant Rat/{v}']))                               # and it survives the next rebuild
+        self.assertEqual((self.lane_states(), self.runnable()), (['cancelled'], []))
+
+    def test_queue_rebuilt_inside_cancel_before_its_own_lookup(self):
+        mid, v, task_id, gen, ident = self.lost_cancel()
+        shown = monster_lane.resolve_task(self.root, task_id, ident['key'], ident['generation'])
+        real = taskqueue.TaskQueue.by_key
+        calls = []
+
+        def by_key(queue, key):
+            if not calls:                                       # right before cancel_task's own (second) lookup
+                calls.append(1)
+                self.assertEqual(self.rebuild(), ([f'Giant Rat/{v}'], []))
+            return real(queue, key)
+        with mock.patch.object(taskqueue.TaskQueue, 'by_key', by_key):
+            self.assertTrue(monster_lane.cancel_task(self.root, shown))
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['state'], 'cancelled')
+        self.assertEqual((self.lane_states(), self.runnable()), (['cancelled'], []))
+
+    def test_rebuilt_queue_without_a_row_yet_gets_the_durable_cancel(self):
+        mid, v, task_id, gen, ident = self.lost_cancel()
+        shown = monster_lane.resolve_task(self.root, task_id, ident['key'], ident['generation'])
+        self.drop_queue()                                       # rebuilt, not ticked yet: no row at all
+        self.assertTrue(monster_lane.cancel_task(self.root, shown))
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['state'], 'cancelled')
+        out = monster_lane.tick(self.root)
+        self.assertEqual((out['queued'], out['restored']), ([], [f'Giant Rat/{v}']))             # never queued again
+        self.assertEqual((self.lane_states(), self.runnable()), (['cancelled'], []))
+
+    def test_state_changed_between_the_lookups_is_409_changed(self):
+        mid, v, task_id, gen, ident = self.lost_cancel()
+        real = monster_lane.resolve_task
+
+        def resolve(*args, **kwargs):
+            row = real(*args, **kwargs)
+            self.rebuild()                                      # queued again ...
+            q = taskqueue.for_root(self.root)
+            q.claim(q.by_key(row['key'])['id'], 'tok', None)    # ... and the dispatcher started it
+            return row
+        with mock.patch.object(monster_lane, 'resolve_task', resolve):
+            with self.assertRaises(guard.Changed) as caught:
+                actions.queue_op(self.root, {'op': 'cancel'} | ident)
+        self.assertEqual(caught.exception.code, 'changed')                                       # never `ok: true`
+        self.assertIsNone(mv.disposition_of(self.vj(v), gen))                                    # nothing claimed to be cancelled
+        self.assertEqual(self.lane_states(), ['starting'])
+
+    def test_start_between_the_durable_write_and_the_row_cancel_takes_the_write_back(self):
+        mid, v, task_id, gen, ident = self.lost_cancel()
+        shown = monster_lane.resolve_task(self.root, task_id, ident['key'], ident['generation'])
+        self.rebuild()
+        real = taskqueue.TaskQueue.cancel
+
+        def started_meanwhile(queue, tid, detail='', manual_gen=None, expect=None):
+            self.assertEqual(mv.disposition_of(self.vj(v), gen)['state'], 'cancelled')           # the durable disposition came FIRST
+            queue.claim(tid, 'tok', None)
+            return real(queue, tid, detail, manual_gen, expect)
+        with mock.patch.object(taskqueue.TaskQueue, 'cancel', started_meanwhile):
+            with self.assertRaises(guard.Changed):
+                monster_lane.cancel_task(self.root, shown)
+        self.assertIsNone(mv.disposition_of(self.vj(v), gen))                                    # our own write, taken back
+        self.assertEqual(self.lane_states(), ['starting'])
+
+    def test_repeat_is_success_only_with_a_durable_cancel_and_no_runnable_row(self):
+        mid, v, task_id, gen = self.frozen()
+        self.assertEqual(self.qop('cancel', task_id)['state'], 'cancelled')
+        seq = mv.disposition_seq(self.vj(v))
+        self.assertEqual(self.qop('cancel', task_id)['state'], 'cancelled')                      # idempotent: durable + not runnable
+        self.assertEqual(mv.disposition_seq(self.vj(v)), seq)                                    # (nothing rewritten)
+        ident = {'id': task_id} | self.ident(task_id)
+        # the durable disposition says FAILED by now (not cancelled): the repeat is not a success
+        mv.set_disposition(self.root, 'Giant Rat', v, gen, None)
+        mv.set_disposition(self.root, 'Giant Rat', v, gen, {'state': 'failed', 'reason': 'STOPPED: cost'})
+        with self.assertRaises(guard.Changed):
+            actions.queue_op(self.root, {'op': 'cancel'} | ident)
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['state'], 'failed')
+        self.assertEqual(self.runnable(), [])
+
+    def test_answer_never_reports_a_runnable_row(self):
+        mid, v, task_id, gen, ident = self.lost_cancel()
+        real = monster_lane.cancel_task
+
+        def cancel_then_revive(root, task, detail='manual'):
+            done = real(root, task, detail)
+            mv.set_disposition(root, 'Giant Rat', v, gen, None)                                 # (a Retry right after it)
+            taskqueue.for_root(root).retry(taskqueue.for_root(root).by_key(task['key'])['id'])
+            return done
+        with mock.patch.object(monster_lane, 'cancel_task', cancel_then_revive):
+            with self.assertRaises(guard.Changed):
+                actions.queue_op(self.root, {'op': 'cancel'} | ident)
+
+
+class LastCheckPauseTest(FinalVerifyCase):
+    """Row 5: a pause's identity and reason come from ONE snapshot; a consent for pause A is never accepted while B is reported."""
+
+    def pause_file(self, reason):
+        guard.write_atomic(self.batch() / 'PAUSE', json.dumps({'since': 's', 'reason': reason, 'scope': ['conversions']}).encode())
+
+    def hook(self, fn):
+        modes.READS.append(fn)
+        self.addCleanup(lambda: fn in modes.READS and modes.READS.remove(fn))
+
+    def test_each_file_is_read_once_per_gate(self):
+        modes.write_mode(self.root, 'pause-conversions')
+        self.pause_file('maintenance: A')
+        seen = []
+        self.hook(lambda path: seen.append(Path(path).name))
+        with mock.patch.object(modes, 'pause_extra', side_effect=AssertionError('a second look at PAUSE')), \
+                mock.patch.object(modes, 'file_identity', side_effect=AssertionError('a second look at the file')), \
+                mock.patch.object(modes, 'read_json', side_effect=AssertionError('a second look at the file')):
+            gate = monster_lane.gate(self.root, {'run_now': True}, 10, True)
+            self.assertEqual(sorted(seen), ['PAUSE', 'supervisor_mode.json'])
+            del seen[:]
+            manual = modes.manual_pause(self.root)
+            self.assertEqual(sorted(seen), ['PAUSE', 'supervisor_mode.json'])
+            del seen[:]
+            snap = modes.snapshot(self.root, supervisor=(False, ''))
+            self.assertEqual(sorted(seen), ['PAUSE', 'supervisor_mode.json'])
+        self.assertEqual((gate['pause_id'], snap['pause_id']), (manual['pause_id'], manual['pause_id']))
+        self.assertNotIn('extra', gate['pause'])                                                 # the API shape is unchanged
+        self.assertNotIn('extra', snap['pause'])
+
+    def test_replacing_pause_a_by_b_between_reads_never_accepts_the_consent_for_a(self):
+        modes.write_mode(self.root, 'views-run')
+        self.pause_file('maintenance: A')
+        id_a = modes.manual_pause(self.root)['pause_id']
+        args = {'run_now': True, 'override_pause': id_a}                                          # the user confirmed pause A
+        self.assertTrue(monster_lane.gate(self.root, args, 10, True)['open'])
+        swapped = []
+
+        def replace(path):                                      # the reviewer's writer: A is replaced by B right after a read of PAUSE
+            if Path(path).name == 'PAUSE' and not swapped:
+                swapped.append(1)
+                self.pause_file('maintenance: B')
+        self.hook(replace)
+        gate = monster_lane.gate(self.root, args, 10, True)
+        # that evaluation read A, as ONE snapshot: A's reason with A's id (the consent for A covers A) ...
+        self.assertEqual((gate['pause_reason'], gate['pause_id'], gate['pause']['reason'], gate['open']),
+                         ('maintenance: A', id_a, 'maintenance: A', True))
+        self.assertEqual(swapped, [1])
+        # ... and from the next read on it is B with B's id: reported AND compared as B, the consent for A is not accepted
+        gate = monster_lane.gate(self.root, args, 10, True)
+        self.assertEqual((gate['pause_reason'], gate['open'], gate['code'], gate['needs_confirm']), ('maintenance: B', False, 'paused', True))
+        self.assertNotEqual(gate['pause_id'], id_a)
+        self.assertFalse(modes.consent_covers(id_a, modes.manual_pause(self.root)))
+        # manual_pauses given a display-shaped pause (no `extra`) does not complete it from a second look: it takes one new snapshot
+        del swapped[:]
+        self.pause_file('maintenance: A2')
+        shown = modes.read_pause(self.root)                     # (the hook replaced A2 by B right after this read)
+        self.assertEqual(shown['reason'], 'maintenance: A2')
+        manual = modes.manual_pause(self.root, modes.read_mode(self.root), shown)
+        self.assertEqual((manual['reason'], manual['pause_id'] != shown['pause_id']), ('maintenance: B', True))
+
+    def test_a_writer_flipping_a_and_b_never_yields_a_mixed_snapshot(self):
+        modes.write_mode(self.root, 'views-run')
+        self.pause_file('maintenance: A')
+        id_a = modes.manual_pause(self.root)['pause_id']
+        args = {'run_now': True, 'override_pause': id_a}
+        stop = threading.Event()
+
+        def writer():
+            n = 0
+            while not stop.is_set():
+                n += 1
+                try:
+                    self.pause_file(f'maintenance: B{n}')
+                except OSError:
+                    pass
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        try:
+            for _ in range(300):
+                gate = monster_lane.gate(self.root, args, 10, True)
+                if gate['open']:                                # only ever for A itself, reported as A
+                    self.assertEqual((gate['pause_reason'], gate['pause_id']), ('maintenance: A', id_a))
+                else:
+                    self.assertNotEqual(gate['pause_id'], id_a)
+        finally:
+            stop.set()
+            thread.join(10)
+
+    def test_write_mode_runs_under_the_gate_transition_mutex(self):
+        mutex = self.batch() / paid_gate.MUTEX_DIR
+        real = guard.write_atomic
+        held = []
+
+        def write(path, data):
+            if Path(path).name == 'supervisor_mode.json':
+                held.append(mutex.is_dir())
+            return real(path, data)
+        with mock.patch.object(guard, 'write_atomic', write):
+            self.assertEqual(modes.write_mode(self.root, 'pause')['mode'], 'pause')
+        self.assertEqual((held, mutex.exists()), ([True], False))                                 # held for the write, released after it
+        before = (self.batch() / 'supervisor_mode.json').read_bytes()
+        with paid_gate.transition_lock(self.root, what='a paid click'):                           # a click's check + dispatch is running
+            with mock.patch.object(modes, 'LOCK_WAIT', 0.2):
+                with self.assertRaises(modes.ModeError):
+                    modes.write_mode(self.root, 'run')
+            self.assertEqual((self.batch() / 'supervisor_mode.json').read_bytes(), before)        # nothing was written meanwhile
+            done = []
+            thread = threading.Thread(target=lambda: done.append(modes.write_mode(self.root, 'run')['mode']), daemon=True)
+            thread.start()                                      # a writer RETRIES while the mutex is busy ...
+            time.sleep(0.3)
+            self.assertEqual((done, (self.batch() / 'supervisor_mode.json').read_bytes()), ([], before))
+        thread.join(30)                                         # ... and writes once the click is through
+        self.assertEqual((done, modes.read_mode(self.root)['mode']), (['run'], 'run'))
+
+
+    def test_gate_cli_is_read_only_and_never_takes_the_transition_mutex(self):
+        # a paid click holds the mutex WHILE it runs the gate command: the command must answer, not wait for the mutex
+        modes.write_mode(self.root, 'views-run')
+        args = {'run_now': True, 'override_pause': None}
+        before = sorted(p.name for p in self.batch().iterdir())
+        with paid_gate.transition_lock(self.root, what='a paid click'):
+            held = sorted(p.name for p in self.batch().iterdir())
+            start = time.monotonic()
+            proc = subprocess.run(monster_lane.gate_command(self.root, args, 1000, True), capture_output=True, text=True, timeout=60)
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(monster_lane.main(['gate', '--root', str(self.root), '--task-args', json.dumps(args), '--idle', '1000']), 0)
+            self.assertTrue(monster_lane.gate(self.root, args, 1000, True)['open'])
+            self.assertLess(time.monotonic() - start, 30)
+            self.assertEqual(sorted(p.name for p in self.batch().iterdir()), held)                # nothing written, the mutex untouched
+        self.assertEqual(sorted(p.name for p in self.batch().iterdir()), before)
+
+
+class LastCheckPaidTest(FinalVerifyCase):
+    """Row 8: the paid-ledger error file is updated under the ledger lock (read-merge-write): concurrent failures keep both repairs."""
+
+    def records(self):
+        out = []
+        for n in (1, 2):
+            record = {'model_id': f'm{n}', 'actions': {'geometry': {'confirmed_at': 't', 'observed_cost': 0.5}}, 'pending_action': None}
+            path = self.root / f'rec{n}' / 'studio_submission.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps(record))
+            out.append((path, record))
+        return out
+
+    def test_two_concurrent_ledger_failures_keep_both_repairs(self):
+        records = self.records()
+        monster_lane.paid_log_path(self.root).mkdir(parents=True)                                 # the ledger cannot be written
+        real = monster_lane._read_errors
+
+        def slow_read(root):                                    # widens the read-merge-write window of the error file
+            value = real(root)
+            time.sleep(0.15)
+            return value
+        barrier = threading.Barrier(2)
+        texts = []
+
+        def fail(path, record):
+            barrier.wait(10)
+            texts.append(monster_lane.reconcile_paid(self.root, 'Giant Rat', 'main', ['front.png'], path, record))
+        with mock.patch.object(monster_lane, '_read_errors', slow_read):
+            threads = [threading.Thread(target=fail, args=pair) for pair in records]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(60)
+        self.assertEqual(len(texts), 2)
+        self.assertTrue(all(t and 'could not be written' in t for t in texts), texts)
+        errors = monster_lane.paid_summary(self.root)['errors']
+        self.assertEqual(sorted(e['record'] for e in errors), sorted(p.as_posix() for p, _r in records))    # BOTH errors are kept
+        self.assertEqual(sorted(a['id'] for e in errors for a in e['actions']), ['hyper3d:m1:geometry', 'hyper3d:m2:geometry'])
+        monster_lane.paid_log_path(self.root).rmdir()                                             # the ledger works again
+        self.assertEqual(monster_lane.repair_accounting(self.root), [])
+        summary = monster_lane.paid_summary(self.root)
+        self.assertEqual((summary['count'], summary['credits'], summary['errors']), (2, 1.0, []))  # 1.0 credits, not 0.5
+
+    def test_a_failure_during_another_records_repair_is_not_overwritten(self):
+        (path1, record1), (path2, record2) = self.records()
+        monster_lane.paid_log_path(self.root).mkdir(parents=True)
+        monster_lane.reconcile_paid(self.root, 'Giant Rat', 'main', ['front.png'], path1, record1)
+        monster_lane.paid_log_path(self.root).rmdir()
+        real = monster_lane._update_error
+        late = []
+
+        def update(root, rec_text, change):
+            if not late and rec_text == path1.as_posix():       # record 2 fails while record 1's repair is about to clear its entry
+                late.append(1)
+                real(root, path2.as_posix(), lambda current: {'time': 't', 'error': 'the paid log could not be written (test)',
+                                                              'monster': 'Giant Rat', 'variant': 'main', 'views': ['front.png'],
+                                                              'model_id': 'm2', 'actions': monster_lane.paid_actions(record2)})
+            return real(root, rec_text, change)
+        with mock.patch.object(monster_lane, '_update_error', update):
+            self.assertIsNone(monster_lane.reconcile_paid(self.root, 'Giant Rat', 'main', ['front.png'], path1, record1))
+        errors = monster_lane.paid_summary(self.root)['errors']
+        self.assertEqual([e['record'] for e in errors], [path2.as_posix()])                       # 1 repaired, 2 still listed
+        self.assertEqual(monster_lane.repair_accounting(self.root), [])
+        summary = monster_lane.paid_summary(self.root)
+        self.assertEqual((summary['count'], summary['credits'], summary['errors']), (2, 1.0, []))
+
+
+@unittest.skipUnless(os.name == 'nt', 'Windows Job Objects')
+class LastCheckTreeTest(FinalVerifyCase):
+    """Row 9: a final empty-job check immediately before the ownership record is unlinked."""
+
+    def test_successor_spawned_during_cleanup_keeps_the_record(self):
+        import psutil
+        mid, v, task_id, gen = self.frozen()
+        stub = Path(self.temp.name) / 'successor_stub.py'
+        stub.write_text(SUCCESSOR_STUB)
+        go, note = Path(self.temp.name) / 'go', Path(self.temp.name) / 'successor.pid'
+        driver = subprocess.run([sys.executable, str(stub), str(HERE), str(self.root), v, str(go), str(note)], capture_output=True,
+                                text=True, timeout=120)
+        successor = int(note.read_text()) if note.exists() else 0
+        self.addCleanup(lambda: successor and psutil.pid_exists(successor) and psutil.Process(successor).kill())
+        self.assertEqual(driver.returncode, 0, driver.stderr)
+        job, member = driver.stdout.split()
+        self.assertTrue(job.startswith(monster_lane.JOB_PREFIX), driver.stdout)                   # a REAL job object owned the tree
+        self.assertFalse(psutil.pid_exists(int(member)))                                          # the member exited during the cleanup
+        self.assertTrue(psutil.pid_exists(successor))                                             # its successor lives
+        path = monster_lane.children_path(self.root, 'Giant Rat', v)
+        self.assertTrue(path.exists())                                                           # the record was NOT unlinked
+        by_pid = {d['pid']: d for d in monster_lane.recorded_children(self.root, 'Giant Rat', v)['descendants']}
+        self.assertIn(successor, by_pid)
+        self.assertIsNotNone(by_pid[successor]['create'])
+        self.assertIn(str(successor), monster_lane.tree_hold(self.root, 'Giant Rat', v))          # the slot stays held, by name
+        plan = monster_lane.plan_starts(self.root, idle=1000, idle_known=True)
+        self.assertEqual((plan['start'], plan['active']), ([], 1))
+        drained = monster_lane.drain_tree(self.root, 'Giant Rat', v, monster_lane.tree_plan(self.root, 'Giant Rat', v), 10.0)
+        self.assertEqual(drained['problems'], [])
+        self.assertFalse(psutil.pid_exists(successor))
+        self.assertFalse(path.exists())
+
+    def test_final_look_decides_the_unlink(self):
+        mid, v, task_id, gen = self.frozen()
+        path = monster_lane.children_path(self.root, 'Giant Rat', v)
+        sleeper = self.sleeper()
+        for members, kept, text in (([], False, None), ([sleeper.pid], True, None), (None, True, 'could not be queried')):
+            tracker = monster_lane._Tracker(self.root, 'Giant Rat', v)
+            tracker._scan = lambda: False                       # the earlier looks of the cleanup saw nothing ...
+            tracker._job_survivors = lambda: None
+            tracker._handle = 1
+            looks = []
+
+            def job_pids(handle, members=members, looks=looks):
+                looks.append(1)                                 # ... the FINAL look, right before the unlink, sees `members`
+                return None if members is None else [os.getpid()] + members
+            with mock.patch.object(monster_lane, 'job_pids', job_pids), mock.patch.object(monster_lane, 'job_close'):
+                tracker.close()
+            self.assertEqual((looks, path.exists()), ([1], kept), members)
+            if kept:
+                data = json.loads(path.read_text())
+                if text:
+                    self.assertIn(text, data['incomplete'])
+                else:
+                    self.assertEqual([d['pid'] for d in data['descendants']], [sleeper.pid])
+                path.unlink()
+
+
+class LastCheckJournalTest(FinalVerifyCase):
+    """Row 11: the journal must prove its recovery target (names_entry derivable from the journal + names_prev, and from the file)."""
+
+    def journal(self, **fields):
+        path = mv.journal_path(self.root, 'Giant Rat')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({'schema': 1, 'time': 't', 'monster': 'Giant Rat'} | fields))
+        return path
+
+    def refused(self, mid, v, needle, **fields):
+        """A journal with these fields changes NOTHING: names, views and the journal stay byte-identical, the card is damaged."""
+        names_path = mv.variant_names_path(self.mroot, 'Giant Rat')
+        vdir = mv.views_dir(self.mroot, 'Giant Rat', v)
+        names_before, views_before = names_path.read_bytes(), (vdir / 'views.json').read_bytes()
+        path = self.journal(op='import', variant=v, tmp=f'.v2_pick_{v}_0123abcd', **fields)
+        before = path.read_bytes()
+        with self.assertRaises(guard.Unreadable) as caught:
+            mv.read_journal(self.root, 'Giant Rat')
+        self.assertIn(needle, str(caught.exception))
+        out = monster_lane.tick(self.root)
+        self.assertTrue(any(path.name in e and needle in e for e in out['errors']), out['errors'])
+        self.assertFalse(any('completed' in r or 'rolled back' in r for r in out['recovered']), out['recovered'])
+        self.assertEqual(names_path.read_bytes(), names_before)                                  # the provenance is NOT erased
+        self.assertEqual(path.read_bytes(), before)                                              # the journal is NOT deleted
+        self.assertEqual((vdir / 'views.json').read_bytes(), views_before)
+        mv.invalidate()
+        card = self.tabs()['approved'][mid]
+        self.assertEqual((card['actions'], bool(card['damaged'])), ([], True))                   # a read-only damaged card
+        self.assertIn(needle, card['damaged']['error'])
+        with self.assertRaises(guard.Unreadable):
+            self.act(mid, 'views', enabled={'front': True})
+        with self.assertRaises(guard.Unreadable):
+            self.act('mconcept:Giant Rat/codex2', 'approve')
+        self.assertEqual((names_path.read_bytes(), path.read_bytes()), (names_before, before))
+        path.unlink()
+        mv.invalidate()
+
+    def test_damaged_import_journal_with_only_the_import_stamps(self):
+        mid, v = self.pick_rat()                                                                 # an existing pick with its provenance
+        names = json.loads(mv.variant_names_path(self.mroot, 'Giant Rat').read_text())['variants'][v]
+        self.assertEqual(names['was'], 'codex1')
+        stamps = {'imported': '2026-11-25T10:00:00+00:00', 'imported_by': 'v2'}
+        # the reviewer's journal: what is left of names_entry are the import stamps
+        self.refused(mid, v, 'only the import stamps', names_entry=dict(stamps), names_prev=None)
+        self.refused(mid, v, 'only the import stamps', names_entry=dict(stamps), names_prev={})
+        self.refused(mid, v, 'only the import stamps', names_entry=dict(stamps), names_prev=dict(names))
+        # an entry that is not names_prev + the stamps (a field of the earlier record was lost)
+        self.refused(mid, v, 'not names_prev plus the import stamps', names_entry={'concept': names['concept']} | stamps,
+                     names_prev=dict(names))
+        # no names_prev and not the record of an approved concept
+        self.refused(mid, v, 'not the record of an approved concept', names_entry={'note': 'x'} | stamps, names_prev=None)
+        # internally consistent, but the file holds ANOTHER record of that variant: the journal does not prove the target
+        self.refused(mid, v, 'does not prove what to write', names_entry={'was': 'codex9', 'concept': 'codex9-front.png'} | stamps,
+                     names_prev=None)
+        self.refused(mid, v, 'does not prove what to write', names_entry={'was': 'codex9'} | stamps, names_prev={'was': 'codex9'})
+        self.assertFalse(self.tabs()['approved'][mid].get('damaged'))                             # repaired by hand: usable again
+        self.assertIsInstance(self.act(mid, 'views', enabled={'front': True}), dict)
+
+    def test_record_rules_for_an_import(self):
+        stamps = {'imported': 't', 'imported_by': 'v2'}
+        base = {'op': 'import', 'monster': 'Giant Rat', 'variant': '1', 'tmp': '.v2_pick_1_0123abcd'}
+        ok = [base | {'names_entry': {'was': 'codex1 (then 1)'} | stamps, 'names_prev': {'was': 'codex1 (then 1)'}},
+              base | {'names_entry': {'was': 'codex1', 'x': 1} | stamps, 'names_prev': {'was': 'codex1', 'x': 1, 'imported': 'old'}},
+              base | {'names_entry': {'was': 'codex3', 'concept': 'codex3-front.png', 'how': 'migration mapping'} | stamps,
+                      'names_prev': None}]
+        bad = [base | {'names_entry': dict(stamps), 'names_prev': None}, base | {'names_entry': dict(stamps), 'names_prev': {}},
+               base | {'names_entry': dict(stamps), 'names_prev': {'was': 'codex1'}},
+               base | {'names_entry': {'was': 'codex2'} | stamps, 'names_prev': {'was': 'codex1'}},
+               base | {'names_entry': {'was': 'codex1', 'extra': 1} | stamps, 'names_prev': {'was': 'codex1'}},
+               base | {'names_entry': {'was': 'main'} | stamps, 'names_prev': None},
+               base | {'names_entry': {'was': 'codex3', 'concept': 'codex4-front.png'} | stamps, 'names_prev': None}]
+        for record in ok:
+            self.assertIsNone(mv.journal_record_problem(record, 'Giant Rat'), record)
+        for record in bad:
+            self.assertIsNotNone(mv.journal_record_problem(record, 'Giant Rat'), record)
+
+    def test_real_interrupted_publications_still_recover(self):
+        # the journals the app writes prove their target at every crash point: before and after the names entry is published
+        for fault in ('import_names',):
+            mv.FAULTS[fault] = lambda: (_ for _ in ()).throw(Crash())
+            with self.assertRaises(Crash):
+                mv.import_pick(self.root, 'Hobgoblin', '1')
+            mv.FAULTS.clear()
+            self.assertIsNone(mv.journal_problem(self.root, 'Hobgoblin'))
+            self.assertIn('Hobgoblin: completed', monster_lane.tick(self.root)['recovered'])
+        entry = json.loads(mv.variant_names_path(self.mroot, 'Hobgoblin').read_text())['variants']['1']
+        self.assertEqual((entry['was'], entry['concept'], entry['imported_by']), ('codex1', 'codex1-front.png', 'v2'))
+        mv.FAULTS['pick_renamed'] = lambda: (_ for _ in ()).throw(Crash())
+        with self.assertRaises(Crash):
+            self.act('mconcept:Giant Rat/codex1', 'approve')
+        mv.FAULTS.clear()
+        self.assertIsNone(mv.journal_problem(self.root, 'Giant Rat'))
+        self.assertEqual(monster_lane.tick(self.root)['recovered'], ['Giant Rat: completed'])
+
+
 class MigrateCliTest(MonsterCase):
     def run_migrate(self, *extra):
         return subprocess.run([sys.executable, '-X', 'utf8', str(HERE / 'migrate.py'), '--root', str(self.root), *extra],

@@ -179,13 +179,37 @@ def read_namespace_strict(root) -> dict:
         raw = json.loads(text)
     except ValueError as exc:
         raise NamespaceUnreadable(f'{path.name} is not valid JSON ({exc}); nothing is registered until it is repaired') from None
+    maps = namespace_validator()(raw)
+    if maps is None:
+        raise NamespaceUnreadable(f'{path.name} does not hold both maps {{"sets": {{...}}, "families": {{id: set}}}}; nothing is registered '
+                                  'until it is repaired')
+    return {'sets': maps[0], 'families': maps[1]}
+
+
+def _namespace_maps(raw):
+    """The structure rule of set_namespace.json = tools/convert_queue.py namespace_maps (a test compares the two): both maps present, every
+    key and every family owner a set name (NAME). Used only when the worker's validator cannot be imported."""
     sets, families = (raw.get('sets'), raw.get('families')) if isinstance(raw, dict) else (None, None)
     if not isinstance(sets, dict) or not isinstance(families, dict) \
             or not all(isinstance(k, str) and NAME.fullmatch(k) for k in sets) \
             or not all(isinstance(k, str) and isinstance(v, str) and NAME.fullmatch(k) and NAME.fullmatch(v) for k, v in families.items()):
-        raise NamespaceUnreadable(f'{path.name} does not hold both maps {{"sets": {{...}}, "families": {{id: set}}}}; nothing is registered '
-                                  'until it is repaired')
-    return {'sets': dict(sets), 'families': dict(families)}
+        return None
+    return dict(sets), dict(families)
+
+
+def namespace_validator():
+    """ONE validator for the registration (here) and the dispatch (the worker): `tools/convert_queue.py namespace_maps`, imported lazily like
+    owner_check (convert_queue imports the conversion tooling; the worker never imports the preview app). The equal local rule
+    (_namespace_maps) stands in when it is missing (an older convert_queue.py) or cannot be imported."""
+    try:
+        tools = str(HERE.parents[1])
+        if tools not in sys.path:
+            sys.path.insert(0, tools)
+        import convert_queue  # noqa: PLC0415
+    except Exception:  # noqa: BLE001
+        return _namespace_maps
+    fn = getattr(convert_queue, 'namespace_maps', None)
+    return fn if callable(fn) else _namespace_maps
 
 
 def namespace_problem(root) -> str | None:

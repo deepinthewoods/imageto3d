@@ -128,6 +128,155 @@ def env_for(root, override_pause: bool = False, cmd: list[str] | None = None) ->
     return {ENV: json.dumps(spec)}
 
 
+# ---------------------------------------------------------------------------------------------------- transition lock
+# Last-check review row 6: a hold / drain / pause written between a click's final gate check and its dispatch still let one click
+# through. So the final check + dispatch of every paid click, and every WRITE of CONVERT_HOLD, CONVERT_DRAIN, PAUSE and
+# supervisor_mode.json by current code, run under one short mutex: the directory `.codex_jobs/_batch/gate_mutex/` (mkdir is atomic
+# on every filesystem, so python and node take it the same way; `owner.json` inside names the holder). Critical sections are
+# milliseconds; a mutex whose owner process is gone, or older than MUTEX_STALE seconds, is reclaimed (renamed aside, never deleted
+# while it might be live). A holder that cannot get it within `wait` gets GateBusy: a clicker treats that as a closed gate, a
+# writer retries. Older code (the pre-cut-over supervisor) writes PAUSE without it; that is the documented pre-cut-over residual.
+# `owner.json` carries a random token: a holder releases only a mutex that is still its own (one reclaimed from it as stale and
+# taken by someone else is left alone), and a clicker looks that it still owns the mutex right before it dispatches (`owned()`;
+# a gate check that outlasted MUTEX_STALE therefore ends as a closed gate, never as an unserialized click).
+MUTEX_DIR = 'gate_mutex'
+MUTEX_STALE = 30.0
+OWNERLESS_STALE = 2.0
+
+
+class GateBusy(Exception):
+    """The gate transition mutex could not be taken in time."""
+
+
+def _mutex_path(root) -> Path:
+    return Path(root) / '.codex_jobs' / '_batch' / MUTEX_DIR
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        import psutil
+        return psutil.pid_exists(int(pid))
+    except Exception:   # noqa: BLE001  no psutil / bad pid: assume alive (only the age rule then reclaims)
+        return True
+
+
+def _reclaim_if_stale(path: Path) -> bool:
+    """Rename a stale mutex aside (owner gone, or older than MUTEX_STALE); True when it was reclaimed."""
+    import time
+    try:
+        owner = json.loads((path / 'owner.json').read_text(encoding='utf-8'))
+    except Exception:   # noqa: BLE001  owner not written yet / unreadable: judge by the directory's age only
+        owner = {}
+    try:
+        age = time.time() - path.stat().st_mtime
+    except FileNotFoundError:
+        return True
+    gone = isinstance(owner, dict) and owner.get('pid') is not None and not _pid_alive(owner['pid'])
+    ownerless = not (isinstance(owner, dict) and owner.get('pid') is not None)
+    # owner.json is written right after the mkdir, so a mutex still without an owner after OWNERLESS_STALE seconds was abandoned
+    # (a holder whose release could not remove the folder, or one that died between mkdir and the owner write)
+    if not gone and age < (OWNERLESS_STALE if ownerless else MUTEX_STALE):
+        return False
+    try:
+        path.rename(path.with_name(f'{MUTEX_DIR}.stale-{int(time.time() * 1000)}-{os.getpid()}'))
+    except OSError:
+        return False
+    return True
+
+
+class transition_lock:
+    """`with paid_gate.transition_lock(root, what='...'):` hold the gate transition mutex of `root` (see above)."""
+
+    def __init__(self, root, wait: float = 10.0, what: str = ''):
+        self.path, self.wait, self.what, self.held = _mutex_path(root), wait, what, False
+        self.token, self.wrote = os.urandom(8).hex(), False
+
+    def owned(self) -> bool:
+        """This holder still has the mutex: it was not reclaimed as stale (and possibly taken by another process) meanwhile."""
+        if not self.held:
+            return False
+        try:
+            owner = json.loads((self.path / 'owner.json').read_text(encoding='utf-8'))
+        except Exception:   # noqa: BLE001  gone / unreadable: ours only when we never managed to write it and the folder is there
+            return not self.wrote and self.path.is_dir()
+        return isinstance(owner, dict) and owner.get('token') == self.token
+
+    def __enter__(self):
+        import time
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.wait
+        spins = 0
+        while True:
+            try:
+                os.mkdir(self.path)
+                break
+            except (FileExistsError, PermissionError):   # PermissionError: Windows, while the folder is being removed or renamed
+                if _reclaim_if_stale(self.path) and spins < 3:   # out of the way: try at once (bounded, then the timed path)
+                    spins += 1
+                    continue
+                if time.monotonic() >= deadline:
+                    raise GateBusy(f'{self.path}: the paid-gate transition mutex is busy')
+                time.sleep(0.01)
+        self.held = True
+        try:
+            (self.path / 'owner.json').write_text(json.dumps({'pid': os.getpid(), 'time': time.time(), 'what': self.what,
+                                                              'token': self.token}), encoding='utf-8')
+            self.wrote = True
+        except OSError:
+            pass
+        return self
+
+    def __exit__(self, *exc):
+        if not self.held:
+            return
+        mine = self.owned()
+        self.held = False
+        if not mine:          # reclaimed as stale meanwhile: whatever is at the path now belongs to another holder
+            return
+        # Release = rename the folder aside first (one atomic step; Windows can refuse a remove for a moment while an indexer or a
+        # contender's mkdir touches it), then tidy the renamed copy. Retried briefly; whatever is left over is ownerless and is
+        # reclaimed after OWNERLESS_STALE seconds by the next contender, never held for MUTEX_STALE.
+        import time
+        aside = self.path.with_name(f'{MUTEX_DIR}.released-{self.token}')
+        for attempt in range(20):
+            try:
+                os.rename(self.path, aside)
+                break
+            except FileNotFoundError:
+                return
+            except OSError:
+                time.sleep(0.01 * (attempt + 1))
+        else:
+            aside = self.path
+        for attempt in range(20):
+            try:
+                (aside / 'owner.json').unlink(missing_ok=True)
+                os.rmdir(aside)
+                return
+            except FileNotFoundError:
+                return
+            except OSError:
+                time.sleep(0.01 * (attempt + 1))
+
+
+def checked_dispatch(dispatch, environ=None, root=None, wait: float = 2.0):
+    """Run `dispatch()` (the paid click) only while the gate is open, with the final check and the dispatch under the transition
+    mutex. Raises GateClosed (closed, or the mutex was busy) without calling it. No gate configured and no root = no mutex."""
+    spec = spec_from_env(environ)
+    lock_root = root or (spec.get('root') if isinstance(spec, dict) and 'malformed' not in spec else None)
+    if lock_root is None:
+        check(environ)
+        return dispatch()
+    try:
+        with transition_lock(lock_root, wait=wait, what='paid click') as lock:
+            check(environ)
+            if not lock.owned():   # the check outlasted MUTEX_STALE and the mutex was reclaimed: no longer serialized
+                raise GateClosed('the paid-gate transition mutex was lost during the gate check; nothing was clicked')
+            return dispatch()
+    except GateBusy as exc:
+        raise GateClosed(f'gate transition in progress ({exc})') from exc
+
+
 def main(argv=None) -> int:
     """`check`: exit 0 when a paid click may happen now, EXIT_GATE_CLOSED (reason on the first stdout line) when not."""
     args = list(sys.argv[1:] if argv is None else argv)

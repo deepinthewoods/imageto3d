@@ -26,7 +26,10 @@ Every command (submit / collect / preview / inspect / bind) holds `<out_dir>/.re
 only after taking it; a second command on the same output stops at once with 'another process is handling this output'.
 
 Click-time paid gate (DESIGN_PHASE4 I.8, tools/paid_gate.py): every credit-capable step (geometry confirm, material generate,
-material confirm) calls paid_gate.check() when it starts, before it writes its intent and again right before the click. A closed
+material confirm) calls paid_gate.check() when it starts, before it writes its intent and again right before the click. That
+last check and the click itself run under the paid-gate transition mutex (paid_gate.checked_dispatch; last-check row 6), which
+every writer of CONVERT_HOLD / CONVERT_DRAIN / PAUSE / the mode takes too: a hold is written before the check (no click) or
+after the click was dispatched, never in between; a mutex that stays busy counts as a closed gate. A closed
 gate raises GateClosed: no intent is left behind (one written a moment earlier is withdrawn: nothing was clicked), the CLI prints
 `PAID GATE CLOSED: <reason>` and exits EXIT_GATE_CLOSED (4); the caller waits for its gate and runs collect again. The free
 preview submit is not gated. Without $IMAGETO3D_PAID_GATE (a manual run) the explicit --allow-paid is the authority.
@@ -52,10 +55,20 @@ and once confirmed `confirmed_at`, `confirmed_by: "stage_advanced"`, `stage_afte
 (informational: other jobs share the wallet) and `provider_action_id` (only when the session can read one; None otherwise).
 An action counts as charged only when it has `confirmed_at`.
 
-Inputs (phase 5 review finding 7; recheck finding 13): submit copies the views it uploads into <out_dir>/upload_inputs/, hashes
-the copies, makes them READ-ONLY and uploads those copies; it stores `inputs: [{name, sha256, size}]` (upload order, the exact
-bytes uploaded) and `upload_dir` in the record; `record_inputs(record)` reads it (None for a record written before the field
-existed = unknown). `verify_upload_inputs(record)` re-hashes <out_dir>/upload_inputs/ against the record ([] = identical, None =
+Inputs (phase 5 review finding 7; recheck finding 13; last-check row 14): submit copies the views it uploads into a FRESH folder
+<out_dir>/upload_inputs/<stamp>-<pid>-<random>/ (exclusive mkdir, never an existing folder), hashes the copies, makes them
+READ-ONLY and uploads those copies; it stores `inputs: [{name, sha256, size}]` (upload order, the exact bytes uploaded),
+`upload_dir` and the folder's pinned identity `upload_dir_id: {name, dev, ino}` in the record; `record_inputs(record)` reads the
+inputs (None for a record written before the field existed = unknown). The pin (upload_pin_problem: `upload_inputs/` and the
+folder are plain folders, not links / junctions / reparse points, the folder still has the recorded file id and resolves inside
+the output) is re-verified immediately before every temp-file create and every os.replace of the snapshot, before the upload,
+before the free click and before every paid step; a mismatch stops there. A record from before the pin keeps the flat
+<out_dir>/upload_inputs/ layout. Residual: python has no handle-relative rename on Windows, so a local attacker who can write
+to the output folder could still swap the folder in the instants between a check and the os.replace / the browser's own open
+of the files; what was uploaded is then caught by the re-hash and pin check before the click and before every paid step (the
+free preview costs nothing), but a file of the attacker's own folder may have been replaced by a view copy. Moving an output
+folder to another volume changes the file id: its record then needs review before a paid step.
+`verify_upload_inputs(record)` checks the pin and re-hashes the folder against the record ([] = identical, None =
 unknown): submit runs it immediately before the upload and again before the click (a mismatch sets the record aside: nothing was
 generated), collect before every credit-capable intent (a mismatch stops before the paid click). Deleting an output folder on
 Windows needs the read-only attribute cleared first (renaming / moving it does not).
@@ -415,8 +428,8 @@ def _same_file_path(a, b):
 
 
 def _upload_dir(out_dir):
-    """<out_dir>/upload_inputs/ as a real folder of the output dir (created when missing); Stop when it is a link / junction or
-    resolves anywhere else (final-verify row 14)."""
+    """<out_dir>/upload_inputs/ (the container of the per-submission snapshot folders) as a real folder of the output dir
+    (created when missing); Stop when it is a link / junction or resolves anywhere else (final-verify row 14)."""
     out_dir = Path(out_dir)
     target = out_dir / UPLOAD_DIR
     info = _lstat(target)
@@ -430,12 +443,62 @@ def _upload_dir(out_dir):
     return target
 
 
+def _plain_name(name):
+    return isinstance(name, str) and name not in ('', '.', '..') and Path(name).name == name
+
+
+def upload_pin_problem(out_dir, pin):
+    """Why <out_dir>/upload_inputs/<pin name> is not (or no longer) the folder a snapshot was written to, else None (last-check
+    row 14). `pin` = {name, dev, ino} taken when the folder was created with an exclusive mkdir. Checked: `upload_inputs/` and
+    the folder are plain directories (no symbolic link, junction or other reparse point), the folder still has the pinned file
+    id (st_dev, st_ino: a folder swapped in under the same name has another one) and resolves to exactly that path inside the
+    resolved output dir."""
+    if not (isinstance(pin, dict) and _plain_name(pin.get('name')) and all(
+            isinstance(pin.get(k), int) and not isinstance(pin.get(k), bool) for k in ('dev', 'ino'))):
+        return f'malformed upload folder pin {pin!r}'
+    container = Path(out_dir) / UPLOAD_DIR
+    target = container / pin['name']
+    for entry in (container, target):
+        info = _lstat(entry)
+        if info is None:
+            return f'upload snapshot folder is gone: {entry}'
+        if _is_link(info) or not stat.S_ISDIR(info.st_mode):
+            return f'upload snapshot folder is not a plain folder (a link, junction or file): {entry}'
+    if (info.st_dev, info.st_ino) != (pin['dev'], pin['ino']):
+        return f'upload snapshot folder was replaced (not the folder the snapshot was written to): {target}'
+    if not _same_file_path(target, Path(os.path.realpath(str(out_dir))) / UPLOAD_DIR / pin['name']):
+        return f'upload snapshot folder resolves outside the output: {target} -> {os.path.realpath(str(target))}'
+    return None
+
+
+def _require_pin(out_dir, pin):
+    problem = upload_pin_problem(out_dir, pin)
+    if problem:
+        raise Stop(f'{problem}; nothing more is written, uploaded or clicked')
+
+
+def _new_upload_dir(out_dir):
+    """A fresh snapshot folder <out_dir>/upload_inputs/<stamp>-<pid>-<random>/ for ONE submission (last-check row 14): made with
+    an exclusive mkdir (an existing entry of that name is never reused: Stop) and pinned at once. Returns (path, pin)."""
+    container = _upload_dir(out_dir)
+    name = f'{time.strftime("%Y%m%dT%H%M%S")}-{os.getpid()}-{os.urandom(6).hex()}'
+    target = container / name
+    try:
+        os.mkdir(target)
+    except FileExistsError:
+        raise Stop(f'upload snapshot folder already exists and is never reused: {target}') from None
+    info = os.lstat(target)
+    pin = {'name': name, 'dev': info.st_dev, 'ino': info.st_ino}
+    _require_pin(out_dir, pin)
+    return target, pin
+
+
 def _own_destination(target, name):
     """(path, lstat or None) of the final file <target>/<name>, checked (final-verify row 14): `name` is a bare file name, and an
     existing entry is this snapshot's OWN regular file: not a link / junction / reparse point, not a folder, not a hard link
     shared with another name (its attributes and bytes would be another file's too), and it resolves to exactly
     <resolved target>/<name>. Stop otherwise; nothing is changed."""
-    if not isinstance(name, str) or name in ('', '.', '..') or Path(name).name != name:
+    if not _plain_name(name):
         raise Stop(f'upload snapshot: not a plain file name: {name!r}')
     path = Path(target) / name
     info = _lstat(path)
@@ -471,21 +534,17 @@ def _unprotect_own(path, info):
     os.chmod(path, stat.S_IREAD | stat.S_IWRITE)
 
 
-def _remove_own(target, name):
-    """Delete <target>/<name> when it exists and is the snapshot's own file (_own_destination); a link is refused, not followed."""
-    path, info = _own_destination(target, name)
-    if info is not None:
-        _unprotect_own(path, info)
-        os.unlink(path)
-
-
-def _replace_own(source, target, name):
+def _replace_own(source, target, name, pinned=None):
     """Put a read-only copy of `source` at <target>/<name> without ever writing THROUGH an existing entry (final-verify row 14):
     the bytes go to a new temp file of the same folder (exclusive create), are hashed there, and the temp file is renamed over
     the destination (os.replace swaps the directory entry; it never follows a link). An existing destination must be the
-    snapshot's own file (_own_destination) and only that verified file loses its read-only bit. Returns (sha256, size)."""
+    snapshot's own file (_own_destination) and only that verified file loses its read-only bit. `pinned` (last-check row 14):
+    a callable that raises Stop when `target` is no longer the pinned snapshot folder; it runs immediately before the temp file
+    is created and immediately before the os.replace. Returns (sha256, size)."""
+    pinned = pinned or (lambda: None)
     path, info = _own_destination(target, name)
     temp = Path(target) / f'.{name}.{os.getpid()}.{os.urandom(4).hex()}.tmp'
+    pinned()
     fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0), 0o600)
     try:
         with os.fdopen(fd, 'wb') as out, open(source, 'rb') as data:
@@ -495,6 +554,7 @@ def _replace_own(source, target, name):
         path, info = _own_destination(target, name)      # looked at again right before the swap
         if info is not None:
             _unprotect_own(path, info)
+        pinned()                                         # the folder is still the pinned one: checked right before the swap
         os.replace(temp, path)
     except BaseException:
         with contextlib.suppress(OSError):
@@ -505,46 +565,67 @@ def _replace_own(source, target, name):
 
 
 def snapshot_inputs(plan, out_dir):
-    """Copy the views of `plan` into <out_dir>/upload_inputs/, hash the copies and make them read-only (finding 13): (dir,
-    [{name, sha256, size}] of the uploaded views in upload order). The browser uploads these copies, so the recorded hashes
-    are the bytes uploaded; verify_upload_inputs re-hashes them before the upload and before every paid step. A
-    views_omitted.json marker is copied too (validate_views reads it). An earlier snapshot of a submission that was set aside
-    (not_submitted) is replaced.
+    """Copy the views of `plan` into a FRESH folder <out_dir>/upload_inputs/<unique>/, hash the copies and make them read-only
+    (finding 13): (dir, [{name, sha256, size}] of the uploaded views in upload order, pin). The browser uploads these copies,
+    so the recorded hashes are the bytes uploaded; verify_upload_inputs re-hashes them before the upload and before every paid
+    step. A views_omitted.json marker is copied too (validate_views reads it). The snapshot of an earlier submission that was
+    set aside (not_submitted) stays where it is: every submission gets its own folder.
 
-    Final-verify row 14: every final destination is checked before anything is written (_upload_dir, _own_destination: no link
-    or junction, resolved inside the output dir) and a file is replaced by renaming a new temp file over it, never by writing
-    or changing permissions through the existing name; a destination that is not the snapshot's own file stops the submit
-    (Stop) with nothing overwritten."""
-    target = _upload_dir(out_dir)
+    Row 14 (final-verify, last-check): the folder is created by an exclusive mkdir and pinned (_new_upload_dir: file id, no
+    link / junction / reparse point on the way, resolved inside the output dir); the pin is re-verified immediately before
+    every temp-file create and every os.replace (upload_pin_problem), every final destination is checked before anything is
+    written (_own_destination) and a file is put in place by renaming a new temp file, never by writing through a name. A
+    mismatch stops the submit (Stop) before the record exists: nothing is uploaded or clicked."""
+    target, pin = _new_upload_dir(out_dir)
     source = Path(plan['views_dir'])
     names = ['views_omitted.json', *plan['images']]
     for name in names:                                   # all destinations first: nothing is written when one is refused
         _own_destination(target, name)
+
+    def pinned():
+        _require_pin(out_dir, pin)
     if (source / 'views_omitted.json').is_file():
-        _replace_own(source / 'views_omitted.json', target, 'views_omitted.json')
-    else:
-        _remove_own(target, 'views_omitted.json')
-    written = {name: _replace_own(source / name, target, name) for name in plan['images']}
+        _replace_own(source / 'views_omitted.json', target, 'views_omitted.json', pinned)
+    written = {name: _replace_own(source / name, target, name, pinned) for name in plan['images']}
     inputs = [{'name': name, 'sha256': written[name][0], 'size': written[name][1]} for name in plan['uploaded']]
-    return target, inputs
+    pinned()
+    return target, inputs, pin
+
+
+def _record_upload(record):
+    """(record dict, output folder or None, pin or None) of `record` as verify_upload_inputs takes it."""
+    if isinstance(record, Record):
+        return record.data, record.path.parent, record.data.get('upload_dir_id')
+    if isinstance(record, dict):
+        return record, None, record.get('upload_dir_id')
+    path = Path(record)
+    folder = path if path.is_dir() else path.parent
+    data = json.loads((folder / RECORD).read_text(encoding='utf-8-sig'))
+    return data, folder, data.get('upload_dir_id') if isinstance(data, dict) else None
 
 
 def verify_upload_inputs(record, upload_dir=None):
-    """Re-hash the final upload copies against the record (finding 13): [] when every recorded input is in
-    <record folder>/upload_inputs/ with the recorded size and sha256, else the list of differences; None when the record
-    predates the `inputs` field (unknown). `record`: as record_inputs (a Record, an output dir or a record path; for a bare
-    dict pass `upload_dir`). ValueError for a malformed inputs field."""
+    """Re-hash the final upload copies against the record (finding 13): [] when every recorded input is in the record's
+    snapshot folder with the recorded size and sha256, else the list of differences; None when the record predates the
+    `inputs` field (unknown). The folder is <record folder>/upload_inputs/<pinned name> when the record carries a pin
+    (`upload_dir_id`, last-check row 14): the pin is checked first (upload_pin_problem) and a folder that is not the pinned one
+    is a difference, nothing is read through it. A record without a pin has the flat <record folder>/upload_inputs/.
+    `record`: as record_inputs (a Record, an output dir or a record path; for a bare dict the record's own `upload_dir` is
+    read, without a pin check, unless `upload_dir` is passed). ValueError for a malformed inputs field."""
     inputs = record_inputs(record)
     if inputs is None:
         return None
     if upload_dir is None:
-        if isinstance(record, Record):
-            upload_dir = record.path.parent / UPLOAD_DIR
-        elif isinstance(record, dict):
-            upload_dir = record.get('upload_dir')
+        data, folder, pin = _record_upload(record)
+        if folder is None:
+            upload_dir = data.get('upload_dir')
+        elif pin is not None:
+            problem = upload_pin_problem(folder, pin)
+            if problem:
+                return [problem]
+            upload_dir = folder / UPLOAD_DIR / pin['name']
         else:
-            path = Path(record)
-            upload_dir = (path if path.is_dir() else path.parent) / UPLOAD_DIR
+            upload_dir = folder / UPLOAD_DIR
     if not upload_dir:
         return ['the record names no upload_dir']
     upload_dir = Path(upload_dir)
@@ -714,12 +795,13 @@ def submit(views_dir, out_dir, *, config=None, session_factory=None, dry_run=Fal
 def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
     if (out_dir / RECORD).exists():   # checked before the snapshot: an existing record's upload_inputs/ are never overwritten
         raise Stop(f'Submission record already exists; collect or inspect instead: {out_dir / RECORD}')
-    upload_dir, inputs = snapshot_inputs(plan, out_dir)
+    upload_dir, inputs, pin = snapshot_inputs(plan, out_dir)   # a fresh, pinned folder per submission (last-check row 14)
     upload_plan = validate_views(upload_dir, config)   # the copies are what goes up: checked like the originals
     if upload_plan['uploaded'] != plan['uploaded']:
         raise Stop(f'upload snapshot differs from the views: {upload_plan["uploaded"]} != {plan["uploaded"]}')
+    _require_pin(out_dir, pin)
     record = Record.create(out_dir / RECORD, {**_record_data(plan, config, views_dir, out_dir),
-                                              'upload_dir': str(upload_dir.resolve()), 'inputs': inputs})
+                                              'upload_dir': str(upload_dir.resolve()), 'upload_dir_id': pin, 'inputs': inputs})
     session_factory = session_factory or (lambda: SeleniumRodin(config, out_dir))
     with contextlib.ExitStack() as stack:
         try:
@@ -731,7 +813,7 @@ def _submit_locked(views_dir, out_dir, plan, config, session_factory, dry_run):
         try:
             session.open_workspace()
             paths = [(name, Path(upload_plan['views_dir']) / name) for name in upload_plan['uploaded']]
-            changed = verify_upload_inputs(record)   # finding 13: re-hashed immediately before the upload
+            changed = verify_upload_inputs(record)   # finding 13 + row 14: pin checked, re-hashed immediately before the upload
             if changed:
                 not_submitted(record, f'the upload copies changed after they were hashed ({"; ".join(changed)})')
             prepared = session.prepare_multiview(paths, config) or {}
@@ -801,14 +883,16 @@ def _step(record, session, config, kind, expected, allow_paid, accept_preview=Fa
 
 
 def _click(record, session, kind, before):
-    """The credit-capable click, with the paid gate checked right before it. A gate that closed after the intent was written
+    """The credit-capable click, with the paid gate checked right before it (check + click under the gate transition mutex:
+    paid_gate.checked_dispatch). A gate that closed after the intent was written
     puts the record back as it was before the intent (nothing was clicked, so nothing may stay pending) and raises GateClosed."""
     try:
-        paid_gate.check()
+        # last-check row 6: the final gate check and the click are one critical section under the transition mutex that every
+        # hold / drain / pause / mode writer takes; a busy mutex counts as a closed gate
+        paid_gate.checked_dispatch(lambda: session.click(kind))
     except paid_gate.GateClosed:
         record.restore(before, f'{kind}_intent_withdrawn')
         raise
-    session.click(kind)
 
 
 def _provider_action_id(session, kind):

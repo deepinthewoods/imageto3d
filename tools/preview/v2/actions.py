@@ -1505,6 +1505,8 @@ def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
         # a MANUAL cancel holds for the current approval generation: reconcile never queues it again (re-check R8)
         if task['lane'] == monster_lane.LANE:
             # monster (phase 5 review F4): `cancelled` is persisted in the variant's views.json first, so a rebuilt queue never revives it
+            # last-check new blocker: `task` may be stale by now (a repeated Cancel, a rebuilt queue); cancel_task acts on the row as it
+            # is NOW and answers True only when no runnable row of the generation is left (409 `changed` when the state moved on)
             done = monster_lane.cancel_task(root, task, 'manual')
         else:
             done = queue.cancel(task_id, 'manual', manual_gen=(gen or 'manual') if task['lane'] == 'layers' else 'manual')
@@ -1518,6 +1520,19 @@ def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
         if task['state'] != 'orphan' and not builds.is_stalled(task, time.time(), builds.stall_minutes(root)):
             raise ValueError(f'task {task_id} is not stalled; Kill & retry is only for a build whose output stopped (or an orphaned builder)')
         done = queue.request_kill(task_id, token)
+    if monster_row is not None:
+        # a monster row is identified by its key (a rebuilt queue renumbers): the answer reports the row as it is NOW, and a Cancel
+        # NEVER reports success while a runnable row of that generation exists (last-check review, new blocker)
+        now_row = queue.by_key(monster_row['key'])
+        if not done:
+            raise ValueError(f'task {task_id} is {now_row["state"] if now_row else "gone"}; ' +
+                             {'retry': 'only a failed or cancelled task can be retried', 'cancel': 'only a queued task can be cancelled'}[op])
+        if op == 'cancel' and now_row is not None and now_row['state'] in taskqueue.OPEN:
+            raise guard.Changed(f'the conversion is {now_row["state"]} again; reload and look again', changes=['task'])
+        catalog.invalidate()
+        if now_row is None:                                     # (cancelled durably; the rebuilt queue has not restored the row yet)
+            return {'ok': True, 'id': task_id, 'state': 'cancelled' if op == 'cancel' else 'queued', 'kill_requested': False}
+        return {'ok': True, 'id': now_row['id'], 'state': now_row['state'], 'kill_requested': bool(now_row.get('kill_requested'))}
     if not done:
         state = queue.get(task_id)['state']
         raise ValueError(f'task {task_id} is {state}; ' + {'retry': 'only a failed or cancelled task can be retried',

@@ -190,7 +190,9 @@ Invoke-Check rollback         # exit 0 (SAFE) only when the hold may be removed 
 It refuses while any of these holds, and names it:
 - a drain is outstanding: `CONVERT_DRAIN` exists, the convert record still has a pending legacy stop (`drain_hold`), a recorded suspended
   process (`suspensions.json`) still exists, or a `convert_job.py` / an old-code `convert_queue.py` of this checkout still runs (EVERY
-  convert worker counts, whatever its `--worker N`: the same enumeration as `drained`, each worker's code age tested on its own). Finish
+  convert worker counts, whatever its `--worker N`: the same enumeration as `drained`, each worker's code age tested on its own; a
+  python process that may be one but cannot be resolved, because its command line or its working directory cannot be read, counts as
+  running too: the check never answers SAFE on a guess. Run the check as the user who owns the workers, or stop that process). Finish
   step 4 with v2 running (start v2 again as in step 2: at start it resumes anything a stopped manager left suspended and finishes or
   continues the drain), or wait for those processes to exit by themselves. If v2 will not be started again and NO convert worker runs,
   `CONVERT_DRAIN` may be deleted by hand together with the hold; with an old worker still running it must stay;
@@ -243,16 +245,52 @@ def script_of(proc):
         return None
     return norm(found if os.path.isabs(found) else os.path.join(proc.cwd(), found))
 
+UNRESOLVED = {}   # rel -> ['pid N ...']: candidates of running(rel) that could not be resolved; a check that relies on rel refuses
+
 def running(rel):
-    """Processes of THIS checkout running tools/<rel> (any arguments, any worker number)."""
-    want, out = norm(os.path.join(repo, rel)), []
+    """Processes of THIS checkout running tools/<rel> (any arguments, any worker number). A python process that may be one but
+    cannot be resolved (its command line is unreadable, or it names a script of that file name by a relative path and its working
+    directory cannot be read) is NOT skipped: it is listed in UNRESOLVED[rel], and the caller refuses (never SAFE on a guess)."""
+    want, out, unknown = norm(os.path.join(repo, rel)), [], []
+    base = os.path.basename(rel).lower()
     for proc in psutil.process_iter():
         try:
-            if script_of(proc) == want:
+            name = (proc.name() or '').lower()
+            if not name.startswith('python'):
+                continue
+            try:
+                cmd = proc.cmdline()
+            except psutil.NoSuchProcess:
+                raise
+            except (psutil.Error, OSError) as error:
+                unknown.append(f'pid {proc.pid} ({name}): its command line cannot be read ({type(error).__name__})')
+                continue
+            found, _args = services.python_script(cmd) if cmd else (None, None)
+            if not found:
+                continue
+            if os.path.isabs(found):
+                path = norm(found)
+            elif os.path.basename(found).lower() != base:
+                continue                   # another script, wherever it runs
+            else:
+                try:
+                    path = norm(os.path.join(proc.cwd(), found))
+                except psutil.NoSuchProcess:
+                    raise
+                except (psutil.Error, OSError) as error:
+                    unknown.append(f'pid {proc.pid} runs {found} from a working directory that cannot be read ({type(error).__name__})')
+                    continue
+            if path == want:
                 out.append(proc)
-        except (psutil.Error, OSError):
+        except psutil.NoSuchProcess:
             continue
+        except psutil.Error:
+            continue                       # not even its name can be read: not a python process of this user
+    UNRESOLVED[rel] = unknown
     return out
+
+def unresolved(*rels):
+    return [text for rel in rels for text in UNRESOLVED.get(rel, [])]
 
 def workers():
     """EVERY convert worker of this checkout (`--worker N` for any N, or none): the one enumeration both `drained` and `rollback` use."""
@@ -284,7 +322,10 @@ if what == 'stop-listener':                # stop-listener <port> <script>: exac
     if len(pids) != 1:
         sys.exit(f'REFUSED: {len(pids)} listener(s) on port {port} {pids}; exactly one expected')
     proc = psutil.Process(pids[0])
-    first, created = script_of(proc), proc.create_time()
+    try:
+        first, created = script_of(proc), proc.create_time()
+    except (psutil.Error, OSError) as error:
+        sys.exit(f'REFUSED: the listener pid {pids[0]} cannot be resolved ({type(error).__name__}: {error}); nothing was stopped')
     if first != norm(os.path.join(repo, rel)):
         sys.exit(f'REFUSED: pid {pids[0]} runs {proc.cmdline()} (script {first}), not {rel} of {repo}')
     time.sleep(1.0)
@@ -304,9 +345,12 @@ elif what == 'drained':                    # the old paid work is gone: hold pre
     pending = services.read_drain(repo) is not None or bool(conv.get('stop_requested') and conv.get('drain_hold'))
     frozen = [i['pid'] for i in services.read_suspensions(repo) if psutil.pid_exists(i['pid'])]
     waiters = [w['pid'] for w in services.gate_waiters(repo, clean=False)]
+    unknown = unresolved('tools/tripo_pipeline/convert_job.py', 'tools/convert_queue.py')
     print(f'hold: {"present" if hold is not None else "MISSING"}; drain: {"pending" if pending else "none"}; gate waiters: {waiters}; '
           f'convert_job.py: {[p.pid for p in jobs]}; convert_queue.py: {[p.pid for p in queue]}; suspended: {frozen}')
-    sys.exit(0 if hold is not None and not pending and not jobs and not queue and not frozen else 1)
+    if unknown:
+        print('REFUSED: not drained while a possible convert process cannot be resolved:\n  - ' + '\n  - '.join(unknown))
+    sys.exit(0 if hold is not None and not pending and not jobs and not queue and not frozen and not unknown else 1)
 elif what == 'rollback':                   # read-only: may a conversion hold left by a stopped v2 be removed by hand?
     hold = services.read_hold(repo)
     if hold is None:
@@ -329,6 +373,8 @@ elif what == 'rollback':                   # read-only: may a conversion hold le
     old = old_workers()                    # every worker number, not only the managed worker 1
     if old:
         why.append(f'a convert worker of older code still runs {old} (any --worker number counts)')
+    for text in unresolved('tools/tripo_pipeline/convert_job.py', 'tools/convert_queue.py'):
+        why.append(f'a possible convert process cannot be resolved, so it counts as running: {text}')
     sups = services.scan(repo, ['supervisor'])['supervisor']
     if len(sups) != 1:
         why.append(f'{len(sups)} supervisors run; exactly one, of the intended generation, is needed')

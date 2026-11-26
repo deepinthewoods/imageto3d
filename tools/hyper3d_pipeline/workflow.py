@@ -181,9 +181,8 @@ def confirm_geometry(driver, job, allow_paid, accept_preview, wait=True):
     if '2 Credits' not in control.text:
         raise RuntimeError('Expected 2-credit confirmation; stopping on price/UI change')
     screenshot(driver, job, 'before_paid_confirmation')
-    paid_gate.check()   # a caller's paid gate, right before the intent and the click
-    job.intent('geometry_confirm')
-    control.click()
+    # the final gate check, the intent and the click are one critical section under the gate transition mutex (last-check row 6)
+    paid_gate.checked_dispatch(lambda: (job.intent('geometry_confirm'), control.click()))
     job.save('submission_clicked', stage='geometry_processing')
     if wait:
         wait_for(driver, job, {'material_ready', 'material_preview', 'export_ready'})
@@ -202,9 +201,8 @@ def generate_material(driver, job, wait=True):
     # Let the De-light state update settle before submitting its React form.
     time.sleep(1)
     generate = exact(scope(driver, MATERIAL), 'Generate')
-    paid_gate.check()   # a caller's paid gate, right before the intent and the click
-    job.intent('material_generate')
-    generate.click()
+    # the final gate check, the intent and the click are one critical section under the gate transition mutex (last-check row 6)
+    paid_gate.checked_dispatch(lambda: (job.intent('material_generate'), generate.click()))
     job.save('submission_clicked', stage='material_processing')
     if wait:
         wait_for(driver, job, {'material_preview', 'export_ready'})
@@ -212,9 +210,8 @@ def generate_material(driver, job, wait=True):
 
 def confirm_material(driver, job, wait=True):
     confirm = exact(scope(driver, MATERIAL), 'Confirm')
-    paid_gate.check()   # a caller's paid gate, right before the intent and the click
-    job.intent('material_confirm')
-    confirm.click()
+    # the final gate check, the intent and the click are one critical section under the gate transition mutex (last-check row 6)
+    paid_gate.checked_dispatch(lambda: (job.intent('material_confirm'), confirm.click()))
     job.save('submission_clicked', stage='material_confirming')
     if wait:
         wait_for(driver, job, {'export_ready'})

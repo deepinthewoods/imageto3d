@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { gatedPaidClick } from './paid_click.mjs';
+import { gatedPaidClick, takeGateMutex } from './paid_click.mjs';
 
 const [command, sourceArg, outputArg, topologyArg] = process.argv.slice(2);
 if (!['submit', 'collect', 'retry', 'balance'].includes(command)) throw new Error('Usage: node studio.mjs submit <views_dir> <output_dir> [Triangle|Quad] | collect <output_dir> | retry <previous_output_dir> <output_dir> | balance');
@@ -86,9 +86,16 @@ function unregisterBrowser(){
 // asked again after it: a hold that took effect meanwhile makes the outcome `uncertain` (needs review), never `clicked`.
 const GATE_TOOL = fileURLToPath(new URL('../paid_gate.py',import.meta.url));
 const EXIT_GATE_CLOSED = 4;
+// Last-check row 6: the final gate check, the intent and the Generate dispatch run under the paid-gate transition mutex of the
+// gate's root (paid_click.mjs takeGateMutex = tools/paid_gate.py transition_lock; `paid_gate.py check` itself does not take it).
+// The check is bounded well below the mutex's 30 s stale age; one that does not answer in time counts as closed.
+const GATE_CHECK_TIMEOUT_MS = 20000;
+function paidGateRoot(){
+ try{const spec=JSON.parse(process.env.IMAGETO3D_PAID_GATE??'');return typeof spec?.root==='string'&&spec.root?spec.root:null;}catch{return null;}
+}
 function paidGateClosed(){
  if(!process.env.IMAGETO3D_PAID_GATE)return null;
- const run=spawnSync(PY,['-X','utf8',GATE_TOOL,'check'],{encoding:'utf8',stdio:['ignore','pipe','pipe']});
+ const run=spawnSync(PY,['-X','utf8',GATE_TOOL,'check'],{encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:GATE_CHECK_TIMEOUT_MS});
  if(run.status===0)return null;
  return (run.stdout||'').trim().split('\n')[0]||(run.stderr||'').trim().split('\n').pop()||run.error?.message||`gate check exit ${run.status}`;
 }
@@ -220,7 +227,9 @@ async function submit(){
     if(Date.now()>queueDeadline)throw new Error('Generate stayed disabled; another Studio generation may be stuck');
     record.status='waiting_for_studio_queue';write(record);await page.waitForTimeout(15000);
    }
+   const gateRoot=paidGateRoot();   // null: no gate (a manual run) or a malformed one (paidGateClosed then says closed)
    click=await gatedPaidClick({control:generate,gateClosed:paidGateClosed,
+    takeMutex:gateRoot?()=>takeGateMutex(gateRoot,{what:`tripo generate ${path.basename(output)}`}):null,
     stillReady:async()=>{const empty=await pending();return empty.length?`Upload slot emptied before Generate: ${empty.join(', ')}`:null;},
     writeIntent:()=>{record.status='submission_attempted';record.submit_clicked_at=new Date().toISOString();write(record);}});
    if(click.outcome!=='not_actionable')break;

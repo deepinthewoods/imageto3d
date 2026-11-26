@@ -1354,11 +1354,32 @@ def read_journal(root: Path, monster: str) -> dict | None:
         return None
     if j.get('op') not in ('pick', 'import') or canon(str(j.get('monster'))) != canon(monster):
         raise guard.Unreadable(f'{path.name}: not a publication journal of {monster}; check {monster} by hand before removing it')
-    problem = journal_record_problem(j, monster)
+    problem = journal_record_problem(j, monster) or journal_target_problem(mroot_of(root), monster, j)
     if problem:
         raise guard.Unreadable(f'{path.name}: not a complete {j["op"]} journal ({problem}); nothing was changed: check {monster} by hand '
                                'before removing it')
     return j
+
+
+IMPORT_STAMPS = ('imported', 'imported_by')                     # what import_pick adds to the earlier names record
+
+
+def journal_target_problem(mroot: Path, monster: str, j: dict) -> str | None:
+    """Last-check review, row 11: the journal must PROVE its recovery target against variant_names.json as it is. Recovery writes
+    `names_entry` over the variant's record (or restores `names_prev`), so the record on disk must be one of the two states the
+    operation itself produces: still `names_prev` (not published yet; null = no record) or already `names_entry` (published). Any
+    other record was not written by this operation: the journal cannot say what to put there, and nothing is replaced. `j` passed
+    journal_record_problem. An unreadable variant_names.json is a problem too (never read as "no record")."""
+    variant = j['variant']
+    try:
+        names = read_variant_names(mroot, monster, strict=True)
+    except guard.Unreadable as exc:
+        return f'variant_names.json cannot be read to check the journal against it ({exc})'
+    current = names['variants'].get(variant)
+    if current == j['names_entry'] or current == j['names_prev']:
+        return None
+    return (f'the variant_names.json record of {variant} is neither the earlier record of the journal (names_prev) nor the record it '
+            'publishes (names_entry): the journal does not prove what to write there')
 
 
 def journal_record_problem(j: dict, monster: str) -> str | None:
@@ -1369,7 +1390,9 @@ def journal_record_problem(j: dict, monster: str) -> str | None:
               record recovery publishes), names_prev (present: null or the object it restores);
       pick:   folder, key (`codex<N>`), origin (a stage a pick starts from), state_entry (an object: stage approved, this variant),
               names_entry.was = key, names_prev null;
-      import: names_entry.imported (the import stamp)."""
+      import: names_entry.imported (the import stamp), and names_entry = names_prev + the import stamps (names_prev null: the record
+              of an approved concept, was `codex<N>` + concept `codex<N>-front.png`, + the stamps); never the stamps alone.
+    read_journal also checks the record against variant_names.json itself (journal_target_problem, last-check row 11)."""
     op = j.get('op')
     if op not in ('pick', 'import'):
         return f'unknown operation {op!r}'
@@ -1404,8 +1427,21 @@ def journal_record_problem(j: dict, monster: str) -> str | None:
             return 'names_entry is not the record of this concept'
         if j['names_prev'] is not None:
             return 'a pick has no earlier names entry to restore'
-    elif not isinstance(entry.get('imported'), str) or not entry['imported']:
-        return 'names_entry is not an import record (no `imported` stamp)'
+    else:
+        if not isinstance(entry.get('imported'), str) or not entry['imported']:
+            return 'names_entry is not an import record (no `imported` stamp)'
+        # last-check review, row 11: the entry to write must be DERIVABLE from the journal: import_pick writes the earlier record
+        # (names_prev) plus the import stamps, or, for a variant only the migration knows (names_prev null), the record of its
+        # approved concept plus the stamps. An entry that carries only the stamps would replace a record's provenance by nothing.
+        body = {k: v for k, v in entry.items() if k not in IMPORT_STAMPS}
+        if not body:
+            return 'names_entry carries only the import stamps (no record of the variant to publish)'
+        prev = j['names_prev']
+        if isinstance(prev, dict):
+            if body != {k: v for k, v in prev.items() if k not in IMPORT_STAMPS}:
+                return 'names_entry is not names_prev plus the import stamps (the journal does not prove the record to publish)'
+        elif not isinstance(body.get('was'), str) or not KEY.fullmatch(body['was']) or body.get('concept') != f'{body["was"]}-front.png':
+            return 'names_entry is not the record of an approved concept (was / concept), and there is no names_prev it comes from'
     return None
 
 

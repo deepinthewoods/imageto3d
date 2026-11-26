@@ -2213,16 +2213,31 @@ class CutoverCheckerTest(TempRoot):
         self.script = self.root / '_checker' / 'imageto3d_cutover_check.py'
         self.script.parent.mkdir()
         self.script.write_text(text[start:text.index("\n'@)", start)] + '\n', encoding='utf-8')
-        for source in list(HERE.glob('*.py')) + [TOOLS / 'tripo_pipeline' / 'claim_lock.py']:   # the checker imports <root>/tools/preview/v2/services.py
+        # the checker imports <root>/tools/preview/v2/services.py (which imports <root>/tools/paid_gate.py)
+        for source in list(HERE.glob('*.py')) + [TOOLS / 'tripo_pipeline' / 'claim_lock.py', TOOLS / 'paid_gate.py']:
             if source.name.startswith('test_'):
                 continue
             target = self.root / 'tools' / source.relative_to(TOOLS)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
 
-    def check(self, what):
-        run = subprocess.run([sys.executable, '-X', 'utf8', str(self.script), str(self.root), what], capture_output=True, text=True,
-                             encoding='utf-8', errors='replace', timeout=120)
+    def check(self, what, deny=None):
+        """Run the checker. `deny` = (pid, 'cwd' | 'cmdline'): in the checker's process that psutil call fails with AccessDenied for
+        that pid (a worker of another session / an elevated one), everything else is the real machine."""
+        cmd = [sys.executable, '-X', 'utf8', str(self.script), str(self.root), what]
+        if deny:
+            wrapper = ('import runpy, sys, psutil\n'
+                       'pid, call = int(sys.argv[1]), sys.argv[2]\n'
+                       'real = getattr(psutil.Process, call)\n'
+                       'def denied(self, *a, **k):\n'
+                       '    if self.pid == pid:\n'
+                       '        raise psutil.AccessDenied(pid)\n'
+                       '    return real(self, *a, **k)\n'
+                       'setattr(psutil.Process, call, denied)\n'
+                       'sys.argv = sys.argv[3:]\n'
+                       'runpy.run_path(sys.argv[0], run_name="__main__")\n')
+            cmd = [sys.executable, '-X', 'utf8', '-c', wrapper, str(deny[0]), deny[1], str(self.script), str(self.root), what]
+        run = subprocess.run(cmd, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=120)
         return run.returncode, run.stdout + run.stderr
 
     def assert_safe(self):
@@ -2288,6 +2303,35 @@ class CutoverCheckerTest(TempRoot):
         self.assertIn(f'still runs [{seven.pid}]', out)
         seven.kill()
         seven.wait(10)
+        self.assert_safe()
+
+    def test_last_check_n3_a_worker_that_cannot_be_resolved_refuses(self):
+        """Last-check review, new 3: a legacy worker 2 shows its relative script path but denies access to its working directory. The
+        checker skipped it and printed SAFE; an unresolved candidate must refuse instead."""
+        self.left_hold()
+        two = self.worker(2)
+        self.code_written(psutil.Process(two.pid).create_time() - 600)                # current code: resolved, it is no obstacle
+        self.assert_safe()
+        for call in ('cwd', 'cmdline'):                                               # its cwd, or its whole command line, is unreadable
+            code, out = self.check('rollback', deny=(two.pid, call))
+            self.assertEqual(code, 1, out)
+            self.assertTrue(out.startswith('REFUSED'), out)
+            self.assertNotIn('SAFE', out)
+            self.assertIn(f'cannot be resolved, so it counts as running: pid {two.pid} ', out)
+            code, out = self.check('drained', deny=(two.pid, call))
+            self.assertEqual(code, 1, out)
+            self.assertIn('REFUSED: not drained while a possible convert process cannot be resolved', out)
+            self.assertIn(f'pid {two.pid} ', out)
+        self.assertIn('tools/convert_queue.py from a working directory that cannot be read',
+                      self.check('rollback', deny=(two.pid, 'cwd'))[1].replace('\\', '/'))
+        self.assertTrue(services.hold_path(self.root).exists())                       # read-only
+        # a python process running ANOTHER script by a relative path from an unreadable cwd is no candidate
+        other = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'], cwd=str(self.root))
+        self.popens.append(other)
+        code, out = self.check('rollback', deny=(other.pid, 'cwd'))
+        self.assertEqual((code, out.startswith('SAFE')), (0, True), out)
+        two.kill()
+        two.wait(10)
         self.assert_safe()
 
 

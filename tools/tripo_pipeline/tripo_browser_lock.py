@@ -19,7 +19,8 @@ every entry point is covered:
     python tools/tripo_pipeline/tripo_browser_lock.py run --profile <dir> [--wait S] -- node tools/tripo_pipeline/studio.mjs ...
     python tools/tripo_pipeline/tripo_browser_lock.py verify --profile <dir> --lock <path> --token <token> [--register-pid N]
                                                                                                          (exit 0 = valid)
-    python tools/tripo_pipeline/tripo_browser_lock.py users --profile <dir>     (exit 1 + lines: an orphan still uses it)
+    python tools/tripo_pipeline/tripo_browser_lock.py users --profile <dir>     (exit 1 + lines: an orphan still uses it;
+                                                                                 READ-ONLY: it never removes a pid file)
 
 A manual run is simply `node tools/tripo_pipeline/studio.mjs balance` (it reserves the profile itself, waiting up to
 $IMAGETO3D_TRIPO_PROFILE_WAIT seconds, default 600, then exits 75 "Tripo browser busy").
@@ -31,7 +32,9 @@ name>.imageto3d.pid` = {pid, create_time, registered}; it prints the path) and r
 normally (the browser context closed). Every acquirer checks it after taking the byte lock (`profile_users`): a registered node
 that still runs (same pid AND create time), or, when it is gone, any Firefox process started with `-profile <this profile>`,
 keeps the profile BUSY until it exits (polled like a held lock: `wait` / TripoBrowserBusy, exit 75 from `run`). A pid file whose
-process is gone and that no Firefox uses is stale and is removed. Process facts come from psutil (always present on Windows:
+process is gone and that no Firefox uses is stale and is removed, but ONLY by an acquirer, under the handshake lock (last-check
+row 18): the `users` query and every other caller of profile_users only look (an unlocked clean-up could delete a registration
+written a moment after it was judged stale and admit a second holder). Process facts come from psutil (always present on Windows:
 portable.py needs it), else /proc on Linux; where neither exists a pid file cannot be checked and counts as busy (fail closed).
 
 Handshake (final-verify row 18): checking a reservation and publishing the pid are ONE step, serialized with acquisition by a third
@@ -240,11 +243,15 @@ def unregister_browser(profile, pid=None) -> bool:
         return False
 
 
-def profile_users(profile=None) -> list:
+def profile_users(profile=None, cleanup=False) -> list:
     """Who still has `profile` open although no holder keeps its reservation (finding 18), as texts; [] = nobody. Looked at only
     when a pid file exists (studio.mjs removes it after a normal end): the registered node when it still runs (same pid and
-    create time), else every browser process (BROWSER_NAMES) started with `-profile <this profile>`. A stale pid file (its
-    process gone, no such browser) is removed. A pid file that cannot be read or checked here counts as a user (fail closed)."""
+    create time), else every browser process (BROWSER_NAMES) started with `-profile <this profile>`. A pid file that cannot be
+    read or checked here counts as a user (fail closed).
+
+    Read-only by default (last-check row 18). `cleanup=True` also removes a stale pid file (its process gone, no such browser)
+    and is ONLY for a caller that holds the handshake lock of the profile (the acquirer in profile_reservation): registration
+    (register_browser) runs under the same lock, so no fresh registration can appear between the look and the removal."""
     path = browser_pid_path(profile)
     try:
         text = path.read_text(encoding='utf-8')
@@ -275,7 +282,7 @@ def profile_users(profile=None) -> list:
             continue
         if any(flag in ('-profile', '--profile') and _same_path(value, real) for flag, value in zip(args, args[1:])):
             users.append(f'{name} pid {other} still on the profile')
-    if not users:
+    if not users and cleanup:
         try:
             if path.read_text(encoding='utf-8') == text:      # not re-registered meanwhile
                 path.unlink()
@@ -369,7 +376,7 @@ def profile_reservation(profile=None, what='studio.mjs', wait=None, announce=Non
                     if not locked:
                         kind, text = 'lock', f'Tripo browser busy (held by {described or "another process"})'
                     else:
-                        users = profile_users(profile)
+                        users = profile_users(profile, cleanup=True)   # under the handshake lock: the only clean-up
                         if users:
                             kind, text = 'users', f'Tripo browser busy (profile still in use: {"; ".join(users)})'
                         else:
@@ -467,7 +474,7 @@ def main(argv=None) -> int:
     p.add_argument('--profile')
     args = parser.parse_args(argv)
     if args.command == 'users':
-        users = profile_users(args.profile)
+        users = profile_users(args.profile)       # a look only: no handshake lock is held here, so nothing is removed (row 18)
         for user in users:
             print(user, flush=True)
         return 1 if users else 0

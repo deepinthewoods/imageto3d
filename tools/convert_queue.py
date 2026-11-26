@@ -65,7 +65,10 @@ Recorded owner (pre-cut-over review finding 2): a set id on the list authorizes 
 whose id the job's prefix is (.codex_jobs/_app/set_namespace.json), that owner is X; a job without `parent_set` whose prefix was
 written as a family id of set S needs S on the list. While set_namespace.json exists but is unreadable (not JSON, or not BOTH
 maps `sets` and `families` with the right types) no job is authorised at all. A refused job is reported once
-(`OWNER <job>: ...`) and left alone.
+(`OWNER <job>: ...`) and left alone. Every id of the namespace (set ids, family ids, family owners), the job's own prefix and its
+`parent_set` must be a set name of the registration grammar (SET_NAME = the preview app's serve.NAME; namespace_maps is the ONE
+validator, used by the preview app's writer tools/preview/v2/convert_list.py too): an owner such as "cape " (trailing space) is
+not the set `cape`, so it would slip past a `!cape` exclude; it makes the namespace unreadable instead (last-check row 2).
 
 Events (stdout and .codex_jobs/_batch/convert_events.log): CONVERT, CONVERTED, PARTIAL, FAILED, DEFERRED, OWNER, BALANCE, IDLE, FINISH,
 PAUSED.
@@ -74,6 +77,7 @@ import argparse
 import fnmatch
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -331,12 +335,35 @@ def listed(set_id, sets):
             and not any(fnmatch.fnmatchcase(set_id, pattern[1:]) for pattern in sets if pattern.startswith('!')))
 
 
+SET_NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_-]*')   # a set / family id: the registration grammar (tools/preview/serve.py NAME)
+
+
+def valid_set_name(value):
+    """`value` is a set id of the registration grammar (the whole string: no surrounding space, no path or pattern characters)."""
+    return isinstance(value, str) and SET_NAME.fullmatch(value) is not None
+
+
+def namespace_maps(raw):
+    """The ONE structure validator of set_namespace.json, shared by this worker's dispatch check and the preview app's writer
+    (tools/preview/v2/convert_list.py read_namespace_strict; last-check row 2): ({set id: ...}, {family id: owner set}) when
+    `raw` is an object that holds BOTH maps (`sets` and `families`, each an object), every key of both is a valid set name and
+    every family owner is a valid set name (valid_set_name); else None. A missing map is never read as an empty one."""
+    if not isinstance(raw, dict):
+        return None
+    sets, families = raw.get('sets'), raw.get('families')
+    if not isinstance(sets, dict) or not isinstance(families, dict):
+        return None
+    if not all(valid_set_name(k) for k in sets) or not all(valid_set_name(k) and valid_set_name(v) for k, v in families.items()):
+        return None
+    return dict(sets), dict(families)
+
+
 def read_namespace(root):
     """The preview app's record of whose a listed id is (`.codex_jobs/_app/set_namespace.json`, tools/preview/v2/convert_list.py):
     ({set id: ...}, {family id: parent set}); ({}, {}) when the file does not exist; None when it exists but is UNREADABLE: it
-    cannot be read, is not JSON, or is not an object that holds BOTH maps with the right types (`sets`: {set id: ...} and
-    `families`: {family id: set id}, every key and every family owner a non-empty string). A missing map is never read as an
-    empty one (final verification row 2): that would silently drop every recorded owner."""
+    cannot be read, is not JSON, or fails the registration validator (namespace_maps: BOTH maps present, every key and every
+    family owner a valid set name; `"cape "` is not one). A missing map is never read as an empty one (final verification
+    row 2): that would silently drop every recorded owner."""
     path = Path(root) / '.codex_jobs' / '_app' / 'set_namespace.json'
     try:
         raw = json.loads(path.read_text(encoding='utf-8-sig'))
@@ -344,15 +371,7 @@ def read_namespace(root):
         return {}, {}
     except (OSError, ValueError):
         return None
-    if not isinstance(raw, dict):
-        return None
-    sets, families = raw.get('sets'), raw.get('families')
-    if not isinstance(sets, dict) or not isinstance(families, dict):
-        return None
-    if not all(isinstance(k, str) and k for k in sets) \
-            or not all(isinstance(k, str) and k and isinstance(v, str) and v for k, v in families.items()):
-        return None
-    return dict(sets), dict(families)
+    return namespace_maps(raw)
 
 
 def owner_allows(root, job_name, record, sets):
@@ -365,10 +384,14 @@ def owner_allows(root, job_name, record, sets):
       - the record names `parent_set` X: X is listed, and the namespace's owner of the job's prefix (itself when it was approved
         as a set, the set it was written for as a family id), when recorded, is X;
       - the record names no parent: when the prefix was written as a family id of S, S is listed (else the list alone decides).
+    The job's prefix and a recorded `parent_set` must themselves be valid set names (valid_set_name; last-check row 2): a name
+    with a surrounding space or other characters is nobody's registered id and is refused, whatever the patterns say.
     Read-only."""
     prefix = job_name.split('--')[0]
+    if not valid_set_name(prefix):
+        return False, f'its set id {prefix!r} is not a valid set name'
     parent = record.get('parent_set') if isinstance(record, dict) else None
-    if parent is not None and (not isinstance(parent, str) or not parent):
+    if parent is not None and not valid_set_name(parent):
         return False, 'its record has an invalid parent_set'
     namespace = read_namespace(root)
     if namespace is None:

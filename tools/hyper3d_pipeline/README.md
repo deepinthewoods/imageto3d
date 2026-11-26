@@ -89,8 +89,11 @@ every profile entry point with fake selenium modules) and `test_monster_wrappers
   `actions.free_preview` gets `done_at`, `model_id`, `resolved_by`) once its model is positively identified: the URL captured
   by `submit`, a `bind`, or on load by `collect` / `preview` / `inspect` of an existing record bound to a model (records written
   before the fix are repaired that way). A click whose model was never identified stays pending.
-- **Recorded inputs** (finding 7). `submit` copies the views into `<out_dir>/upload_inputs/`, uploads those copies and stores
-  `upload_dir` and `inputs: [{name, sha256, size}]` (upload order, the bytes uploaded) in the record.
+- **Recorded inputs** (finding 7; last-check row 14). `submit` copies the views into a fresh folder
+  `<out_dir>/upload_inputs/<stamp>-<pid>-<random>/` (exclusive mkdir, one per submission, never reused), uploads those copies and
+  stores `upload_dir`, the pinned folder identity `upload_dir_id: {name, dev, ino}` and `inputs: [{name, sha256, size}]` (upload
+  order, the bytes uploaded) in the record. The pin (plain folders, no link / junction, same file id) is re-verified before every
+  replace, before the upload and before every paid step; records from before the pin keep the flat `upload_inputs/`.
   `rodin_backend.record_inputs(record_or_dir)` returns that list, or None for an older record (unknown).
 - **Linux login** (phase-4 finding 15). `native_browser.py login` waits for the sign-in window while it holds the browser lock on
   Linux too (no `exec`, which dropped the close-on-exec lock).

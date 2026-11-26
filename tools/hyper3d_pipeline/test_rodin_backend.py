@@ -759,7 +759,10 @@ class Phase5Tests(unittest.TestCase):
         session = self.submit()
         data = self.record()
         upload = Path(data['upload_dir'])
-        self.assertEqual(upload, (self.out / rb.UPLOAD_DIR).resolve())
+        self.assertEqual(upload, (self.out / rb.UPLOAD_DIR / data['upload_dir_id']['name']).resolve())   # a fresh folder (row 14)
+        info = os.lstat(upload)
+        self.assertEqual((data['upload_dir_id']['dev'], data['upload_dir_id']['ino']), (info.st_dev, info.st_ino))
+        self.assertIsNone(rb.upload_pin_problem(self.out, data['upload_dir_id']))
         self.assertEqual([n for n, _ in session.uploaded], CONFIG['view_order'])
         self.assertTrue(all(Path(p).parent.resolve() == upload for _, p in session.uploaded))   # the copies went up
         inputs = rb.record_inputs(rb.Record(self.out / rb.RECORD))
@@ -780,11 +783,13 @@ class Phase5Tests(unittest.TestCase):
 
     def test_an_existing_record_keeps_its_upload_snapshot(self):
         self.submit()
-        before = rb.sha256_file(self.out / rb.UPLOAD_DIR / 'front.png')
+        upload = Path(self.record()['upload_dir'])
+        before = rb.sha256_file(upload / 'front.png')
         (self.views / 'front.png').write_bytes((self.views / 'front.png').read_bytes() + b'changed')
         with self.assertRaisesRegex(rb.Stop, 'already exists'):
             self.submit()
-        self.assertEqual(rb.sha256_file(self.out / rb.UPLOAD_DIR / 'front.png'), before)
+        self.assertEqual(rb.sha256_file(upload / 'front.png'), before)
+        self.assertEqual([p.name for p in (self.out / rb.UPLOAD_DIR).iterdir()], [upload.name])   # no second snapshot folder
 
     # -- finding 2
     def collect(self, session):
@@ -870,6 +875,49 @@ class Phase5Tests(unittest.TestCase):
             os.environ.pop(rb.paid_gate.ENV)
             session = FakeSession(self.out, stages=['geometry_preview', 'export_ready'], costs=self.paid_costs())
             self.collect(session)
+        self.assertIn(('click', 'geometry'), session.calls)
+
+    # -- last-check row 6: the final gate check and the click are one critical section under the gate transition mutex
+    def test_a_hold_cannot_be_written_between_the_final_check_and_the_click(self):
+        self.submit()
+        gate, batch, seen = rb.paid_gate, self.batch, {}
+        gate_root = self.gate_root
+
+        class Clicking(FakeSession):
+            def click(self, kind):
+                # the app tries to hold conversions while this click is dispatched: its writer cannot get the mutex
+                try:
+                    with gate.transition_lock(gate_root, wait=0.05, what='hold writer'):
+                        (batch / 'CONVERT_HOLD').write_text('{}')
+                    seen[kind] = 'written'
+                except gate.GateBusy:
+                    seen[kind] = 'busy'
+                seen['owner'] = json.loads((batch / gate.MUTEX_DIR / 'owner.json').read_text())
+                super().click(kind)
+        session = Clicking(self.out, stages=['geometry_preview', 'export_ready'], costs=self.paid_costs())
+        self.collect(session)
+        self.assertEqual(seen['geometry'], 'busy')
+        self.assertEqual((seen['owner']['pid'], seen['owner']['what']), (os.getpid(), 'paid click'))
+        self.assertIn(('click', 'geometry'), session.calls)
+        self.assertFalse((batch / 'CONVERT_HOLD').exists())
+        self.assertFalse((batch / gate.MUTEX_DIR).exists())                      # released after the click
+        with gate.transition_lock(gate_root, wait=0.05):                         # and a writer gets it at once
+            pass
+
+    def test_a_gate_transition_in_progress_is_a_closed_gate_and_withdraws_the_intent(self):
+        self.submit()
+        session = FakeSession(self.out, stages=['geometry_preview'], costs=self.paid_costs())
+        real = rb.paid_gate.checked_dispatch
+        with rb.paid_gate.transition_lock(self.gate_root, what='a hold being written'), \
+                mock.patch.object(rb.paid_gate, 'checked_dispatch', lambda dispatch: real(dispatch, wait=0.1)):
+            with self.assertRaisesRegex(rb.GateClosed, 'gate transition in progress'):
+                self.collect(session)
+        self.assertFalse([c for c in session.calls if c[0] == 'click'])
+        data = self.record()
+        self.assertEqual((data['pending_action'], list(data['actions'])), (None, ['free_preview']))
+        self.assertNotIn('credits_committed', data)
+        session = FakeSession(self.out, stages=['geometry_preview', 'export_ready'], costs=self.paid_costs())
+        self.collect(session)                                                    # resumable once the transition is over
         self.assertIn(('click', 'geometry'), session.calls)
 
 
@@ -1084,14 +1132,18 @@ class RecheckTests(unittest.TestCase):
             self.assertEqual(self.record()['status'], status)
 
     # -- finding 13
+    def upload(self):
+        """The snapshot folder of the current record (a fresh folder per submission: last-check row 14)."""
+        return self.out / rb.UPLOAD_DIR / self.record()['upload_dir_id']['name']
+
     def tamper(self, name='front.png'):
-        path = self.out / rb.UPLOAD_DIR / name
+        path = self.upload() / name
         os.chmod(path, 0o666)
         path.write_bytes(path.read_bytes() + b'tampered')
 
     def test_the_upload_copies_are_read_only_and_verified(self):
         self.submit()
-        upload = self.out / rb.UPLOAD_DIR
+        upload = self.upload()
         for name in CONFIG['view_order']:
             self.assertFalse(os.access(upload / name, os.W_OK), name)
             with self.assertRaises(PermissionError):
@@ -1109,9 +1161,11 @@ class RecheckTests(unittest.TestCase):
         (upload / 'back.png').unlink()
         self.assertEqual(len(rb.verify_upload_inputs(self.out)), 2)
 
-    # -- final-verify row 14: the writer checks every final destination and never writes through an existing entry
+    # -- row 14 (final-verify, last-check): a fresh pinned snapshot folder per submission; destinations are never written through
+    PLAN = property(lambda self: {'views_dir': self.views, 'images': list(CONFIG['view_order']), 'uploaded': list(CONFIG['view_order'])})
+
     def victim(self):
-        """A read-only file OUTSIDE the output dir that a linked destination would redirect the overwrite to."""
+        """A read-only file OUTSIDE the output dir that a redirected snapshot would overwrite."""
         outside = self.root / 'outside'
         outside.mkdir(exist_ok=True)
         path = outside / 'victim.png'
@@ -1129,75 +1183,175 @@ class RecheckTests(unittest.TestCase):
         self.assertFalse((self.out / rb.RECORD).exists())
         self.assertFalse(session.calls)                                         # nothing was opened or uploaded
 
-    def test_a_hard_linked_destination_is_refused_and_the_outside_file_is_untouched(self):
-        victim = self.victim()
-        upload = self.out / rb.UPLOAD_DIR
-        upload.mkdir(parents=True)
-        os.link(victim, upload / 'front.png')                                   # the same file under the destination name
-        self.assert_refused(victim, 'hard-linked to another file')
-        self.assertEqual(sorted(p.name for p in upload.iterdir()), ['front.png'])   # no view was written, no temp file left
+    def junction(self, target, link):
+        """A directory link `link` -> `target` (a junction on Windows: no privilege needed), removed again at the end."""
+        if os.name == 'nt':
+            import _winapi
+            _winapi.CreateJunction(str(target), str(link))
+        else:
+            os.symlink(target, link, target_is_directory=True)
+        self.addCleanup(lambda: (os.rmdir(link) if os.name == 'nt' else os.unlink(link)) if os.path.lexists(link) else None)
 
-    def test_a_symlinked_destination_is_refused_and_not_followed(self):
+    def test_every_submission_gets_a_fresh_exclusively_created_folder(self):
+        first, _, pin1 = rb.snapshot_inputs(self.PLAN, self.out)
+        second, inputs, pin2 = rb.snapshot_inputs(self.PLAN, self.out)
+        self.assertNotEqual(first, second)                                      # never reused
+        self.assertEqual({first.parent, second.parent}, {self.out / rb.UPLOAD_DIR})
+        self.assertEqual((first.name, second.name), (pin1['name'], pin2['name']))
+        for target, pin in ((first, pin1), (second, pin2)):
+            info = os.lstat(target)
+            self.assertEqual((pin['dev'], pin['ino']), (info.st_dev, info.st_ino))
+            self.assertIsNone(rb.upload_pin_problem(self.out, pin))
+            self.assertEqual(sorted(p.name for p in target.iterdir()), sorted(CONFIG['view_order']))   # no temp file left
+        for item in inputs:
+            self.assertEqual(item['sha256'], rb.sha256_file(self.views / item['name']))
+            self.assertEqual(item['size'], (self.views / item['name']).stat().st_size)
+            self.assertFalse(os.access(second / item['name'], os.W_OK))
+        # an entry that already has the name is never reused: the mkdir is exclusive
+        with mock.patch.object(rb.os, 'urandom', lambda n: b'\x01' * n), mock.patch.object(rb.time, 'strftime', lambda *a: 'STAMP'):
+            taken = self.out / rb.UPLOAD_DIR / f'STAMP-{os.getpid()}-{"01" * 6}'
+            taken.mkdir()
+            (taken / 'front.png').write_bytes(b'somebody else\'s')
+            with self.assertRaisesRegex(rb.Stop, 'already exists and is never reused'):
+                rb.snapshot_inputs(self.PLAN, self.out)
+            self.assertEqual((taken / 'front.png').read_bytes(), b'somebody else\'s')
+
+    def test_the_reviewers_case_a_folder_swapped_for_a_junction_before_the_replace_writes_nothing_there(self):
+        """Last-check row 14: the checked upload directory is swapped for a junction to another directory that holds a
+        front.png; the replacement must not be redirected there."""
         victim = self.victim()
-        upload = self.out / rb.UPLOAD_DIR
-        upload.mkdir(parents=True)
-        try:
-            os.symlink(victim, upload / 'back.png')
-        except (OSError, NotImplementedError) as error:
-            self.skipTest(f'cannot create a symlink here ({error})')
-        self.assert_refused(victim, 'is a link, junction or not a regular file')
-        self.assertTrue(os.path.islink(upload / 'back.png'))
+        other = victim.parent
+        (other / 'front.png').write_bytes(b'another directory\'s front.png')
+        real_own, swapped = rb._own_destination, []
+
+        def swap_then_check(target, name):
+            result = real_own(target, name)
+            if name == 'front.png' and len(swapped) == 2:                        # the 3rd look: right before the os.replace
+                aside = Path(str(target) + '.aside')
+                os.rename(target, aside)                                         # the attacker moves the checked folder away
+                self.junction(other, target)                                     # ... and puts a junction in its place
+            if name == 'front.png':
+                swapped.append(name)
+            return result
+        session = FakeSession(self.out)
+        with mock.patch.object(rb, '_own_destination', swap_then_check):
+            with self.assertRaisesRegex(rb.Stop, 'not a plain folder|was replaced'):
+                rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertEqual(len(swapped), 3)
+        self.assertEqual((other / 'front.png').read_bytes(), b'another directory\'s front.png')   # not replaced
+        self.assertEqual(sorted(p.name for p in other.iterdir()), ['front.png', 'victim.png'])       # nothing written through it
+        self.assertEqual(victim.read_bytes(), b'not a view: must survive')
+        self.assertFalse((self.out / rb.RECORD).exists())                        # stopped before the record, the upload, any click
+        self.assertFalse(session.calls)
+
+    def test_a_folder_replaced_by_another_plain_folder_fails_the_pin(self):
+        target, _, pin = rb.snapshot_inputs(self.PLAN, self.out)
+        self.assertIsNone(rb.upload_pin_problem(self.out, pin))
+        os.rename(target, Path(str(target) + '.aside'))
+        target.mkdir()                                                           # same name, another directory
+        self.assertIn('was replaced', rb.upload_pin_problem(self.out, pin))
+        os.rmdir(target)
+        self.assertIn('is gone', rb.upload_pin_problem(self.out, pin))
+        for bad in (None, {}, {'name': '../x', 'dev': 1, 'ino': 1}, {'name': 'a', 'dev': True, 'ino': 1}, {'name': 'a', 'dev': 1}):
+            self.assertIn('malformed', rb.upload_pin_problem(self.out, bad))
+
+    def test_a_swap_after_the_snapshot_stops_before_the_upload_and_before_a_paid_click(self):
+        victim = self.victim()
+        swap = {}
+
+        def do_swap():
+            target = self.upload()
+            aside = Path(str(target) + '.aside')
+            os.rename(target, aside)
+            copy = victim.parent / f'copy{len(swap)}'                            # identical bytes elsewhere: only the pin can tell
+            shutil.copytree(aside, copy)
+            self.junction(copy, target)
+            swap.update(target=target, aside=aside)
+
+        class Swapping(FakeSession):
+            def open_workspace(self):
+                do_swap()                                                        # after the snapshot, before the upload
+                super().open_workspace()
+        session = Swapping(self.out)
+        with self.assertRaisesRegex(rb.Stop, 'upload copies changed after they were hashed .*not a plain folder'):
+            rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
+        self.assertFalse([c for c in session.calls if c[0] in ('prepare_multiview', 'click_free_preview')])
+        # the same swap after a good submit: collect stops before the paid intent and click
+        os.rmdir(swap['target'])
+        self.submit()
+        do_swap()
+        self.assertIn('not a plain folder', rb.verify_upload_inputs(self.out)[0])
+        session = FakeSession(self.out, stages=['geometry_preview'], costs=self.COSTS)
+        with self.assertRaisesRegex(rb.Stop, 'upload inputs differ from the recorded submission before geometry'):
+            self.collect(session)
+        self.assertFalse([c for c in session.calls if c[0] == 'click'])
+        self.assertEqual(list(self.record()['actions']), ['free_preview'])
 
     def test_an_upload_folder_that_is_a_link_or_junction_is_refused(self):
         victim = self.victim()
         self.out.mkdir(parents=True)
-        link = self.out / rb.UPLOAD_DIR
-        if os.name == 'nt':
-            import _winapi
-            _winapi.CreateJunction(str(victim.parent), str(link))
-        else:
-            os.symlink(victim.parent, link, target_is_directory=True)
-        self.addCleanup(lambda: os.rmdir(link) if os.name == 'nt' else os.unlink(link))
+        self.junction(victim.parent, self.out / rb.UPLOAD_DIR)
         self.assert_refused(victim, 'not a plain folder of the output')
         self.assertEqual([p.name for p in victim.parent.iterdir()], ['victim.png'])   # nothing was written through the junction
 
-    def test_a_destination_that_is_a_folder_or_not_a_bare_name_is_refused(self):
-        upload = self.out / rb.UPLOAD_DIR
-        (upload / 'front.png').mkdir(parents=True)
+    def test_destinations_inside_the_folder_are_never_written_through(self):
+        """_replace_own / _own_destination (final-verify row 14) on a folder of the test's own: a hard link, a symbolic link, a
+        folder and a non-bare name are refused; an own read-only file is replaced by a new file."""
+        victim = self.victim()
+        folder = self.root / 'folder'
+        folder.mkdir()
+        os.link(victim, folder / 'front.png')                                   # the same file under the destination name
+        with self.assertRaisesRegex(rb.Stop, 'hard-linked to another file'):
+            rb._replace_own(self.views / 'front.png', folder, 'front.png')
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ['front.png'])   # no temp file left
+        (folder / 'side.png').mkdir()
         with self.assertRaisesRegex(rb.Stop, 'not a regular file'):
-            rb.snapshot_inputs({'views_dir': self.views, 'images': ['front.png'], 'uploaded': ['front.png']}, self.out)
+            rb._replace_own(self.views / 'front.png', folder, 'side.png')
         for name in ('../escaped.png', 'sub/front.png', '..', ''):
             with self.assertRaisesRegex(rb.Stop, 'not a plain file name'):
-                rb.snapshot_inputs({'views_dir': self.views, 'images': [name], 'uploaded': [name]}, self.out)
-        self.assertFalse((self.out / 'escaped.png').exists())
-
-    def test_an_own_read_only_snapshot_is_replaced_by_a_new_file_not_written_in_place(self):
-        upload = self.out / rb.UPLOAD_DIR
-        upload.mkdir(parents=True)
-        old = upload / 'front.png'
+                rb._replace_own(self.views / 'front.png', folder, name)
+        self.assertFalse((self.root / 'escaped.png').exists())
+        try:
+            os.symlink(victim, folder / 'back.png')
+        except (OSError, NotImplementedError):
+            pass                                                                 # no symlink privilege here: the other cases ran
+        else:
+            with self.assertRaisesRegex(rb.Stop, 'is a link, junction or not a regular file'):
+                rb._replace_own(self.views / 'back.png', folder, 'back.png')
+            self.assertTrue(os.path.islink(folder / 'back.png'))
+        self.assertEqual(victim.read_bytes(), b'not a view: must survive')
+        self.assertFalse(os.access(victim, os.W_OK))
+        old = folder / 'own.png'
         old.write_bytes(b'an earlier snapshot')
         os.chmod(old, 0o444)
-        keep = self.root / 'kept_handle.png'
         before = os.stat(old)
-        plan = {'views_dir': self.views, 'images': list(CONFIG['view_order']), 'uploaded': list(CONFIG['view_order'])}
-        target, inputs = rb.snapshot_inputs(plan, self.out)
-        self.assertEqual(target, upload)
+        calls = []
+        digest, size = rb._replace_own(self.views / 'front.png', folder, 'own.png', lambda: calls.append(1))
         after = os.stat(old)
+        self.assertEqual(len(calls), 2)                                         # the pin: before the temp file and before the swap
         self.assertNotEqual((before.st_ino, before.st_size), (after.st_ino, after.st_size))   # a new file took the name
-        self.assertEqual(old.read_bytes(), (self.views / 'front.png').read_bytes())
-        self.assertEqual([i['name'] for i in inputs], list(CONFIG['view_order']))
-        for item in inputs:
-            self.assertEqual(item['sha256'], rb.sha256_file(self.views / item['name']))
-            self.assertEqual(item['size'], (self.views / item['name']).stat().st_size)
-            self.assertFalse(os.access(upload / item['name'], os.W_OK))
-        self.assertEqual(sorted(p.name for p in upload.iterdir()), sorted(CONFIG['view_order']))   # no temp file left
-        self.assertFalse(keep.exists())
-        # a stale marker of the snapshot's own is removed although it is read-only
-        marker = upload / 'views_omitted.json'
-        marker.write_text('{}')
-        os.chmod(marker, 0o444)
-        rb.snapshot_inputs(plan, self.out)
-        self.assertFalse(marker.exists())
+        self.assertEqual((digest, size), (rb.sha256_file(self.views / 'front.png'), (self.views / 'front.png').stat().st_size))
+        self.assertFalse(os.access(old, os.W_OK))
+
+        def refuse():
+            raise rb.Stop('pin lost')
+        with self.assertRaisesRegex(rb.Stop, 'pin lost'):
+            rb._replace_own(self.views / 'back.png', folder, 'new.png', refuse)
+        self.assertFalse((folder / 'new.png').exists())
+        self.assertFalse([p for p in folder.iterdir() if p.name.endswith('.tmp')])
+
+    def test_a_record_from_before_the_pin_keeps_the_flat_folder(self):
+        self.submit()
+        path = self.out / rb.RECORD
+        data = json.loads(path.read_text())
+        flat = self.out / rb.UPLOAD_DIR
+        for name in CONFIG['view_order']:
+            shutil.copyfile(self.upload() / name, flat / name)
+        del data['upload_dir_id']
+        data['upload_dir'] = str(flat.resolve())
+        path.write_text(json.dumps(data))
+        self.assertEqual(rb.verify_upload_inputs(self.out), [])
+        self.assertEqual(rb.verify_upload_inputs(self.record()), [])
 
     def test_a_copy_changed_before_the_upload_stops_the_submit_before_anything_is_sent(self):
         tamper = self.tamper
@@ -1211,8 +1365,9 @@ class RecheckTests(unittest.TestCase):
             rb.submit(self.views, self.out, config=CONFIG, session_factory=lambda: session)
         self.assertFalse([c for c in session.calls if c[0] in ('prepare_multiview', 'click_free_preview')])
         self.assertFalse((self.out / rb.RECORD).exists())                        # set aside: nothing was generated
-        self.submit()                                                            # a re-run replaces the read-only snapshot
+        self.submit()                                                            # a re-run snapshots into a new folder
         self.assertEqual((self.record()['status'], rb.verify_upload_inputs(self.out)), ('submitted', []))
+        self.assertEqual(len(list((self.out / rb.UPLOAD_DIR).iterdir())), 2)
 
     def test_a_copy_changed_during_the_upload_stops_before_the_click(self):
         tamper = self.tamper

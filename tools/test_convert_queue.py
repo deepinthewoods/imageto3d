@@ -630,6 +630,52 @@ class OwnerTests(Base):
         self.namespace(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
         self.assertEqual(cq.next_job({'cape', 'cape_human_male'}), (job, True))
 
+    def test_the_last_check_reviewers_case_a_malformed_owner_is_refused(self):
+        """Last-check row 2: the owner `"cape "` (trailing space) is not `cape`, so `!cape` did not exclude it and `*` listed it;
+        the worker claimed the excluded set's job. The dispatch uses the registration validator: such a namespace is unreadable."""
+        job = self.stage('cape_human_male--fedcba')                                     # no parent_set
+        sets = ['*', '!cape']
+        self.namespace(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}))
+        self.assertEqual(cq.next_job(sets), (None, False))                              # well-formed: its owner cape is excluded
+        self.namespace(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape '}}))
+        self.assertIsNone(cq.read_namespace(self.root))
+        ok, reason = cq.owner_allows(self.root, job.name, {}, sets)
+        self.assertFalse(ok)
+        self.assertIn('unreadable', reason)
+        self.assertEqual(cq.next_job(sets), (None, False))                              # not claimed
+        self.assertFalse((cq.LOCKS / f'{job.name}.lock').exists())
+        for bad in ({'sets': {'cape ': 'x'}, 'families': {}}, {'sets': {}, 'families': {' cape_human_male': 'cape'}},
+                    {'sets': {}, 'families': {'cape_human_male': 'ca pe'}}, {'sets': {}, 'families': {'cape_human_male': 'cape\n'}},
+                    {'sets': {}, 'families': {'cape_human_male': '*'}}, {'sets': {'!cape': 'x'}, 'families': {}},
+                    {'sets': {}, 'families': {'cape_human_male': '../cape'}}):
+            self.assertIsNone(cq.namespace_maps(bad), bad)
+            self.namespace(json.dumps(bad))
+            self.assertEqual(cq.next_job(sets), (None, False), bad)
+        # the job's own record and name go through the same grammar
+        self.namespace(json.dumps({'sets': {'cape': 'x'}, 'families': {}}))
+        for parent in ('cape ', ' cape', 'ca*e', ''):
+            self.assertEqual(cq.owner_allows(self.root, 'x_human_male--1', {'parent_set': parent}, ['*', '!cape']),
+                             (False, 'its record has an invalid parent_set'), parent)
+        ok, reason = cq.owner_allows(self.root, 'cape --1', {}, ['*', '!cape'])
+        self.assertFalse(ok)
+        self.assertIn('not a valid set name', reason)
+
+    def test_the_worker_and_the_preview_app_share_one_namespace_validator(self):
+        sys.path.insert(0, str(Path(cq.__file__).resolve().parent / 'preview' / 'v2'))
+        try:
+            import convert_list
+        finally:
+            sys.path.pop(0)
+        self.assertIs(convert_list.namespace_validator(), cq.namespace_maps)            # the app's writer uses the worker's rule
+        self.assertEqual(convert_list.NAME.pattern, f'^{cq.SET_NAME.pattern}$')         # and the local stand-in has the same grammar
+        for raw in ({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape'}}, {'sets': {}, 'families': {}},
+                    {'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape '}}, {'sets': {'cape': 'x'}}, [], None,
+                    {'sets': {'a b': 1}, 'families': {}}, {'sets': {}, 'families': {'a': 7}}, {'sets': {}, 'families': {'a': 'b\n'}}):
+            self.assertEqual(convert_list._namespace_maps(raw), cq.namespace_maps(raw), raw)
+        self.namespace(json.dumps({'sets': {'cape': 'x'}, 'families': {'cape_human_male': 'cape '}}))
+        with self.assertRaises(convert_list.NamespaceUnreadable):                       # nothing is registered on top of it either
+            convert_list.read_namespace_strict(self.root)
+
 
 if __name__ == '__main__':
     unittest.main()

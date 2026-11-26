@@ -507,6 +507,8 @@ class BrowserLifetimeTests(unittest.TestCase):
         data['create_time'] -= 3600                                  # the registered process started an hour before this one
         self.pid_file.write_text(json.dumps(data))
         self.assertEqual(tbl.profile_users(self.profile), [])
+        self.assertTrue(self.pid_file.exists())                      # a look only (last-check row 18)
+        self.assertTrue(self.acquire(wait=0))                        # the acquirer removes it, under the handshake lock
         self.assertFalse(self.pid_file.exists())
 
     def test_a_firefox_left_on_the_profile_by_a_dead_node_keeps_it_busy(self):
@@ -543,7 +545,44 @@ class BrowserLifetimeTests(unittest.TestCase):
         self.assertTrue(self.pid_file.exists())
         self.pid_file.write_text('{half')                            # damaged: decided by the browser scan
         self.assertEqual(tbl.profile_users(self.profile), [])
+        self.assertTrue(self.pid_file.exists())
+        self.assertEqual(tbl.profile_users(self.profile, cleanup=True), [])
         self.assertFalse(self.pid_file.exists())
+
+    def stale_registration(self):
+        dead = subprocess.run([sys.executable, '-c', 'import os; print(os.getpid())'], capture_output=True, text=True)
+        self.pid_file.write_text(json.dumps({'pid': int(dead.stdout), 'create_time': 1.0, 'registered': 'long ago'}) + '\n')
+        return self.pid_file.read_text()
+
+    def test_the_users_query_is_read_only(self):
+        """Last-check row 18: the unlocked `users` command must not clean up."""
+        text = self.stale_registration()
+        run = subprocess.run([sys.executable, str(LOCK_TOOL), 'users', '--profile', str(self.profile)], capture_output=True, text=True)
+        self.assertEqual((run.returncode, run.stdout), (0, ''))
+        self.assertEqual(self.pid_file.read_text(), text)            # the stale file is left for an acquirer
+        with mock.patch.object(Path, 'unlink', side_effect=AssertionError('the query removed a file')), \
+                mock.patch.object(tbl.os, 'replace', side_effect=AssertionError('the query wrote a file')):
+            self.assertEqual(tbl.main(['users', '--profile', str(self.profile)]), 0)
+
+    def test_the_reviewers_sequence_a_registration_made_during_the_users_query_survives(self):
+        """The query finds a stale pid file; while it scans the processes the child of a holder registers (the file now names a
+        live process). The old clean-up deleted that fresh registration and the next acquirer was admitted beside it."""
+        self.stale_registration()
+        node = self.sleeper()
+        real = tbl._processes
+
+        def registering():
+            rows = real()
+            tbl._record_browser(self.profile, node.pid)              # lands after the query judged the old file
+            return rows
+        with mock.patch.object(tbl, '_processes', registering):
+            self.assertEqual(tbl.main(['users', '--profile', str(self.profile)]), 0)   # its answer is about the stale file
+        self.assertEqual(json.loads(self.pid_file.read_text())['pid'], node.pid)       # the registration is still there
+        with self.assertRaisesRegex(tbl.TripoBrowserBusy, f'node pid {node.pid}'):
+            self.acquire(wait=0.2)                                   # so no second holder is admitted
+        self.stop(node)
+        self.assertTrue(self.acquire(wait=0))
+        self.assertFalse(self.pid_file.exists())                     # removed by the acquirer, under the handshake lock
 
     def test_unregister_only_removes_the_callers_own_registration(self):
         node = self.sleeper()

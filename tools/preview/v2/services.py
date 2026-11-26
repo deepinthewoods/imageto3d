@@ -32,6 +32,9 @@ by begin_management, before the supervisor is stopped or restarted (naming that 
 removed by the tick only when it is ours, the running supervisor wrote `supervisor_tick.json` (its pid, a time after the hold's since) AND
 that supervisor is the intended generation: not a retiring one, no stop of it pending, no legacy worker drain in progress (release_blocker;
 DESIGN_PHASE4.md I.9). A hold of a dead owner older than STALE_HOLD_S is replaced by ours; a hold of a live other owner is never touched.
+Every write and removal of CONVERT_HOLD and CONVERT_DRAIN (and the PAUSE put back after a supervisor restart) is made under the paid-gate
+transition mutex (gate_transition = tools/paid_gate.py transition_lock; last-check review row 6): a paid click holds it from its final gate
+check to its dispatch, so a hold lands before the check or after the click, never between.
 
 Convert worker stop (I.2): `.codex_jobs/_batch/convert_worker1.stop` = {pid, create_time, request, time} naming the worker process; the worker
 acknowledges with `convert_worker1.stopping`, finishes its job (finish + offload) and exits. The manager waits and NEVER kills on a timeout:
@@ -84,12 +87,13 @@ import threading
 import time
 
 HERE = Path(__file__).resolve().parent
-for _p in (HERE.parent, HERE):
+for _p in (HERE.parents[1], HERE.parent, HERE):            # tools/ (paid_gate), tools/preview, tools/preview/v2
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 import convert_list  # noqa: E402
 import guard  # noqa: E402
 import modes  # noqa: E402
+import paid_gate  # noqa: E402   (tools/paid_gate.py: the gate transition mutex for the CONVERT_HOLD / CONVERT_DRAIN writes)
 import settings as app_settings  # noqa: E402
 
 import psutil  # noqa: E402   (required: the manager cannot see processes without it)
@@ -508,6 +512,30 @@ def _lock_held(root, svc: Service) -> bool:
 
 # ------------------------------------------------------------------------------------------------------------------ conversion hold
 
+GATE_LOCK_TRIES = 4   # x paid_gate.transition_lock's 10 s wait; the mutex is reclaimed as stale after 30 s, so this always ends
+
+
+def gate_transition(root, action, what: str):
+    """Run `action()` (a WRITE or REMOVAL of CONVERT_HOLD / CONVERT_DRAIN, or the PAUSE put back after a supervisor restart) under the
+    paid-gate transition mutex of `root` (tools/paid_gate.py transition_lock; last-check review row 6): a paid click's final gate check and
+    its dispatch hold the same mutex, so a hold is never written between the two: it lands before the check (no click) or after the click
+    was dispatched. A busy mutex is retried (GATE_LOCK_TRIES); if it never frees (it is reclaimed as stale after 30 s, so only a broken
+    folder gets here) the action still runs: a hold that is not written at all is worse than one written without the mutex."""
+    for _ in range(GATE_LOCK_TRIES):
+        try:
+            lock = paid_gate.transition_lock(root, what=what)
+            lock.__enter__()
+        except paid_gate.GateBusy:
+            continue
+        except OSError:
+            break
+        try:
+            return action()
+        finally:
+            lock.__exit__(None, None, None)
+    return action()
+
+
 def hold_path(root) -> Path:
     return batch(root) / HOLD_FILE
 
@@ -577,7 +605,8 @@ def write_hold(root, reason: str, now: float | None = None, retiring: list[dict]
             'owner_pid': os.getpid(), 'owner_create_time': _my_create_time()}
     if retiring:
         hold['retiring'] = retiring[-MAX_RETIRING:]
-    guard.write_atomic(hold_path(root), (json.dumps(hold, indent=2) + '\n').encode('utf-8'))
+    gate_transition(root, lambda: guard.write_atomic(hold_path(root), (json.dumps(hold, indent=2) + '\n').encode('utf-8')),
+                    f'CONVERT_HOLD ({reason})')
     return hold
 
 
@@ -627,7 +656,8 @@ def withdraw_retiring(root, inst: dict) -> bool:
         new['retiring'] = keep
     else:
         new.pop('retiring', None)
-    guard.write_atomic(hold_path(root), (json.dumps(new, indent=2) + '\n').encode('utf-8'))
+    gate_transition(root, lambda: guard.write_atomic(hold_path(root), (json.dumps(new, indent=2) + '\n').encode('utf-8')),
+                    'CONVERT_HOLD (retiring withdrawn)')
     return True
 
 
@@ -722,7 +752,7 @@ def release_hold(root, sup: dict | None) -> str | None:
     if release_blocker(root, sup, hold):
         return None
     if supervisor_ticked(root, sup, _hold_time(hold)):
-        hold_path(root).unlink(missing_ok=True)
+        gate_transition(root, lambda: hold_path(root).unlink(missing_ok=True), 'CONVERT_HOLD released')
         return f'conversion hold released (supervisor pid {sup["pid"]} completed a tick)'
     return None
 
@@ -875,7 +905,7 @@ def _restore_pause(root, rec: dict) -> None:
     backup = rec.pop('pause_backup', None)
     path = batch(root) / 'PAUSE'
     if backup is not None and not path.exists():
-        guard.write_atomic(path, backup.encode('utf-8'))
+        gate_transition(root, lambda: guard.write_atomic(path, backup.encode('utf-8')), 'PAUSE restored after a supervisor restart')
 
 
 def _finish_stop(root, name: str, rec: dict, now: float) -> None:
@@ -1194,7 +1224,8 @@ def write_drain(root, inst: dict, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     drain = {'since': datetime.fromtimestamp(now).isoformat(timespec='milliseconds'), 'since_unix': now, 'reason': 'legacy convert worker drain',
              'owner_pid': os.getpid(), 'owner_create_time': _my_create_time(), 'worker': _ident(inst)}
-    guard.write_atomic(drain_path(root), (json.dumps(drain, indent=2) + '\n').encode('utf-8'))
+    gate_transition(root, lambda: guard.write_atomic(drain_path(root), (json.dumps(drain, indent=2) + '\n').encode('utf-8')),
+                    'CONVERT_DRAIN')
     return drain
 
 
@@ -1320,7 +1351,7 @@ def settle_drain(root, now: float | None = None) -> list[str]:
         if unlocked:
             events.append(f'convert: removed the job lock(s) of the stopped older worker: {", ".join(unlocked)}')
         if drain is not None:
-            drain_path(root).unlink(missing_ok=True)
+            gate_transition(root, lambda: drain_path(root).unlink(missing_ok=True), 'CONVERT_DRAIN removed')
             deferred = sum(e['exits'] for e in restored)
             events.append(f'conversion drain finished: CONVERT_DRAIN removed ({deferred} deferred convert_job exit(s))')
         if restored or unlocked or drain is not None:

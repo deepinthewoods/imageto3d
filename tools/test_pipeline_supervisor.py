@@ -299,6 +299,50 @@ def test_release_all_on_exit(root, monkeypatch):
     assert sorted(p for p, s in sent if s == ps.SIGCONT) == [111, 112, 118, 120]
 
 
+def test_pause_and_mode_writes_take_the_gate_transition_mutex(root, monkeypatch):
+    """Last-check row 6: PAUSE and supervisor_mode.json change only under the paid-gate transition mutex, so a paid click's
+    final gate check and its dispatch (which hold it) never straddle a pause."""
+    import threading
+    monkeypatch.setattr(ps, 'process_table', lambda: [])
+    sup = make_sup(root)
+    mutex = root / '.codex_jobs' / '_batch' / ps.paid_gate.MUTEX_DIR
+    seen, real_write, real_unlink = [], ps.atomic_write, Path.unlink
+
+    def write(path, data):
+        if path in (sup.pause_file, sup.mode_file):
+            seen.append(('write', path.name, json.loads((mutex / 'owner.json').read_text())['what']))
+        real_write(path, data)
+
+    def unlink(self, missing_ok=False):
+        if self == sup.pause_file:
+            seen.append(('unlink', self.name, json.loads((mutex / 'owner.json').read_text())['what']))
+        real_unlink(self, missing_ok=missing_ok)
+    monkeypatch.setattr(ps, 'atomic_write', write)
+    monkeypatch.setattr(Path, 'unlink', unlink)
+    sup.run_cmd.screen = '(false,)\n'                       # the user is active: pause
+    sup.tick_screen()
+    sup.run_cmd.screen = '(true,)\n'                        # away: resume
+    sup.tick_screen()
+    ps.main(['--root', str(root), 'mode', 'pause'])
+    sup.tick_screen()
+    sup.release_all()
+    assert seen == [('write', 'PAUSE', 'supervisor PAUSE (user active)'), ('unlink', 'PAUSE', 'supervisor PAUSE removed'),
+                    ('write', 'supervisor_mode.json', 'supervisor mode pause'), ('write', 'PAUSE', 'supervisor PAUSE (manual pause)'),
+                    ('unlink', 'PAUSE', 'supervisor exit: PAUSE removed')]
+    assert not mutex.exists()                               # released every time
+    # a click in progress (its check + dispatch hold the mutex): the pause is written only after it
+    ps.main(['--root', str(root), 'mode', 'auto'])
+    sup.run_cmd.screen = '(false,)\n'
+    with ps.paid_gate.transition_lock(root, what='paid click'):
+        ticker = threading.Thread(target=sup.tick_screen)
+        ticker.start()
+        ticker.join(0.4)
+        assert ticker.is_alive() and not sup.pause_file.exists()     # the writer waits for the click's critical section
+    ticker.join(20)
+    assert not ticker.is_alive() and sup.pause_file.exists()
+    assert seen[-1] == ('write', 'PAUSE', 'supervisor PAUSE (user active)')
+
+
 # ---------------------------------------------------------------- gate 1
 def gate1_ready(root, **kwargs):
     for race in RACES:

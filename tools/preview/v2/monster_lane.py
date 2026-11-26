@@ -348,45 +348,86 @@ def record_failure(root: Path, task: dict, error: str | None) -> None:
         persist_disposition(root, gen[0], gen[1], gen[2], {'state': 'failed', 'reason': str(error or 'failed')[:300], 'key': task.get('key')})
 
 
+CANCEL_PASSES = 5                  # cancel_task: how often it looks again while the row keeps changing under it
+
+
 def cancel_task(root: Path, task: dict, detail: str = 'manual') -> bool:
-    """HOOK (Queue tab Cancel of a monster row; `task` = resolve_task's row): persist `cancelled` for the generation FIRST, then cancel
-    the queued row in a transaction that compares the displayed identity (finding 4). Finding 3:
-      - a row that is ALREADY cancelled (the dispatcher saw the new disposition and cancelled it first, or a repeated click) is the same
-        terminal state: success, the durable `cancelled` stands;
-      - when the row left the queue another way (it started), only OUR OWN write is taken back, and only while no newer disposition was
-        written (the variant's monotonic sequence): an older disposition is never put back over a newer one.
-    Final-verify row 3: the write itself is a COMPARE-AND-SET (`mv.set_disposition(..., only_absent=True)`, under the monster lock):
-    `cancelled` is recorded only while the generation has NO disposition. `task` may be stale (the attempt ran and failed after the
-    client saw the row queued): the `failed` that is recorded then is never overwritten, so there is nothing of ours to take back when
-    the SQLite cancel loses, and the failure survives a rebuilt queue.
-    False when the row was not queued."""
+    """HOOK (Queue tab Cancel of a monster row; `task` = resolve_task's row, which may be STALE by now): persist `cancelled` for the
+    generation FIRST, then cancel the queued row in a transaction that compares the displayed identity (finding 4).
+
+    A Cancel is never lost and never answers success while the generation stays runnable (last-check review, new blocker + row 3).
+    `task` only says what the client was shown; every pass looks the row up again by its EXACT key and acts on what is there NOW:
+      - a QUEUED row of that generation (also when the client was shown it cancelled: the queue was rebuilt and the generation queued
+        again because its durable disposition was missing) -> the durable `cancelled` is written first, as a COMPARE-AND-SET
+        (`mv.set_disposition(..., only_absent=True)`, under the monster lock: a recorded failure is never replaced, final-verify row
+        3), then the row is cancelled with the identity compared in the same transaction;
+      - a CANCELLED row, or no row at all for a Cancel that was shown a cancelled one (a rebuilt queue that has not been ticked) ->
+        the durable `cancelled` is (re)written when the generation has no disposition;
+      - anything else (it started, failed, finished): a Cancel that was shown a QUEUED row answers False (only OUR OWN write is taken
+        back, and only while no newer disposition was written: the variant's monotonic sequence); a REPEATED Cancel (shown a
+        cancelled row) answers 409 `changed` (guard.Changed).
+    Success (True) is answered only after a last look finds NO runnable row of the generation, and for a repeated Cancel only when the
+    durable disposition says `cancelled` (or the variant has no views.json any more: nothing frozen, nothing runnable); otherwise the
+    passes go on, and 409 `changed` is the answer when the state keeps changing. False when the row the client saw queued is not
+    queued (and not cancelled) any more."""
     q = queue(root)
     if task['lane'] != LANE:
         raise mv.not_found(f'Unknown monster conversion task {task["id"]}')
-    gen = _generation_of(task)
-    value = {'state': 'cancelled', 'reason': 'cancelled by the user', 'key': task['key']}
-    if task['state'] == 'cancelled':
-        now = q.by_key(task['key'])                             # (the snapshot may be stale: only a row that IS cancelled gets its record)
-        if gen and now is not None and now['state'] == 'cancelled':
-            mv.set_disposition(root, gen[0], gen[1], gen[2], value, only_absent=True)
-        return True
-    if task['state'] != 'queued':
+    shown = task['state']
+    if shown not in ('queued', 'cancelled'):
         return False
-    wrote = mv.set_disposition(root, gen[0], gen[1], gen[2], value, only_absent=True) if gen else None
-    try:
-        done = q.cancel(task['id'], detail, manual_gen='manual', expect=task_ident(task))
-    except taskqueue.Expired as exc:
-        if wrote and wrote.get('written'):
-            mv.set_disposition(root, gen[0], gen[1], gen[2], None, expect_seq=wrote['seq'])
-        raise guard.Changed(f'{exc}; reload and look again', changes=['task']) from None
-    if done:
-        return True
-    now = q.by_key(task['key'])
-    if now is not None and now['state'] == 'cancelled':
-        return True                                            # the same terminal transition, made by the dispatcher first
-    if wrote and wrote.get('written'):
-        mv.set_disposition(root, gen[0], gen[1], gen[2], None, expect_seq=wrote['seq'])
-    return False
+    gen = _generation_of(task)
+    ident = task_ident(task)
+    value = {'state': 'cancelled', 'reason': 'cancelled by the user', 'key': task['key']}
+    own: list[dict] = []                                        # our own durable write (taken back when the Cancel loses)
+
+    def take_back() -> None:
+        if own:
+            mv.set_disposition(root, gen[0], gen[1], gen[2], None, expect_seq=own.pop()['seq'])
+
+    def changed(text: str) -> guard.Changed:
+        return guard.Changed(f'{text}; reload and look again', changes=['task'])
+
+    def row_now() -> dict | None:
+        row = q.by_key(task['key'])
+        if row is None and not q.health_view().get('ok'):
+            raise guard.Unreadable('the task queue cannot be read; try again shortly')
+        if row is not None and (row['lane'] != LANE or (row.get('args') or {}).get('frozen_sha') != ident['generation']):
+            take_back()
+            raise changed(f'the task {task["key"]!r} belongs to another choice of views now')
+        return row
+
+    for _pass in range(CANCEL_PASSES):
+        row = row_now()
+        state = row['state'] if row is not None else None
+        if state not in ('queued', 'cancelled', None) or (state is None and shown == 'queued'):
+            take_back()
+            if shown == 'queued' and state is not None:
+                return False                                    # it started / failed / finished: the newer state stands
+            raise changed('the conversion task you were shown is not in the queue any more' if state is None else
+                          f'the conversion is {state} now, not cancelled')
+        durable = None                                          # the generation's disposition after the compare-and-set
+        if gen:
+            wrote = mv.set_disposition(root, gen[0], gen[1], gen[2], value, only_absent=True)   # the durable disposition FIRST
+            if wrote.get('written'):
+                own[:] = [wrote]
+            durable = 'missing' if wrote.get('missing') else 'cancelled' if wrote.get('written') or wrote.get('same') else \
+                str((wrote.get('previous') or {}).get('state'))
+        if state == 'queued':
+            try:
+                done = q.cancel(row['id'], detail, manual_gen='manual', expect=ident)
+            except taskqueue.Expired as exc:
+                take_back()
+                raise changed(str(exc)) from None
+            if not done:
+                continue                                        # the row moved meanwhile: look again
+        if shown == 'cancelled' and durable not in ('cancelled', 'missing', None):
+            raise changed(f'the conversion of this choice is {durable} now, not cancelled')   # (not runnable either: it has a disposition)
+        last = row_now()                                        # NO runnable row may be left (the queue may have been rebuilt)
+        if last is None or last['state'] == 'cancelled':
+            return True
+    take_back()
+    raise changed('the conversion task keeps changing')
 
 
 def retry_task(root: Path, task: dict) -> bool:
@@ -510,15 +551,17 @@ def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_k
     `paused` / `pause_id` / `pause_reason` describe ALL independent manual pauses in force (modes.manual_pause: the pause mode and a
     separate manual PAUSE file; the supervisor's own reflection of the mode or of the user's activity is not one) whatever else closes
     the gate; `args.override_pause` (the `pause_id` the user confirmed) overrides them only while EVERY pause in force is in it
-    (modes.consent_covers: finding 5, final-verify row 5). The `gate` sub-command (the paid child's click-time check) evaluates this
-    same function."""
+    (modes.consent_covers: finding 5, final-verify row 5). The mode file and the PAUSE file are each read ONCE; the reported reason
+    and the id the consent is compared with come from that one snapshot (last-check row 5). The `gate` sub-command (the paid child's
+    click-time check) evaluates this same function."""
     args = args or {}
     mode_rec = modes.read_mode(root)
     mode = mode_rec['mode']
-    pause = modes.read_pause(root)
+    snap = modes.pause_snapshot(root)                      # ONE read: id, reason, scope and extra of the same bytes (last-check row 5)
+    pause = modes.public_pause(snap)
     hold = read_hold(root)
     drain = read_drain(root)
-    manual = modes.manual_pause(root, mode_rec, pause)      # ALL independent manual pauses in force, as one identity (row 5)
+    manual = modes.manual_pause(root, mode_rec, snap)       # ALL independent manual pauses in force, as one identity (row 5)
     key = manual['pause_id'] if manual else None
     if idle is None and not idle_known:
         idle, _source = modes.idle_seconds()
@@ -801,6 +844,34 @@ def _merge_actions(rec_text: str, *lists: list[dict]) -> list[dict]:
     return list(out.values())
 
 
+def _ledger_lock(root: Path) -> guard.OsLock:
+    return guard.os_lock(Path(root) / guard.APP / 'paid_log.lock')
+
+
+def _errors_lock(root: Path) -> guard.OsLock:
+    """The lock of paid_log_errors.json (last-check review, row 8). EVERY write of that file is a read-merge-write under it; it is
+    always taken INSIDE the ledger lock when that is held (order: ledger, then errors), and alone only when the ledger lock itself
+    could not be taken."""
+    return guard.os_lock(Path(root) / guard.APP / 'paid_log_errors.lock')
+
+
+def _update_error(root: Path, rec_text: str, change) -> None:
+    """Read-merge-write of ONE record's entry of paid_log_errors.json under the errors lock: `change(entry now | None)` returns the
+    entry to store, or None to drop it. The other records' entries are the ones just read, so two concurrent failures (or a failure
+    and a repair) never overwrite each other (row 8)."""
+    with _errors_lock(root):
+        errors = _read_errors(root)
+        current = errors.get(rec_text)
+        new = change(current)
+        if new is None:
+            if rec_text not in errors:
+                return
+            errors.pop(rec_text)
+        else:
+            errors[rec_text] = new
+        guard.write_atomic(paid_errors_path(root), mv.dump(errors))
+
+
 def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], record_path: Path, record: dict | None,
                    stored: list[dict] | None = None) -> str | None:
     """Bring paid_log.jsonl in line with a record (F5), on every run: one entry per provider action id, appended when it is new or its
@@ -810,16 +881,36 @@ def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], rec
     Finding 8: the error entry STORES the actions it could not log ({id, provider_id, action, status, credits, model_id, evidence}), so a
     repair does not depend on the record still being at `record_path` (Reconvert moves it): `stored` = those actions; they are logged
     even when the record is gone or belongs to another model by now. Final-verify row 8: the actions stored with the path's error
-    entry are merged in by EVERY call (read under the ledger lock), and the entry is cleared only of the ids the ledger carries."""
+    entry are merged in by EVERY call (read under the ledger lock), and the entry is cleared only of the ids the ledger carries.
+    Last-check row 8: the ERROR FILE is updated under the same ledger lock too (and always as a read-merge-write of this record's
+    entry, `_update_error`): a failed ledger write records its repair before the ledger lock is released, so two concurrent failures
+    both keep their repair. Only when the ledger lock itself cannot be taken is the repair written under the errors lock alone."""
     rec_text = Path(record_path).as_posix()
     wanted = _merge_actions(rec_text, stored or [], paid_actions(record))
+
+    def failed(exc: BaseException, actions: list[dict]) -> str:
+        text = f'the paid log could not be written ({type(exc).__name__}: {exc})'
+
+        def keep(current):
+            kept = _merge_actions(rec_text, _stored_actions(current), actions)     # the evidence travels with the repair
+            return {'time': guard.now(), 'error': text, 'monster': monster, 'variant': variant, 'views': list(files),
+                    'model_id': (record or {}).get('model_id'), 'actions': kept}
+        try:
+            _update_error(root, rec_text, keep)
+        except (OSError, guard.Conflict):
+            pass                                               # the verdict and the task row still carry the text
+        return text
+
     try:
-        with guard.os_lock(Path(root) / guard.APP / 'paid_log.lock'):
+        ledger = _ledger_lock(root).__enter__()
+    except (OSError, guard.Conflict) as exc:
+        return failed(exc, wanted)                             # (no ledger lock: the errors lock alone guards the repair)
+    try:
+        try:
             # final-verify row 8: EVERY reconciliation (not only repair_accounting) merges the actions stored with an unrepaired write
             # error of this path, read under the ledger lock: an ordinary run after Reconvert moved the record away (record None, or a
             # new model's record at the path) logs them instead of dropping them with the error entry.
-            errors = _read_errors(root)
-            unrepaired = _stored_actions(errors.get(rec_text))
+            unrepaired = _stored_actions(_read_errors(root).get(rec_text))
             wanted = _merge_actions(rec_text, unrepaired, stored or [], paid_actions(record))
             entries = paid_entries(root)
             last = {e['id']: e for e in entries if isinstance(e.get('id'), str)}
@@ -843,34 +934,29 @@ def reconcile_paid(root: Path, monster: str, variant: str, files: list[str], rec
                 with open(path, 'a', encoding='utf-8') as handle:
                     for entry in new:
                         handle.write(json.dumps(entry) + '\n')
-            if rec_text in errors:
-                # clear only what is ACCOUNTED: a stored action leaves the error once the ledger carries its id (just written, or there
-                # already); the entry goes when none is left AND it had evidence at all (stored actions, or the record of the same
-                # model at the path). An entry without either stays listed (repair_accounting reports it; never cleared silently).
-                info = errors[rec_text] if isinstance(errors[rec_text], dict) else {}
-                ledger = {e['id'] for e in paid_entries(root) if isinstance(e.get('id'), str)}
-                legacy_ok = {a['id'] for a in wanted if a['id'] not in ledger and a['action'] in ('geometry', 'committed') and any(
-                    e.get('record') == rec_text and 'id' not in e and e.get('model_id') == a.get('model_id') for e in entries)}
-                left = [a for a in _merge_actions(rec_text, unrepaired) if a['id'] not in ledger and a['id'] not in legacy_ok]
+            # clear only what is ACCOUNTED: a stored action leaves the error once the ledger carries its id (just written, or there
+            # already); the entry goes when none is left AND it had evidence at all (stored actions, or the record of the same
+            # model at the path). An entry without either stays listed (repair_accounting reports it; never cleared silently).
+            in_ledger = {e['id'] for e in paid_entries(root) if isinstance(e.get('id'), str)}
+            legacy_ok = {a['id'] for a in wanted if a['id'] not in in_ledger and a['action'] in ('geometry', 'committed') and any(
+                e.get('record') == rec_text and 'id' not in e and e.get('model_id') == a.get('model_id') for e in entries)}
+
+            def clear(current):
+                if current is None:
+                    return None
+                info = current if isinstance(current, dict) else {}
+                had = _stored_actions(current)                  # (the entry as it is NOW, under the errors lock)
+                left = [a for a in _merge_actions(rec_text, had) if a['id'] not in in_ledger and a['id'] not in legacy_ok]
                 same_model = record is not None and (info.get('model_id') is None or record.get('model_id') == info.get('model_id'))
                 if left:
-                    errors[rec_text] = info | {'actions': left}
-                    guard.write_atomic(paid_errors_path(root), mv.dump(errors))
-                elif unrepaired or same_model:
-                    errors.pop(rec_text)
-                    guard.write_atomic(paid_errors_path(root), mv.dump(errors))
-        return None
-    except (OSError, guard.Conflict) as exc:
-        text = f'the paid log could not be written ({type(exc).__name__}: {exc})'
-        try:
-            errors = _read_errors(root)
-            kept = _merge_actions(rec_text, _stored_actions(errors.get(rec_text)), wanted)     # the evidence travels with the repair
-            errors[rec_text] = {'time': guard.now(), 'error': text, 'monster': monster, 'variant': variant, 'views': list(files),
-                                'model_id': (record or {}).get('model_id'), 'actions': kept}
-            guard.write_atomic(paid_errors_path(root), mv.dump(errors))
-        except OSError:
-            pass                                               # the verdict and the task row still carry the text
-        return text
+                    return info | {'actions': left}
+                return None if had or same_model else current
+            _update_error(root, rec_text, clear)
+            return None
+        except (OSError, guard.Conflict) as exc:
+            return failed(exc, wanted)                         # STILL under the ledger lock (last-check row 8)
+    finally:
+        ledger.__exit__(None, None, None)
 
 
 def repair_accounting(root: Path) -> list[str]:
@@ -1373,6 +1459,33 @@ class _Tracker:
             time.sleep(0.2)                                     # (a process that is exiting right now leaves the job in a moment)
         return f'process(es) {", ".join(map(str, unknown[:8]))} of the attempt\'s job object could not be identified'
 
+    def _job_empty(self) -> bool:
+        """Last-check review, row 9: the FINAL look, immediately before the ownership record is unlinked. True only when the attempt's
+        Job Object has NO member besides this driver (or there is no job: the recorded processes were the evidence). A member that is
+        there now (a successor a job member spawned before it exited, after `_job_survivors` looked) is put on record and keeps the
+        record; a job that cannot be queried now makes the record `incomplete`. An empty job is conclusive: only a member can add a
+        member, and this driver starts nothing any more."""
+        try:
+            members = self._job_members()
+        except Exception as exc:  # noqa: BLE001
+            self.incomplete = f'the job object of the attempt could not be checked ({type(exc).__name__}: {exc})'
+            return False
+        if members is None:
+            self.incomplete = 'the job object of the attempt could not be queried when the driver ended'
+            return False
+        if not members:
+            return True
+        unknown = []
+        for pid in members:
+            created = _create_time(pid)
+            if created is None:
+                unknown.append(pid)
+            self.descendants[pid] = {'pid': pid, 'create': created, 'name': 'job member'}
+        if unknown:                                             # (it may have exited this instant; the record stays and says so)
+            self.incomplete = (f'process(es) {", ".join(map(str, unknown[:8]))} were in the attempt\'s job object when the driver '
+                               'ended and could not be identified')
+        return False
+
     def _watch(self) -> None:
         while not self._stop.wait(self.WATCH_S):
             try:
@@ -1429,7 +1542,9 @@ class _Tracker:
         """End of the driver run: the record is removed only when the driver sees that nothing of its tree is left; otherwise it stays
         (with the survivors) and the slot stays held. The attempt's Job Object is asked BEFORE the record may be unlinked (final-verify
         row 9): a process that is still in the job (a grandchild whose short-lived parent exited between two watcher samples) is
-        recorded and keeps the record; a job that cannot be queried leaves the record `incomplete`."""
+        recorded and keeps the record; a job that cannot be queried leaves the record `incomplete`. Last-check row 9: the job is asked
+        ONCE MORE, immediately before the unlink (`_job_empty`): a successor that a member spawned during this cleanup keeps the
+        record."""
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
@@ -1447,7 +1562,7 @@ class _Tracker:
             self.children = [c for c in self.children if _alive(c.get('pid'), c.get('create'))]
             self.descendants = {pid: d for pid, d in self.descendants.items() if _alive(pid, d.get('create'))}
             try:
-                if not self.children and not self.descendants and not self.incomplete:
+                if not self.children and not self.descendants and not self.incomplete and self._job_empty():
                     self.path.unlink(missing_ok=True)
                 else:
                     self._write()

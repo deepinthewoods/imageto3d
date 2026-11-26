@@ -1266,5 +1266,92 @@ class ConvertQueueStopFileTest(unittest.TestCase):
         self.assertGreaterEqual(time.time() - started, 0.25)
 
 
+class GateTransitionTest(TempRoot):
+    """Last-check review row 6: every write / removal of CONVERT_HOLD and CONVERT_DRAIN (and the PAUSE the manager puts back) happens under
+    the paid-gate transition mutex (tools/paid_gate.py), which a paid click holds from its final gate check to its dispatch."""
+
+    def setUp(self):
+        super().setUp()
+        import paid_gate
+        self.gate = paid_gate
+        self.batch = self.root / '.codex_jobs' / '_batch'
+        self.mutex = self.batch / paid_gate.MUTEX_DIR
+
+    def test_every_hold_and_drain_change_is_made_under_the_mutex(self):
+        seen, watched = [], {'CONVERT_HOLD', 'CONVERT_DRAIN', 'PAUSE'}
+        real_write, real_unlink = guard.write_atomic, Path.unlink
+
+        def owner():
+            return json.loads((self.mutex / 'owner.json').read_text())['what']
+
+        def write(path, data):
+            if Path(path).name in watched:
+                seen.append(('write', Path(path).name, owner()))
+            real_write(path, data)
+
+        def unlink(path, missing_ok=False):
+            if path.name in watched and path.parent == self.batch:
+                seen.append(('unlink', path.name, owner()))
+            real_unlink(path, missing_ok=missing_ok)
+        me = {'pid': os.getpid(), 'create_time': services._my_create_time()}
+        old = {'pid': 999999, 'create_time': 1.0}
+        with mock.patch.object(guard, 'write_atomic', write), mock.patch.object(Path, 'unlink', unlink):
+            services.write_hold(self.root, 'supervisor restart', now=time.time() - 60, retiring=[old])
+            self.assertTrue(services.withdraw_retiring(self.root, old))
+            (self.batch / services.TICK_FILE).write_text(json.dumps({'pid': me['pid'], 'create_time': me['create_time'], 'time': time.time()}))
+            self.assertIn('released', services.release_hold(self.root, me) or '')
+            services.write_drain(self.root, old)
+            services.settle_drain(self.root)
+            services._restore_pause(self.root, {'pause_backup': '{"reason": "user active"}'})
+        self.assertEqual(seen, [('write', 'CONVERT_HOLD', 'CONVERT_HOLD (supervisor restart)'),
+                                ('write', 'CONVERT_HOLD', 'CONVERT_HOLD (retiring withdrawn)'),
+                                ('unlink', 'CONVERT_HOLD', 'CONVERT_HOLD released'),
+                                ('write', 'CONVERT_DRAIN', 'CONVERT_DRAIN'), ('unlink', 'CONVERT_DRAIN', 'CONVERT_DRAIN removed'),
+                                ('write', 'PAUSE', 'PAUSE restored after a supervisor restart')])
+        self.assertFalse(self.mutex.exists())                           # released every time
+        self.assertFalse((self.batch / 'CONVERT_HOLD').exists() or (self.batch / 'CONVERT_DRAIN').exists())
+
+    def test_the_reviewers_case_a_hold_written_during_the_intent_write_cannot_be_followed_by_a_click(self):
+        """The click's critical section (final check, intent, dispatch) holds the mutex: the manager's hold lands after the click was
+        dispatched, or before the check (then nothing is clicked). Never between the two."""
+        env = self.gate.env_for(self.root)
+        hold, order = self.batch / 'CONVERT_HOLD', []
+        writer = threading.Thread(target=lambda: (services.write_hold(self.root, 'supervisor restart'), order.append('hold written')))
+
+        def intent_then_click():
+            order.append('intent')
+            writer.start()                                              # the hold is requested exactly while the intent is written
+            writer.join(0.4)
+            self.assertTrue(writer.is_alive(), 'the hold writer did not wait for the click')
+            self.assertFalse(hold.exists())
+            order.append('click')
+        self.gate.checked_dispatch(intent_then_click, env)
+        writer.join(20)
+        self.assertEqual(order, ['intent', 'click', 'hold written'])
+        self.assertTrue(hold.exists())
+        with self.assertRaisesRegex(self.gate.GateClosed, 'CONVERT_HOLD'):  # and the next click sees it under the mutex
+            self.gate.checked_dispatch(lambda: order.append('second click'), env)
+        self.assertNotIn('second click', order)
+        self.assertFalse(self.mutex.exists())
+
+    def test_a_writer_retries_a_busy_mutex_and_a_stale_one_is_reclaimed(self):
+        self.mutex.mkdir()                                              # a crashed holder: its process is gone
+        (self.mutex / 'owner.json').write_text(json.dumps({'pid': 999999999, 'time': 0, 'what': 'crashed click'}))
+        services.write_hold(self.root, 'manager start')
+        self.assertTrue((self.batch / 'CONVERT_HOLD').exists())
+        self.assertFalse(self.mutex.exists())
+        calls = []
+        with self.gate.transition_lock(self.root, what='slow click'), \
+                mock.patch.object(self.gate, 'transition_lock', lambda root, what='': calls.append(what) or self.gate_busy()):
+            services.gate_transition(self.root, lambda: calls.append('action'), 'x')
+        self.assertEqual(calls, ['x'] * services.GATE_LOCK_TRIES + ['action'])   # retried, then written anyway: a hold is never lost
+
+    def gate_busy(self):
+        class Busy:
+            def __enter__(inner):
+                raise self.gate.GateBusy('busy')
+        return Busy()
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -12,7 +12,8 @@ User gate (every 30 s): the user is AWAY when the screen is locked/blanked (GNOM
 no keyboard/mouse input for AWAY_AFTER (5 min, Mutter IdleMonitor GetIdletime; a playing video, which keeps the screen
 from locking, does not count as input). Away = run, at the computer = pause (user, 2026-10-27: the screen never
 locked overnight, so the old screen-only rule paused all night). Pausing
-writes .codex_jobs/_batch/PAUSE (json: since, reason, scope): convert_queue.py then starts nothing new, view_batch.py
+writes .codex_jobs/_batch/PAUSE (json: since, reason, scope; every write / removal of PAUSE and of supervisor_mode.json happens
+under the paid-gate transition mutex, gate_transition): convert_queue.py then starts nothing new, view_batch.py
 only when the scope lists "views" (a manual `mode pause`, and a user-active pause since the 2026-10-29 user rule;
 `mode pause-conversions` keeps view generation running; `mode views-run` (user, 2026-11-14) follows the user for
 conversions only, so views generate at any time and conversions run while the user is away), and
@@ -75,6 +76,7 @@ else:
 ROOT = Path(__file__).resolve().parents[1]
 if str(Path(__file__).resolve().parent) not in sys.path:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
+import paid_gate  # noqa: E402  (tools/paid_gate.py: the gate transition mutex for the PAUSE / mode writes)
 import proc_cmdline  # noqa: E402  (tools/proc_cmdline.py: the interpreter entry-point parser)
 sys.path.insert(0, str(ROOT / 'tools' / 'tripo_pipeline'))
 import views_omitted  # noqa: E402
@@ -115,6 +117,30 @@ def atomic_write(path, data):
     tmp = path.with_name(path.name + '.tmp')
     tmp.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8', newline='\n')
     tmp.replace(path)
+
+
+GATE_LOCK_TRIES = 4   # x paid_gate.transition_lock's 10 s wait; the mutex is reclaimed as stale after 30 s, so this always ends
+
+
+def gate_transition(root, action, what):
+    """Run `action()` (a WRITE or REMOVAL of PAUSE / supervisor_mode.json) under the paid-gate transition mutex of `root`
+    (tools/paid_gate.py transition_lock; last-check review row 6): a paid click's final gate check and its dispatch hold the same
+    mutex, so the gate file never changes between the two. A busy mutex is retried (GATE_LOCK_TRIES); if it never frees (it is
+    reclaimed as stale after 30 s, so only a broken folder gets here) the action still runs: a pause that is not written at all
+    is worse than one written without the mutex."""
+    for _ in range(GATE_LOCK_TRIES):
+        try:
+            lock = paid_gate.transition_lock(root, what=what)
+            lock.__enter__()
+        except paid_gate.GateBusy:
+            continue
+        except OSError:
+            break
+        try:
+            return action()
+        finally:
+            lock.__exit__(None, None, None)
+    return action()
 
 
 class advance_lock:
@@ -552,7 +578,8 @@ class Supervisor:
             current = read_json(self.pause_file, {}) or {}
             if not self.pause_file.exists() or current.get('reason') != reason or current.get('scope') != scope:
                 since = current.get('since') or datetime.now().isoformat(timespec='seconds')
-                atomic_write(self.pause_file, {'since': since, 'reason': reason, 'scope': scope})
+                gate_transition(self.root, lambda: atomic_write(self.pause_file, {'since': since, 'reason': reason, 'scope': scope}),
+                                f'supervisor PAUSE ({reason})')
             if not self.paused:
                 self.emit(f'PAUSE ({reason}): {" and ".join(scope)} start nothing new; heavy local steps freeze')
             frozen = self.freeze()
@@ -560,7 +587,7 @@ class Supervisor:
                 self.emit('FREEZE ' + ', '.join(f"{r['pid']}:{r['comm']}" for r in frozen))
         else:
             if self.paused or self.pause_file.exists() or self.pids_file.exists():
-                self.pause_file.unlink(missing_ok=True)
+                gate_transition(self.root, lambda: self.pause_file.unlink(missing_ok=True), 'supervisor PAUSE removed')
                 resumed = self.resume()
                 self.emit(f'RESUME ({reason}): PAUSE removed' + (f', continued {len(resumed)} process(es)' if resumed else ''))
         self.paused = paused
@@ -579,7 +606,7 @@ class Supervisor:
         self.emit(f'RESUME at start: continued {len(resumed)} process(es) left suspended by an earlier instance')
 
     def release_all(self):
-        self.pause_file.unlink(missing_ok=True)
+        gate_transition(self.root, lambda: self.pause_file.unlink(missing_ok=True), 'supervisor exit: PAUSE removed')
         resumed = self.resume()
         if resumed:
             self.emit(f'RESUME on exit: continued {len(resumed)} process(es)')
@@ -1198,7 +1225,9 @@ def main(argv=None):
         print(f'stop requested (pid {pid}); it exits within a second')
     elif args.command == 'mode':
         if args.value:
-            atomic_write(sup.mode_file, {'mode': args.value, 'since': datetime.now().isoformat(timespec='seconds')})
+            gate_transition(sup.root, lambda: atomic_write(sup.mode_file, {'mode': args.value,
+                                                                           'since': datetime.now().isoformat(timespec='seconds')}),
+                            f'supervisor mode {args.value}')
         print(f'mode: {sup.mode()}')
     elif args.dry_run:
         sup.dry_run_report()
