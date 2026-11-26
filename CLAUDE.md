@@ -18,7 +18,7 @@ concept or view task.
 | Regenerating a rejected view | Codex job |
 | `workflow.py status/check/claim/ready`, folder moves | Claude |
 | Visual review of generated views (dimensions, alpha, side, boundaries, colors). Concept art is one-shot and NOT reviewed or checked (user rule 2026-10-28) | Codex job (view self-checks only; no concept review) |
-| `convert_job.py` (Tripo submit/collect + `reduce_model.py`, then for `piece_colours` body armour the segment-first rigid-piece split with `split_pieces.py --rigid auto` as automatic fallback), material review, `completed/` | Claude |
+| `convert_job.py` (Tripo submit/collect + `reduce_model.py`, then for `piece_colours` body armour the segment-first rigid-piece split with `split_pieces.py --rigid auto` as automatic fallback), material review, `completed/` | the app's convert worker runs it automatically (since 2026-11-25); Claude only for a hand conversion the user asks for, and material review |
 
 Wherever `AGENTS.md`/`PROMPTING_GUIDE.md` say "use the imagegen skill / built-in
 image generation tool", that means: write a Codex job prompt and launch it. Never
@@ -79,7 +79,23 @@ since `back_three_quarter` depends on `back`.
 3. For a failed view, launch a new Codex job naming the specific failure and
    repeating the invariants (as `PROMPTING_GUIDE.md` describes). Keep prior
    versions outside the ready set.
-4. Only then run `workflow.py ready` and continue with the Tripo/reduction steps,
-   which Claude runs directly.
+4. Only then run `workflow.py ready`. The app's convert worker then converts the staged job (Tripo / Hyper3D,
+   reduction); Claude runs `convert_job.py` by hand only when the user asks for it.
 
-The user approves or rejects concepts in the local preview site (`python3 tools/preview/serve.py --open`). Approval has two stages (user rule 2026-10-28): the first moves a set into `provisional/`, approving it again from the Provisional tab moves it into `approved/`; rejection moves it to restorable `trash/concepts/`. Never approve a set on the user's behalf. Promotion into `approved/` is itself the processing request: the supervisor claims and processes `approved/` automatically (see `AGENTS.md`).
+## The preview app (v2, 2026-11-25)
+
+The user reviews and approves everything in the preview app on :8765, started from the repo root with
+`python -X utf8 -u tools/preview/v2/server.py --port 8765 --manage-services` (see `tools/preview/v2/CUTOVER.md`; the old
+`python3 tools/preview/serve.py --open` site is retired and only prints this). `AGENTS.md` lists its tabs. Approval has two
+stages (user rule 2026-10-28): Provisional moves a set into `provisional/`, Approve from the Provisional tab moves it into
+`approved/`; since 2026-11-25 the Concepts tab can also Approve straight into `approved/` (user). Rejection moves it to
+restorable `trash/concepts/`. **Never approve, reject or unapprove anything on the user's behalf** (concepts, 3D LODs, Aligned,
+Completed, monster picks or view choices). Promotion into `approved/` is itself the processing request: the app adds the set to
+the convert list and the supervisor claims and processes it automatically (see `AGENTS.md`).
+
+**The app manages the pipeline daemons** (supervisor, view runner, convert worker) when it runs with `--manage-services`. While
+it does, Claude must not start, stop, restart or signal any of them by hand (no `pipeline_supervisor.py run|stop`, no
+`view_batch.py run`, no `convert_queue.py`, no killing their PIDs): use the Queue tab's service ops (Start / Stop / Restart,
+`POST /api/v2/queue {"op": "service"}`) or ask the user. Do not start a second app server on the same checkout either (a dev / test server goes on another port
+with `--read-only`, never with `--manage-services`). The Codex image jobs Claude launches with `tools/codex_imagegen.sh` are
+separate from the view runner and are fine.

@@ -1,4 +1,4 @@
-"""Monsters tab of the preview site (added 2026-11-21).
+"""Monster variant scan of the preview app (added 2026-11-21 for the old site's Monsters tab; used by v2 since 2026-11-25).
 
 Monsters are a much smaller pipeline than outfits (one image, one model, no races or modules; see
 characters/monsters/aaa/AGENTS.md), and their files live outside this project, in
@@ -7,8 +7,10 @@ characters/monsters/aaa/AGENTS.md), and their files live outside this project, i
     characters/monsters/aaa/pipeline/<Monster Name>/models/<variant>/  hyper3d/glb_*.glb, reduced/lod_error_<lv>.glb,
                                                                         chosen_lod.json
 
-so this module keeps its own scan, file route and one write (the LOD / approval choice). serve.py only calls
-`cards`, `resolve_file` and `write_choice`. Nothing here is cached: there are few monsters.
+so this module keeps its own scan, file route and one write (the LOD / approval choice). The v2 app (v2/monsters_v2.py,
+v2/server.py) uses `cards`, `monsters_root`, `FILE_PREFIX`, `SERVED`, `LOD_LEVELS` and `CHOICE`; it writes the LOD / approval
+itself under a per-variant lock (v2/decisions.py), so `write_choice` and `resolve_file` (the old site's route and writer) have no
+caller left and are kept only with their tests. Nothing here is cached: there are few monsters.
 
 Card shape (one per monster variant; deliberately none of the keys the outfit cards use to pick a modal view:
 `races`, `views`, `jobs`, `entries`):

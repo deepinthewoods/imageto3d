@@ -1,6 +1,7 @@
 # Pipeline v2: the preview app runs the whole pipeline (plan, 2026-11-25)
 
-Status: **draft; the user answered the questions on 2026-11-25 (section 13); waiting for the go-ahead to implement.** Merged from Claude's plan and Codex's independent plan
+Status: **implemented in phases 0-6 (2026-11-25); the app is the site once CUTOVER.md is done. The plan below is kept as written** (the user answered
+the questions on 2026-11-25, section 13; the as-built contracts are `tools/preview/v2/DESIGN*.md`). Merged from Claude's plan and Codex's independent plan
 (`.codex_jobs/plan_pipeline_v2_20261125/plan.md`); section 11 lists what was taken from Codex.
 
 ## 1. Goal

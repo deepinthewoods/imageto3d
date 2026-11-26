@@ -25,7 +25,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 BLENDER = r'C:\Users\niall\Tools\blender-5.1.2-windows-x64\blender.exe'
-sys.path.insert(0, str(ROOT / 'experiments' / 'shell_slots_20261122'))
+sys.path.insert(0, str(ROOT / 'tools' / 'layers'))      # visibility.py moved here from experiments/shell_slots_20261122 (pipeline v2 phase 2)
 import visibility as vis  # noqa: E402
 
 DUMP = r'''

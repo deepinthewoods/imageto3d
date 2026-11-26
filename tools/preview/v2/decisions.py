@@ -3,7 +3,7 @@
 `models/<set>/pipeline_v2.json` is written only here: atomic (tmp + os.replace, retried on the Windows PermissionError a
 reader or virus scanner can cause), under a per-set CROSS-PROCESS lock (`models/<set>/.pipeline_v2.lock`), every mutation
 bumps `rev` and appends to `history`. LOD picks are mutations too: they bump the same `rev`.
-`chosen_lod.json` keeps its existing format (`serve.write_lod`); it is written into the module folder of the chosen job.
+`chosen_lod.json` keeps the format the old site wrote (`lod_record`); it is written into the module folder of the chosen job.
 A file that exists but cannot be read (invalid UTF-8 or JSON, a wrongly shaped nested record) is NEVER replaced by defaults: every mutation of
 that set is refused (HTTP 409). A set with an unresolved interrupted transaction is read-only too (409 `recovering`, guard.check_recovering).
 Multi-file changes (LOD picks, both approvals, unapprove with its ready.json revocation) are ONE guard.apply_transaction each.
@@ -351,7 +351,7 @@ def read_chosen(folder: Path) -> str | None:
 
 
 def lod_record(lod: str) -> dict:
-    """The same record `serve.write_lod` writes."""
+    """The chosen_lod.json record (the format the retired old site wrote; the outfit exporter reads it)."""
     return {'lod': lod, 'reduced': f'reduced/lod_error_{lod}.glb', 'wearable': f'reduced/lod_error_{lod}__wearable.glb',
             'updated': datetime.now(timezone.utc).isoformat()}
 

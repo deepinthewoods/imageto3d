@@ -1,9 +1,16 @@
 # Preview app v2 - technical design (contract for the implementers)
 
+**Status (2026-11-25, phase 6): v2 is the site.** It runs on :8765 with `--manage-services` (CUTOVER.md) and manages the pipeline services. The old
+site's UI (`tools/preview/app.js`, `index.html`, `style.css`, `fitsym.js`, `monsters.js`, `test_fitsym.mjs`, `preview.sh` and the HTTP handler of
+`serve.py`: fit lab, body sections, face marks, Models / Approved models / Pipeline / Held tabs, `/api/*` approve / promote / LOD / marks routes)
+was removed; `serve.py` stays as the library v2 imports (section 1) and its `main()` only prints how to start v2 (exit 2). The prototype
+`experiments/shell_slots_20261122` (its :8790 Mix server, scripts and pages) was removed too; `tools/layers/` and the Mix / Aligned tabs replace it.
+Section 0 describes the rules of the build phases 1-5; those about the live old site no longer apply.
+
 The user-facing plan is `PIPELINE_V2_PLAN.md` (repo root); read it first. This file fixes the code layout, data shapes and HTTP
 contract so the backend, the frontend and the layer builder can be built in parallel. Change it only together with the code.
 
-## 0. Ground rules (all phases)
+## 0. Ground rules (phases 1-5; historical since phase 6)
 - The live old site (`tools/preview/serve.py` on :8765, started by the user) and the pipeline services (supervisor, view runner,
   convert worker) and the prototype server (:8790) keep running until cut-over. **Never kill or restart them**; never
   `taskkill /IM python.exe`. Kill only processes you started yourself, by PID.
@@ -34,6 +41,9 @@ tools/preview/web/
   index.html (import map -> vendor/three), main.js, api.js, state.js, tabs.js, cards.js, modal.js, concept.js, approved.js,
   model3d.js, aligned.js (phase 3), mix.js (phase 3), queue.js (phase 4), viewer.js, style.css, vendor/three/ (r160, local copy)
 tools/layers/      the production layer builder (phase 2): build.py (API + CLI), layers.py, geodiv.py, shell_slots.py, ... , checks/
+tools/preview/     (after phase 6) serve.py = library only (name rules, scan cache, concept / trash / job-view / review scans, thumbnails,
+                   flat legacy helpers, action log; test_serve.py checks that every serve.<name> v2 uses exists), monsters.py (monster
+                   variant scan; test_monsters.py), export_bases.py (game body cache), review.json (Review tab lists), cache/ (not tracked)
 ```
 
 ## 2. Units, stages and derivation
@@ -305,7 +315,7 @@ read-only server. JSON bodies <= 4 KB, thumbnail <= 8 MB; JSON over 4 KB is gzip
 - **Promotions (phase 1 review #3, #4)**: a legacy approve marks `approved/<set>/.preview-promotion.json` with a `promotion_id` that the origin sidecar
   and the intent also record; an Undo withdraws only that promotion, and Recovery `complete` accepts a promotion that was already claimed.
 
-### CUTOVER notes (phase 1 review #2 and #9: legacy writers)
+### CUTOVER notes (phase 1 review #2 and #9: legacy writers; resolved in phase 6: the old site's handlers were removed)
 The two remaining partial findings are coexistence issues with the OLD site (`tools/preview/serve.py` on :8765), not v2 defects: its Unapprove handler
 checks only the job record (no claim lock) and its monster LOD writer uses a fixed temp file without the v2 per-variant lock. Both end at cut-over,
 when the old site is stopped (CUTOVER.md step 1) and v2 is the only writer; no code change is made to serve.py / monsters.py (section 0). Until then,

@@ -7,7 +7,7 @@
 worker; DESIGN_PHASE4.md A and H). Without it the server never starts, stops or signals any of them, and the Queue tab's `service` op answers
 409; everything else (mode, settings, release, view retry, convert reset, balance check) still works.
 
-serve.py is imported as a library (its scans, caches and file rules); the old site keeps running unchanged on :8765.
+serve.py is imported as a library (its scans, caches and file rules); the old site it served was retired in phase 6 (this server is the site).
 Safety rules (DESIGN.md section 6):
 * Every route (index, static, files, API) only answers a `Host` that is loopback (127.0.0.1 / localhost / [::1] on our port) or one of the
   tailnet names found at start (`tailscale status --json`) / listed in `.codex_jobs/_app/settings.json` `allowed_hosts`; anything else

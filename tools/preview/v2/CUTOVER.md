@@ -3,8 +3,8 @@
 DESIGN_PHASE4.md sections G and I, as commands. The old site (`python -u tools/preview/serve.py`, port 8765; Tailscale serve already forwards
 to 8765) is replaced by v2 (`python -X utf8 -u tools/preview/v2/server.py --port 8765 --manage-services`). Service management is OFF unless
 the server is started with `--manage-services`: only the cut-over server gets the flag (a dev / test server on 8766 never adopts, starts,
-stops or signals a service). The prototype on :8790 is `experiments/shell_slots_20261122/serve.py`: it is not part of the cut-over; leave it
-running.
+stops or signals a service). The prototype on :8790 is `experiments/shell_slots_20261122/serve.py`: it is not part of steps 1-8; leave it
+running until step 9, which removes its files.
 
 The pipeline services (supervisor, view runner, convert worker) are never killed by the cut-over. v2 adopts them; the steps below replace
 them in a fixed order, each through the paid-safety interlock of DESIGN_PHASE4.md I: the conversion hold `.codex_jobs/_batch/CONVERT_HOLD`
@@ -217,6 +217,29 @@ powershell -NoProfile -ExecutionPolicy Bypass -File tools\preview\v2\install_log
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\preview\v2\install_logon_task.ps1             # register
 powershell -NoProfile -ExecutionPolicy Bypass -File tools\preview\v2\install_logon_task.ps1 -Uninstall  # remove
 ```
+
+## 10. Merge the phase 6 branch (done 2026-11-26, after the cut-over)
+
+Branch `pipeline-v2-phase6` retires the old site's UI and the prototype:
+- the old site's files go: `tools/preview/app.js`, `index.html`, `style.css`, `fitsym.js`, `monsters.js`, `test_fitsym.mjs` and
+  `preview.sh`;
+- `serve.py` loses its HTTP handler and becomes the library v2 imports (`main()` prints how to start v2 and exits 2);
+- the prototype's code and pages in `experiments/shell_slots_20261122/` go (its `out/` data and README stay);
+- AGENTS.md, CLAUDE.md and the READMEs are updated for v2.
+
+Order:
+1. Stop exactly the prototype's listener first (`Invoke-Check stop-listener 8790 experiments/shell_slots_20261122/serve.py`).
+2. `git tag pre-phase6-merge`.
+3. `git merge --no-ff pipeline-v2-phase6`.
+4. Run `python -X utf8 -m unittest tools/preview/test_serve.py tools/preview/test_monsters.py`.
+
+v2 keeps running: it loaded `serve.py` at start, and the functions it uses are unchanged. The services are not touched.
+
+**Rollback of this step only** restores just the retired files, then starts the old site with section 8's command:
+```powershell
+git checkout pre-phase6-merge -- tools/preview/serve.py tools/preview/test_serve.py tools/preview/app.js tools/preview/index.html tools/preview/style.css tools/preview/fitsym.js tools/preview/monsters.js tools/preview/test_fitsym.mjs tools/preview/preview.sh experiments/shell_slots_20261122
+```
+Never restore all of `tools/preview` from an older commit: that would undo the v2 and paid-safety fixes made since.
 
 ## Checker script
 
