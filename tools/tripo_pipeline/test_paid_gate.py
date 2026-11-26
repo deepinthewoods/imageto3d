@@ -5,6 +5,8 @@ studio.mjs tests run node only on paths that exit before Playwright opens a brow
 
     python -X utf8 -m pytest tools/tripo_pipeline/test_paid_gate.py -q
 """
+import contextlib
+import io
 import json
 import os
 import shutil
@@ -78,6 +80,47 @@ class GateTests(Root):
         self.assertEqual(convert_job.conversion_gate(), 'CONVERT_HOLD: supervisor restart')
         (self.batch / 'CONVERT_HOLD').write_text('')       # a hold is a hold, readable or not
         self.assertEqual(convert_job.conversion_gate(), 'CONVERT_HOLD: conversion hold')
+
+    def test_post_cutover_3_a_queue_pause_closes_the_character_gate_before_the_supervisor_ticks(self):
+        """review_v2_post_cutover_20261126, blocker 3: the mode write alone (no PAUSE yet: the supervisor reflects it up to 30 s
+        later) closes the gate convert_job waits at AND the gate its paid children check under the dispatch lock."""
+        gate = convert_job.paid_gate
+        mode = self.batch / 'supervisor_mode.json'
+        for value in ('auto', 'views-run', 'run'):
+            mode.write_text(json.dumps({'mode': value}))
+            self.assertIsNone(convert_job.conversion_gate(), value)
+            self.assertIsNone(gate.closed_reason(convert_job.gate_env()), value)
+        for value in ('pause', 'pause-conversions'):
+            mode.write_text(json.dumps({'mode': value, 'since': 'now', 'pause_id': 'p1'}))     # what the Queue tab's Pause writes
+            self.assertFalse((self.batch / 'PAUSE').exists())
+            self.assertEqual(convert_job.conversion_gate(), f'conversions are paused (mode {value})')
+            self.assertEqual(gate.closed_reason(convert_job.gate_env()), f'conversions are paused (mode {value})')
+            clicks = []
+            with self.assertRaises(gate.GateClosed):
+                gate.checked_dispatch(lambda: clicks.append(1), convert_job.gate_env())
+            self.assertEqual(clicks, [])
+        mode.unlink()
+        # blocker 1: the supervisor's own pause counts beside a PAUSE somebody else wrote (which the supervisor leaves alone)
+        self.pause(scope=('views',))
+        (self.batch / 'supervisor_pause.json').write_text(json.dumps({'reason': 'user active', 'scope': ['conversions', 'views'],
+                                                                      'mirror': None}))
+        self.assertEqual(convert_job.conversion_gate(), 'conversions are paused (supervisor: user active)')
+        (self.batch / 'supervisor_pause.json').unlink()
+        self.assertIsNone(convert_job.conversion_gate())
+
+    def test_post_cutover_3_a_paid_step_waits_for_a_pause_mode_and_goes_on_when_it_is_lifted(self):
+        mode = self.batch / 'supervisor_mode.json'
+        mode.write_text(json.dumps({'mode': 'pause-conversions'}))
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            if len(sleeps) == 2:
+                mode.write_text(json.dumps({'mode': 'views-run'}))
+        with mock.patch.object(convert_job.time, 'sleep', sleep), contextlib.redirect_stdout(io.StringIO()) as out:
+            convert_job.wait_for_gate('human_male/outfit', 'tripo submit')
+        self.assertEqual(len(sleeps), 2)
+        self.assertIn('PAUSED (conversions are paused (mode pause-conversions))', out.getvalue())
 
     def test_wait_for_gate_blocks_until_the_hold_is_gone(self):
         self.hold()

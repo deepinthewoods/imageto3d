@@ -2020,13 +2020,25 @@ def _draft(vdir: Path, vj: dict | None) -> dict:
             'created': now(), 'by': 'v2', 'legacy': True}
 
 
-def read_choice(mdir: Path) -> dict:
-    """chosen_lod.json ({} when absent). An existing file that cannot be read is NEVER treated as empty (guard.Unreadable, HTTP 409)."""
+NO_CHOICE = 'none'                 # choice_rev of a variant without a chosen_lod.json
+
+
+def choice_rev(raw: bytes | None) -> str:
+    """The APPROVAL REVISION of a variant (post-cut-over review, blocker 5): a digest of the bytes of its chosen_lod.json (`c:` + 32 hex;
+    `none` without a file). Every write of the file (Approve, Unapprove, an LOD pick) makes a new one: an approval step stores a fresh
+    `approval_id`, so approving the same level again is a new revision too. The item shows it (`approval_rev`); Unapprove and every
+    Undo of an approval step echo it, and it is compared under the variant lock (write_choice)."""
+    return NO_CHOICE if raw is None else 'c:' + hashlib.sha256(raw).hexdigest()[:32]
+
+
+def choice_snapshot(mdir: Path) -> tuple[dict, str]:
+    """(chosen_lod.json, its choice_rev) from ONE read of the file ({} and `none` when absent). An existing file that cannot be read is
+    NEVER treated as empty (guard.Unreadable, HTTP 409)."""
     path = Path(mdir) / CHOICE
     try:
         raw = path.read_bytes()
     except FileNotFoundError:
-        return {}
+        return {}, NO_CHOICE
     except OSError as exc:
         raise guard.Unreadable(f'{CHOICE}: cannot be read: {exc}') from None
     try:
@@ -2035,7 +2047,12 @@ def read_choice(mdir: Path) -> dict:
         raise guard.Unreadable(f'{CHOICE}: not valid JSON: {exc}') from None
     if not isinstance(value, dict):
         raise guard.Unreadable(f'{CHOICE}: not an object')
-    return value
+    return value, choice_rev(raw)
+
+
+def read_choice(mdir: Path) -> dict:
+    """chosen_lod.json ({} when absent); strict (choice_snapshot)."""
+    return choice_snapshot(mdir)[0]
 
 
 def set_ticks(root: Path, item_id: str, enabled: object) -> dict:
@@ -2235,18 +2252,35 @@ def convert(root: Path, item_id: str, args: dict, reconvert: bool = False) -> di
     return out
 
 
-def write_choice(root: Path, item_id: str, approved: bool, lod: object = None, glb_sha256: object = None) -> dict:
-    """3D Approve / Completed Unapprove: chosen_lod.json {lod, reduced, approved, glb_sha256, generation, legacy, updated} under the monster
-    lock and the variant's `.pipeline_v2.lock` (the lock of decisions.write_monster_lod and of Reconvert, F6). Approve needs `lod` and the
-    `glb_sha256` the modal showed (item `lods[lod].sha256`: 409 `changed` when the file is another one now), a reduction the lane verified
-    (or a legacy one by the compatibility rule; 409 `unverified` otherwise) and no active conversion (409 `busy`)."""
+def write_choice(root: Path, item_id: str, approved: bool, lod: object = None, glb_sha256: object = None,
+                 approval_rev: object = None) -> dict:
+    """3D Approve / Completed Unapprove: chosen_lod.json {lod, reduced, approved, glb_sha256, generation, legacy, updated, approval_id}
+    under the monster lock and the variant's `.pipeline_v2.lock` (the lock of decisions.write_monster_lod and of Reconvert, F6). Approve
+    needs `lod` and the `glb_sha256` the modal showed (item `lods[lod].sha256`: 409 `changed` when the file is another one now), a
+    reduction the lane verified (or a legacy one by the compatibility rule; 409 `unverified` otherwise) and no active conversion (409
+    `busy`).
+
+    `approval_rev` (post-cut-over review, blocker 5) = the approval revision the client DISPLAYED (item `approval_rev`, or the
+    `approval_rev` of the answer an Undo reverses; choice_rev). It is compared with the file as it is NOW, under the variant lock, before
+    anything else: 409 `changed` when the record was written since, so a stale tab's Unapprove never clears a LATER approval and a stale
+    Undo never approves over a later decision. Unapprove REQUIRES it (400 without); Approve compares it when given (the 3D modal's
+    Approve is bound to the model bytes on screen instead; the Undo of an Unapprove sends it). The answer carries the `approval_rev`
+    of the record just written."""
+    if approval_rev is not None and (not isinstance(approval_rev, str) or not approval_rev):
+        raise ValueError('args.approval_rev must be the approval revision shown (item approval_rev)')
+    if not approved and approval_rev is None:
+        raise ValueError('args.approval_rev is required: the approval revision of the item the Unapprove was made on (item approval_rev)')
     mroot, monster, variant, vdir, mdir = _variant_paths(root, item_id)
     if not mdir.is_dir():
         raise not_found(f'{monster}/{variant} has no models folder')
     contained(mroot, mdir / LOD_LOCK, mdir / CHOICE, mdir / RECONVERT_JOURNAL, mdir / 'reduced')      # before the lock is opened (finding 14)
     with monster_lock(root, monster), guard.os_lock(mdir / LOD_LOCK):
         _recover_reconvert_locked(mdir, vdir)
-        record = read_choice(mdir)
+        record, rev_now = choice_snapshot(mdir)
+        if approval_rev is not None and approval_rev != rev_now:
+            is_now = f'approved at LOD {record.get("lod")}' if record.get('approved') is True else 'not approved'
+            raise guard.Changed(f'{monster}/{variant}: the approval changed since you were shown it (it is {is_now} now); nothing was '
+                                'changed, look again', changes=['approval'])
         previous = {'lod': record.get('lod'), 'approved': record.get('approved') is True}
         if approved:
             if record.get('approved') is True:
@@ -2278,11 +2312,14 @@ def write_choice(root: Path, item_id: str, approved: bool, lod: object = None, g
                 raise ValueError(f'{monster}/{variant} is not approved')
             record['approved'] = False
         record['updated'] = datetime.now(timezone.utc).isoformat()
-        guard.write_atomic(mdir / CHOICE, json.dumps(record, indent=1).encode('utf-8'))
+        record['approval_id'] = uuid.uuid4().hex               # every approval step is a new revision (also the same level again)
+        written = json.dumps(record, indent=1).encode('utf-8')
+        guard.write_atomic(mdir / CHOICE, written)
     level = record.get('lod')
     digest = record.get('glb_sha256') if approved else (file_sha256(mdir / 'reduced' / f'lod_error_{level}.glb') if level in LOD_LEVELS
                                                       else None)
-    return {'ok': True, 'lod': level, 'approved': record['approved'], 'previous': previous, 'glb_sha256': digest}
+    return {'ok': True, 'lod': level, 'approved': record['approved'], 'previous': previous, 'glb_sha256': digest,
+            'approval_rev': choice_rev(written)}
 
 
 def view_retry(root: Path, item_id: str, view: object) -> dict:
@@ -2490,14 +2527,19 @@ def variant_action(root: Path, verb: str, item_id: str, args: dict) -> dict:
     if verb == 'view_repair':
         return view_repair(root, item_id, args.get('view'))
     if verb == 'approve':
-        result = write_choice(root, item_id, True, args.get('lod'), args.get('glb_sha256'))
-        return result | {'stage': 'completed', 'undo': {'verb': 'unapprove', 'id': item_id}}
+        result = write_choice(root, item_id, True, args.get('lod'), args.get('glb_sha256'), args.get('approval_rev'))
+        # the Undo names the approval it reverses (blocker 5): it never clears a later one
+        return result | {'stage': 'completed', 'undo': {'verb': 'unapprove', 'id': item_id, 'args': {'approval_rev': result['approval_rev']}}}
     # unapprove: completed -> 3d; a variant v2 picked whose views have not started -> the pick is undone
     mroot, monster, variant, _vdir, mdir = _variant_paths(root, item_id)
-    if mdir.is_dir() and read_choice(mdir).get('approved') is True:
-        result = write_choice(root, item_id, False)
+    # An Unapprove that names an approval revision (the Completed modal, the Undo of an Approve) is about the APPROVAL only: when the
+    # variant is not approved any more it answers 409 `changed` (write_choice) and never falls through to undoing the pick. One of an
+    # approved variant WITHOUT a revision is refused by write_choice (400). (blocker 5)
+    if mdir.is_dir() and (args.get('approval_rev') is not None or read_choice(mdir).get('approved') is True):
+        result = write_choice(root, item_id, False, approval_rev=args.get('approval_rev'))
         return result | {'stage': '3d', 'undo': {'verb': 'approve', 'id': item_id,
-                                                 'args': {'lod': result['lod'], 'glb_sha256': result['glb_sha256']}}}
+                                                 'args': {'lod': result['lod'], 'glb_sha256': result['glb_sha256'],
+                                                          'approval_rev': result['approval_rev']}}}
     rec = read_variant_names(mroot, monster, strict=True)['variants'].get(variant)
     folder = folder_for_monster(mroot, monster)
     if isinstance(rec, dict) and rec.get('by') == 'v2' and isinstance(rec.get('was'), str) and folder:
@@ -2573,7 +2615,8 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
     reduce_problem, disposition, accounting_error, started, task}.
     Recheck (findings 3-5): `key` + `generation` = the identity of the displayed task (Run now / Retry / Cancel must echo both; a row id
     is only a hint), `pause_id` = the manual pause of conversions in force (a confirmed Run now echoes it), `disposition_pending` = a
-    failure / cancellation that could not be written to views.json yet (shown as an error; nothing is queued again meanwhile)."""
+    failure / cancellation that could not be written to views.json yet (shown as an error; nothing is queued again meanwhile).
+    `conversion_seq` = the variant's disposition revision as displayed (Retry / Run now of a failed or cancelled task echo it)."""
     import monster_lane
     mdir = models_dir(mroot, monster, variant)
     record = record_of(mdir)
@@ -2650,7 +2693,7 @@ def conversion_info(root: Path, mroot: Path, monster: str, variant: str, task: d
             'credits': round(sum(known), 3) if known else None, 'error': error, 'attempts': view['attempts'] if view else 0,
             'run_now': bool(view and view['run_now']), 'record': rec, 'screenshots': shots, 'reduced': reduced,
             'reduce_problem': None if reduced else verify['problem'], 'disposition': disposition, 'accounting_error': accounting,
-            'generation': generation, 'started': conversion_started(mdir), 'task': view}
+            'generation': generation, 'conversion_seq': disposition_seq(vj), 'started': conversion_started(mdir), 'task': view}
 
 
 def _tasks_by_variant(root: Path) -> dict[str, dict]:
@@ -2740,7 +2783,9 @@ def variant_card(root: Path, mroot: Path, raw: dict, tasks: dict) -> dict:
         badges.append({'text': hint, 'tone': 'warn'})
     return {'id': raw['id'], 'type': 'monster', 'kind': 'monster', 'name': raw['name'], 'title': raw['name'], 'stage': stage,
             'thumbnail': raw.get('image'), 'thumbnail_kind': None, 'model': lods[lod]['url'] if lod else None, 'races': [],
-            'badges': badges, 'actions': actions, 'progress': None, 'monster': monster, 'variant': variant, 'library_hint': hint}
+            'badges': badges, 'actions': actions, 'progress': None, 'monster': monster, 'variant': variant, 'library_hint': hint,
+            # the approval revision the card shows: its hover Unapprove echoes it (post-cut-over blocker 5)
+            'approval_rev': choice_snapshot(models_dir(mroot, monster, variant))[1] if 'unapprove' in actions else None}
 
 
 def _newest_mtime(folder: Path) -> float | None:
@@ -2962,6 +3007,7 @@ def _variant_item(root: Path, mroot: Path, monster: str, variant: str, raw: dict
     generation = frozen_digest((vj or {}).get('frozen'))
     reduce = reduce_status(mdir, generation) if raw.get('lods') else None
     return raw | {'stage': card['stage'], 'card': card, 'lods': lods, 'damaged': None,
+                  'approval_rev': choice_snapshot(mdir)[1],   # the approval revision shown: Unapprove echoes it (blocker 5)
                   'views': views, 'views_json': vj, 'views_rev': views_rev(vdir, vj), 'phase': phase,
                   'legacy': phase == 'legacy' or bool(reduce and reduce.get('legacy')),
                   'importable': importing, 'unattended': bool((vj or {}).get('unattended')), 'frozen': frozen,

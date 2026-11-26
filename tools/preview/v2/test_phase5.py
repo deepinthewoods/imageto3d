@@ -397,15 +397,45 @@ class MonsterCase(unittest.TestCase):
         row = taskqueue.for_root(self.root).get(task_id)
         return {'key': row['key'], 'generation': row['args']['frozen_sha']}
 
+    def seq(self, task_id):
+        """The disposition revision a lane row is displayed with (`conversion_seq`): Retry / Run now of a failed or cancelled row echo it
+        (post-cut-over blocker 4)."""
+        return monster_lane.shown_seq(self.root, taskqueue.for_root(self.root).get(task_id))
+
     def qop(self, op, task_id, **extra):
         if extra.get('confirm') and 'pause_id' not in extra:
             extra['pause_id'] = monster_lane.pause_id(self.root)
+        if op in ('retry', 'run_now'):
+            extra.setdefault('conversion_seq', self.seq(task_id))
         return actions.queue_op(self.root, {'op': op, 'id': task_id} | self.ident(task_id) | extra)
 
     def run_now(self, task_id, **extra):
         if extra.get('confirm') and 'pause_id' not in extra:
             extra['pause_id'] = monster_lane.pause_id(self.root)
+        extra.setdefault('conversion_seq', self.seq(task_id))
         return monster_lane.run_now(self.root, task_id, **(self.ident(task_id) | extra))
+
+    def supervisor_pause(self, reason, scope, since='s', mirror=True):
+        """What the supervisor writes when it pauses (DESIGN_PHASE4.md I.11): its OWN record supervisor_pause.json and, as `mirror`
+        says, the PAUSE mirror whose sha256 the record names. Returns the mirror's bytes."""
+        batch = self.root / '.codex_jobs/_batch'
+        body = (json.dumps({'since': since, 'reason': reason, 'scope': scope}, indent=2) + '\n').encode('utf-8')
+        if mirror:
+            guard.write_atomic(batch / 'PAUSE', body)
+        guard.write_atomic(batch / 'supervisor_pause.json', json.dumps(
+            {'since': since, 'reason': reason, 'scope': scope, 'pid': os.getpid(), 'mirror': hashlib.sha256(body).hexdigest()}).encode())
+        return body
+
+    def supervisor_resume(self, mirror=True):
+        """The supervisor resumes: its record goes, and PAUSE too when it was its mirror."""
+        batch = self.root / '.codex_jobs/_batch'
+        (batch / 'supervisor_pause.json').unlink(missing_ok=True)
+        if mirror:
+            (batch / 'PAUSE').unlink(missing_ok=True)
+
+    def unapprove(self, item_id, **args):
+        """Unapprove as the Completed modal sends it: with the approval revision the item shows (post-cut-over blocker 5)."""
+        return self.act(item_id, 'unapprove', approval_rev=mv.item(self.root, item_id)['approval_rev'], **args)
 
     def pick_rat(self, n=1, unattended=False):
         r = self.act(f'mconcept:Giant Rat/codex{n}', 'approve', unattended=unattended)
@@ -904,7 +934,9 @@ class CompletedTest(MonsterCase):
             self.act(mid, 'approve', lod='0p2', glb_sha256='0' * 64)
         self.assertEqual(caught.exception.code, 'changed')
         r = self.act(mid, 'approve', lod='0p2', glb_sha256=sha)
-        self.assertEqual((r['lod'], r['approved'], r['undo']), ('0p2', True, {'verb': 'unapprove', 'id': mid}))
+        self.assertEqual((r['lod'], r['approved'], r['undo']),
+                         ('0p2', True, {'verb': 'unapprove', 'id': mid, 'args': {'approval_rev': r['approval_rev']}}))
+        self.assertEqual(r['approval_rev'], mv.item(self.root, mid)['approval_rev'])
         choice = json.loads((self.mroot / 'pipeline/Goblin Shaman/models/main/chosen_lod.json').read_text())
         self.assertEqual((choice['glb_sha256'], choice['legacy']), (sha, True))
         card = self.tabs()['completed'][mid]
@@ -912,8 +944,12 @@ class CompletedTest(MonsterCase):
         self.assertIn('legacy reduction', [b['text'] for b in card['badges']])
         with self.assertRaises(guard.AlreadyApproved):
             self.act(mid, 'approve', lod='0p2', glb_sha256=sha)
-        r = self.act(mid, 'unapprove')
-        self.assertEqual(r['undo'], {'verb': 'approve', 'id': mid, 'args': {'lod': '0p2', 'glb_sha256': sha}})
+        self.assertEqual(card['approval_rev'], r['approval_rev'])                                 # the card's hover Unapprove echoes it
+        with self.assertRaises(ValueError):
+            self.act(mid, 'unapprove')                                                            # no approval revision: refused
+        r = self.unapprove(mid)
+        self.assertEqual(r['undo'], {'verb': 'approve', 'id': mid,
+                                     'args': {'lod': '0p2', 'glb_sha256': sha, 'approval_rev': r['approval_rev']}})
         self.assertEqual(self.tabs()['3d'][mid]['actions'], ['approve'])
         # an approved choice over an incomplete reduction (no materials.json) is not Completed
         self.act(mid, 'approve', lod='0p2', glb_sha256=sha)
@@ -957,11 +993,13 @@ class LaneTest(MonsterCase):
         out = self.convert(mid, files or ['front.png'] + [f'{n}.png' for n in views])
         return v, taskqueue.for_root(self.root).get(out['task'])
 
-    def mode(self, mode=None, pause=None, since='2026-11-25T10:00:00'):
+    def mode(self, mode=None, pause=None, since='2026-11-25T10:00:00', own=False):
         batch = self.root / '.codex_jobs/_batch'
         if mode:
             (batch / 'supervisor_mode.json').write_text(json.dumps({'mode': mode, 'since': since}))
-        if pause:
+        if pause and own:                                       # the supervisor's own pause: its record + the PAUSE mirror (I.11)
+            self.supervisor_pause(pause['reason'], pause['scope'], pause.get('since', 's'))
+        elif pause:                                             # somebody else's PAUSE (a manual / maintenance pause)
             (batch / 'PAUSE').write_text(json.dumps(pause))
 
     def test_gate_and_bound_pause_override(self):
@@ -969,10 +1007,10 @@ class LaneTest(MonsterCase):
         self.assertFalse(g(self.root, {}, 10, True)['open'])
         self.assertTrue(g(self.root, {}, 400, True)['open'])
         self.assertTrue(g(self.root, {'run_now': True}, 10, True)['open'])
-        self.mode(pause={'reason': 'user active (views keep running)', 'scope': ['conversions']})
+        self.mode(pause={'reason': 'user active (views keep running)', 'scope': ['conversions']}, own=True)
         self.assertFalse(g(self.root, {}, 400, True)['open'])
         self.assertTrue(g(self.root, {'run_now': True}, 10, True)['open'])
-        self.mode(mode='pause-conversions', pause={'reason': 'manual pause-conversions', 'scope': ['conversions']})
+        self.mode(mode='pause-conversions', pause={'reason': 'manual pause-conversions', 'scope': ['conversions']}, own=True)
         closed = g(self.root, {'run_now': True}, 400, True)
         self.assertEqual((closed['open'], closed['needs_confirm']), (False, True))
         key = closed['pause_id']
@@ -980,8 +1018,12 @@ class LaneTest(MonsterCase):
         self.assertFalse(g(self.root, {'run_now': True, 'override_pause': True}, 10, True)['open'])   # an unbound override is no override
         self.mode(mode='pause-conversions', since='2026-11-25T11:00:00')                         # a NEW pause
         self.assertFalse(g(self.root, {'run_now': True, 'override_pause': key}, 10, True)['open'])
-        (self.root / '.codex_jobs/_batch/PAUSE').unlink()
         self.mode(mode='run')
+        # the supervisor has not ticked yet: its own pause still reflects the EARLIER mode, an independent pause until it is lifted
+        stale = g(self.root, {'run_now': True}, 1000, True)
+        self.assertEqual((stale['open'], stale['code']), (False, 'paused'))
+        self.assertIn('supervisor pause: manual pause-conversions', stale['pause_reason'])
+        self.supervisor_resume()
         self.assertTrue(g(self.root, {}, 0, True)['open'])
         self.mode(mode='pause')
         self.assertFalse(g(self.root, {}, 1000, True)['open'])
@@ -1946,7 +1988,7 @@ class RecheckIdentityTest(RecheckCase):
         by_variant = {t['set_name']: t for t in q.tasks(lane=monster_lane.LANE)}
         self.assertNotEqual(by_variant[f'monster:Giant Rat/{v2}']['id'], shown['id'])
         self.assertEqual(q.get(shown['id'])['set_name'], f'monster:Giant Rat/{v1}')
-        out = actions.queue_op(self.root, {'op': 'run_now'} | shown)
+        out = actions.queue_op(self.root, {'op': 'run_now', 'conversion_seq': mv.disposition_seq(self.vj(v2))} | shown)
         self.assertEqual(out['key'], shown['key'])
         self.assertEqual(q.by_key(shown['key'])['state'], 'queued')                               # the displayed task, found by its key
         self.assertEqual(by_variant[f'monster:Giant Rat/{v1}']['state'], 'cancelled')
@@ -2028,7 +2070,8 @@ class RecheckPauseTest(RecheckCase):
         (batch / 'PAUSE').write_text(pause)
         p2 = modes.manual_pause(self.root)
         self.assertEqual((p1['kind'], p2['kind'], p1['pause_id'] != p2['pause_id']), ('pause', 'pause', True))
-        (batch / 'PAUSE').write_text(json.dumps({'since': 's', 'reason': 'user active', 'scope': ['conversions', 'views']}))
+        (batch / 'PAUSE').unlink()
+        self.supervisor_pause('user active', ['conversions', 'views'])
         self.assertIsNone(modes.manual_pause(self.root))                                          # the idle gate is not a manual pause
 
     def test_confirm_must_echo_the_pause_the_user_saw(self):
@@ -2754,7 +2797,7 @@ class FinalVerifyPauseTest(FinalVerifyCase):
         self.assertIsNone(self.child_gate(args))
         # the supervisor reflects ITS OWN mode in PAUSE: the same pause, the consent still covers it
         pause = self.batch() / 'PAUSE'
-        pause.write_text(json.dumps({'since': '2026-11-25T10:00:01', 'reason': 'manual pause-conversions', 'scope': ['conversions']}))
+        self.supervisor_pause('manual pause-conversions', ['conversions'], '2026-11-25T10:00:01')
         self.assertEqual(monster_lane.pause_id(self.root), seen)
         self.assertEqual(len(monster_lane.plan_starts(self.root, idle=10, idle_known=True)['start']), 1)
         self.assertIsNone(self.child_gate(args))
@@ -2788,18 +2831,23 @@ class FinalVerifyPauseTest(FinalVerifyCase):
         self.assertEqual(len(monster_lane.plan_starts(self.root, idle=10, idle_known=True)['start']), 1)
 
     def test_what_counts_as_the_supervisors_own_reflection(self):
+        # asked about the supervisor's OWN record (supervisor_pause.json), never about a PAUSE file (post-cut-over blocker 1)
         mode = {'mode': 'pause', 'pause_id': 'm'}
-        same = {'reason': 'manual pause', 'scope': ['conversions', 'views'], 'extra': []}
+        same = {'reason': 'manual pause', 'scope': ['conversions', 'views'], 'readable': True}
         self.assertTrue(modes.mode_reflection(mode, same))
         for other in (same | {'reason': 'manual pause-conversions'},           # the reflection of ANOTHER mode
                       same | {'scope': ['conversions']},                        # not the scope the supervisor writes for this mode
-                      same | {'extra': ['by']},                                 # a field the supervisor never writes
+                      same | {'readable': False},                               # a record that could not be read
                       same | {'reason': 'maintenance'}):
             self.assertFalse(modes.mode_reflection(mode, other), other)
+            self.assertEqual(modes.own_kind(mode, other), 'other')
         self.assertFalse(modes.mode_reflection({'mode': 'views-run', 'pause_id': None}, same))    # no pause mode: a pause of its own
+        self.assertFalse(modes.mode_reflection(mode, None))
+        self.assertEqual((modes.own_kind(mode, same), modes.own_kind(mode, None), modes.own_kind(mode, same | {'scope': ['views']})),
+                         ('mode', None, None))
         # the idle gate (the supervisor's reflection of the user's activity) is never a manual pause, and Run now still overrides it
         modes.write_mode(self.root, 'views-run')
-        (self.batch() / 'PAUSE').write_text(json.dumps({'since': 's', 'reason': 'user active (views keep running)', 'scope': ['conversions']}))
+        self.supervisor_pause('user active (views keep running)', ['conversions'])
         self.assertIsNone(modes.manual_pause(self.root))
         self.assertTrue(monster_lane.gate(self.root, {'run_now': True}, 10, True)['open'])
         self.assertFalse(modes.consent_covers(None, None))
@@ -3283,13 +3331,13 @@ class LastCheckPauseTest(FinalVerifyCase):
                 mock.patch.object(modes, 'file_identity', side_effect=AssertionError('a second look at the file')), \
                 mock.patch.object(modes, 'read_json', side_effect=AssertionError('a second look at the file')):
             gate = monster_lane.gate(self.root, {'run_now': True}, 10, True)
-            self.assertEqual(sorted(seen), ['PAUSE', 'supervisor_mode.json'])
+            self.assertEqual(sorted(seen), ['PAUSE', 'supervisor_mode.json', 'supervisor_pause.json'])
             del seen[:]
             manual = modes.manual_pause(self.root)
-            self.assertEqual(sorted(seen), ['PAUSE', 'supervisor_mode.json'])
+            self.assertEqual(sorted(seen), ['PAUSE', 'supervisor_mode.json', 'supervisor_pause.json'])
             del seen[:]
             snap = modes.snapshot(self.root, supervisor=(False, ''))
-            self.assertEqual(sorted(seen), ['PAUSE', 'supervisor_mode.json'])
+            self.assertEqual(sorted(seen), ['PAUSE', 'supervisor_mode.json', 'supervisor_pause.json'])
         self.assertEqual((gate['pause_id'], snap['pause_id']), (manual['pause_id'], manual['pause_id']))
         self.assertNotIn('extra', gate['pause'])                                                 # the API shape is unchanged
         self.assertNotIn('extra', snap['pause'])
@@ -3354,17 +3402,16 @@ class LastCheckPauseTest(FinalVerifyCase):
             thread.join(10)
 
     def test_write_mode_runs_under_the_gate_transition_mutex(self):
-        mutex = self.batch() / paid_gate.MUTEX_DIR
         real = guard.write_atomic
         held = []
 
         def write(path, data):
             if Path(path).name == 'supervisor_mode.json':
-                held.append(mutex.is_dir())
+                held.append(paid_gate.lock_busy(self.root))     # (the OS lock of paid_gate.transition_lock: post-cut-over blocker 2)
             return real(path, data)
         with mock.patch.object(guard, 'write_atomic', write):
             self.assertEqual(modes.write_mode(self.root, 'pause')['mode'], 'pause')
-        self.assertEqual((held, mutex.exists()), ([True], False))                                 # held for the write, released after it
+        self.assertEqual((held, paid_gate.lock_busy(self.root)), ([True], False))                 # held for the write, released after it
         before = (self.batch() / 'supervisor_mode.json').read_bytes()
         with paid_gate.transition_lock(self.root, what='a paid click'):                           # a click's check + dispatch is running
             with mock.patch.object(modes, 'LOCK_WAIT', 0.2):
@@ -3616,6 +3663,365 @@ class LastCheckJournalTest(FinalVerifyCase):
         mv.FAULTS.clear()
         self.assertIsNone(mv.journal_problem(self.root, 'Giant Rat'))
         self.assertEqual(monster_lane.tick(self.root)['recovered'], ['Giant Rat: completed'])
+
+
+class PostCutoverPauseTest(FinalVerifyCase):
+    """Post-cut-over review (review_v2_post_cutover_20261126), blocker 1: Run-now consent covers EVERY independent pause in force, and
+    a supervisor tick that rewrites PAUSE never turns an unconfirmed maintenance pause into a confirmed one. A PAUSE file is the
+    supervisor's only when its record (supervisor_pause.json, DESIGN_PHASE4.md I.11) proves it (`mirror` = sha256 of the PAUSE bytes)."""
+
+    OLD_REFLECTION = {'since': '2026-11-26T09:00:00', 'reason': 'manual pause-conversions', 'scope': ['conversions']}
+    child_gate = FinalVerifyPauseTest.child_gate            # the paid child's click-time check, as the driver configures it
+
+    def old_tick(self):
+        """One tick of the PRE-fix supervisor in mode pause-conversions (pipeline_supervisor.py tick_screen as reviewed): a PAUSE whose
+        reason / scope differ is OVERWRITTEN with its reflection of the mode, keeping `since`; no record of its own."""
+        pause = self.batch() / 'PAUSE'
+        current = json.loads(pause.read_text()) if pause.exists() else {}
+        if current.get('reason') != 'manual pause-conversions' or current.get('scope') != ['conversions']:
+            guard.write_atomic(pause, (json.dumps({'since': current.get('since') or 'now', 'reason': 'manual pause-conversions',
+                                                   'scope': ['conversions']}, indent=2) + '\n').encode())
+
+    def closed_everywhere(self, args, text=None):
+        gate = monster_lane.gate(self.root, args, 10, True)
+        self.assertEqual((gate['open'], gate['code'], gate['needs_confirm']), (False, 'paused', True), gate)
+        self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])     # the lane
+        self.assertIsNotNone(self.child_gate(args))                                                          # the paid child
+        self.assertEqual(monster_lane.main(['gate', '--root', str(self.root), '--task-args', json.dumps(args), '--idle', '10']), 1)
+        if text:
+            self.assertIn(text, gate['reason'])
+        return gate
+
+    def open_everywhere(self, args):
+        self.assertTrue(monster_lane.gate(self.root, args, 10, True)['open'])
+        self.assertEqual(len(monster_lane.plan_starts(self.root, idle=10, idle_known=True)['start']), 1)
+        self.assertIsNone(self.child_gate(args))
+
+    def confirmed(self):
+        mid, v, task_id, gen = self.frozen()
+        ident = {'id': task_id} | self.ident(task_id)
+        seen = modes.write_mode(self.root, 'pause-conversions')['pause_id']
+        out = actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': seen} | ident)
+        self.assertEqual(out['pause_id'], seen)
+        return task_id, ident, seen, taskqueue.for_root(self.root).get(task_id)['args']
+
+    def test_a_maintenance_pause_overwritten_by_a_supervisor_tick_keeps_the_gate_closed(self):
+        # The reviewer's sequence: consent for `pause-conversions`, then a separate maintenance PAUSE, then ONE supervisor tick.
+        task_id, ident, seen, args = self.confirmed()
+        self.open_everywhere(args)                                # the confirmed Run now runs through the mode pause
+        pause = self.batch() / 'PAUSE'
+        pause.write_text(json.dumps({'since': '2026-11-26T09:05:00', 'reason': 'maintenance: disk swap', 'scope': ['conversions']}))
+        self.closed_everywhere(args, 'maintenance: disk swap')    # an independent pause nobody confirmed
+        self.old_tick()                                           # the supervisor rewrites it as its reflection of the mode
+        self.assertEqual(json.loads(pause.read_text())['reason'], 'manual pause-conversions')
+        gate = self.closed_everywhere(args)                       # ... and the SAME consent does not reopen the gate
+        manual = modes.manual_pause(self.root)
+        self.assertEqual([p['kind'] for p in manual['pauses']], ['mode', 'pause'])
+        self.assertNotEqual(gate['pause_id'], seen)
+        self.old_tick()                                           # further ticks change nothing
+        self.closed_everywhere(args)
+        # the old consent is refused; only a confirmation that names what is in force now opens it, and only for exactly that
+        with self.assertRaises(monster_lane.ConfirmPaused) as caught:
+            actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': seen} | ident)
+        both = caught.exception.extra['pause_id']
+        self.assertEqual(both, manual['pause_id'])
+        actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': both} | ident)
+        args = taskqueue.for_root(self.root).get(task_id)['args']
+        self.open_everywhere(args)
+        pause.write_text(json.dumps({'since': '2026-11-26T09:20:00', 'reason': 'maintenance: again', 'scope': ['conversions']}))
+        self.closed_everywhere(args, 'maintenance: again')
+        self.old_tick()
+        self.closed_everywhere(args)                              # again: rewritten, still not confirmed
+
+    def test_a_rewritten_pause_with_the_bytes_of_a_confirmed_one_is_still_a_new_pause(self):
+        # The consent names the mode AND an (unproven) reflection PAUSE; maintenance replaces it; the tick writes the SAME bytes back.
+        mid, v, task_id, gen = self.frozen()
+        ident = {'id': task_id} | self.ident(task_id)
+        modes.write_mode(self.root, 'pause-conversions')
+        pause = self.batch() / 'PAUSE'
+        body = (json.dumps(self.OLD_REFLECTION, indent=2) + '\n').encode()
+        guard.write_atomic(pause, body)                           # an older supervisor's reflection: nothing proves whose it is
+        both = monster_lane.pause_id(self.root)
+        self.assertEqual([p['kind'] for p in modes.manual_pause(self.root)['pauses']], ['mode', 'pause'])
+        actions.queue_op(self.root, {'op': 'run_now', 'confirm': True, 'pause_id': both} | ident)
+        args = taskqueue.for_root(self.root).get(task_id)['args']
+        self.open_everywhere(args)
+        guard.write_atomic(pause, json.dumps(self.OLD_REFLECTION | {'reason': 'maintenance'}).encode())
+        self.closed_everywhere(args, 'maintenance')
+        time.sleep(0.02)
+        guard.write_atomic(pause, body)                           # byte for byte what the user confirmed, but another write
+        self.assertEqual(pause.read_bytes(), body)
+        self.closed_everywhere(args)
+        self.assertNotEqual(monster_lane.pause_id(self.root), both)
+
+    def test_only_the_supervisors_record_makes_a_pause_file_its_reflection(self):
+        task_id, ident, seen, args = self.confirmed()
+        mirror = self.supervisor_pause('manual pause-conversions', ['conversions'], '2026-11-26T09:00:00')   # the new supervisor ticked
+        self.assertEqual(monster_lane.pause_id(self.root), seen)  # the same pause as the mode: one consent covers both
+        self.open_everywhere(args)
+        pause = self.batch() / 'PAUSE'
+        # a maintenance pause replaces the mirror; the supervisor leaves a PAUSE that is not its own alone (I.11)
+        guard.write_atomic(pause, json.dumps({'since': 'x', 'reason': 'maintenance: disk swap', 'scope': ['conversions']}).encode())
+        self.closed_everywhere(args, 'maintenance: disk swap')
+        # nothing a PAUSE file SAYS makes it the supervisor's: not the reflection's wording, not a writer's name, not the idle reason
+        for claim in ({'since': 'x', 'reason': 'manual pause-conversions', 'scope': ['conversions']},
+                      {'since': '2026-11-26T09:00:00', 'reason': 'manual pause-conversions', 'scope': ['conversions'],
+                       'written_by': 'supervisor'},
+                      {'since': 'x', 'reason': 'user active (views keep running)', 'scope': ['conversions']},
+                      {'since': 'x', 'reason': 'user active', 'scope': ['conversions', 'views']}):
+            guard.write_atomic(pause, json.dumps(claim).encode())
+            gate = self.closed_everywhere(args)
+            self.assertEqual([p['kind'] for p in modes.manual_pause(self.root)['pauses']], ['mode', 'pause'], claim)
+            self.assertNotEqual(gate['pause_id'], seen)
+        guard.write_atomic(pause, mirror)                         # exactly the bytes the supervisor's record names: proven its mirror
+        self.assertEqual(monster_lane.pause_id(self.root), seen)
+        self.open_everywhere(args)
+        pause.unlink()                                            # no PAUSE at all: the supervisor's record still reflects the mode
+        self.open_everywhere(args)
+
+    def test_the_supervisors_own_pause_is_read_from_its_record(self):
+        mid, v, task_id, gen = self.frozen()
+        batch = self.batch()
+        modes.write_mode(self.root, 'views-run')
+        # idle: only the supervisor's record makes a `user active` pause the idle gate (Run now overrides it, nothing to confirm)
+        self.supervisor_pause('user active (views keep running)', ['conversions'])
+        gate = monster_lane.gate(self.root, {}, 1000, True)
+        self.assertEqual((gate['open'], gate['code'], gate['paused'], gate['supervisor_pause']['reason']),
+                         (False, 'user_present', False, 'user active (views keep running)'))
+        self.assertTrue(monster_lane.gate(self.root, {'run_now': True}, 10, True)['open'])
+        self.supervisor_resume(mirror=False)                      # the same PAUSE without the record: an independent pause
+        gate = monster_lane.gate(self.root, {'run_now': True}, 10, True)
+        self.assertEqual((gate['open'], gate['code'], gate['needs_confirm']), (False, 'paused', True))
+        self.assertEqual(modes.manual_pause(self.root)['kind'], 'pause')
+        (batch / 'PAUSE').unlink()
+        # the reflection of a mode that is NOT the current one (the supervisor has not ticked since the mode changed): independent
+        self.supervisor_pause('manual pause', ['conversions', 'views'])
+        manual = modes.manual_pause(self.root)
+        self.assertEqual((manual['kind'], manual['reason']), ('supervisor', 'supervisor pause: manual pause'))
+        gate = monster_lane.gate(self.root, {'run_now': True}, 1000, True)
+        self.assertEqual((gate['open'], gate['code']), (False, 'paused'))
+        self.assertTrue(monster_lane.gate(self.root, {'run_now': True, 'override_pause': manual['pause_id']}, 10, True)['open'])
+        modes.write_mode(self.root, 'pause')                      # ... and of the current one: the same pause as the mode
+        self.assertEqual([p['kind'] for p in modes.manual_pause(self.root)['pauses']], ['mode'])
+        # a record that cannot be read pauses, and proves nothing about PAUSE
+        modes.write_mode(self.root, 'views-run')
+        (batch / 'supervisor_pause.json').write_text('{not json')
+        manual = modes.manual_pause(self.root)
+        self.assertEqual([p['kind'] for p in manual['pauses']], ['supervisor', 'pause'])
+        self.assertFalse(monster_lane.gate(self.root, {'run_now': True}, 1000, True)['open'])
+        snap = modes.snapshot(self.root, supervisor=(False, ''))
+        self.assertEqual(snap['pause_id'], manual['pause_id'])
+        self.assertEqual(set(monster_lane.gate(self.root, {}, 10, True)['supervisor_pause']), {'since', 'reason', 'scope', 'pause_id'})
+        self.assertEqual(modes.OWN_PAUSE, paid_gate.SUPERVISOR_PAUSE)
+
+    def test_the_pair_of_files_caught_between_its_two_writes_is_looked_at_once_more(self):
+        modes.write_mode(self.root, 'pause-conversions')
+        seen = modes.read_mode(self.root)['pause_id']
+        self.supervisor_pause('manual pause-conversions', ['conversions'], 'A')
+        new = self.supervisor_pause('manual pause-conversions', ['conversions'], 'B', mirror=False)   # the record first ...
+        looks = []
+
+        def finish(path):                                         # ... and the mirror right after this reader's first look
+            if Path(path).name == 'supervisor_pause.json':
+                looks.append(1)
+                if len(looks) == 1:
+                    guard.write_atomic(self.batch() / 'PAUSE', new)
+        modes.READS.append(finish)
+        self.addCleanup(lambda: finish in modes.READS and modes.READS.remove(finish))
+        gate = monster_lane.gate(self.root, {'run_now': True, 'override_pause': seen}, 10, True)
+        self.assertEqual((gate['open'], gate['pause_id'], len(looks)), (True, seen, 2))
+        # a pair that stays inconsistent is an independent pause (fail closed), decided on the SECOND set of snapshots alone
+        self.supervisor_pause('manual pause-conversions', ['conversions'], 'C', mirror=False)
+        del looks[:]
+        looks.append(0)                                           # (the hook writes nothing this time)
+        gate = monster_lane.gate(self.root, {'run_now': True, 'override_pause': seen}, 10, True)
+        self.assertEqual((gate['open'], gate['code']), (False, 'paused'))
+
+
+class PostCutoverRetryTest(FinalVerifyCase):
+    """Post-cut-over review (review_v2_post_cutover_20261126), blocker 4: a stale Retry never erases a newer failure. Retry is bound to
+    the displayed disposition revision (`conversion_seq`), and a Retry that loses the queue transition puts the disposition back."""
+
+    def fail_attempt(self, task_id, error):
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, f'tok-{error}', None)
+        orch = orchestrator.Orchestrator(self.root, idle=lambda: 10.0, scan_stale=False)
+        orch._finish(q.get(task_id), {'exit': 1, 'last_json': {'status': 'failed', 'step': 'collect', 'error': error}})
+        self.assertEqual(q.get(task_id)['state'], 'failed')
+
+    def rebuild(self):
+        self.drop_queue()
+        return monster_lane.tick(self.root)
+
+    def test_the_displayed_revision_is_shown_and_required(self):
+        mid, v, task_id, gen = self.frozen()
+        self.fail_attempt(task_id, 'first')
+        seq = mv.disposition_seq(self.vj(v))
+        self.assertEqual(mv.item(self.root, mid)['conversion']['conversion_seq'], seq)
+        row = [t for t in orchestrator.queue_state(self.root, True)['tasks'] if t['id'] == task_id][0]
+        self.assertEqual((row['state'], row['conversion_seq']), ('failed', seq))
+        for bad in ({}, {'conversion_seq': None}, {'conversion_seq': True}, {'conversion_seq': str(seq)}):
+            with self.assertRaises(ValueError):
+                actions.queue_op(self.root, {'op': 'retry', 'id': task_id} | self.ident(task_id) | bad)
+            with self.assertRaises(ValueError):
+                actions.queue_op(self.root, {'op': 'run_now', 'id': task_id} | self.ident(task_id) | bad)
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['reason'], 'first')                   # nothing was cleared
+        self.assertEqual(actions.queue_op(self.root, {'op': 'retry', 'id': task_id, 'conversion_seq': seq} | self.ident(task_id))['state'],
+                         'queued')
+        self.assertIsNone(mv.disposition_of(self.vj(v), gen))
+
+    def test_stale_retry_after_a_newer_failure_then_rebuild_stays_failed(self):
+        mid, v, task_id, gen = self.frozen()
+        self.fail_attempt(task_id, 'first')
+        shown = {'op': 'retry', 'id': task_id, 'conversion_seq': self.seq(task_id)} | self.ident(task_id)   # what an old tab displays
+        self.qop('retry', task_id)                                # another tab retries; the new attempt fails again
+        self.fail_attempt(task_id, 'second (newer)')
+        newer = mv.disposition_of(self.vj(v), gen)
+        self.assertEqual((newer['state'], newer['reason']), ('failed', 'second (newer)'))
+        with self.assertRaises(guard.Changed) as caught:
+            actions.queue_op(self.root, shown)                    # the stale tab's Retry
+        self.assertEqual(caught.exception.code, 'changed')
+        with self.assertRaises(guard.Changed):
+            actions.queue_op(self.root, shown | {'op': 'run_now'})   # ... and its Run now (a Retry first)
+        self.assertEqual(mv.disposition_of(self.vj(v), gen), newer)                               # the newer failure is still recorded
+        self.assertEqual(taskqueue.for_root(self.root).get(task_id)['state'], 'failed')
+        out = self.rebuild()
+        self.assertEqual((out['queued'], out['restored']), ([], [f'Giant Rat/{v}']))
+        rows = taskqueue.for_root(self.root).tasks(lane=monster_lane.LANE)
+        self.assertEqual([r['state'] for r in rows], ['failed'])
+        self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])
+        self.assertEqual(mv.item(self.root, mid)['conversion']['state'], 'failed')
+
+    def test_retry_that_loses_the_queue_transition_keeps_the_failure(self):
+        # The reviewer's case: the failure of the running attempt is recorded (record_failure runs BEFORE the row fails), a Retry made
+        # on a stale `failed` row clears nothing for good: the queue transition answers False and the disposition is put back.
+        mid, v, task_id, gen = self.frozen()
+        self.fail_attempt(task_id, 'first')
+        stale_row = dict(taskqueue.for_root(self.root).get(task_id))                               # state failed
+        self.qop('retry', task_id)
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, 'tok2', None)                                                             # the new attempt runs ...
+        monster_lane.record_failure(self.root, q.get(task_id), 'second (newer)')                   # ... and its failure is recorded
+        self.assertIn(q.get(task_id)['state'], taskqueue.ACTIVE)
+        seq = mv.disposition_seq(self.vj(v))
+        self.assertFalse(monster_lane.retry_task(self.root, stale_row, seq))                       # even with the CURRENT revision
+        kept = mv.disposition_of(self.vj(v), gen)
+        self.assertEqual((kept['state'], kept['reason']), ('failed', 'second (newer)'))
+        self.assertGreater(mv.disposition_seq(self.vj(v)), seq)                                    # cleared + put back: two more revisions
+        with self.assertRaises(guard.Changed):
+            monster_lane.retry_task(self.root, stale_row, seq)                                     # and the old revision is stale now
+        q.finish(task_id, 'tok2', False, 'second (newer)')
+        out = self.rebuild()
+        self.assertEqual((out['queued'], out['restored']), ([], [f'Giant Rat/{v}']))
+        self.assertEqual([r['state'] for r in taskqueue.for_root(self.root).tasks(lane=monster_lane.LANE)], ['failed'])
+        self.assertEqual(monster_lane.plan_starts(self.root, idle=1000, idle_known=True)['start'], [])
+
+    def test_retry_of_an_expired_row_keeps_the_disposition(self):
+        mid, v, task_id, gen = self.frozen()
+        self.fail_attempt(task_id, 'first')
+        row = dict(taskqueue.for_root(self.root).get(task_id))
+        seq = self.seq(task_id)
+        with mock.patch.object(taskqueue.TaskQueue, 'retry', side_effect=taskqueue.Expired('the task is another one now')):
+            with self.assertRaises(guard.Changed):
+                monster_lane.retry_task(self.root, row, seq)
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['reason'], 'first')
+        with mock.patch.object(taskqueue.TaskQueue, 'retry', side_effect=sqlite3.OperationalError('database is locked')):
+            with self.assertRaises(sqlite3.OperationalError):
+                monster_lane.retry_task(self.root, row, mv.disposition_seq(self.vj(v)))
+        self.assertEqual(mv.disposition_of(self.vj(v), gen)['reason'], 'first')                    # put back also when the queue raised
+
+
+class PostCutoverApprovalTest(FinalVerifyCase):
+    """Post-cut-over review, blocker 5: Unapprove and Undo name the approval revision that was displayed (the revision of
+    chosen_lod.json), compared under the variant lock; a stale one answers 409 `changed` and the newer approval stays."""
+
+    def reduced(self):
+        mid, v, task_id, gen = self.frozen()
+        q = taskqueue.for_root(self.root)
+        q.claim(task_id, 'tok', None)
+        q.finish(task_id, 'tok', True)
+        self.converted('Giant Rat', v)
+        return mid, v, mv.models_dir(self.mroot, 'Giant Rat', v)
+
+    def approve(self, mid, lod):
+        return self.act(mid, 'approve', lod=lod, glb_sha256=mv.item(self.root, mid)['lods'][lod]['sha256'])
+
+    def choice(self, mdir):
+        return json.loads((mdir / 'chosen_lod.json').read_text())
+
+    def test_stale_0p4_unapprove_after_a_0p2_approval_is_409_and_the_approval_is_kept(self):
+        mid, v, mdir = self.reduced()
+        self.approve(mid, '0p4')
+        old_tab = mv.item(self.root, mid)                         # an old tab shows: approved at 0p4
+        self.assertEqual((old_tab['approved'], old_tab['lod']), (True, '0p4'))
+        self.unapprove(mid)                                       # elsewhere: unapproved, then approved at 0p2
+        second = self.approve(mid, '0p2')
+        before = (mdir / 'chosen_lod.json').read_bytes()
+        with self.assertRaises(guard.Changed) as caught:
+            self.act(mid, 'unapprove', approval_rev=old_tab['approval_rev'])
+        self.assertEqual(caught.exception.code, 'changed')
+        self.assertEqual((mdir / 'chosen_lod.json').read_bytes(), before)                          # the 0p2 approval is untouched
+        self.assertEqual((self.choice(mdir)['approved'], self.choice(mdir)['lod']), (True, '0p2'))
+        self.assertIn(mid, self.tabs()['completed'])
+        with self.assertRaises(ValueError):
+            self.act(mid, 'unapprove')                            # no revision at all: refused, never "whatever is approved now"
+        self.assertEqual((mdir / 'chosen_lod.json').read_bytes(), before)
+        r = self.act(mid, 'unapprove', approval_rev=second['approval_rev'])                        # the tab that shows 0p2 can
+        self.assertEqual((r['approved'], r['lod'], r['stage']), (False, '0p2', '3d'))
+
+    def test_stale_undo_never_reverses_a_later_decision(self):
+        mid, v, mdir = self.reduced()
+        first = self.approve(mid, '0p4')
+        undo_approve = first['undo']                              # the toast's Undo of the 0p4 approval
+        self.assertEqual(undo_approve, {'verb': 'unapprove', 'id': mid, 'args': {'approval_rev': first['approval_rev']}})
+        un = self.unapprove(mid)
+        undo_unapprove = un['undo']                               # the toast's Undo of that Unapprove: approve 0p4 again
+        self.assertEqual(undo_unapprove['args']['approval_rev'], un['approval_rev'])
+        self.approve(mid, '0p2')                                  # a later decision
+        before = (mdir / 'chosen_lod.json').read_bytes()
+        for undo in (undo_approve, undo_unapprove):
+            with self.assertRaises(guard.Changed):
+                self.act(undo['id'], undo['verb'], **undo['args'])
+            self.assertEqual((mdir / 'chosen_lod.json').read_bytes(), before)
+        self.unapprove(mid)                                       # later still: not approved, level 0p2
+        before = (mdir / 'chosen_lod.json').read_bytes()
+        with self.assertRaises(guard.Changed):
+            self.act(undo_unapprove['id'], undo_unapprove['verb'], **undo_unapprove['args'])       # would have approved 0p4 again
+        with self.assertRaises(guard.Changed):                    # a stale Unapprove of a variant that is NOT approved any more is 409 too:
+            self.act(mid, 'unapprove', **undo_approve['args'])    # it never falls through to undoing the pick
+        self.assertEqual((mdir / 'chosen_lod.json').read_bytes(), before)
+        self.assertTrue(mv.views_dir(self.mroot, 'Giant Rat', v).is_dir())
+
+    def test_a_fresh_undo_works_and_every_step_is_a_new_revision(self):
+        mid, v, mdir = self.reduced()
+        first = self.approve(mid, '0p4')
+        r = self.act(first['undo']['id'], first['undo']['verb'], **first['undo']['args'])          # Undo of the approval
+        self.assertEqual((r['approved'], r['stage']), (False, '3d'))
+        again = self.act(r['undo']['id'], r['undo']['verb'], **r['undo']['args'])                  # Undo of the Undo: approved at 0p4 again
+        self.assertEqual((again['approved'], again['lod']), (True, '0p4'))
+        self.assertEqual(len({first['approval_rev'], r['approval_rev'], again['approval_rev']}), 3)   # the same level again: a new revision
+        with self.assertRaises(guard.Changed):
+            self.act(mid, 'unapprove', approval_rev=first['approval_rev'])                         # the first approval's tab is stale
+        # an LOD pick is a write of the record too: the revision an unapproved item shows changes with it
+        self.unapprove(mid)
+        shown = mv.item(self.root, mid)['approval_rev']
+        import decisions
+        decisions.write_monster_lod(self.root, mid, '0p1')
+        self.assertNotEqual(mv.item(self.root, mid)['approval_rev'], shown)
+        self.assertEqual(mv.choice_rev(None), 'none')
+
+    def test_the_revision_is_compared_under_the_variant_lock(self):
+        mid, v, mdir = self.reduced()
+        first = self.approve(mid, '0p4')
+        seen = []
+        real = mv.choice_snapshot
+
+        def snapshot(folder):
+            seen.append(guard.os_lock(mdir / mv.LOD_LOCK)._depth)   # the variant lock is HELD while the record is read and compared
+            return real(folder)
+        with mock.patch.object(mv, 'choice_snapshot', snapshot):
+            mv.write_choice(self.root, mid, False, approval_rev=first['approval_rev'])
+        self.assertEqual(seen[-1], 1)                             # (earlier strict reads of the damage check are unlocked)
 
 
 class MigrateCliTest(MonsterCase):

@@ -478,3 +478,82 @@ the same pass, and the `completed` entry is `ok: true` with `replacement` (after
 `restart failed: ...` / `restart blocked: ...` (it still starts by itself once the blocker is gone). A pending Restart starts the service like
 Start does, also when it is disabled or was held. `ServiceManager._settle_outstanding` resolves a restart as ok only when the status shows a
 running instance with another pid than the stopped one.
+
+### I.11 As built: post-cut-over review (review_v2_post_cutover_20261126; blockers 1 supervisor side, 2, 3, 6, 7)
+
+This section is also the CONTRACT between the pause files' writers and readers (the monster lane's consent rule reads it).
+
+**The gate transition lock (blocker 2).** `paid_gate.transition_lock(root, wait=10.0, what='')`: same name and context-manager API
+as before (`GateBusy` when it stays busy for `wait` seconds, `.owned()`), new mechanism.
+- It is an OS byte lock on `.codex_jobs/_batch/gate.lock` (`msvcrt.locking` on Windows, `fcntl.flock` elsewhere; byte `1 << 20`,
+  the `claim_lock.py` convention). The lock file is never deleted. `gate.lock.owner.json` beside it ({pid, time, what}) is
+  information only: `paid_gate.lock_owner(root)` (None when free) and `paid_gate.lock_busy(root)`.
+- It **never expires**. While its owner lives nobody else gets it, however long the owner stalls. The kernel releases it when the
+  owner exits or dies, so there is nothing to reclaim. Two handles exclude each other inside one process too (threads).
+  The former `gate_mutex/` directory (mkdir, reclaimed after 30 s) is gone: that expiry let a second holder in while a stalled
+  first one was still between its gate check and its click.
+- **Clickers.** `paid_gate.checked_dispatch(dispatch)` holds it from the final gate check until `dispatch()` has returned
+  (Hyper3D: `rodin_backend._click`, control look-up included; `hyper3d_pipeline/workflow.py`). A busy lock is a closed gate:
+  `GateClosed`, nothing clicked.
+- **node.** node cannot take a byte lock. `paid_click.mjs takeGateMutex(root, {wait, what, python})` (async) starts
+  `python tools/paid_gate.py hold --root R --wait S --what TEXT`. The helper takes the lock, prints `held` and keeps it until its
+  stdin closes; `busy` + exit 3 when it could not be taken. `release()` closes the pipe and waits for the helper to exit. If node
+  dies the pipe closes by itself and the helper leaves. If the helper dies, `owned()` is false and `gatedPaidClick` answers
+  `gate_closed` before the intent. `studio.mjs` holds it from the final check through the intent write and the Generate dispatch.
+- **Writers.** Every write and removal of CONVERT_HOLD, CONVERT_DRAIN, PAUSE, supervisor_pause.json and supervisor_mode.json takes
+  the lock: `services.gate_transition`, `pipeline_supervisor.gate_transition` (4 tries x 10 s) and `modes.write_mode`.
+  **A writer never writes without it.** When it stays busy, `services.gate_transition` raises `ServiceError` (the hold / drain is
+  not reported as written), the supervisor logs `ERROR pause-write` once, keeps freezing and tries again next tick, and
+  `pipeline_supervisor.py mode <value>` prints `mode NOT changed` and exits 1. (Before, a writer wrote anyway after 40 s.)
+- Readers never take the lock. The click-time gate command (`paid_gate.py check`, the monster lane's `gate`) runs while its
+  caller holds it.
+
+**The three independent pauses (blockers 1 and 3).** Three things under `.codex_jobs/_batch/` pause conversions. Each closes the paid
+gate by itself (`paid_gate.file_reason`, `convert_job.conversion_gate`), and only `override_pause` (a confirmed Run now of the
+monster lane) passes them. CONVERT_HOLD and CONVERT_DRAIN are not pauses and are never overridden.
+
+| File | Writer | Meaning |
+| --- | --- | --- |
+| `supervisor_mode.json` | the app (`modes.write_mode`), `pipeline_supervisor.py mode` | the manual mode; `pause` / `pause-conversions` pause conversions |
+| `supervisor_pause.json` | the supervisor only | the supervisor's OWN pause: the idle rule (`user active`, `user active (views keep running)`) or its reflection of the mode (`manual pause`, `manual pause-conversions`) |
+| `PAUSE` | anybody (a manual / maintenance pause), or the supervisor as a mirror | the file the older readers look at (`convert_queue.py`, `view_batch.py`) |
+
+- **Blocker 3: the mode closes the gate at once.** `paid_gate.mode_reason` reads `supervisor_mode.json` in every gate check, so
+  also in the final check under the dispatch lock. `modes.write_mode` writes under that lock. So once a Queue Pause is
+  acknowledged no character payment is dispatched: the write lands before a click's check (closed) or after its dispatch. The
+  supervisor's reflection, up to 30 s later, is not waited for. A mode file that exists but cannot be read counts as a pause;
+  no file is the default mode.
+- **Blocker 1: `supervisor_pause.json`** = `{"since", "reason", "scope", "pid", "mirror"}`. The supervisor writes it whenever it
+  pauses and removes it when it resumes or exits. `scope` is as in PAUSE (a list; unreadable = everything). `mirror` is the
+  sha256 (hex) of the PAUSE bytes the supervisor wrote, or `null` when PAUSE is not its own.
+- **PAUSE keeps its shape** (`since`, `reason`, `scope`, nothing else) when the supervisor writes it, so its readers are unchanged.
+- **The supervisor only touches a PAUSE that is its own** (`pipeline_supervisor.pause_is_own`):
+  - with a `supervisor_pause.json`: PAUSE is its own only when its bytes hash to `mirror`;
+  - with no `supervisor_pause.json` at all (an older supervisor's file, or the PAUSE the app put back after a restart): PAUSE is
+    its own only when it has exactly the supervisor's shape (only since / reason / scope, one of the four reasons above, a list
+    scope). The first tick then records it (`mirror`).
+  - Any other PAUSE is foreign. The supervisor never overwrites or removes it: not on a tick, not when the mode changes, not on
+    resume, not on exit. It logs `PAUSE FOREIGN (<reason>)` once, keeps its own pause in `supervisor_pause.json` with
+    `mirror: null`, and mirrors into PAUSE again once the foreign file is gone.
+- **Write order.** Under one hold of the lock the supervisor writes `supervisor_pause.json` first, then PAUSE. A reader that
+  takes no lock can see the new record with the old PAUSE for a moment: an unproven PAUSE, which a reader must treat as a pause.
+- **Consent rule for readers (the monster lane; `modes.py`).** A consent to run while paused must cover every independent pause
+  in force: (1) the pause mode; (2) the supervisor's own pause when it is neither the idle rule nor the reflection of the current
+  mode; (3) every PAUSE covering conversions that is not provably the supervisor's mirror (`mirror` == sha256 of the bytes read),
+  whatever its reason says. A PAUSE that replaces a confirmed one is a new pause. Nothing in a PAUSE file's content proves whose
+  it is.
+
+**Failed resume (blocker 6).** `Supervisor.resume()` removes a record from `paused_pids.json` only when its process was resumed or is
+confirmed gone (no process has the pid, or the pid has a known other start time; a pid whose start time cannot be read is not
+confirmed). A resume that raised keeps its record: every tick, the exit path and the next start try again. The failed pids are
+never in the returned list; the event log says `RESUME FAILED <pid>:<name> (<error>)` once per change of the failing set, and the
+RESUME line adds `N process(es) could NOT be resumed and stay on record`.
+
+**Kill & retry (blocker 7).** `Orchestrator._terminate` verifies (create time, command line) and kills ONE `psutil.Process` object
+(`_verified_handle`), as `services._terminate` does. psutil binds the object to (pid, create time), so a pid reused between the
+check and the signal is not killed: the outcome is `gone`. Both the generic path (`_kill`) and the monster path use it.
+
+**What needs a restart.** A running process keeps the lock code it loaded. Until the supervisor, the convert worker (and its
+`convert_job.py` / `studio.mjs` / `rodin_backend.py` children, which start fresh per job) and the v2 server all run this code, an
+old process still uses `gate_mutex/` and a new one `gate.lock`: the two do not exclude each other. Restart all three together.
+An old supervisor still overwrites a foreign PAUSE.

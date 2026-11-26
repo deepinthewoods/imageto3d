@@ -21,7 +21,7 @@ v2 does **not** rewrite them. The server becomes their **process manager**, give
 - Service table (name, command line, matcher):
   - supervisor: `python -X utf8 -u tools/pipeline_supervisor.py run`
   - views: `python -u tools/view_batch.py run --parallel 8`
-  - convert: `python -X utf8 -u tools/convert_queue.py --sets-file .codex_jobs/_app/convert_sets.txt --worker 1 <backend flags>`
+  - convert: `python -X utf8 -u tools/convert_queue.py --sets-file .codex_jobs/_batch/convert_sets.txt --worker 1 <backend flags>`
   - The backend flags come from settings: `--no-tripo` while Tripo has no credits (the current state), otherwise Tripo first.
 - **Adopt before start.** At startup and every 30 s, find running instances by scanning processes (psutil): python processes whose
   command line runs that script. A matching instance (e.g. one the user started by hand) is adopted and recorded in
@@ -38,9 +38,12 @@ v2 does **not** rewrite them. The server becomes their **process manager**, give
   "layer_workers_away": 4}`.
 
 ### Convert eligibility
-- The worker converts only sets matching its sets-file patterns. v2 writes its own file, `.codex_jobs/_app/convert_sets.txt`:
-  - the old `.codex_jobs/_batch/convert_sets.txt` lines (legacy allowlist and `!` excludes), copied once;
-  - plus every set that was approved in v2 (the action log), so an approval is the processing request.
+- The worker converts only sets matching its sets-file patterns. **As built (AGENTS.md "Approval is the processing request";
+  DESIGN_PHASE4.md B and I.6): there is ONE convert list, `.codex_jobs/_batch/convert_sets.txt`,** the file the worker already
+  re-reads every loop. There is no separate `.codex_jobs/_app/convert_sets.txt`:
+  - its existing lines stay (the legacy allowlist and the `!` excludes);
+  - a set reaching `approved/` in v2 gets its exact ids appended there under a lock (`<set>`, `<set>_<race>` for every active race,
+    `<set>_gnome`; never a wildcard), so an approval is the processing request.
 - Old jobs in `multiview_ready/` / `processing/` that match no pattern show as **held: not in the convert list**, with a
   **Release** button that appends the set.
 - Paid work still obeys the PAUSE / mode authority. Conversions are manually paused today; v2 shows that and leaves it until the
@@ -144,9 +147,12 @@ events(id INTEGER PRIMARY KEY, time REAL, task_id INTEGER, kind TEXT, detail TEX
   - It is gated like conversions (PAUSE scope `conversions`, idle rule).
   - Backend: Tripo is off this month (settings). Hyper3D runs `hyper3d_single.py` for one enabled view and an N-view generalisation
     of `hyper3d_twoview.py` for 2-4 views (upload order = enabled order; no direction labels).
-  - Paid steps carry `--allow-paid --accept-preview` only when the app's paid budget allows. The user allowed up to 4 Hyper3D
-    conversions without asking (2026-11-25); the app counts them in `.codex_jobs/_app/paid_log.jsonl`. Beyond that a conversion
-    waits as "needs approval" with an **Allow** button.
+  - Paid steps carry `--allow-paid --accept-preview`. **As built (DESIGN_PHASE5.md H.7; AGENTS.md "Paid limit for agents"): the
+    setting `paid_budget_hyper3d` is informational only.** The lane never reads it, nothing waits as "needs approval" and there is
+    no **Allow** button. What the lane spends is recorded in `.codex_jobs/_app/paid_log.jsonl` and shown in the Queue tab. The limit
+    of four Hyper3D conversions without asking (user, 2026-11-25) binds Claude/Codex, not the app: a conversion the user starts in
+    the app (Approve, Use enabled views, Run now, Reconvert) is the user's own request. What does stop a paid step is the paid
+    gate (DESIGN_PHASE4.md I.8 and I.11): CONVERT_HOLD / CONVERT_DRAIN, every pause, and in Auto mode the idle rule.
   - Then `reduce_monster.py <variant>` (Blender) runs, giving 5 LODs.
 - **3D -> Completed.** Approve writes `chosen_lod.json` with `approved: true` (`monsters.write_choice`), so
   `build_monster_blends.py sync` keeps working.

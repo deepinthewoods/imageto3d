@@ -1275,14 +1275,13 @@ class GateTransitionTest(TempRoot):
         import paid_gate
         self.gate = paid_gate
         self.batch = self.root / '.codex_jobs' / '_batch'
-        self.mutex = self.batch / paid_gate.MUTEX_DIR
 
     def test_every_hold_and_drain_change_is_made_under_the_mutex(self):
         seen, watched = [], {'CONVERT_HOLD', 'CONVERT_DRAIN', 'PAUSE'}
         real_write, real_unlink = guard.write_atomic, Path.unlink
 
         def owner():
-            return json.loads((self.mutex / 'owner.json').read_text())['what']
+            return (self.gate.lock_owner(self.root) or {}).get('what')   # None: nobody holds the lock (an unserialized write)
 
         def write(path, data):
             if Path(path).name in watched:
@@ -1308,7 +1307,7 @@ class GateTransitionTest(TempRoot):
                                 ('unlink', 'CONVERT_HOLD', 'CONVERT_HOLD released'),
                                 ('write', 'CONVERT_DRAIN', 'CONVERT_DRAIN'), ('unlink', 'CONVERT_DRAIN', 'CONVERT_DRAIN removed'),
                                 ('write', 'PAUSE', 'PAUSE restored after a supervisor restart')])
-        self.assertFalse(self.mutex.exists())                           # released every time
+        self.assertFalse(self.gate.lock_busy(self.root))                # released every time
         self.assertFalse((self.batch / 'CONVERT_HOLD').exists() or (self.batch / 'CONVERT_DRAIN').exists())
 
     def test_the_reviewers_case_a_hold_written_during_the_intent_write_cannot_be_followed_by_a_click(self):
@@ -1332,19 +1331,34 @@ class GateTransitionTest(TempRoot):
         with self.assertRaisesRegex(self.gate.GateClosed, 'CONVERT_HOLD'):  # and the next click sees it under the mutex
             self.gate.checked_dispatch(lambda: order.append('second click'), env)
         self.assertNotIn('second click', order)
-        self.assertFalse(self.mutex.exists())
+        self.assertFalse(self.gate.lock_busy(self.root))
 
-    def test_a_writer_retries_a_busy_mutex_and_a_stale_one_is_reclaimed(self):
-        self.mutex.mkdir()                                              # a crashed holder: its process is gone
-        (self.mutex / 'owner.json').write_text(json.dumps({'pid': 999999999, 'time': 0, 'what': 'crashed click'}))
-        services.write_hold(self.root, 'manager start')
+    def test_a_crashed_holder_leaves_no_lock_and_a_busy_lock_is_retried_then_refused(self):
+        """Post-cut-over review, blocker 2: the lock is an OS byte lock. A holder that died holds nothing (the kernel released it; no
+        stale folder to reclaim), and a holder that is alive is never overtaken: after the retries the write is refused, not made."""
+        holder = subprocess.Popen([sys.executable, '-X', 'utf8', str(Path(self.gate.__file__)), 'hold', '--root', str(self.root),
+                                   '--what', 'crashed click'], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (holder.kill(), holder.wait(), holder.stdin.close(), holder.stdout.close()))
+        self.assertEqual(holder.stdout.readline().strip(), b'held')
+        self.assertEqual(self.gate.lock_owner(self.root)['pid'], holder.pid)
+        holder.kill()                                                   # the click's process dies inside its critical section
+        holder.wait(10)
+        services.write_hold(self.root, 'manager start')                 # at once: nothing to wait out
         self.assertTrue((self.batch / 'CONVERT_HOLD').exists())
-        self.assertFalse(self.mutex.exists())
+        (self.batch / 'CONVERT_HOLD').unlink()
         calls = []
         with self.gate.transition_lock(self.root, what='slow click'), \
-                mock.patch.object(self.gate, 'transition_lock', lambda root, what='': calls.append(what) or self.gate_busy()):
-            services.gate_transition(self.root, lambda: calls.append('action'), 'x')
-        self.assertEqual(calls, ['x'] * services.GATE_LOCK_TRIES + ['action'])   # retried, then written anyway: a hold is never lost
+                mock.patch.object(self.gate, 'transition_lock', lambda root, wait=0, what='': calls.append(what) or self.gate_busy()):
+            with self.assertRaisesRegex(services.ServiceError, 'stayed busy.*slow click'):
+                services.gate_transition(self.root, lambda: calls.append('action'), 'x')
+        self.assertEqual(calls, ['x'] * services.GATE_LOCK_TRIES)       # retried, then refused: never written beside a live holder
+        with self.gate.transition_lock(self.root, what='slow click'), mock.patch.object(services, 'GATE_LOCK_TRIES', 2), \
+                mock.patch.object(services, 'GATE_LOCK_WAIT', 0.05):
+            with self.assertRaises(services.ServiceError):
+                services.write_hold(self.root, 'supervisor restart')
+            self.assertFalse((self.batch / 'CONVERT_HOLD').exists())    # the real lock: not written while the click is inside
+        services.write_hold(self.root, 'supervisor restart')
+        self.assertTrue((self.batch / 'CONVERT_HOLD').exists())
 
     def gate_busy(self):
         class Busy:

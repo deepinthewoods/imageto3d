@@ -8,6 +8,8 @@ import shutil
 import struct
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 import zlib
@@ -892,7 +894,7 @@ class Phase5Tests(unittest.TestCase):
                     seen[kind] = 'written'
                 except gate.GateBusy:
                     seen[kind] = 'busy'
-                seen['owner'] = json.loads((batch / gate.MUTEX_DIR / 'owner.json').read_text())
+                seen['owner'] = gate.lock_owner(gate_root)
                 super().click(kind)
         session = Clicking(self.out, stages=['geometry_preview', 'export_ready'], costs=self.paid_costs())
         self.collect(session)
@@ -900,9 +902,43 @@ class Phase5Tests(unittest.TestCase):
         self.assertEqual((seen['owner']['pid'], seen['owner']['what']), (os.getpid(), 'paid click'))
         self.assertIn(('click', 'geometry'), session.calls)
         self.assertFalse((batch / 'CONVERT_HOLD').exists())
-        self.assertFalse((batch / gate.MUTEX_DIR).exists())                      # released after the click
+        self.assertFalse(gate.lock_busy(gate_root))                              # released after the click
         with gate.transition_lock(gate_root, wait=0.05):                         # and a writer gets it at once
             pass
+
+    def test_a_slow_control_lookup_inside_the_click_keeps_the_lock_and_a_queue_pause_stops_the_next_click(self):
+        """Post-cut-over review, blockers 2 and 3: session.click looks the control up AFTER the gate check; while that stalls a
+        pause writer stays locked out (the lock does not expire), and a manual pause MODE closes the gate without any PAUSE file."""
+        self.submit()
+        gate, batch, order = rb.paid_gate, self.batch, []
+        gate_root = self.gate_root
+        mode = batch / gate.MODE_FILE
+
+        def pause():                                                             # Queue Pause: the mode write, under the lock
+            with gate.transition_lock(gate_root, wait=20.0, what='mode pause'):
+                mode.write_text(json.dumps({'mode': 'pause'}))
+                order.append('paused')
+        writer = threading.Thread(target=pause)
+
+        class Stalling(FakeSession):
+            def click(self, kind):
+                writer.start()
+                time.sleep(0.5)                                                  # the control look-up stalls
+                assert writer.is_alive() and not mode.exists()
+                order.append(f'click {kind}')
+                super().click(kind)
+
+            def wait_stage(self, stages, timeout):
+                if writer.ident is not None:
+                    writer.join(20)                                              # the Pause request has been acknowledged
+                return super().wait_stage(stages, timeout)
+        session = Stalling(self.out, stages=['geometry_preview', 'material_ready'], costs=self.paid_costs())
+        self.addCleanup(lambda: writer.ident is None or writer.join(20))
+        with self.assertRaisesRegex(rb.GateClosed, 'mode pause'):                # acknowledged: the next paid step does not click
+            self.collect(session)
+        self.assertEqual(order, ['click geometry', 'paused'])                    # the pause landed after the click, not inside it
+        self.assertFalse((batch / 'PAUSE').exists())                             # no supervisor tick was needed
+        self.assertEqual([c for c in session.calls if c[0] == 'click'], [('click', 'geometry')])
 
     def test_a_gate_transition_in_progress_is_a_closed_gate_and_withdraws_the_intent(self):
         self.submit()

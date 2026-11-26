@@ -20,8 +20,10 @@ const TONE = { running: 'info', starting: 'info', queued: 'info', done: 'ok', fa
 const OP_TEXT = { retry: ['Retrying', 'Retry'], cancel: ['Cancelled', 'Cancel'], kill_retry: ['Killed and re-queued', 'Kill & retry'], kill: ['Killed', 'Kill'] };
 const ACTIVE = ['running', 'starting', 'stalled', 'orphan'];
 const isActive = task => ACTIVE.includes(task.state);
-/** What identifies a displayed task beyond its row number: {key, generation?} (generation: the frozen view list of a monster conversion). */
-const identity = task => ({ ...(task.key ? { key: task.key } : {}), ...(task.generation ? { generation: task.generation } : {}) });
+/** What identifies a displayed task beyond its row number: {key, generation?, conversion_seq?} (generation: the frozen view list of a
+ * monster conversion; conversion_seq: the disposition revision a failed / cancelled monster row is shown with, which Retry echoes). */
+const identity = task => ({ ...(task.key ? { key: task.key } : {}), ...(task.generation ? { generation: task.generation } : {}),
+  ...(Number.isInteger(task.conversion_seq) ? { conversion_seq: task.conversion_seq } : {}) });
 
 /** Sets whose card carries a "stale n" badge (the stale scan found their published builds, or their bare builds, out of date). */
 const staleSets = () => ['3d', 'aligned', 'completed'].flatMap(tab => state.tabs[tab] || [])

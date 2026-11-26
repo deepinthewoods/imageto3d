@@ -303,7 +303,20 @@ export async function showMonster3d(modal, host) {
     syncApprove();
   }
   if (stage === 'completed' || item.approved === true) {
-    const unapprove = button('Unapprove', () => host.actThenAdvance(card, 'unapprove', { subject: name }), '', 'Clear the approval: the monster goes back to 3D');
+    // post-cut-over blocker 5: Unapprove names the approval THIS modal shows (item.approval_rev, the revision of chosen_lod.json). When
+    // the record was written since (another tab unapproved it and approved another level), the server answers 409 `changed`, the
+    // newer approval stays and the lists are read again. The revision is the one read when the modal OPENED (a later re-read of the
+    // item for the model never replaces it). The toast's Undo carries the revision of the step it reverses (the server's descriptor).
+    const shownApproval = item.approval_rev;
+    const unapprove = button('Unapprove', () => host.actThenAdvance(card, 'unapprove', {
+      args: { approval_rev: shownApproval }, subject: name, quiet: true,
+      onError: error => {
+        if (!error.conflict) return;
+        toast(error.code === 'changed' ? 'The approval changed since you opened this (nothing was changed); close and open it again'
+          : conflictMessage(error, 'model'), { ms: 8000 });
+        refresh().catch(() => {});
+      },
+    }), '', 'Clear the approval: the monster goes back to 3D');
     unapprove.dataset.action = 'unapprove';
     approveSlot.append(unapprove);
   }

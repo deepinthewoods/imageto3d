@@ -27,9 +27,12 @@ only after taking it; a second command on the same output stops at once with 'an
 
 Click-time paid gate (DESIGN_PHASE4 I.8, tools/paid_gate.py): every credit-capable step (geometry confirm, material generate,
 material confirm) calls paid_gate.check() when it starts, before it writes its intent and again right before the click. That
-last check and the click itself run under the paid-gate transition mutex (paid_gate.checked_dispatch; last-check row 6), which
+last check and the click itself run under the paid-gate transition lock (paid_gate.checked_dispatch; last-check row 6), which
 every writer of CONVERT_HOLD / CONVERT_DRAIN / PAUSE / the mode takes too: a hold is written before the check (no click) or
-after the click was dispatched, never in between; a mutex that stays busy counts as a closed gate. A closed
+after the click was dispatched, never in between; a lock that stays busy counts as a closed gate. The lock is an OS byte lock
+(post-cut-over review, blocker 2): it is held until session.click() has returned, control look-up included, however long that
+takes, it never expires, and the kernel releases it if this process dies. The check also reads the manual pause mode
+(supervisor_mode.json) and the supervisor's own pause, so a Queue Pause stops the click at once (blocker 3). A closed
 gate raises GateClosed: no intent is left behind (one written a moment earlier is withdrawn: nothing was clicked), the CLI prints
 `PAID GATE CLOSED: <reason>` and exits EXIT_GATE_CLOSED (4); the caller waits for its gate and runs collect again. The free
 preview submit is not gated. Without $IMAGETO3D_PAID_GATE (a manual run) the explicit --allow-paid is the authority.
@@ -883,12 +886,13 @@ def _step(record, session, config, kind, expected, allow_paid, accept_preview=Fa
 
 
 def _click(record, session, kind, before):
-    """The credit-capable click, with the paid gate checked right before it (check + click under the gate transition mutex:
+    """The credit-capable click, with the paid gate checked right before it (check + click under the gate transition lock:
     paid_gate.checked_dispatch). A gate that closed after the intent was written
     puts the record back as it was before the intent (nothing was clicked, so nothing may stay pending) and raises GateClosed."""
     try:
-        # last-check row 6: the final gate check and the click are one critical section under the transition mutex that every
-        # hold / drain / pause / mode writer takes; a busy mutex counts as a closed gate
+        # last-check row 6: the final gate check and the click are one critical section under the transition lock that every
+        # hold / drain / pause / mode writer takes; a busy lock counts as a closed gate. Post-cut-over blocker 2: session.click
+        # looks its control up before it clicks, inside this section; the lock is an OS lock that does not expire meanwhile
         paid_gate.checked_dispatch(lambda: session.click(kind))
     except paid_gate.GateClosed:
         record.restore(before, f'{kind}_intent_withdrawn')

@@ -1852,6 +1852,52 @@ class RecheckTests(Phase3Case):
         self.assertIn('still running after the kill', row['error'])
         self.assertEqual(q.count(taskqueue.ACTIVE), 2)
 
+    @unittest.skipIf(psutil is None, 'needs psutil')
+    def test_post_cutover_7_kill_and_retry_signals_the_very_process_object_it_verified(self):
+        """review_v2_post_cutover_20261126, blocker 7: the old code verified the pid, then opened a FRESH psutil.Process(pid) to kill
+        it; a pid reused between the two got the kill. Now the object whose create time and command line were checked is the one
+        that is killed, and a process that ended in between is 'gone' with nothing signalled."""
+        made, verified, killed = [], [], []
+        real = psutil.Process
+
+        class Tracking(real):
+            def __init__(self, pid=None):
+                super().__init__(pid)
+                made.append(self)
+
+            def cmdline(self):
+                verified.append(self)
+                return super().cmdline()
+
+            def kill(self):
+                killed.append(self)
+                return super().kill()
+        victim = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', 'tok-k'])
+        self.addCleanup(lambda: (victim.kill(), victim.wait()))
+        created = orchestrator.create_time(victim.pid)
+        orch = self.orch(raw=True)
+        with mock.patch.object(psutil, 'Process', Tracking):
+            self.assertEqual(orch._terminate(victim.pid, created, ['tok-k']), 'killed')
+        self.assertEqual(len(killed), 1)
+        self.assertIs(killed[0], verified[-1])                  # the SAME object: no second look-up by pid before the signal
+        self.assertEqual(victim.wait(10) is not None, True)
+        # the verified process ends and Windows gives its pid to another process before the signal: nothing is killed
+        bystander = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)', 'tok-r'])
+        self.addCleanup(lambda: (bystander.kill(), bystander.wait()))
+        created = orchestrator.create_time(bystander.pid)
+
+        class Reused(Tracking):
+            def is_running(self):                               # psutil's answer once the pid is no longer this object's process
+                return self not in verified
+        del killed[:], verified[:]
+        with mock.patch.object(psutil, 'Process', Reused):
+            self.assertEqual(orch._terminate(bystander.pid, created, ['tok-r']), 'gone')
+        self.assertEqual((killed, bystander.poll()), ([], None))
+        # and an unverifiable process (wrong create time / command line) is still not touched
+        self.assertEqual(orch._terminate(bystander.pid, created, ['another-token']), 'unverified')
+        self.assertIsNone(orch._verified_handle(bystander.pid, None, ['tok-r']))
+        self.assertIsNone(bystander.poll())
+
     # ------------------------------------------------------------------------------------------------------------------ R8
     def test_r8_a_manual_cancel_holds_for_the_approval_generation(self):
         self.sets_ready()

@@ -157,7 +157,7 @@ GATE_CLOSED = paid_gate.EXIT_GATE_CLOSED   # a paid child stopped at a closed ga
 
 def gate_env():
     """{IMAGETO3D_PAID_GATE: ...} for a paid child: the gate this process was given (a caller's own gate stays in force), else
-    CONVERT_HOLD / PAUSE of ROOT."""
+    CONVERT_HOLD / CONVERT_DRAIN / PAUSE / supervisor_pause.json / the manual pause mode of ROOT (paid_gate.file_reason)."""
     inherited = os.environ.get(paid_gate.ENV)
     return {paid_gate.ENV: inherited} if inherited else paid_gate.env_for(ROOT)
 
@@ -196,7 +196,11 @@ def drain_requested():
 
 def conversion_gate():
     """Why a paid step must wait right now, else None: CONVERT_HOLD exists, or PAUSE exists and its scope covers conversions
-    (a PAUSE without a readable scope counts: fail closed), or CONVERT_DRAIN exists (a drain without its hold still closes the gate)."""
+    (a PAUSE without a readable scope counts: fail closed), or CONVERT_DRAIN exists (a drain without its hold still closes the gate),
+    or the supervisor's own pause (supervisor_pause.json) covers conversions, or the manual mode in supervisor_mode.json is `pause` /
+    `pause-conversions` (post-cut-over review, blockers 1 and 3: the mode file closes the gate by itself, at once; the supervisor's
+    PAUSE reflection of it, up to a 30 s tick later, is not waited for). = paid_gate.file_reason, which the paid children check
+    again under the dispatch lock."""
     pause, hold = gate_files()
     if hold.exists():
         data = _gate_json(hold) or {}
@@ -208,7 +212,7 @@ def conversion_gate():
         scope = (data or {}).get('scope')
         if not isinstance(scope, list) or 'conversions' in scope:
             return f'PAUSE: {(data or {}).get("reason") or "supervisor pause"}'
-    return None
+    return paid_gate.supervisor_pause_reason(pause.parent) or paid_gate.mode_reason(pause.parent)
 
 
 def _own_create_time():

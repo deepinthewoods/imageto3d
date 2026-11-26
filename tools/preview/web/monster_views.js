@@ -32,7 +32,9 @@ const waitingText = reason => WAITING[reason] || reason || 'unknown';
  * Resolves the response, or null when the user said no. Errors other than the confirmation are thrown.
  */
 export async function runNowTask(task, { askFirst = false, pauseId = null } = {}) {
-  const base = { op: 'run_now', id: task.id, key: task.key, generation: task.generation };
+  // conversion_seq: the disposition revision the task is displayed with (Run now of a failed / cancelled task is a Retry first)
+  const base = { op: 'run_now', id: task.id, key: task.key, generation: task.generation,
+    ...(Number.isInteger(task.conversion_seq) ? { conversion_seq: task.conversion_seq } : {}) };
   const ask = async message => confirmDialog({
     title: 'Run now although conversions are paused?',
     lines: [message || 'Conversions were paused by hand. Run now starts this conversion anyway (Hyper3D, paid: 0.5 credits).'],
@@ -310,7 +312,8 @@ export async function showMonsterViews(modal, host) {
     draw();
     try {
       // the task and the pause exactly as this dialog shows them: the server refuses (409) when either is something else by now
-      const result = await runNowTask({ id: conversion.task_id, key: conversion.key, generation: conversion.generation },
+      const result = await runNowTask({ id: conversion.task_id, key: conversion.key, generation: conversion.generation,
+        conversion_seq: conversion.conversion_seq },
         { askFirst: conversion.waiting_reason === 'paused', pauseId: conversion.pause_id });
       if (result) toast(result.warning ? `Run now: ${result.warning}` : 'Conversion starts now', { ms: result.warning ? 8000 : 4000 });
     } catch (error) {
@@ -330,7 +333,9 @@ export async function showMonsterViews(modal, host) {
     retryingConversion = true;
     draw();
     try {
-      await api.queueOp('retry', conversion.task_id, { key: conversion.key, generation: conversion.generation });
+      // the task AND its recorded outcome exactly as shown (conversion_seq): a newer failure / cancel since then answers 409 `changed`
+      await api.queueOp('retry', conversion.task_id, { key: conversion.key, generation: conversion.generation,
+        conversion_seq: conversion.conversion_seq });
       toast('Conversion queued again (it resumes from its record)', { ms: 4000 });
     } catch (error) {
       if (!error.conflict) toast(`Retry failed: ${error.message}`);

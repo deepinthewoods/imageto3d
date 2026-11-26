@@ -33,8 +33,10 @@ removed by the tick only when it is ours, the running supervisor wrote `supervis
 that supervisor is the intended generation: not a retiring one, no stop of it pending, no legacy worker drain in progress (release_blocker;
 DESIGN_PHASE4.md I.9). A hold of a dead owner older than STALE_HOLD_S is replaced by ours; a hold of a live other owner is never touched.
 Every write and removal of CONVERT_HOLD and CONVERT_DRAIN (and the PAUSE put back after a supervisor restart) is made under the paid-gate
-transition mutex (gate_transition = tools/paid_gate.py transition_lock; last-check review row 6): a paid click holds it from its final gate
-check to its dispatch, so a hold lands before the check or after the click, never between.
+transition lock (gate_transition = tools/paid_gate.py transition_lock; last-check review row 6): a paid click holds it from its final gate
+check to its dispatch, so a hold lands before the check or after the click, never between. The lock is an OS byte lock that never expires
+and is released by the kernel when its owner exits (post-cut-over review, blocker 2); when it stays busy the write is NOT made and
+gate_transition raises ServiceError (the hold is not reported as written; the manager's next pass tries again).
 
 Convert worker stop (I.2): `.codex_jobs/_batch/convert_worker1.stop` = {pid, create_time, request, time} naming the worker process; the worker
 acknowledges with `convert_worker1.stopping`, finishes its job (finish + offload) and exits. The manager waits and NEVER kills on a timeout:
@@ -512,28 +514,30 @@ def _lock_held(root, svc: Service) -> bool:
 
 # ------------------------------------------------------------------------------------------------------------------ conversion hold
 
-GATE_LOCK_TRIES = 4   # x paid_gate.transition_lock's 10 s wait; the mutex is reclaimed as stale after 30 s, so this always ends
+GATE_LOCK_TRIES, GATE_LOCK_WAIT = 4, 10.0   # tries x seconds a gate write waits for the transition lock
 
 
 def gate_transition(root, action, what: str):
     """Run `action()` (a WRITE or REMOVAL of CONVERT_HOLD / CONVERT_DRAIN, or the PAUSE put back after a supervisor restart) under the
-    paid-gate transition mutex of `root` (tools/paid_gate.py transition_lock; last-check review row 6): a paid click's final gate check and
-    its dispatch hold the same mutex, so a hold is never written between the two: it lands before the check (no click) or after the click
-    was dispatched. A busy mutex is retried (GATE_LOCK_TRIES); if it never frees (it is reclaimed as stale after 30 s, so only a broken
-    folder gets here) the action still runs: a hold that is not written at all is worse than one written without the mutex."""
+    paid-gate transition lock of `root` (tools/paid_gate.py transition_lock; last-check review row 6): a paid click's final gate check and
+    its dispatch hold the same lock, so a hold is never written between the two: it lands before the check (no click) or after the click
+    was dispatched. The lock is an OS byte lock: it never expires while its owner lives and the kernel releases it when the owner exits
+    (post-cut-over review, blocker 2). A busy lock is retried (GATE_LOCK_TRIES x GATE_LOCK_WAIT); when it still is busy NOTHING is written
+    and ServiceError is raised: a transition that is not serialized with a click in flight is never passed off as made (the caller's
+    operation stops there and is tried again on a later pass / by the user)."""
     for _ in range(GATE_LOCK_TRIES):
         try:
-            lock = paid_gate.transition_lock(root, what=what)
+            lock = paid_gate.transition_lock(root, wait=GATE_LOCK_WAIT, what=what)
             lock.__enter__()
         except paid_gate.GateBusy:
             continue
-        except OSError:
-            break
         try:
             return action()
         finally:
             lock.__exit__(None, None, None)
-    return action()
+    owner = paid_gate.lock_owner(root) or {}
+    raise ServiceError(f'{what}: not done, the paid-gate transition lock stayed busy (held by pid {owner.get("pid", "?")}: '
+                       f'{owner.get("what") or "?"}); a paid click may be in flight')
 
 
 def hold_path(root) -> Path:

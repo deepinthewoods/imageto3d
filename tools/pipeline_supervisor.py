@@ -12,8 +12,8 @@ User gate (every 30 s): the user is AWAY when the screen is locked/blanked (GNOM
 no keyboard/mouse input for AWAY_AFTER (5 min, Mutter IdleMonitor GetIdletime; a playing video, which keeps the screen
 from locking, does not count as input). Away = run, at the computer = pause (user, 2026-10-27: the screen never
 locked overnight, so the old screen-only rule paused all night). Pausing
-writes .codex_jobs/_batch/PAUSE (json: since, reason, scope; every write / removal of PAUSE and of supervisor_mode.json happens
-under the paid-gate transition mutex, gate_transition): convert_queue.py then starts nothing new, view_batch.py
+writes .codex_jobs/_batch/PAUSE (json: since, reason, scope; every write / removal of PAUSE, supervisor_pause.json and
+supervisor_mode.json happens under the paid-gate transition lock, gate_transition): convert_queue.py then starts nothing new, view_batch.py
 only when the scope lists "views" (a manual `mode pause`, and a user-active pause since the 2026-10-29 user rule;
 `mode pause-conversions` keeps view generation running; `mode views-run` (user, 2026-11-14) follows the user for
 conversions only, so views generate at any time and conversions run while the user is away), and
@@ -22,7 +22,16 @@ convert_job.py starts no paid step. "Finish, then freeze": every descendant of a
 blender, or a python running a script under tools/tripo_pipeline/ (other than convert_job.py), is SIGSTOPped (re-checked each
 tick); network steps (codex image jobs, Hyper3D/rodin_backend, firefox, geckodriver, node studio.mjs, Xvfb) are never frozen.
 Frozen pids (with start times) are in paused_pids.json. Resuming (or exiting, or SIGTERM) removes PAUSE and SIGCONTs exactly
-the processes recorded there whose pid AND start time still match (nothing else, review_v2_phase4 finding 7).
+the processes recorded there whose pid AND start time still match (nothing else, review_v2_phase4 finding 7). A process whose
+resume FAILED stays on record and is resumed again every tick until it runs or is confirmed gone; a failed resume is reported as
+`RESUME FAILED`, never as continued (post-cut-over review, blocker 6).
+
+Whose PAUSE (post-cut-over review, blocker 1; DESIGN_PHASE4.md I.11): the supervisor's OWN pause is supervisor_pause.json (since,
+reason, scope, pid, mirror), written whenever it pauses and removed when it resumes or exits. PAUSE is only its MIRROR for the
+readers of that file, and the supervisor writes, rewrites or removes PAUSE only while PAUSE is its own: the bytes it last wrote
+(`mirror` = their sha256), or, when there is no supervisor_pause.json at all (an older supervisor, or the PAUSE the app put back
+after a restart), a file of exactly the supervisor's shape (only since / reason / scope, with one of its own reasons). Any other
+PAUSE (a manual / maintenance pause) is left exactly as it is, also on resume and on exit: `PAUSE FOREIGN` is logged once.
 
 Every completed screen tick writes .codex_jobs/_batch/supervisor_tick.json {pid, create_time, time (epoch s), at (ISO), mode,
 paused}: the preview app removes its CONVERT_HOLD only after a tick of the current supervisor that is newer than the hold
@@ -112,35 +121,68 @@ IDLE_GDBUS = ['gdbus', 'call', '--session', '--dest', 'org.gnome.Mutter.IdleMoni
 BODY_RED_NOTE = 'POSE: body_red shifted'   # allowed on right_gauntlet_boot (the one-sided module shifts the red centroid)
 
 
+def json_bytes(data):
+    return (json.dumps(data, indent=2) + '\n').encode('utf-8')
+
+
 def atomic_write(path, data):
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + '.tmp')
-    tmp.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8', newline='\n')
+    tmp.write_bytes(json_bytes(data))
     tmp.replace(path)
 
 
-GATE_LOCK_TRIES = 4   # x paid_gate.transition_lock's 10 s wait; the mutex is reclaimed as stale after 30 s, so this always ends
+OWN_PAUSE_NAME = paid_gate.SUPERVISOR_PAUSE   # supervisor_pause.json: the supervisor's own pause (PAUSE is only its mirror)
+OWN_PAUSE_REASONS = ('user active', VIEWS_RUN_ACTIVE, 'manual pause', 'manual pause-conversions')   # what desired_pause() says
+PAUSE_SHAPE = {'since', 'reason', 'scope'}    # the fields of a PAUSE the supervisor writes
+
+
+def read_bytes(path):
+    """The bytes of `path`, None when it does not exist (or cannot be read: then it is not ours to touch)."""
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def pause_is_own(own, pause_bytes):
+    """Whether the PAUSE file with these bytes is the supervisor's (see the module docstring, "Whose PAUSE"). `own` = the content
+    of supervisor_pause.json, None when that file does not exist."""
+    if pause_bytes is None:
+        return False
+    if isinstance(own, dict):                     # we have a record: ours only when it is exactly what we wrote
+        return own.get('mirror') == hashlib.sha256(pause_bytes).hexdigest()
+    if own is not None:                           # an unreadable record: nothing is known to be ours
+        return False
+    try:                                          # no record at all: an older supervisor's file, by its shape
+        data = json.loads(pause_bytes.decode('utf-8-sig'))
+    except ValueError:
+        return False
+    return (isinstance(data, dict) and set(data) <= PAUSE_SHAPE and data.get('reason') in OWN_PAUSE_REASONS
+            and isinstance(data.get('scope'), list))
+
+
+GATE_LOCK_TRIES, GATE_LOCK_WAIT = 4, 10.0   # tries x seconds a gate write waits for the transition lock
 
 
 def gate_transition(root, action, what):
-    """Run `action()` (a WRITE or REMOVAL of PAUSE / supervisor_mode.json) under the paid-gate transition mutex of `root`
-    (tools/paid_gate.py transition_lock; last-check review row 6): a paid click's final gate check and its dispatch hold the same
-    mutex, so the gate file never changes between the two. A busy mutex is retried (GATE_LOCK_TRIES); if it never frees (it is
-    reclaimed as stale after 30 s, so only a broken folder gets here) the action still runs: a pause that is not written at all
-    is worse than one written without the mutex."""
+    """Run `action()` (a WRITE or REMOVAL of PAUSE / supervisor_pause.json / supervisor_mode.json) under the paid-gate transition
+    lock of `root` (tools/paid_gate.py transition_lock; last-check review row 6): a paid click's final gate check and its
+    dispatch hold the same lock, so the gate file never changes between the two. The lock is an OS byte lock that never expires
+    (post-cut-over review, blocker 2): a busy one is retried (GATE_LOCK_TRIES), and when it still is busy paid_gate.GateBusy is
+    raised and NOTHING is written (the callers report it and try again; a transition that is not serialized with a click in
+    flight is never passed off as made)."""
     for _ in range(GATE_LOCK_TRIES):
         try:
-            lock = paid_gate.transition_lock(root, what=what)
+            lock = paid_gate.transition_lock(root, wait=GATE_LOCK_WAIT, what=what)
             lock.__enter__()
         except paid_gate.GateBusy:
             continue
-        except OSError:
-            break
         try:
             return action()
         finally:
             lock.__exit__(None, None, None)
-    return action()
+    raise paid_gate.GateBusy(f'the paid-gate transition lock stayed busy; not done: {what}')
 
 
 class advance_lock:
@@ -404,8 +446,11 @@ class Supervisor:
         self.state_file, self.advance_file = self.batch / 'supervisor_state.json', self.batch / 'advance.json'
         self.lock_file, self.stop_file = self.batch / 'supervisor.lock', self.batch / STOP_FILE_NAME
         self.tick_file = self.batch / TICK_FILE_NAME
+        self.own_pause_file = self.batch / OWN_PAUSE_NAME   # this supervisor's own pause; PAUSE is its mirror only while it is ours
         self.claim_active = None   # set whose claim lock this process holds (whole claim: moves, claim child, add-views)
-        self.paused, self.stop, self.last_error, self.screen_failed = self.pause_file.exists(), False, {}, False
+        self.paused = self.own_pause_file.exists() or self.pause_owned()
+        self.stop, self.last_error, self.screen_failed = False, {}, False
+        self.foreign_pause, self.resume_failures, self.reported_failures = None, [], None
         self.claim_held = None   # set whose claim lock this process holds while its claim child runs
         self.write_lock, self.sizes, self.cache = threading.Lock(), {}, {}
         self.state = read_json(self.state_file, {}) or {}
@@ -527,17 +572,59 @@ class Supervisor:
 
     def resume(self, rows=None):
         """SIGCONT exactly the processes recorded in paused_pids.json whose pid and start time still match (identities this
-        supervisor suspended); a stopped process it did not record is never touched. Returns the pids resumed."""
+        supervisor suspended); a stopped process it did not record is never touched. Returns the pids resumed.
+        Post-cut-over review, blocker 6: a record leaves paused_pids.json only when its process was resumed or is CONFIRMED GONE
+        (no process with that pid, or the pid belongs to a process with another start time). A resume that failed keeps its
+        record, so every later tick (and the next start) tries again; `self.resume_failures` = [(record, error text)] of this
+        call, and the failed pids are never part of the returned list."""
         rows = process_table() if rows is None else rows
-        records = self.recorded()
-        targets = {row['pid']: row['start'] for row in rows if any(same_process(row, r) for r in records)}
-        for pid in sorted(targets):
+        resumed, kept, failures = [], [], []
+        for record in self.recorded():
+            if not isinstance(record, dict) or 'pid' not in record or 'start' not in record:
+                continue
+            row = next((row for row in rows if same_process(row, record)), None)
+            if row is None:
+                if not self.confirmed_gone(record, rows):   # there, but its identity could not be read: not ours to drop
+                    kept.append(record)
+                    failures.append((record, 'its identity could not be read'))
+                continue
             try:
-                self.send(pid, SIGCONT, start=targets[pid])
-            except OSError:
-                pass
-        self.pids_file.unlink(missing_ok=True)
-        return sorted(targets)
+                self.send(row['pid'], SIGCONT, start=row['start'])
+            except OSError as error:
+                try:
+                    gone = self.confirmed_gone(record, process_table())   # it may have ended just now
+                except Exception:   # noqa: BLE001  (no process table: not confirmed)
+                    gone = False
+                if not gone:
+                    kept.append(record)
+                    failures.append((record, str(error)[:200]))
+                continue
+            resumed.append(row['pid'])
+        self.resume_failures = failures
+        if not self.dry_run:
+            if kept:
+                atomic_write(self.pids_file, kept)
+            else:
+                self.pids_file.unlink(missing_ok=True)
+        return sorted(resumed)
+
+    @staticmethod
+    def confirmed_gone(record, rows):
+        """The recorded process no longer exists: no row has its pid, or the pid now belongs to a process with a KNOWN other start
+        time. A row with that pid whose start time is unknown (0: the process could not be inspected) does not confirm it."""
+        same_pid = [row for row in rows if row['pid'] == record['pid']]
+        return not any(same_process(row, record) or not row['start'] for row in same_pid)
+
+    def resume_report(self):
+        """' ; N could not be resumed ...' for the RESUME line, and one RESUME FAILED event per change of the failing set."""
+        failed = sorted(record['pid'] for record, _ in self.resume_failures)
+        if failed != self.reported_failures:
+            self.reported_failures = failed
+            if failed:
+                self.emit('RESUME FAILED ' + ', '.join(f"{record['pid']}:{record.get('comm', '?')} ({error})"
+                                                       for record, error in self.resume_failures)
+                          + '; kept in paused_pids.json and tried again every tick until resumed or gone')
+        return f'; {len(failed)} process(es) could NOT be resumed and stay on record' if failed else ''
 
     def send(self, pid, sig, start=None):
         """Deliver SIGSTOP / SIGCONT to `pid`. With `start` (the process table's create time of the process meant) the identity is
@@ -575,23 +662,101 @@ class Supervisor:
         if paused:
             scope = (list(SCREEN_ON_SCOPE) if reason == 'user active'
                      else ['conversions'] if reason in ('manual pause-conversions', VIEWS_RUN_ACTIVE) else ['conversions', 'views'])
-            current = read_json(self.pause_file, {}) or {}
-            if not self.pause_file.exists() or current.get('reason') != reason or current.get('scope') != scope:
-                since = current.get('since') or datetime.now().isoformat(timespec='seconds')
-                gate_transition(self.root, lambda: atomic_write(self.pause_file, {'since': since, 'reason': reason, 'scope': scope}),
-                                f'supervisor PAUSE ({reason})')
-            if not self.paused:
+            written = True
+            try:
+                self.write_pause(reason, scope)
+            except paid_gate.GateBusy as error:   # a paid click is being dispatched: not written, tried again next tick
+                written = False
+                self.guard_note('pause-write', f'PAUSE ({reason}) not written yet: {error}')
+            if written and not self.paused:
                 self.emit(f'PAUSE ({reason}): {" and ".join(scope)} start nothing new; heavy local steps freeze')
             frozen = self.freeze()
             if frozen:
                 self.emit('FREEZE ' + ', '.join(f"{r['pid']}:{r['comm']}" for r in frozen))
-        else:
-            if self.paused or self.pause_file.exists() or self.pids_file.exists():
-                gate_transition(self.root, lambda: self.pause_file.unlink(missing_ok=True), 'supervisor PAUSE removed')
-                resumed = self.resume()
-                self.emit(f'RESUME ({reason}): PAUSE removed' + (f', continued {len(resumed)} process(es)' if resumed else ''))
-        self.paused = paused
+            self.paused = written or self.paused
+            return True
+        if self.paused or self.own_pause_file.exists() or self.pids_file.exists() or self.pause_owned():
+            was_paused = self.paused or self.own_pause_file.exists() or self.pause_owned()
+            try:
+                self.remove_pause('supervisor PAUSE removed')
+            except paid_gate.GateBusy as error:   # still paused: nothing is resumed before the pause is really gone
+                self.guard_note('pause-write', f'PAUSE not removed yet: {error}')
+                return True
+            resumed = self.resume()
+            note = self.resume_report()
+            if was_paused or resumed:
+                self.emit(f'RESUME ({reason}): PAUSE removed' + (f', continued {len(resumed)} process(es)' if resumed else '') + note)
+        self.paused = False
         return True
+
+    def guard_note(self, name, message):
+        """Log `message` as an ERROR once per change (like guard, for a failure that is handled)."""
+        if self.last_error.get(name) != message:
+            self.last_error[name] = message
+            self.emit(f'ERROR {name}: {message}')
+
+    def pause_owned(self):
+        """PAUSE exists and is this supervisor's own mirror (pause_is_own)."""
+        own = read_json(self.own_pause_file, {}) if self.own_pause_file.exists() else None
+        return pause_is_own(own, read_bytes(self.pause_file))
+
+    def write_pause(self, reason, scope):
+        """Make the supervisor's own pause {reason, scope} current: supervisor_pause.json always, and PAUSE as its mirror unless
+        a PAUSE somebody else wrote is there (left untouched; blocker 1). One read-decide-write under the gate transition lock;
+        nothing is written when everything already is as wanted. Raises paid_gate.GateBusy when the lock stays busy."""
+        def current():
+            own = read_json(self.own_pause_file, {}) if self.own_pause_file.exists() else None
+            pause = read_bytes(self.pause_file)
+            if pause is None and self.pause_file.exists():
+                pause = b''                               # unreadable: foreign
+            mine = pause is None or pause_is_own(own, pause)
+            since = own.get('since') if isinstance(own, dict) else None
+            if since is None and mine and pause:
+                try:
+                    since = (json.loads(pause.decode('utf-8-sig')) or {}).get('since')
+                except (ValueError, AttributeError):
+                    since = None
+            want = {'since': since or datetime.now().isoformat(timespec='seconds'), 'reason': reason, 'scope': scope}
+            mirror = hashlib.sha256(json_bytes(want)).hexdigest() if mine else None
+            record = dict(want, pid=os.getpid(), mirror=mirror)
+            return own, pause, mine, want, record
+
+        own, pause, mine, want, record = current()
+        if own == record and (not mine or pause == json_bytes(want)):
+            self.note_foreign(None if mine else pause)
+            return
+
+        def action():
+            own, pause, mine, want, record = current()    # decided again under the lock
+            if own != record:
+                atomic_write(self.own_pause_file, record)
+            if mine and pause != json_bytes(want):
+                atomic_write(self.pause_file, want)
+            return None if mine else pause
+        self.note_foreign(gate_transition(self.root, action, f'supervisor PAUSE ({reason})'))
+
+    def note_foreign(self, pause):
+        """Log once that a PAUSE of somebody else is in force and left alone (`pause` = its bytes, None when PAUSE is ours)."""
+        digest = hashlib.sha256(pause).hexdigest() if pause is not None else None
+        if digest != self.foreign_pause:
+            self.foreign_pause = digest
+            if digest:
+                reason = (read_json(self.pause_file, {}) or {}).get('reason') if self.pause_file.exists() else None
+                self.emit(f'PAUSE FOREIGN ({reason or "no reason"}): a PAUSE this supervisor did not write is in force; it is left '
+                          'untouched (the supervisor\'s own pause is in supervisor_pause.json)')
+
+    def remove_pause(self, what):
+        """End the supervisor's own pause: remove supervisor_pause.json, and PAUSE only when it is our own mirror (a PAUSE of
+        somebody else stays; blocker 1). Under the gate transition lock; raises paid_gate.GateBusy when it stays busy."""
+        def action():
+            own = read_json(self.own_pause_file, {}) if self.own_pause_file.exists() else None
+            if pause_is_own(own, read_bytes(self.pause_file)):
+                self.pause_file.unlink(missing_ok=True)
+            self.own_pause_file.unlink(missing_ok=True)
+        if self.own_pause_file.exists() or self.pause_file.exists():
+            gate_transition(self.root, action, what)
+        if self.pause_file.exists():
+            self.note_foreign(read_bytes(self.pause_file) or b'')
 
     def write_tick(self):
         """supervisor_tick.json after a completed screen tick (the preview app's CONVERT_HOLD release waits for one)."""
@@ -603,13 +768,17 @@ class Supervisor:
 
     def resume_stale(self):
         resumed = self.resume()
-        self.emit(f'RESUME at start: continued {len(resumed)} process(es) left suspended by an earlier instance')
+        self.emit(f'RESUME at start: continued {len(resumed)} process(es) left suspended by an earlier instance' + self.resume_report())
 
     def release_all(self):
-        gate_transition(self.root, lambda: self.pause_file.unlink(missing_ok=True), 'supervisor exit: PAUSE removed')
+        try:
+            self.remove_pause('supervisor exit: PAUSE removed')
+        except paid_gate.GateBusy as error:   # left in place (a pause too many is safe); the next instance takes it over
+            self.guard_note('pause-write', f'PAUSE not removed on exit: {error}')
         resumed = self.resume()
-        if resumed:
-            self.emit(f'RESUME on exit: continued {len(resumed)} process(es)')
+        note = self.resume_report()           # what could not be resumed stays in paused_pids.json for the next start
+        if resumed or note:
+            self.emit(f'RESUME on exit: continued {len(resumed)} process(es)' + note)
 
     def gate_promoted(self):
         """User-promoted sets (two-stage approval, 2026-10-28): a set the user moved into approved/ without a
@@ -1113,7 +1282,7 @@ class Supervisor:
             signal.signal(sig, lambda *_: setattr(self, 'stop', True))
         self.stop_file.unlink(missing_ok=True)   # a stop requested before this start is stale
         self.emit(f'START pid {os.getpid()}, mode {self.mode()}')
-        if IS_WIN and self.recorded():   # a killed predecessor cannot have resumed what it froze
+        if IS_WIN and self.recorded():   # a killed predecessor cannot have resumed what it froze (or its resume failed)
             self.guard('startup-resume', self.resume_stale)
         last_advance = 0
         try:
@@ -1161,7 +1330,10 @@ class Supervisor:
         print(f'supervisor: {"running (pid " + pid + ")" if running else "not running"}')
         away = self.user_away()
         print(f'mode: {self.mode()}; user: ' + {True: 'away (run)', False: 'active (pause)', None: 'unknown'}[away])
-        print(f'PAUSE: {json.dumps(read_json(self.pause_file)) if self.pause_file.exists() else "absent"}')
+        print(f'PAUSE: {json.dumps(read_json(self.pause_file)) if self.pause_file.exists() else "absent"}'
+              + (' (not the supervisor\'s: left untouched)' if self.pause_file.exists() and not self.pause_owned() else ''))
+        print('supervisor pause: '
+              + (json.dumps(read_json(self.own_pause_file)) if self.own_pause_file.exists() else 'absent'))
         rows = process_table()
         records = self.recorded()
         alive = [r for r in records if any(same_process(row, r) for row in rows)]
@@ -1225,9 +1397,14 @@ def main(argv=None):
         print(f'stop requested (pid {pid}); it exits within a second')
     elif args.command == 'mode':
         if args.value:
-            gate_transition(sup.root, lambda: atomic_write(sup.mode_file, {'mode': args.value,
-                                                                           'since': datetime.now().isoformat(timespec='seconds')}),
-                            f'supervisor mode {args.value}')
+            try:
+                gate_transition(sup.root, lambda: atomic_write(sup.mode_file, {'mode': args.value,
+                                                                               'since': datetime.now().isoformat(timespec='seconds')}),
+                                f'supervisor mode {args.value}')
+            except paid_gate.GateBusy as error:
+                print(f'mode NOT changed: {error}', file=sys.stderr)
+                print(f'mode: {sup.mode()}')
+                return 1
         print(f'mode: {sup.mode()}')
     elif args.dry_run:
         sup.dry_run_report()

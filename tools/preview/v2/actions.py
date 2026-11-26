@@ -1468,7 +1468,7 @@ def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
         # a monster conversion (recheck findings 4, 5): the task is the one the client displayed (`key` + `generation`, `id` a hint);
         # overrides the idle gate; while paused by hand 409 `confirm` (with `pause_id`) until the client sends confirm: true + that pause_id
         result = monster_lane.run_now(root, data.get('id'), data.get('confirm') is True, data.get('key'), data.get('generation'),
-                                      data.get('pause_id'))
+                                      data.get('pause_id'), data.get('conversion_seq'))
         _log_op(root, 'run_now', f'task {result.get("id")} {result.get("key")}' + (' (override pause)' if result.get('override_pause') else ''))
         catalog.invalidate()
         return result
@@ -1498,7 +1498,9 @@ def queue_op(root: Path, data: object, ctx: dict | None = None) -> dict:
             raise ValueError(f'task {task_id} belongs to an approval that was withdrawn or changed; approve the set again instead')
         if task['lane'] == monster_lane.LANE:
             # monster (phase 5 review F4): the generation's persisted disposition is cleared first, Run now and its override are dropped
-            done = monster_lane.retry_task(root, task)
+            # post-cut-over blocker 4: bound to the disposition revision the client displayed (`conversion_seq`; 409 `changed` when a
+            # newer outcome was recorded since); a Retry that loses the queue transition puts the disposition back
+            done = monster_lane.retry_task(root, task, data.get('conversion_seq'))
         else:
             done = queue.retry(task_id, approval_gen=gen if task['lane'] == 'layers' else None)
     elif op == 'cancel':

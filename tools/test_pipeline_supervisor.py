@@ -300,22 +300,29 @@ def test_release_all_on_exit(root, monkeypatch):
 
 
 def test_pause_and_mode_writes_take_the_gate_transition_mutex(root, monkeypatch):
-    """Last-check row 6: PAUSE and supervisor_mode.json change only under the paid-gate transition mutex, so a paid click's
-    final gate check and its dispatch (which hold it) never straddle a pause."""
+    """Last-check row 6: PAUSE, supervisor_pause.json and supervisor_mode.json change only under the paid-gate transition lock,
+    so a paid click's final gate check and its dispatch (which hold it) never straddle a pause."""
     import threading
     monkeypatch.setattr(ps, 'process_table', lambda: [])
     sup = make_sup(root)
-    mutex = root / '.codex_jobs' / '_batch' / ps.paid_gate.MUTEX_DIR
     seen, real_write, real_unlink = [], ps.atomic_write, Path.unlink
+
+    def holder():
+        owner = ps.paid_gate.lock_owner(root)       # None when nobody holds the lock: the write would be unserialized
+        return owner['what'] if owner else None
 
     def write(path, data):
         if path in (sup.pause_file, sup.mode_file):
-            seen.append(('write', path.name, json.loads((mutex / 'owner.json').read_text())['what']))
+            seen.append(('write', path.name, holder()))
+        elif path == sup.own_pause_file:
+            assert holder() is not None
         real_write(path, data)
 
     def unlink(self, missing_ok=False):
         if self == sup.pause_file:
-            seen.append(('unlink', self.name, json.loads((mutex / 'owner.json').read_text())['what']))
+            seen.append(('unlink', self.name, holder()))
+        elif self == sup.own_pause_file:
+            assert holder() is not None
         real_unlink(self, missing_ok=missing_ok)
     monkeypatch.setattr(ps, 'atomic_write', write)
     monkeypatch.setattr(Path, 'unlink', unlink)
@@ -329,8 +336,9 @@ def test_pause_and_mode_writes_take_the_gate_transition_mutex(root, monkeypatch)
     assert seen == [('write', 'PAUSE', 'supervisor PAUSE (user active)'), ('unlink', 'PAUSE', 'supervisor PAUSE removed'),
                     ('write', 'supervisor_mode.json', 'supervisor mode pause'), ('write', 'PAUSE', 'supervisor PAUSE (manual pause)'),
                     ('unlink', 'PAUSE', 'supervisor exit: PAUSE removed')]
-    assert not mutex.exists()                               # released every time
-    # a click in progress (its check + dispatch hold the mutex): the pause is written only after it
+    assert not ps.paid_gate.lock_busy(root)                 # released every time
+    assert not sup.own_pause_file.exists()
+    # a click in progress (its check + dispatch hold the lock): the pause is written only after it
     ps.main(['--root', str(root), 'mode', 'auto'])
     sup.run_cmd.screen = '(false,)\n'
     with ps.paid_gate.transition_lock(root, what='paid click'):
@@ -341,6 +349,168 @@ def test_pause_and_mode_writes_take_the_gate_transition_mutex(root, monkeypatch)
     ticker.join(20)
     assert not ticker.is_alive() and sup.pause_file.exists()
     assert seen[-1] == ('write', 'PAUSE', 'supervisor PAUSE (user active)')
+
+
+# ---------------------------------------------------------------- post-cut-over review (review_v2_post_cutover_20261126)
+def pause_bytes(sup):
+    return sup.pause_file.read_bytes() if sup.pause_file.exists() else None
+
+
+def test_blocker1_the_supervisor_never_overwrites_or_removes_a_pause_it_did_not_write(root, monkeypatch):
+    """The reviewer's case: the mode pauses conversions (the supervisor mirrors that into PAUSE), then a separate maintenance PAUSE
+    is written. No tick, no mode change and no exit of the supervisor may overwrite or remove it."""
+    monkeypatch.setattr(ps, 'process_table', lambda: [])
+    sup = make_sup(root)
+    gate = ps.paid_gate
+    ps.main(['--root', str(root), 'mode', 'pause-conversions'])
+    sup.tick_screen()
+    mirror = pause_bytes(sup)
+    own = json.loads(sup.own_pause_file.read_text())
+    assert json.loads(mirror) == {'since': own['since'], 'reason': 'manual pause-conversions', 'scope': ['conversions']}
+    assert own['mirror'] == hashlib.sha256(mirror).hexdigest() and own['pid'] == ps.os.getpid()
+    assert set(json.loads(mirror)) == {'since', 'reason', 'scope'}          # the mirror keeps the old shape for its readers
+    maintenance = json.dumps({'reason': 'maintenance: disk swap', 'scope': ['conversions']}).encode()
+    sup.pause_file.write_bytes(maintenance)                                  # a second, independent pause replaces the mirror
+    for _ in range(3):
+        sup.tick_screen()
+        assert pause_bytes(sup) == maintenance                               # (the reviewer saw it overwritten by one tick)
+    own = json.loads(sup.own_pause_file.read_text())
+    assert (own['reason'], own['mirror']) == ('manual pause-conversions', None)   # our own pause is still on record, separately
+    assert sum('PAUSE FOREIGN (maintenance: disk swap)' in line for line in events(root)) == 1
+    ps.main(['--root', str(root), 'mode', 'run'])                            # Run: the supervisor's own pause ends ...
+    sup.tick_screen()
+    assert pause_bytes(sup) == maintenance and not sup.own_pause_file.exists()   # ... the maintenance pause does not
+    assert 'maintenance: disk swap' in gate.file_reason(root)
+    ps.main(['--root', str(root), 'mode', 'pause'])                          # and a new mode pause does not replace it either
+    sup.tick_screen()
+    assert pause_bytes(sup) == maintenance and json.loads(sup.own_pause_file.read_text())['reason'] == 'manual pause'
+    sup.release_all()                                                        # nor does the supervisor's exit
+    assert pause_bytes(sup) == maintenance and not sup.own_pause_file.exists()
+    sup.pause_file.unlink()                                                  # maintenance over: the supervisor mirrors again
+    sup.tick_screen()
+    assert json.loads(pause_bytes(sup))['reason'] == 'manual pause'
+    ps.main(['--root', str(root), 'mode', 'run'])
+    sup.tick_screen()
+    assert pause_bytes(sup) is None and not sup.own_pause_file.exists()
+
+
+def test_blocker1_a_supervisor_shaped_pause_without_a_record_is_taken_over_any_other_is_not(root, monkeypatch):
+    """Start-up: an older supervisor's PAUSE (or the one the app put back after a restart) has no supervisor_pause.json beside
+    it. One of exactly the supervisor's shape is its own and follows the user gate; anything else is somebody else's."""
+    monkeypatch.setattr(ps, 'process_table', lambda: [])
+    batch = root / '.codex_jobs' / '_batch'
+    write(batch / 'PAUSE', {'since': '2026-11-26T08:00:00', 'reason': 'user active', 'scope': ['conversions', 'views']})
+    sup = make_sup(root)
+    assert sup.paused
+    sup.run_cmd.screen = '(false,)\n'                       # still active: adopted (since kept), recorded as ours
+    sup.tick_screen()
+    assert json.loads(pause_bytes(sup))['since'] == '2026-11-26T08:00:00'
+    assert json.loads(sup.own_pause_file.read_text())['mirror'] == hashlib.sha256(pause_bytes(sup)).hexdigest()
+    sup.run_cmd.screen = '(true,)\n'                        # away: removed
+    sup.tick_screen()
+    assert pause_bytes(sup) is None
+    for foreign in ({'since': 'x', 'reason': 'user active', 'scope': ['conversions'], 'by': 'niall'},     # an extra field
+                    {'since': 'x', 'reason': 'maintenance', 'scope': ['conversions']},                    # not our reason
+                    {'reason': 'manual pause'}):                                                          # no scope
+        write(batch / 'PAUSE', foreign)
+        before = pause_bytes(sup)
+        fresh = make_sup(root)
+        assert not fresh.paused
+        fresh.tick_screen()                                 # away: nothing of ours to remove
+        fresh.run_cmd.screen = '(false,)\n'
+        fresh.tick_screen()                                 # active: our own pause is recorded beside it
+        fresh.release_all()
+        assert pause_bytes(sup) == before and not fresh.own_pause_file.exists()
+
+
+def test_blocker2_a_stalled_lock_holder_keeps_the_pause_unwritten_and_the_tick_alive(root, monkeypatch):
+    """The transition lock never expires. While a (stalled) click holds it the supervisor writes no PAUSE, says so once, still
+    freezes the heavy steps and writes it on the first tick after the holder left."""
+    rows, sent = table(root), []
+    monkeypatch.setattr(ps, 'process_table', lambda: rows)
+    monkeypatch.setattr(ps, 'GATE_LOCK_TRIES', 2)
+    monkeypatch.setattr(ps, 'GATE_LOCK_WAIT', 0.05)
+    sup = make_sup(root)
+    monkeypatch.setattr(sup, 'send', lambda pid, sig, start=None: sent.append((pid, sig)))
+    sup.run_cmd.screen = '(false,)\n'
+    with ps.paid_gate.transition_lock(root, what='a stalled paid click'):
+        assert sup.tick_screen() is True
+        sup.tick_screen()
+        assert not sup.pause_file.exists() and not sup.own_pause_file.exists() and not sup.paused
+        assert sorted(p for p, s in sent if s == ps.SIGSTOP) == [111, 112, 118, 120]
+    assert sum('ERROR pause-write' in line and 'not written yet' in line for line in events(root)) == 1
+    sup.tick_screen()
+    assert sup.pause_file.exists() and sup.paused
+    sup.run_cmd.screen = '(true,)\n'
+    with ps.paid_gate.transition_lock(root, what='a stalled paid click'):
+        sup.tick_screen()                                   # the pause cannot be removed: nothing is resumed either
+        assert sup.pause_file.exists() and sup.paused and not [s for s in sent if s[1] == ps.SIGCONT]
+        assert ps.main(['--root', str(root), 'mode', 'pause']) == 1     # a mode write is not passed off as made
+        assert not sup.mode_file.exists()
+    sup.tick_screen()
+    assert not sup.pause_file.exists() and not sup.paused
+
+
+def test_blocker6_a_failed_resume_keeps_the_identity_and_is_retried_until_it_works(root, monkeypatch):
+    """The reviewer's case: resume raises (a Windows error). The supervisor must not report the process as continued and must
+    not delete its only record of the suspension; it tries again every tick."""
+    rows, sent, broken = table(root), [], {111}
+    monkeypatch.setattr(ps, 'process_table', lambda: rows)
+    sup = make_sup(root)
+
+    def send(pid, sig, start=None):
+        if sig == ps.SIGCONT and pid in broken:
+            raise OSError('[WinError 5] Access is denied')
+        sent.append((pid, sig))
+    monkeypatch.setattr(sup, 'send', send)
+    sup.run_cmd.screen = '(false,)\n'
+    sup.tick_screen()
+    record = {r['pid']: r for r in json.loads(sup.pids_file.read_text())}[111]
+    sup.run_cmd.screen = '(true,)\n'
+    sup.tick_screen()
+    assert json.loads(sup.pids_file.read_text()) == [record]                 # the failed identity is kept, the others are done
+    assert sorted(p for p, s in sent if s == ps.SIGCONT) == [112, 118, 120]
+    log = events(root)
+    assert any('RESUME (user away)' in line and 'continued 3 process(es)' in line and '1 process(es) could NOT be resumed' in line
+               for line in log)
+    assert sum('RESUME FAILED 111:blender ([WinError 5] Access is denied)' in line for line in log) == 1
+    assert not sup.pause_file.exists() and not sup.paused
+    sup.tick_screen()                                                        # tried again on every tick, reported once
+    sup.tick_screen()
+    assert json.loads(sup.pids_file.read_text()) == [record]
+    assert sum('RESUME FAILED' in line for line in events(root)) == 1
+    assert not any('continued 4' in line for line in events(root))
+    sup.release_all()                                                        # an exit keeps it for the next start as well
+    assert json.loads(sup.pids_file.read_text()) == [record]
+    assert any('RESUME on exit: continued 0 process(es); 1 process(es) could NOT be resumed' in line for line in events(root))
+    later = make_sup(root)                                                   # the next instance resumes it at start
+    monkeypatch.setattr(later, 'send', send)
+    broken.clear()
+    later.resume_stale()
+    assert (111, ps.SIGCONT) in sent and not later.pids_file.exists()
+    assert any('RESUME at start: continued 1 process(es)' in line for line in events(root))
+
+
+def test_blocker6_a_record_is_dropped_only_when_the_process_is_confirmed_gone(root, monkeypatch):
+    rows = table(root)
+    by_pid = {row['pid']: row for row in rows}
+    monkeypatch.setattr(ps, 'process_table', lambda: rows)
+    sup = make_sup(root)
+    records = [{'pid': pid, 'start': by_pid[pid]['start'], 'comm': 'blender'} for pid in (111, 112, 118, 120)]
+    ps.atomic_write(sup.pids_file, records)
+
+    def send(pid, sig, start=None):
+        if pid == 111:                                       # it ends while it is being resumed
+            rows.remove(by_pid[111])
+            raise OSError('process no longer exists')
+        if pid == 112:
+            raise OSError('resume failed')
+    monkeypatch.setattr(sup, 'send', send)
+    by_pid[118]['start'] = by_pid[118]['start'] + 500        # the pid belongs to a later process now: gone, never signalled
+    by_pid[120]['start'] = 0                                 # its identity cannot be read: not confirmed gone
+    assert sup.resume() == []
+    assert sorted(r['pid'] for r in json.loads(sup.pids_file.read_text())) == [112, 120]
+    assert sorted(r['pid'] for r, _ in sup.resume_failures) == [112, 120]
 
 
 # ---------------------------------------------------------------- gate 1

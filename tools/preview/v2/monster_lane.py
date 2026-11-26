@@ -430,22 +430,61 @@ def cancel_task(root: Path, task: dict, detail: str = 'manual') -> bool:
     raise changed('the conversion task keeps changing')
 
 
-def retry_task(root: Path, task: dict) -> bool:
-    """HOOK (Retry of a failed / cancelled monster row, also Run now of one; `task` = resolve_task's row): the generation's disposition
-    is cleared FIRST (the plan would cancel the queued row otherwise), then the row is queued again in a transaction that compares the
-    displayed identity; Retry also clears Run now and its pause override (taskqueue.retry). A Retry that finds the row in another state
-    changes nothing back: whoever moved the row owns the newer state (finding 3)."""
+def shown_seq(root: Path, task: dict) -> int | None:
+    """The disposition revision a lane row is DISPLAYED with (queue row / item.conversion `conversion_seq`): the variant's monotonic
+    counter (views.json `conversion_seq`, mv.disposition_seq) now. None when the variant cannot be read (display only: the server
+    refuses a Retry without it)."""
+    gen = _generation_of(task)
+    if not gen:
+        return None
+    try:
+        return mv.disposition_seq(mv.read_views_json(mv.views_dir(mv.mroot_of(root), gen[0], gen[1])))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def retry_task(root: Path, task: dict, seq: object = None) -> bool:
+    """HOOK (Retry of a failed / cancelled monster row, also Run now of one; `task` = resolve_task's row; `seq` = the disposition
+    revision the client DISPLAYED, `conversion_seq` of the queue row / item.conversion): the generation's disposition is cleared FIRST
+    (the plan would cancel the queued row otherwise), then the row is queued again in a transaction that compares the displayed
+    identity; Retry also clears Run now and its pause override (taskqueue.retry).
+
+    A stale Retry never erases a newer outcome (post-cut-over review, blocker 4):
+      - the disposition is cleared as a COMPARE-AND-SET on the variant's monotonic counter (`mv.set_disposition(..., expect_seq=seq)`,
+        under the monster lock): when anything was recorded since the client was shown the row (a newer failure, a Cancel, another
+        Retry), nothing is cleared and the answer is 409 `changed`; a Retry of a failed / cancelled row WITHOUT `seq` is refused (400);
+      - when the queue transition then loses (the row is not failed / cancelled any more: False; it is another task by now: 409
+        `changed`; the queue raised), the disposition this call cleared is PUT BACK (only while no newer one was written), so a
+        rebuilt queue restores the row as failed / cancelled and never makes that conversion runnable."""
     q = queue(root)
     if task['lane'] != LANE:
         raise mv.not_found(f'Unknown monster conversion task {task["id"]}')
     gen = _generation_of(task)
-    cleared = mv.set_disposition(root, gen[0], gen[1], gen[2], None) if gen and task['state'] in ('failed', 'cancelled') else None
-    try:
-        return q.retry(task['id'], expect=task_ident(task))
-    except taskqueue.Expired as exc:
+    cleared = None
+    if gen and task['state'] in ('failed', 'cancelled'):
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            raise ValueError('conversion_seq is required: the disposition revision of the conversion task the client displayed (queue '
+                             'row / item.conversion `conversion_seq`)')
+        cleared = mv.set_disposition(root, gen[0], gen[1], gen[2], None, expect_seq=seq)
+        if cleared.get('stale'):
+            raise guard.Changed('the outcome of this conversion changed since you were shown it (a newer failure, cancel or retry was '
+                                'recorded); reload and look again', changes=['task'])
+
+    def put_back() -> None:
         if cleared and cleared.get('written') and isinstance(cleared.get('previous'), dict):
             mv.set_disposition(root, gen[0], gen[1], gen[2], cleared['previous'], expect_seq=cleared['seq'])
+
+    try:
+        done = q.retry(task['id'], expect=task_ident(task))
+    except taskqueue.Expired as exc:
+        put_back()
         raise guard.Changed(f'{exc}; reload and look again', changes=['task']) from None
+    except BaseException:
+        put_back()
+        raise
+    if not done:
+        put_back()                                              # the row moved on: its recorded outcome stands, never erased
+    return done
 
 
 def active_reason(root: Path, monster: str, variant: str) -> str | None:
@@ -548,27 +587,35 @@ def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_k
     """Whether a monster conversion step may run now: {open, reason, code, mode, pause, pause_id, paused, pause_reason, hold, drain,
     idle, away, needs_confirm}. `idle` = the user's idle seconds (None + idle_known=False: read presence.json / GetLastInputInfo).
     `code`: held (CONVERT_HOLD, or CONVERT_DRAIN with `draining: true`; neither is ever overridden) | paused | user_present | None.
-    `paused` / `pause_id` / `pause_reason` describe ALL independent manual pauses in force (modes.manual_pause: the pause mode and a
-    separate manual PAUSE file; the supervisor's own reflection of the mode or of the user's activity is not one) whatever else closes
-    the gate; `args.override_pause` (the `pause_id` the user confirmed) overrides them only while EVERY pause in force is in it
-    (modes.consent_covers: finding 5, final-verify row 5). The mode file and the PAUSE file are each read ONCE; the reported reason
-    and the id the consent is compared with come from that one snapshot (last-check row 5). The `gate` sub-command (the paid child's
-    click-time check) evaluates this same function."""
+    `paused` / `pause_id` / `pause_reason` describe ALL independent manual pauses in force (modes.manual_pause: the pause mode, a
+    supervisor pause that is neither the idle rule nor its reflection of the current mode, and every PAUSE file that is not PROVABLY
+    the supervisor's mirror of its own pause) whatever else closes the gate; `args.override_pause` (the `pause_id` the user confirmed)
+    overrides them only while EVERY pause in force is in it (modes.consent_covers: finding 5, final-verify row 5).
+
+    Post-cut-over review, blocker 1: a PAUSE file is never taken for the supervisor's reflection of the confirmed mode by what it SAYS.
+    Only the supervisor's own record (supervisor_pause.json, DESIGN_PHASE4.md I.11) can be that reflection, and a PAUSE is its mirror
+    only when the record's `mirror` is the sha256 of the PAUSE bytes. A maintenance PAUSE that a supervisor tick rewrites as `manual
+    <mode>` (an older supervisor did) is a NEW unconfirmed pause: the consent given for the mode does not cover it and the gate stays
+    closed. The idle rule too is read from the supervisor's record: a PAUSE that only says `user active` is an independent pause.
+
+    The mode file, the PAUSE file and the supervisor's record are one modes.pause_state; the reported reason and the id the consent is
+    compared with come from that one set of snapshots (last-check row 5). The `gate` sub-command (the paid child's click-time check)
+    evaluates this same function; it takes no lock (it runs under the gate transition lock of its caller)."""
     args = args or {}
-    mode_rec = modes.read_mode(root)
+    mode_rec, snap, own = modes.pause_state(root)          # ONE set of snapshots: ids, reasons, scope and proof of the same bytes
     mode = mode_rec['mode']
-    snap = modes.pause_snapshot(root)                      # ONE read: id, reason, scope and extra of the same bytes (last-check row 5)
     pause = modes.public_pause(snap)
     hold = read_hold(root)
     drain = read_drain(root)
-    manual = modes.manual_pause(root, mode_rec, snap)       # ALL independent manual pauses in force, as one identity (row 5)
+    manual = modes.manual_pause(root, mode_rec, snap, own)  # ALL independent manual pauses in force, as one identity (row 5)
     key = manual['pause_id'] if manual else None
     if idle is None and not idle_known:
         idle, _source = modes.idle_seconds()
     away = idle is not None and idle >= modes.AWAY_AFTER
     run_now = bool(args.get('run_now'))
     override = modes.consent_covers(args.get('override_pause'), manual)   # every pause in force is one the user confirmed
-    out = {'open': True, 'reason': None, 'code': None, 'mode': mode, 'pause': pause, 'pause_id': key, 'paused': manual is not None,
+    out = {'open': True, 'reason': None, 'code': None, 'mode': mode, 'pause': pause, 'supervisor_pause': modes.public_pause(own),
+           'pause_id': key, 'paused': manual is not None,
            'pause_reason': manual['reason'] if manual else None, 'hold': hold, 'drain': drain, 'idle': idle, 'away': away,
            'needs_confirm': False}
     if hold is not None:                                   # never overridden: the supervisor is (re)starting or has not ticked yet
@@ -578,8 +625,7 @@ def gate(root: Path, args: dict | None = None, idle: float | None = None, idle_k
         return out | {'open': False, 'code': 'held', 'draining': True,
                       'reason': f'conversions are being drained (CONVERT_DRAIN: {drain.get("reason") or "no reason"}); they wait until '
                                 'the drain is over'}
-    paused_conv = pause is not None and 'conversions' in (pause.get('scope') or [])
-    idle_pause = paused_conv and pause.get('reason') in IDLE_REASONS
+    idle_pause = modes.idle_paused(mode_rec, own)          # the supervisor's own record says so (never a PAUSE file's wording)
     if manual is not None and not override:                # the consent must name exactly the set of manual pauses in force now
         return out | {'open': False, 'code': 'paused', 'reason': f'conversions are paused ({manual["reason"]})', 'needs_confirm': True}
     if mode in ('auto', 'views-run') and not run_now:
@@ -682,14 +728,15 @@ def finish_outcome(root: Path, task: dict, result: dict) -> dict:
 
 
 def run_now(root: Path, task_id: object, confirm: bool = False, key: object = None, generation: object = None,
-            pause_id: object = None) -> dict:
+            pause_id: object = None, conversion_seq: object = None) -> dict:
     """HOOK (POST /api/v2/queue {op: "run_now", id, key, generation, confirm?, pause_id?}): mark a queued (or failed / cancelled: queued
     again through retry_task) monster conversion to run now. The task is the one the client DISPLAYED (`key` + `generation`; `id` is a
     hint; 409 `changed` when it expired, finding 4) and every state change compares that identity in its own transaction. Run now
     overrides the idle gate. While conversions are paused by hand it needs `confirm: true` AND the `pause_id` the user was shown (409
     `confirm` with the current `pause_id` otherwise, also when the echoed id is not the pause in force any more); the override then holds
     for THAT pause only (finding 5). The conversion hold (CONVERT_HOLD) is never overridden: the task is marked and starts when the hold
-    lifts (the answer carries a `warning`)."""
+    lifts (the answer carries a `warning`). Run now of a FAILED / CANCELLED row is a Retry first: it needs the `conversion_seq` the
+    client displayed (retry_task: 409 `changed` when a newer outcome was recorded since; post-cut-over blocker 4)."""
     task = resolve_task(root, task_id, key, generation)
     ident, task_id = task_ident(task), task['id']
     q = queue(root)
@@ -708,7 +755,8 @@ def run_now(root: Path, task_id: object, confirm: bool = False, key: object = No
             check = task_check(root, task)
             if not check['wanted'] or check['damaged']:
                 raise ValueError(f'task {task_id} cannot run: {check["why"]}')
-            retry_task(root, task)
+            if not retry_task(root, task, conversion_seq):
+                raise ValueError(f'task {task_id} is no longer failed or cancelled; reload and look again')
         elif task['state'] != 'queued':
             raise ValueError(f'task {task_id} is {task["state"]}; Run now is for a queued task')
         if not q.mark_run_now(task_id, override, expect=ident):

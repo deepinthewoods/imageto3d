@@ -3,6 +3,7 @@
 // and (3D modal) monster3d.js. Loads monster.css itself so index.html and style.css stay untouched.
 import { showMonsterConcept, approveMonsterConcept } from './monster_concept.js';
 import { showMonsterViews } from './monster_views.js';
+import { runAction } from './actions.js';
 
 if (!document.querySelector('link[data-monster-css]')) {
   const link = document.createElement('link');
@@ -27,6 +28,8 @@ export function monsterView(tab, card) {
  *  - Approve on a monster concept asks (variant number, "unattended" tick) before it posts;
  *  - Approve on a 3D monster card only opens its modal (the confirmation lives there);
  *  - Import on a flat pick (Approved) only opens its modal (Import asks about "unattended" there).
+ *  - Unapprove on an approved monster variant names the approval the card shows (card.approval_rev: the server answers 409 `changed`
+ *    when the approval was changed since, and the newer approval stays).
  * Everything else returns false and runs as any other verb.
  */
 export function monsterAction(card, verb, tab, openCard) {
@@ -36,6 +39,10 @@ export function monsterAction(card, verb, tab, openCard) {
   }
   if (isMonsterVariant(card) && ((verb === 'approve' && tab === '3d') || verb === 'import')) {
     openCard(card);
+    return true;
+  }
+  if (isMonsterVariant(card) && verb === 'unapprove') {
+    runAction(card, verb, { tab, args: { approval_rev: card.approval_rev } });
     return true;
   }
   return false;

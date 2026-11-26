@@ -86,9 +86,10 @@ function unregisterBrowser(){
 // asked again after it: a hold that took effect meanwhile makes the outcome `uncertain` (needs review), never `clicked`.
 const GATE_TOOL = fileURLToPath(new URL('../paid_gate.py',import.meta.url));
 const EXIT_GATE_CLOSED = 4;
-// Last-check row 6: the final gate check, the intent and the Generate dispatch run under the paid-gate transition mutex of the
-// gate's root (paid_click.mjs takeGateMutex = tools/paid_gate.py transition_lock; `paid_gate.py check` itself does not take it).
-// The check is bounded well below the mutex's 30 s stale age; one that does not answer in time counts as closed.
+// Last-check row 6: the final gate check, the intent and the Generate dispatch run under the paid-gate transition lock of the
+// gate's root (paid_click.mjs takeGateMutex: a `paid_gate.py hold` helper process holds tools/paid_gate.py's OS byte lock for this
+// process until the dispatch has returned; it never expires, post-cut-over blocker 2; `paid_gate.py check` itself does not take
+// it). The check is bounded; one that does not answer in time counts as closed.
 const GATE_CHECK_TIMEOUT_MS = 20000;
 function paidGateRoot(){
  try{const spec=JSON.parse(process.env.IMAGETO3D_PAID_GATE??'');return typeof spec?.root==='string'&&spec.root?spec.root:null;}catch{return null;}
@@ -229,7 +230,7 @@ async function submit(){
    }
    const gateRoot=paidGateRoot();   // null: no gate (a manual run) or a malformed one (paidGateClosed then says closed)
    click=await gatedPaidClick({control:generate,gateClosed:paidGateClosed,
-    takeMutex:gateRoot?()=>takeGateMutex(gateRoot,{what:`tripo generate ${path.basename(output)}`}):null,
+    takeMutex:gateRoot?()=>takeGateMutex(gateRoot,{what:`tripo generate ${path.basename(output)}`,python:PY}):null,
     stillReady:async()=>{const empty=await pending();return empty.length?`Upload slot emptied before Generate: ${empty.join(', ')}`:null;},
     writeIntent:()=>{record.status='submission_attempted';record.submit_clicked_at=new Date().toISOString();write(record);}});
    if(click.outcome!=='not_actionable')break;

@@ -11,7 +11,8 @@ import { fileURLToPath } from 'node:url';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { gatedPaidClick, takeGateMutex, DISPATCH_TIMEOUT_MS, MUTEX_DIR } from './paid_click.mjs';
+import { pathToFileURL } from 'node:url';
+import { gatedPaidClick, takeGateMutex, DISPATCH_TIMEOUT_MS } from './paid_click.mjs';
 
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -169,8 +170,9 @@ test('an async gate and intent are awaited in order', async () => {
 });
 
 // ------------------------------------------------------------------------------------------------ last-check row 6
-// The transition mutex (tools/paid_gate.py transition_lock = paid_click.mjs takeGateMutex), on a temp root, against the real
-// python side: the gate is `python tools/paid_gate.py check`, the hold writer is python's transition_lock.
+// The transition lock (tools/paid_gate.py transition_lock; paid_click.mjs takeGateMutex holds it through a `paid_gate.py hold`
+// helper process), on a temp root, against the real python side: the gate is `python tools/paid_gate.py check`, the hold writer
+// is python's transition_lock. Post-cut-over review, blocker 2: an OS byte lock that never expires and dies with its owner.
 const PY = process.env.PYTHON ?? 'python';
 const TOOLS = fileURLToPath(new URL('..', import.meta.url));
 const GATE_TOOL = path.join(TOOLS, 'paid_gate.py');
@@ -201,6 +203,11 @@ except paid_gate.GateBusy:
     raise SystemExit(7)
 `;
 const writeHold = (root, wait) => spawnSync(PY, ['-X', 'utf8', '-c', HOLD_WRITER, TOOLS, root, String(wait)], {encoding: 'utf8'});
+/** python's view of the lock: {pid, what} of its holder, null when nobody holds it (paid_gate.lock_owner). */
+const lockOwner = root => JSON.parse(spawnSync(PY, ['-X', 'utf8', '-c',
+  'import sys, json; sys.path.insert(0, sys.argv[1]); import paid_gate; print(json.dumps(paid_gate.lock_owner(sys.argv[2])))',
+  TOOLS, root], {encoding: 'utf8'}).stdout);
+const pidAlive = pid => { try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; } };
 
 test("the last-check reviewer's case: a hold written during the intent write cannot be followed by a click", async t => {
   const root = tempRoot(t);
@@ -214,17 +221,20 @@ test("the last-check reviewer's case: a hold written during the intent write can
     handle.click = async o => { holdExistedAtClick = fs.existsSync(hold); return click(o); };
     return handle;
   };
+  let ownerDuringIntent = null;
   const result = await gatedPaidClick({
     control, gateClosed: pythonGate(root), takeMutex: () => takeGateMutex(root, {what: 'test click'}),
-    // the app tries to hold conversions exactly while the intent is written: its writer must wait for the mutex
-    writeIntent: () => { duringIntent = writeHold(root, 0.3); },
+    // the app tries to hold conversions exactly while the intent is written: its writer must wait for the lock
+    writeIntent: () => { ownerDuringIntent = lockOwner(root); duringIntent = writeHold(root, 0.3); },
   });
+  assert.equal(ownerDuringIntent?.what, 'test click');          // held by the helper process, for this click
   assert.equal(duringIntent.status, 7, `the hold writer got through during the critical section: ${duringIntent.stderr}`);
   assert.equal(holdExistedAtClick, false, 'a hold existed when the click was dispatched');
   assert.deepEqual(result, {outcome: 'clicked'});               // no hold could be written before the click: it is a clean click
   assert.equal(control.clicks.length, 1);
-  assert.ok(!fs.existsSync(path.join(batchOf(root), MUTEX_DIR)), 'the mutex was not released');
-  // afterwards the writer gets the mutex, and the next click sees the hold under it: nothing clicked, no intent
+  assert.equal(lockOwner(root), null, 'the lock was not released');
+  assert.ok(!pidAlive(ownerDuringIntent.pid), 'the lock helper process is still running');
+  // afterwards the writer gets the lock, and the next click sees the hold under it: nothing clicked, no intent
   assert.equal(writeHold(root, 2).status, 0);
   let intents = 0;
   const second = stubControl();
@@ -232,10 +242,10 @@ test("the last-check reviewer's case: a hold written during the intent write can
                                        takeMutex: () => takeGateMutex(root)});
   assert.deepEqual(closed, {outcome: 'gate_closed', gate: 'conversions are held (CONVERT_HOLD: restart)'});
   assert.deepEqual([intents, second.clicks.length], [0, 0]);
-  assert.ok(!fs.existsSync(path.join(batchOf(root), MUTEX_DIR)));
+  assert.equal(lockOwner(root), null);
 });
 
-test('a transition in progress (python holds the mutex) is a closed gate: the gate is not asked, nothing is clicked', async t => {
+test('a transition in progress (python holds the lock) is a closed gate: the gate is not asked, nothing is clicked', async t => {
   const root = tempRoot(t);
   const holder = spawn(PY, ['-X', 'utf8', '-c', `
 import sys, time
@@ -247,8 +257,7 @@ with paid_gate.transition_lock(sys.argv[2], what='slow writer'):
 `, TOOLS, root], {stdio: ['pipe', 'pipe', 'inherit']});
   t.after(() => holder.kill());
   await new Promise(resolve => holder.stdout.once('data', resolve));
-  const owner = JSON.parse(fs.readFileSync(path.join(batchOf(root), MUTEX_DIR, 'owner.json'), 'utf8'));
-  assert.equal(owner.pid, holder.pid);
+  assert.equal(lockOwner(root).pid, holder.pid);
   let asked = 0, intents = 0;
   const control = stubControl();
   const result = await gatedPaidClick({control, gateClosed: () => { asked++; return null; }, writeIntent: () => { intents++; },
@@ -258,29 +267,69 @@ with paid_gate.transition_lock(sys.argv[2], what='slow writer'):
   assert.deepEqual([asked, intents, control.clicks.length], [0, 0, 0]);
   holder.stdin.end();                                           // the writer finishes: python releases, node can take it
   await new Promise(resolve => holder.once('exit', resolve));
-  const mutex = takeGateMutex(root, {wait: 2000});
+  const mutex = await takeGateMutex(root, {wait: 2000});
   assert.ok(mutex?.owned());
-  assert.equal(writeHold(root, 0.2).status, 7);                 // and python sees node's mutex as busy
-  mutex.release();
+  assert.equal(writeHold(root, 0.2).status, 7);                 // and python sees node's lock as busy
+  await mutex.release();
+  assert.ok(!mutex.owned());
   assert.equal(writeHold(root, 2).status, 0);
 });
 
-test('the node mutex reclaims a dead owner, and a holder that lost it neither clicks nor removes the new one', async t => {
+test("the post-cut-over reviewer's case: a holder stalled past 30 s keeps the lock; nobody else gets in", async t => {
+  // The old directory mutex was reclaimed once it looked 30 s old. Here everything an age rule could look at says "an hour old"
+  // while the holder is alive and stalled in its critical section: the lock stays its own.
   const root = tempRoot(t);
-  const dir = path.join(batchOf(root), MUTEX_DIR);
-  const dead = spawnSync(PY, ['-c', 'import os; print(os.getpid())'], {encoding: 'utf8'});
-  fs.mkdirSync(dir);
-  fs.writeFileSync(path.join(dir, 'owner.json'), JSON.stringify({pid: Number(dead.stdout.trim()), time: 0, what: 'crashed'}));
-  const first = takeGateMutex(root, {wait: 500});
-  assert.ok(first?.owned(), 'the mutex of a dead owner was not reclaimed');
-  assert.equal(fs.readdirSync(batchOf(root)).filter(name => name.startsWith(`${MUTEX_DIR}.stale-`)).length, 1);   // renamed aside
-  assert.equal(takeGateMutex(root, {wait: 100}), null);         // live and fresh: busy
-  // the mutex is lost during a (too slow) gate check: another holder owns it now
+  const first = await takeGateMutex(root, {wait: 2000, what: 'stalled click'});
+  t.after(() => first?.release());
+  assert.ok(first?.owned());
+  const old = new Date(Date.now() - 3600 * 1000);
+  for (const name of ['gate.lock', 'gate.lock.owner.json']) fs.utimesSync(path.join(batchOf(root), name), old, old);
+  assert.equal(await takeGateMutex(root, {wait: 300}), null);   // a second node holder
+  assert.equal(writeHold(root, 0.3).status, 7);                 // a python writer (a hold / pause / mode write)
+  let asked = 0, intents = 0;
+  const control = stubControl();
+  const second = await gatedPaidClick({control, gateClosed: () => { asked++; return null; }, writeIntent: () => { intents++; },
+                                       takeMutex: () => takeGateMutex(root, {wait: 300})});
+  assert.equal(second.outcome, 'gate_closed');                  // a second click: not dispatched beside the first
+  assert.deepEqual([asked, intents, control.clicks.length], [0, 0, 0]);
+  assert.ok(first.owned());
+  assert.equal(lockOwner(root).pid, first.pid);
+  // the stalled holder resumes: its intent write and dispatch are still inside the lock, so no hold can have been written
+  const hold = path.join(batchOf(root), 'CONVERT_HOLD');
+  const resumed = stubControl();
+  const result = await gatedPaidClick({control: resumed, gateClosed: pythonGate(root), takeMutex: () => first,
+    writeIntent: async () => { await sleep(300); assert.equal(writeHold(root, 0.2).status, 7); assert.ok(!fs.existsSync(hold)); }});
+  assert.deepEqual(result, {outcome: 'clicked'});
+  assert.equal(lockOwner(root), null);                          // released with the click
+  assert.equal(writeHold(root, 2).status, 0);
+});
+
+test('the lock is released by the OS when the node owner dies, and a holder whose helper is gone does not click', async t => {
+  const root = tempRoot(t);
+  // a node process takes the lock and is killed inside its critical section (no release, no cleanup)
+  const owner = spawn(process.execPath, ['--input-type=module', '-e', `
+    import { takeGateMutex } from ${JSON.stringify(pathToFileURL(path.join(TOOLS, 'tripo_pipeline', 'paid_click.mjs')).href)};
+    const lock = await takeGateMutex(${JSON.stringify(root)}, {wait: 2000, what: 'dying click'});
+    console.log(lock ? 'held' : 'busy');
+    setInterval(() => {}, 1000);
+  `], {stdio: ['ignore', 'pipe', 'inherit']});
+  t.after(() => owner.kill());
+  const said = await new Promise(resolve => owner.stdout.once('data', chunk => resolve(String(chunk).trim())));
+  assert.equal(said, 'held');
+  const helper = lockOwner(root);
+  assert.equal(helper.what, 'dying click');
+  assert.equal(writeHold(root, 0.2).status, 7);
+  owner.kill();
+  await new Promise(resolve => owner.once('exit', resolve));
+  assert.equal(writeHold(root, 10).status, 0, 'the lock outlived its dead owner');   // the helper saw its stdin close and left
+  assert.ok(!pidAlive(helper.pid));
+  fs.rmSync(path.join(batchOf(root), 'CONVERT_HOLD'));
+  // the other way round: the helper is killed while node is in its (slow) gate check; node notices and does not click
+  const mutex = await takeGateMutex(root, {wait: 2000});
   let intents = 0;
   const control = stubControl();
-  const result = await gatedPaidClick({control, writeIntent: () => { intents++; }, takeMutex: () => first,
-    gateClosed: () => { fs.writeFileSync(path.join(dir, 'owner.json'), JSON.stringify({pid: process.pid, token: 'someone else'})); return null; }});
-  assert.deepEqual(result, {outcome: 'gate_closed', gate: 'the paid-gate transition mutex was lost during the gate check'});
+  const result = await gatedPaidClick({control, writeIntent: () => { intents++; }, takeMutex: () => mutex,
+    gateClosed: async () => { process.kill(mutex.pid); for (let i = 0; i < 100 && mutex.owned(); i++) await sleep(50); return null; }});
+  assert.deepEqual(result, {outcome: 'gate_closed', gate: 'the paid-gate transition lock was lost (its holder process is gone)'});
   assert.deepEqual([intents, control.clicks.length], [0, 0]);
-  assert.ok(fs.existsSync(path.join(dir, 'owner.json')), "the other holder's mutex was removed");
 });

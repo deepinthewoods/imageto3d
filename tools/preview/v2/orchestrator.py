@@ -752,25 +752,46 @@ class Orchestrator:
         norm = [os.path.normcase(a) for a in line]
         return all(os.path.normcase(str(m)) in norm for m in must_contain)
 
+    def _verified_handle(self, pid: int | None, recorded_create: float | None, must_contain: list[str]):
+        """ONE psutil.Process of `pid` whose create time is the recorded one and whose command line contains every string of
+        `must_contain`, else None. Every check is made on the returned object itself (post-cut-over review, blocker 7), so the caller
+        signals exactly the process that was verified: psutil binds the object to (pid, create time) and refuses to signal a reused pid."""
+        if psutil is None or not pid or recorded_create is None:
+            return None
+        try:
+            proc = psutil.Process(pid)
+            if abs(proc.create_time() - recorded_create) > CREATE_TIME_TOLERANCE or proc.status() == psutil.STATUS_ZOMBIE:
+                return None
+            line = [str(a) for a in proc.cmdline()]
+        except psutil.Error:
+            return None
+        norm = [os.path.normcase(a) for a in line]
+        return proc if all(os.path.normcase(str(m)) in norm for m in must_contain) else None
+
     def _terminate(self, pid: int | None, created: float | None, marks: list[str]) -> str:
         """Stop one recorded process: 'gone' (not running, or its pid now belongs to another process), 'killed' (verified, killed and confirmed
-        gone), 'unverified' (alive but its identity / command line could not be verified: not touched) or 'survived' (killed, still alive)."""
+        gone), 'unverified' (alive but its identity / command line could not be verified: not touched) or 'survived' (killed, still alive).
+        The process is verified and killed through ONE psutil.Process object (`_verified_handle`, as services._terminate does): no second
+        look-up by pid lies between the check and the signal, so a pid that Windows reused in between is never the one killed (blocker 7)."""
         if not pid or not pid_alive(pid):
             return 'gone'
         actual = create_time(pid)
         if created is not None and actual is not None and abs(actual - created) > CREATE_TIME_TOLERANCE:
             return 'gone'                                       # the pid was reused: the recorded process is gone
-        if not self._verified(pid, created, marks):
+        proc = self._verified_handle(pid, created, marks)
+        if proc is None:
             deadline = time.monotonic() + 3.0                   # (a process that is exiting right now cannot be inspected: wait for it)
             while time.monotonic() < deadline and pid_alive(pid):
                 time.sleep(0.1)
             if not pid_alive(pid):
                 return 'gone'
-            if not self._verified(pid, created, marks):
+            proc = self._verified_handle(pid, created, marks)
+            if proc is None:
                 return 'unverified'
         try:
-            proc = psutil.Process(pid)
-            proc.kill()
+            if not proc.is_running():                           # the verified process ended (its pid may belong to another one now)
+                return 'gone'
+            proc.kill()                                         # the SAME object that was verified
             proc.wait(KILL_WAIT)
         except psutil.NoSuchProcess:
             return 'killed'
@@ -1526,6 +1547,9 @@ def queue_state(root: Path, active: bool, now: float | None = None) -> dict:
     pool = pool_status(root)
     stall = read_settings(root)['build_stall_minutes']
     views = [task_view(t, now, stall) for t in tasks]
+    for task, view in zip(tasks, views):                        # a monster row's disposition revision: Retry echoes it (blocker 4)
+        if task['lane'] == monster_lane.LANE and task['state'] in ('failed', 'cancelled'):
+            view['conversion_seq'] = monster_lane.shown_seq(root, task)
     try:
         monsters = monster_lane.lane_status(root)
     except Exception as exc:  # noqa: BLE001  (display only: a damaged monster root never breaks the queue view)
